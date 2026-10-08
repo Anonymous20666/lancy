@@ -1,0 +1,102 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  RichMessageBuilder, rt, richButton, block, encodeCallback, decodeCallback,
+  inlineKeyboard, collectAttachmentRefs, RICH_LIMITS, richTextToString
+} from '../src/telegram/rich.js';
+
+test('builder produces valid InputRichMessage JSON', () => {
+  const b = new RichMessageBuilder();
+  b.heading('✦ LANCY BOT ✦', 1);
+  b.divider();
+  b.paragraph(rt.concat(rt.bold('hello'), rt.text(' world')));
+  b.table([
+    [{ text: 'Name', is_header: true, align: 'left', valign: 'middle' }, { text: 'Value', is_header: true, align: 'right', valign: 'middle' }],
+    [{ text: 'Stickers', align: 'left', valign: 'middle' }, { text: rt.bold('100'), align: 'right', valign: 'middle' }]
+  ]);
+  b.buttons([richButton.callback('♡ Open', 'l1:pack:open:1')]);
+  b.footer(rt.italic('made with love'));
+  const json = b.toJSON();
+  assert.ok(Array.isArray(json.blocks));
+  assert.equal(json.blocks[0].type, 'heading');
+  assert.equal(json.blocks[1].type, 'divider');
+  assert.equal(json.blocks[2].type, 'paragraph');
+  assert.equal(json.blocks[3].type, 'table');
+  assert.equal(json.blocks[4].type, 'buttons');
+  assert.equal(json.blocks[5].type, 'footer');
+  assert.equal(json.skip_entity_detection, true);
+  b.validate();
+});
+
+test('rich text helpers produce correct shapes', () => {
+  assert.deepEqual(rt.bold('x'), { type: 'bold', text: 'x' });
+  assert.deepEqual(rt.italic('x'), { type: 'italic', text: 'x' });
+  assert.deepEqual(rt.underline('x'), { type: 'underline', text: 'x' });
+  assert.deepEqual(rt.strikethrough('x'), { type: 'strikethrough', text: 'x' });
+  assert.deepEqual(rt.marked('x'), { type: 'marked', text: 'x' });
+  assert.deepEqual(rt.code('x'), { type: 'code', text: 'x' });
+  assert.deepEqual(rt.url('x', 'https://t.me'), { type: 'url', text: 'x', url: 'https://t.me' });
+  const c = rt.concat(rt.bold('a'), 'b', rt.italic('c'));
+  assert.ok(Array.isArray(c));
+  assert.equal(richTextToString(c), 'abc');
+});
+
+test('richTextToString flattens everything', () => {
+  assert.equal(richTextToString('plain'), 'plain');
+  assert.equal(richTextToString([rt.bold('a'), 'b', { type: 'url', text: 'c', url: 'u' }]), 'abc');
+  assert.equal(richTextToString({ type: 'mathematical_expression', expression: 'x^2' }), 'x^2');
+});
+
+test('buttons block caps at 8 per row and supports styles', () => {
+  const buttons = Array.from({ length: 10 }, (_, i) => richButton.callback(`b${i}`, `l1:x:y:${i}`));
+  const blk = block.buttons(buttons);
+  assert.equal(blk.buttons.length, RICH_LIMITS.maxButtonsPerRow);
+  const danger = richButton.callback('Delete', 'l1:x:del', { style: 'danger' });
+  assert.equal(danger.style, 'danger');
+  const link = richButton.url('Open', 'https://t.me/addstickers/x');
+  assert.equal(link.style, 'link');
+  assert.equal(link.url, 'https://t.me/addstickers/x');
+});
+
+test('callback codec round-trips and enforces 64 bytes', () => {
+  const data = encodeCallback('whatsapp', 'togglePack', 42, 3);
+  const decoded = decodeCallback(data);
+  assert.equal(decoded.screen, 'whatsapp');
+  assert.equal(decoded.action, 'togglePack');
+  assert.deepEqual(decoded.args, ['42', '3']);
+  assert.ok(Buffer.byteLength(data) <= 64);
+  assert.equal(decodeCallback('garbage'), null);
+  assert.throws(() => encodeCallback('s', 'a', 'x'.repeat(100)), /too long/);
+});
+
+test('inline keyboard supports 10.3 styles and disabled', () => {
+  const kb = inlineKeyboard([[
+    { text: 'Post', callback_data: 'l1:wa:post_confirm', style: 'success' },
+    { text: 'Delete', callback_data: 'l1:x:del', style: 'danger', disabled: true }
+  ]]);
+  assert.equal(kb.inline_keyboard[0][0].style, 'success');
+  assert.equal(kb.inline_keyboard[0][1].disabled, true);
+});
+
+test('collectAttachmentRefs finds attach:// references', () => {
+  const rich = new RichMessageBuilder().photo('attach://preview_0').photo('attach://preview_1').toJSON();
+  const refs = collectAttachmentRefs(rich);
+  assert.deepEqual([...refs.keys()].sort(), ['preview_0', 'preview_1']);
+});
+
+test('validate enforces block and char limits', () => {
+  const b = new RichMessageBuilder();
+  for (let i = 0; i < RICH_LIMITS.maxBlocks + 1; i++) b.paragraph('x');
+  assert.throws(() => b.validate(), /blocks/);
+  const b2 = new RichMessageBuilder();
+  b2.paragraph('y'.repeat(RICH_LIMITS.maxChars + 1));
+  assert.throws(() => b2.validate(), /chars/);
+});
+
+test('table normalizes cells with required align/valign', () => {
+  const blk = block.table([['a', { text: 'b', is_header: true, colspan: 2 }]]);
+  assert.equal(blk.cells[0][0].align, 'left');
+  assert.equal(blk.cells[0][0].valign, 'top');
+  assert.equal(blk.cells[0][1].is_header, true);
+  assert.equal(blk.cells[0][1].colspan, 2);
+});
