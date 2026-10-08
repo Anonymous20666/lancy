@@ -1,0 +1,288 @@
+import { EventEmitter } from 'node:events';
+import pino from 'pino';
+import { logger } from '../core/logger.js';
+import { friendlyDisconnectReason } from '../core/errors.js';
+import { ensureSessionDir, tightenFile } from '../utils/paths.js';
+import { withRetry, sleep } from '../utils/retry.js';
+
+/**
+ * WASession — one isolated WhatsApp account powered by plogme@2.0.7
+ * (verified against the installed source):
+ *
+ *   import makeWASocket, { useMultiFileAuthState, DisconnectReason, delay } from 'plogme'
+ *   sock.requestPairingCode(phoneNumber)   // digits only, with country code
+ *   sock.ev.on('connection.update', …)     // { connection, qr, lastDisconnect }
+ *   sock.ev.on('creds.update', saveCreds)
+ *   sock.sendMessage(jid, { sticker: buf })                       // single sticker
+ *   sock.sendMessage(jid, { stickers, cover, name, publisher,     // sticker PACK
+ *                          description })                         // ≤ 60 enforced by lib
+ *   sock.sendMessage(jid, { album: [...] }) / sock.sendAlbumMessage(jid, medias)
+ *   sock.newsletterSubscribed() / sock.newsletterMetadata('jid', jid)
+ *
+ * Reconnect: on 'close', reconnect unless DisconnectReason.loggedOut.
+ * Credentials persist via useMultiFileAuthState in an isolated, chmod-700
+ * directory per session. Credentials are never logged, never sent to the AI,
+ * never exposed in Telegram.
+ */
+export class WASession extends EventEmitter {
+  constructor({ sessionId, name, phone, credsDir, settings, log } = {}) {
+    super();
+    this.sessionId = sessionId;
+    this.name = name;
+    this.phone = phone ?? null;
+    this.credsDir = credsDir;
+    this.settings = settings;
+    this.log = log ?? logger().child({ module: 'wa-session', sessionId });
+    this.sock = null;
+    this.status = 'offline'; // offline | connecting | pairing | online | reconnecting | logged_out
+    this.reconnectState = 'idle'; // idle | backing_off | reconnecting
+    this.jid = null;
+    this.pairingCode = null;
+    this.lastConnected = null;
+    this.lastDisconnect = null;
+    this.reconnectAttempts = 0;
+    this.shouldStop = false;
+    this.saveCreds = null;
+    this.stats = { messagesSent: 0, packsPublished: 0, lastPublishAt: null };
+  }
+
+  get isOnline() {
+    return this.status === 'online';
+  }
+
+  async start() {
+    this.shouldStop = false;
+    await this.#connect();
+  }
+
+  async #connect() {
+    const { makeWASocket, useMultiFileAuthState, DisconnectReason, delay, Browsers } = await import('plogme');
+    this.status = this.sock ? 'reconnecting' : 'connecting';
+    this.reconnectState = this.sock ? 'reconnecting' : 'idle';
+    this.emit('status', this.status);
+
+    const dir = ensureSessionDir(this.credsDir, this.sessionId);
+    const { state, saveCreds } = await useMultiFileAuthState(dir);
+    this.saveCreds = (creds) => {
+      // Credentials are written by plogme; tighten permissions after save.
+      try {
+        saveCreds(creds);
+        tightenFile(`${dir}/creds.json`);
+      } catch (error) {
+        this.log.error({ err: error }, 'failed to save creds');
+      }
+    };
+
+    const waLogger = pino({ level: this.settings?.get('logging.level') === 'debug' ? 'debug' : 'silent' });
+    const sock = makeWASocket({
+      auth: state,
+      logger: waLogger,
+      printQRInTerminal: false,
+      browser: Browsers.macOS('Chrome'),
+      markOnlineOnConnect: true,
+      syncFullHistory: false,
+      // Conservative defaults: we are a control center, not a spam bot.
+      defaultQueryTimeoutMs: 30000
+    });
+    this.sock = sock;
+
+    sock.ev.on('creds.update', this.saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+      void this.#onConnectionUpdate(update, { DisconnectReason, delay });
+    });
+
+    return sock;
+  }
+
+  async #onConnectionUpdate(update, { DisconnectReason, delay }) {
+    const { connection, lastDisconnect, qr } = update ?? {};
+    if (qr) this.emit('qr', qr);
+
+    if (connection === 'connecting') {
+      this.status = 'connecting';
+      this.emit('status', this.status);
+    }
+
+    if (connection === 'open') {
+      this.status = 'online';
+      this.reconnectState = 'idle';
+      this.reconnectAttempts = 0;
+      this.jid = sock_jid(this.sock);
+      this.lastConnected = new Date().toISOString();
+      this.emit('status', this.status);
+      this.emit('online', { jid: this.jid });
+      this.log.info({ sessionId: this.sessionId, jid: this.jid }, 'whatsapp session online');
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode
+        ?? lastDisconnect?.error?.data?.statusCode
+        ?? lastDisconnect?.status;
+      const loggedOut = statusCode === DisconnectReason.loggedOut;
+      this.status = loggedOut ? 'logged_out' : 'offline';
+      this.lastDisconnect = new Date().toISOString();
+      this.emit('status', this.status);
+      this.emit('disconnect', { statusCode, reason: friendlyDisconnectReason(statusCode), loggedOut });
+      this.log.warn({ sessionId: this.sessionId, statusCode }, 'whatsapp connection closed');
+
+      if (loggedOut || this.shouldStop) return;
+      if ((this.settings?.get('whatsapp.reconnectBehavior') ?? 'auto') !== 'auto') return;
+
+      // Exponential backoff reconnect — never a tight loop.
+      this.reconnectState = 'backing_off';
+      this.reconnectAttempts++;
+      const delayMs = Math.min(60000, 1000 * Math.pow(2, this.reconnectAttempts - 1));
+      this.emit('reconnecting', { attempt: this.reconnectAttempts, delayMs });
+      await sleep(delayMs);
+      if (this.shouldStop) return;
+      try {
+        await this.#connect();
+      } catch (error) {
+        this.log.error({ err: error }, 'reconnect failed');
+        this.reconnectState = 'idle';
+      }
+    }
+  }
+
+  /**
+   * Request a pairing code. Plogme expects digits only (country code first,
+   * no +). We wait for the socket to be ready, then request with retries.
+   */
+  async requestPairingCode(phoneDigits) {
+    if (!/^\d{8,15}$/.test(phoneDigits)) {
+      throw new Error('Pairing phone number must be digits only with country code');
+    }
+    this.status = 'pairing';
+    this.emit('status', this.status);
+    this.phone = phoneDigits;
+
+    return withRetry(async (attempt) => {
+      // Baileys/plogme convention: the pairing request must happen after the
+      // socket is connecting/open-ish; we give it a moment on first attempt.
+      if (attempt === 1) await sleep(1500);
+      if (!this.sock) await this.#connect();
+      if (this.sock.authState?.creds?.registered) {
+        throw new Error('This session is already registered');
+      }
+      const code = await this.sock.requestPairingCode(phoneDigits);
+      this.pairingCode = code;
+      this.emit('pairingCode', code);
+      return code;
+    }, {
+      attempts: this.settings?.get('whatsapp.retryCount') ?? 3,
+      baseMs: 2000,
+      maxMs: 10000,
+      shouldRetry: (error) => !/already registered/.test(error.message)
+    });
+  }
+
+  /** Send a single sticker (webp buffer). */
+  async sendSticker(jid, webpBuffer) {
+    this.#assertOnline();
+    await this.sock.sendMessage(jid, { sticker: webpBuffer });
+    this.stats.messagesSent++;
+  }
+
+  /**
+   * Send a WhatsApp sticker PACK (plogme stickerPackMessage).
+   * The library physically enforces ≤ 60 stickers — the publisher splits
+   * before calling this. Never bypass that limit.
+   */
+  async sendStickerPack(jid, { name, publisher, description, cover, stickers }) {
+    this.#assertOnline();
+    if (!Array.isArray(stickers) || stickers.length === 0) {
+      throw new Error('sendStickerPack requires at least one sticker');
+    }
+    if (stickers.length > 60) {
+      throw new Error(`WhatsApp sticker packs physically hold at most 60 stickers (got ${stickers.length}) — split first`);
+    }
+    const result = await this.sock.sendMessage(jid, {
+      stickers: stickers.map((s) => ({ data: s.buffer, emojis: s.emoji?.length ? s.emoji : ['♡'] })),
+      cover,
+      name,
+      publisher,
+      description
+    });
+    this.stats.messagesSent++;
+    this.stats.packsPublished++;
+    this.stats.lastPublishAt = new Date().toISOString();
+    return result;
+  }
+
+  /** Send an album (≥2 media items) via plogme's sendAlbumMessage. */
+  async sendAlbum(jid, medias) {
+    this.#assertOnline();
+    if (!Array.isArray(medias) || medias.length < 2) {
+      throw new Error('Albums need at least two media items');
+    }
+    return this.sock.sendAlbumMessage(jid, medias);
+  }
+
+  /** Send a plain text message (used sparingly — WhatsApp is output-only). */
+  async sendText(jid, text) {
+    this.#assertOnline();
+    await this.sock.sendMessage(jid, { text });
+    this.stats.messagesSent++;
+  }
+
+  /** Send an image with caption. */
+  async sendImage(jid, buffer, caption = '') {
+    this.#assertOnline();
+    await this.sock.sendMessage(jid, { image: buffer, caption });
+    this.stats.messagesSent++;
+  }
+
+  /** Send a video with caption. */
+  async sendVideo(jid, buffer, caption = '') {
+    this.#assertOnline();
+    await this.sock.sendMessage(jid, { video: buffer, caption });
+    this.stats.messagesSent++;
+  }
+
+  /** List newsletters/channels this account is subscribed to. */
+  async listSubscribedNewsletters() {
+    this.#assertOnline();
+    return this.sock.newsletterSubscribed();
+  }
+
+  /** Fetch metadata for one channel (includes viewer metadata). */
+  async getNewsletterMetadata(jid) {
+    this.#assertOnline();
+    return this.sock.newsletterMetadata('jid', jid);
+  }
+
+  async logout() {
+    this.shouldStop = true;
+    try {
+      await this.sock?.logout?.('Lancy Bot logout');
+    } catch { /* already closed */ }
+    this.status = 'logged_out';
+    this.emit('status', this.status);
+  }
+
+  async destroy() {
+    this.shouldStop = true;
+    try {
+      this.sock?.ev?.removeAllListeners?.();
+      await this.sock?.end?.();
+    } catch { /* ignore */ }
+    this.sock = null;
+    this.status = 'offline';
+  }
+
+  #assertOnline() {
+    if (!this.sock || this.status !== 'online') {
+      const err = new Error(`Session "${this.name}" is ${this.status} — connect it first`);
+      err.code = 'SESSION_OFFLINE';
+      throw err;
+    }
+  }
+}
+
+function sock_jid(sock) {
+  const id = sock?.authState?.creds?.me?.id ?? sock?.user?.id ?? null;
+  if (!id) return null;
+  // '2348012345678:12@s.whatsapp.net' → '2348012345678@s.whatsapp.net'
+  return String(id).split(':')[0] + '@s.whatsapp.net';
+}
