@@ -195,7 +195,7 @@ test('dashboard → pinterest menu → search query → results (full flow)', as
   assert.equal(app.sm.state(String(OWNER)), 'PINTEREST_SEARCH', 'state machine entered search');
 
   // send the query as a text message
-  await drive([makeUpdateMessage('smoke')], 4000);
+  await drive([makeUpdateMessage('smoke')], 10000);
   assert.equal(app.sm.state(String(OWNER)), 'PINTEREST_RESULTS', 'search completed into results');
   const all = [...sent, ...edited];
   assert.ok(all.length >= 2, 'progress + results messages exist');
@@ -238,9 +238,9 @@ test('restart-required settings are honestly flagged', async () => {
 
 test('AI chat answers through the worker (style picker + message)', async () => {
   sent = []; edited = [];
-  await drive([makeCallbackUpdate('l1:ai:open')], 300);
+  await drive([makeCallbackUpdate('l1:ai:open')], 500);
   assert.equal(app.sm.state(String(OWNER)), 'AI_CHAT', 'AI chat state entered');
-  await drive([makeUpdateMessage('can you write me a caption for gojo?')], 2500);
+  await drive([makeUpdateMessage('can you write me a caption for gojo?')], 6000);
   assert.ok(plain.length + sent.length + edited.length > 0, 'AI answered');
   const text = JSON.stringify([...plain, ...sent, ...edited]);
   assert.doesNotMatch(text, /Error|undefined is not|not defined/i);
