@@ -948,8 +948,9 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '📜 Lyrics & Info ♡',
-                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`
+                text: '🌸 📜 Lyrics & Info ♡',
+                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                style: 'primary'
               }
             ]
           ]
@@ -987,8 +988,9 @@ export class TelegramController extends EventEmitter {
               inline_keyboard: [
                 [
                   {
-                    text: '📥 Full MP3 & Lyrics ♡',
-                    url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`
+                    text: '✨ 📥 Full MP3 & Lyrics ♡',
+                    url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                    style: 'primary'
                   }
                 ]
               ]
@@ -1011,8 +1013,9 @@ export class TelegramController extends EventEmitter {
             inline_keyboard: [
               [
                 {
-                  text: '📥 Download Full MP3 ♡',
-                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`
+                  text: '✨ 📥 Download Full MP3 ♡',
+                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                  style: 'primary'
                 }
               ]
             ]
@@ -1052,8 +1055,9 @@ export class TelegramController extends EventEmitter {
             inline_keyboard: [
               [
                 {
-                  text: '📥 Download Full MP3 ♡',
-                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(cleanSongQuery.replace(/\s+/g, '_')).slice(0, 32)}`
+                  text: '✨ 📥 Download Full MP3 ♡',
+                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(cleanSongQuery.replace(/\s+/g, '_')).slice(0, 32)}`,
+                  style: 'primary'
                 }
               ]
             ]
