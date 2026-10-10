@@ -70,3 +70,14 @@ export function throttle(fn, waitMs) {
 
   return throttled;
 }
+
+/** Parse 'mm:ss' or 'hh:mm:ss' or seconds string/number into integer seconds. */
+export function parseDurationToSeconds(val) {
+  if (typeof val === 'number') return Math.round(val);
+  if (!val || typeof val !== 'string') return 0;
+  const parts = val.trim().split(':').map(Number);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  const num = Number(val);
+  return isNaN(num) ? 0 : Math.round(num);
+}

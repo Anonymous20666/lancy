@@ -274,13 +274,13 @@ export class LancyAssistant {
         // If user is quoting a message that asked about songs or music
         const isQuotingMusic = Boolean(quotedText && /\b(?:song|music|track|audio|artist name|artist|title)\b/i.test(quotedText));
 
-        // If user recently asked about music or songs, and current message is a music title/artist (e.g. "Juice wrld")
+        // If assistant recently asked for a song name, and current message is a music title/artist (e.g. "Juice wrld")
         const history = this.getHistory(userId, 4);
         const prevMessages = history.slice().reverse();
         const prevTurn = prevMessages.find((h) => h.content !== cleanText);
-        const prevWasMusic = Boolean(prevTurn && /\b(?:song|music|track|audio|play)\b/i.test(prevTurn.content));
+        const prevWasMusic = Boolean(prevTurn && prevTurn.role === 'assistant' && /\b(?:which\s+song|what\s+song|song\s+title|artist\s+name|drop\s+the\s+song)\b/i.test(prevTurn.content));
 
-        if ((isQuotingMusic || prevWasMusic) && !/^(?:hi|hey|hello|ok|thanks|yes|sure|fine|no)\b/i.test(cleanText) && cleanText.length < 60) {
+        if ((isQuotingMusic || prevWasMusic) && !/^(?:hi|hey|hello|ok|thanks|yes|sure|fine|no|can\s+you|write|generate|make|help|what|how|why|tell|give|explain)\b/i.test(cleanText) && !/\?$/.test(cleanText) && cleanText.length < 60) {
           musicQuery = cleanText.replace(/^(?:me|some|the|a)\s+/i, '').trim();
         }
       }

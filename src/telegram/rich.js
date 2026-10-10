@@ -96,7 +96,11 @@ export const block = {
   photo: (media, caption) => ({ type: 'photo', photo: typeof media === 'object' && media !== null ? media : { type: 'photo', media }, ...(caption ? { caption: { text: caption } } : {}) }),
   video: (media, caption) => ({ type: 'video', video: typeof media === 'object' && media !== null ? media : { type: 'video', media }, ...(caption ? { caption: { text: caption } } : {}) }),
   animation: (media, caption) => ({ type: 'animation', animation: typeof media === 'object' && media !== null ? media : { type: 'animation', media }, ...(caption ? { caption: { text: caption } } : {}) }),
-  audio: (media, caption) => ({ type: 'audio', audio: typeof media === 'object' && media !== null ? media : { type: 'audio', media }, ...(caption ? { caption: { text: caption } } : {}) }),
+  audio: (media, caption) => ({
+    type: 'audio',
+    audio: typeof media === 'object' && media !== null ? { type: 'audio', ...media } : { type: 'audio', media },
+    ...(caption ? { caption: { text: caption } } : {})
+  }),
   document: (media, caption) => ({ type: 'document', document: typeof media === 'object' && media !== null ? media : { type: 'document', media }, ...(caption ? { caption: { text: caption } } : {}) }),
   collage: (blocks, caption) => ({ type: 'collage', blocks: blocks.map((b) => typeof b === 'string' ? block.photo(b) : b), ...(caption ? { caption: { text: caption } } : {}) }),
   slideshow: (blocks, caption) => ({ type: 'slideshow', blocks: blocks.map((b) => typeof b === 'string' ? block.photo(b) : b), ...(caption ? { caption: { text: caption } } : {}) })

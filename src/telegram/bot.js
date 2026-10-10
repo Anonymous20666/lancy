@@ -623,21 +623,16 @@ export class TelegramController extends EventEmitter {
       const recResult = await recognizeAudio(buffer, { extension: ext });
 
       if (recResult?.success && recResult.title) {
-        const { title, artist, album, year } = recResult;
-        if (progressMsg?.message_id) {
-          await this.api.editMessageText(
-            chatId,
-            progressMsg.message_id,
-            `✨ Song Identified: **${title}** by **${artist || 'Unknown'}** ♡\nDownloading full 320 kbps track…`
-          ).catch(() => {});
-        }
+        const { title, artist } = recResult;
 
         const downloaderScreen = this.screens.get('downloader');
         if (downloaderScreen?.executeDownload) {
-          await downloaderScreen.executeDownload(resolvedCtx, `${title} ${artist || ''}`.trim());
-          if (progressMsg?.message_id) {
-            await this.api.call('deleteMessage', { chat_id: chatId, message_id: progressMsg.message_id }).catch(() => {});
-          }
+          const dlCtx = {
+            ...resolvedCtx,
+            messageId: progressMsg?.message_id,
+            initialStage: `Identified: "${title}" by ${artist || 'Unknown'} ♡`
+          };
+          await downloaderScreen.executeDownload(dlCtx, `${title} ${artist || ''}`.trim());
           return;
         }
       } else {

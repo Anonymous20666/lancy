@@ -43,6 +43,7 @@ export class ProgressTracker {
     if (this.indicator) {
       this.indicator.start(this.action);
     }
+    const prevMsgId = this.messageId;
     if (this.messageId) {
       try {
         await this.api.editMessageRich(this.chatId, this.messageId, richMessage);
@@ -53,7 +54,10 @@ export class ProgressTracker {
       }
     }
     const message = await this.api.sendRichMessage(this.chatId, richMessage);
-    this.messageId = message.message_id;
+    if (prevMsgId && message?.message_id && message.message_id !== prevMsgId) {
+      await this.api.call?.('deleteMessage', { chat_id: this.chatId, message_id: prevMsgId })?.catch?.(() => {});
+    }
+    this.messageId = message?.message_id;
     this.lastRender = JSON.stringify(richMessage);
     return this.messageId;
   }
@@ -137,11 +141,15 @@ export class ProgressTracker {
       return res;
     } catch (error) {
       if (/not modified/i.test(String(error?.description ?? error?.message))) return null;
-      // Message vanished (user deleted it) → send a fresh one instead of failing silently.
+      // Message vanished (user deleted it) or could not be edited with media → send a fresh one.
+      const prevMsgId = this.messageId;
       const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch((err) => {
         this.log.warn({ err }, 'final progress edit failed');
         return null;
       });
+      if (prevMsgId && sent?.message_id && sent.message_id !== prevMsgId) {
+        await this.api.call?.('deleteMessage', { chat_id: this.chatId, message_id: prevMsgId })?.catch?.(() => {});
+      }
       if (sent?.message_id) this.messageId = sent.message_id;
       return sent;
     }

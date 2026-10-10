@@ -6,7 +6,7 @@ import { logger } from '../../core/logger.js';
 import { truncate } from '../../utils/text.js';
 import { getLyrics, formatBlockquoteLyrics, chunkLyrics, escapeHtml } from '../../media/lyrics.js';
 import { extractMediaForMusicRecognition } from '../../media/recognizer.js';
-import { sleep } from '../../utils/time.js';
+import { sleep, parseDurationToSeconds } from '../../utils/time.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -181,7 +181,7 @@ export function createDownloaderScreen({ app }) {
     });
 
     await tracker.live((state, { elapsedMs }) => renderDownloadProgress({ ...state, elapsedMs, url }), {
-      stage: 'Analyzing link & detecting platform…',
+      stage: ctx.initialStage || 'Analyzing link & detecting platform…',
       platform: '',
       url
     });
@@ -268,10 +268,19 @@ export function createDownloaderScreen({ app }) {
           filename: audioTrack.filename || `${(title || 'soundtrack').replace(/[^\w\s-]/g, '') || 'soundtrack'}.mp3`,
           contentType: 'audio/mpeg'
         };
+
+        const parsedDuration = parseDurationToSeconds(audioTrack.duration || result.duration);
+        const audioMediaObj = {
+          media: `attach://${audioField}`,
+          title: audioTrack.title || result.title || title || 'Audio Track',
+          performer: audioTrack.performer || result.artist || result.author || 'Artist',
+          ...(parsedDuration > 0 ? { duration: parsedDuration } : {})
+        };
+
         if (isMusic) {
-          b.audio(`attach://${audioField}`);
+          b.audio(audioMediaObj);
         } else {
-          b.audio(`attach://${audioField}`, '🎵 Extracted Video Soundtrack (MP3) ♡');
+          b.audio(audioMediaObj, '🎵 Extracted Video Soundtrack (MP3) ♡');
         }
       }
 
