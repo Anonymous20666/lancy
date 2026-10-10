@@ -641,20 +641,25 @@ export class TelegramController extends EventEmitter {
           return;
         }
       } else {
-        const reasonText = recResult?.reason?.includes('audio track')
+        const failureMessage = recResult?.reason?.includes('audio track')
           ? `୨୧ No sound or audio track found in this ${label} ♡`
-          : `୨୧ Could not recognize the music in this ${label} ♡`;
+          : `୨୧ Could not recognize the music in this ${label} ♡\n\n` +
+            `💡 <b>How Music Recognition Works:</b>\n` +
+            `• Recognition matches <b>actual song recordings</b> playing on a speaker, radio, TV, or phone.\n` +
+            `• Acoustic engines cannot match acapella voice humming without the original song track playing.\n\n` +
+            `✨ <b>Know any words or lyrics?</b> Tap <b>🔍 Search by Lyrics</b> below or type <code>/play &lt;lyrics&gt;</code> to download it directly! ♡`;
 
         if (progressMsg?.message_id) {
           await this.api.editMessageText(
             chatId,
             progressMsg.message_id,
-            `${reasonText}\nTip: You can use 🎵 Play Music or type /play <song or lyrics> to search & download directly ♡`,
+            failureMessage,
             {
+              parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [
                   [
-                    { text: '🎵 Play Music / Search', callback_data: 'l1:downloader:play' },
+                    { text: '🔍 Search by Lyrics or Title', callback_data: 'l1:downloader:play' },
                     { text: '« Menu', callback_data: 'l1:dashboard:open' }
                   ]
                 ]

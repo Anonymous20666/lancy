@@ -127,9 +127,10 @@ export function createDownloaderScreen({ app }) {
     b.divider();
     b.heading('୨୧ how to recognize music', 3);
     b.paragraph(rt.text(
-      '1. 🎧 Forward any audio track, voice message, or song snippet to this chat\n' +
-      '2. 🎬 Or forward any video (TikTok, Reel, short, etc.) with background music\n' +
-      '3. 🎤 Or send/record a voice note humming or playing the song!'
+      '1. 🎧 Forward any audio track, music file, or song snippet to this chat\n' +
+      '2. 🎬 Or forward any video (TikTok, Reel, story, etc.) with background music\n' +
+      '3. 🎙️ Or record a voice note while the song is playing (speakers, car, TV)!\n\n' +
+      '💡 Note: Recognition matches actual song tracks. If humming or recalling lyrics, use Search by Lyrics instead!'
     ));
     b.divider();
     b.quote(rt.text(
@@ -137,7 +138,7 @@ export function createDownloaderScreen({ app }) {
     ));
     b.divider();
     b.buttons([
-      richButton.callback('🎵 Search by Song Name', encodeCallback(id, 'play'), { style: 'primary' }),
+      richButton.callback('🔍 Search by Song / Lyrics', encodeCallback(id, 'play'), { style: 'primary' }),
       richButton.callback('« Downloader', encodeCallback(id, 'open'))
     ]);
     b.buttons([
