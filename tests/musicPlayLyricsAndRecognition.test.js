@@ -14,8 +14,9 @@ test('Lyrics Engine: getLyrics retrieves and formatBlockquoteLyrics formats in b
   assert.ok(result.lyrics && result.lyrics.length > 20, 'Lyrics content is populated');
 
   const formatted = formatBlockquoteLyrics(result.lyrics);
-  assert.ok(formatted.startsWith('>'), 'Blockquote formatting prepends > to lines');
-  assert.ok(formatted.includes('\n>'), 'Contains multiple blockquote lines');
+  assert.ok(formatted.startsWith('<blockquote expandable>'), 'Blockquote formatting uses Telegram expandable blockquote HTML');
+  assert.ok(formatted.endsWith('</blockquote>'), 'Blockquote formatting closes blockquote tag');
+  assert.ok(!formatted.includes('\n>'), 'Does NOT prepend > to lines');
 });
 
 test('Audio Recognizer: recognizeAudio handles audio buffers safely', async () => {

@@ -983,8 +983,9 @@ export class MediaDownloader {
    * Universal Music Search Downloader (Song title / Artist / Track search)
    */
   async #downloadMusicSearch(query, { onProgress } = {}) {
-    const clean = String(query || '')
+    let clean = String(query || '')
       .replace(/^(music|song|track|audio|play|search\s*music|download\s*song|spotify)\s*[:\-]?\s*/i, '')
+      .replace(/^["'“”]+|["'“”]+$/g, '')
       .trim();
     if (!clean) throw new Error('Please provide a song title or artist to search ♡');
 
@@ -995,9 +996,9 @@ export class MediaDownloader {
 
     try {
       // Check if query looks like lyrics or a verse snippet
-      let isLyricQuery = clean.includes('\n') || (clean.split(/\s+/).length >= 5 && !/[-–—]/.test(clean));
+      let isLyricQuery = clean.includes('\n') || (clean.split(/\s+/).length >= 4 && !/[-–—]/.test(clean));
       if (!isLyricQuery && clean.split(/\s+/).length >= 3) {
-        if (/\b(love|feel|heart|baby|wished|star|shoot|shot|bulletproof|eyes|night|hold|dance|wanna|gonna|overtime|tears|fly|die|kiss|look)\b/i.test(clean)) {
+        if (/\b(love|feel|heart|baby|wished|star|shoot|shot|bulletproof|eyes|night|hold|dance|wanna|gonna|overtime|tears|fly|die|kiss|look|know|tell|say|fall|time|girl|boy|never|always)\b/i.test(clean)) {
           isLyricQuery = true;
         }
       }

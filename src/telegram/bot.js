@@ -385,7 +385,8 @@ export class TelegramController extends EventEmitter {
               ? `𓆩♡𓆪 <b>SONG LYRICS</b> 𓆩♡𓆪\n🎵 <b>${escapeHtml(lyricsRes.title)}</b>` + (lyricsRes.artist ? ` — <i>${escapeHtml(lyricsRes.artist)}</i>` : '') + ` ♡\n\n`
               : `𓆩♡𓆪 <b>SONG LYRICS (${i + 1}/${total})</b> 𓆩♡𓆪\n🎵 <b>${escapeHtml(lyricsRes.title)}</b>` + (lyricsRes.artist ? ` — <i>${escapeHtml(lyricsRes.artist)}</i>` : '') + ` ♡\n\n`;
 
-            const messageHtml = `${header}<blockquote expandable>${escapeHtml(chunks[i])}</blockquote>`;
+            const blockquoteHtml = formatBlockquoteLyrics(chunks[i], { expandable: true });
+            const messageHtml = `${header}${blockquoteHtml}`;
 
             try {
               await this.api.sendMessage(chatId, messageHtml, { parse_mode: 'HTML' });
@@ -393,7 +394,7 @@ export class TelegramController extends EventEmitter {
               try {
                 await this.api.sendMessage(chatId, `${header}<blockquote>${escapeHtml(chunks[i])}</blockquote>`, { parse_mode: 'HTML' });
               } catch {
-                await this.api.sendMessage(chatId, formatBlockquoteLyrics(chunks[i]));
+                await this.api.sendMessage(chatId, `${header.replace(/<[^>]+>/g, '')}${chunks[i]}`);
               }
             }
 
@@ -648,7 +649,17 @@ export class TelegramController extends EventEmitter {
           await this.api.editMessageText(
             chatId,
             progressMsg.message_id,
-            `${reasonText}\nTip: You can use 🎵 Play Music from the menu or type /play <song name> to search & download directly ♡`
+            `${reasonText}\nTip: You can use 🎵 Play Music or type /play <song or lyrics> to search & download directly ♡`,
+            {
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '🎵 Play Music / Search', callback_data: 'l1:downloader:play' },
+                    { text: '« Menu', callback_data: 'l1:dashboard:open' }
+                  ]
+                ]
+              }
+            }
           ).catch(() => {});
         }
         await this.sm.reset(tgId, { reason: 'recognition_failed' }).catch(() => {});

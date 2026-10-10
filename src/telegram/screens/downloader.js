@@ -460,7 +460,8 @@ export function createDownloaderScreen({ app }) {
               ? `𓆩♡𓆪 <b>SONG LYRICS</b> 𓆩♡𓆪\n🎵 <b>${escapeHtml(lyricsRes.title)}</b>` + (lyricsRes.artist ? ` — <i>${escapeHtml(lyricsRes.artist)}</i>` : '') + ` ♡\n\n`
               : `𓆩♡𓆪 <b>SONG LYRICS (${i + 1}/${total})</b> 𓆩♡𓆪\n🎵 <b>${escapeHtml(lyricsRes.title)}</b>` + (lyricsRes.artist ? ` — <i>${escapeHtml(lyricsRes.artist)}</i>` : '') + ` ♡\n\n`;
 
-            const messageHtml = `${header}<blockquote expandable>${escapeHtml(chunks[i])}</blockquote>`;
+            const blockquoteHtml = formatBlockquoteLyrics(chunks[i], { expandable: true });
+            const messageHtml = `${header}${blockquoteHtml}`;
 
             try {
               await ctx.api.sendMessage(ctx.chatId, messageHtml, { parse_mode: 'HTML' });
@@ -468,7 +469,7 @@ export function createDownloaderScreen({ app }) {
               try {
                 await ctx.api.sendMessage(ctx.chatId, `${header}<blockquote>${escapeHtml(chunks[i])}</blockquote>`, { parse_mode: 'HTML' });
               } catch {
-                await ctx.api.sendMessage(ctx.chatId, formatBlockquoteLyrics(chunks[i]));
+                await ctx.api.sendMessage(ctx.chatId, `${header.replace(/<[^>]+>/g, '')}${chunks[i]}`);
               }
             }
 

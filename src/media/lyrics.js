@@ -112,7 +112,31 @@ export async function fetchAzLyrics(url) {
  */
 export async function searchSongByLyrics(snippet) {
   if (!snippet || typeof snippet !== 'string') return null;
+
+  // Handle multi-candidate queries (e.g. "lyrics A" or "lyrics B")
+  const candidates = [];
+  if (/\s+or\s+/i.test(snippet)) {
+    const parts = snippet.split(/\s+or\s+/i);
+    for (const p of parts) {
+      const c = p.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+      if (c.length >= 5) candidates.push(c);
+    }
+  }
+  const mainClean = snippet.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+  if (mainClean && !candidates.includes(mainClean)) {
+    candidates.unshift(mainClean);
+  }
+
+  for (const cand of candidates) {
+    const res = await _doSearchSongByLyrics(cand);
+    if (res) return res;
+  }
+  return null;
+}
+
+async function _doSearchSongByLyrics(snippet) {
   const cleanSnippet = snippet
+    .replace(/^["'“”]+|["'“”]+$/g, '')
     .replace(/[\r\n]+/g, ' ')
     .replace(/[^\w\s']/g, ' ')
     .replace(/\s+/g, ' ')
@@ -367,17 +391,6 @@ export async function getLyrics(rawTitle, rawArtist = '') {
 }
 
 /**
- * Format lyrics as Markdown blockquote lines
- */
-export function formatBlockquoteLyrics(lyricsText) {
-  if (!lyricsText) return '';
-  return lyricsText
-    .split('\n')
-    .map((line) => (line.trim() ? `> ${line}` : '>'))
-    .join('\n');
-}
-
-/**
  * Escape HTML special characters for Telegram HTML mode
  */
 export function escapeHtml(str) {
@@ -386,6 +399,18 @@ export function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+/**
+ * Format lyrics inside Telegram's native HTML blockquote.
+ * Never prepends '>' to lines; preserves clean natural newlines.
+ */
+export function formatBlockquoteLyrics(lyricsText, { expandable = true } = {}) {
+  if (!lyricsText) return '';
+  const escaped = escapeHtml(lyricsText);
+  return expandable
+    ? `<blockquote expandable>${escaped}</blockquote>`
+    : `<blockquote>${escaped}</blockquote>`;
 }
 
 /**
