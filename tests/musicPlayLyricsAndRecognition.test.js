@@ -619,3 +619,63 @@ test('TelegramAPI: sendAudio packages audio buffer and optional thumbnail buffer
   assert.equal(callFiles.thumbnail.contentType, 'image/jpeg');
 });
 
+test('Catalog Verification: verifyWithCatalog verifies real commercial tracks and rejects obscure acoustic collisions', async () => {
+  const { verifyWithCatalog } = await import('../src/media/recognizer.js');
+
+  // Real hit track
+  const hit = await verifyWithCatalog('Blinding Lights', 'The Weeknd');
+  assert.ok(hit, 'Real hit track verified in catalog');
+  assert.equal(hit.verified, true);
+  assert.ok(hit.title.toLowerCase().includes('blinding lights'));
+
+  // Obscure phantom string that does not exist or has no popularity rank
+  const fake = await verifyWithCatalog('Xk99283zzqq Random Nonexistent Song', 'Fake Nobody Artist 999');
+  assert.equal(fake, null, 'Unverified obscure track is rejected');
+});
+
+test('Clone Screen: renders welcome card and prompts with b.quote and zero raw HTML tags in text nodes', async () => {
+  const { createCloneScreen } = await import('../src/telegram/screens/clone.js');
+  const db = new Database(':memory:');
+  const sm = new StateMachine();
+  const app = {
+    db,
+    multiBotManager: { getBotsForOwner: () => [] }
+  };
+
+  const cloneScreen = createCloneScreen({ app });
+  let editedRich = null;
+  const ctx = {
+    tgId: '100',
+    chatId: 100,
+    db,
+    sm,
+    editScreen: async (rich) => { editedRich = rich; return { message_id: 100 }; }
+  };
+
+  await cloneScreen.open(ctx);
+  assert.ok(editedRich, 'Welcome card rendered');
+
+  // Verify there are blockquotes and no raw <b> tags in any text blocks
+  const quoteBlocks = editedRich.blocks.filter((b) => b.type === 'blockquote');
+  assert.ok(quoteBlocks.length > 0, 'Welcome card contains blockquote block for aesthetics');
+
+  const allTextValues = [];
+  function collectText(node) {
+    if (!node) return;
+    if (typeof node === 'string') allTextValues.push(node);
+    if (typeof node.text === 'string') allTextValues.push(node.text);
+    else if (typeof node.text === 'object') collectText(node.text);
+    if (Array.isArray(node.children)) node.children.forEach(collectText);
+    if (Array.isArray(node.blocks)) node.blocks.forEach(collectText);
+  }
+  editedRich.blocks.forEach(collectText);
+
+  for (const text of allTextValues) {
+    assert.ok(!text.includes('<b>') && !text.includes('</b>'), `Text "${text}" must not contain raw <b> tags`);
+    assert.ok(!text.includes('<i>') && !text.includes('</i>'), `Text "${text}" must not contain raw <i> tags`);
+  }
+
+  db.close();
+});
+
+

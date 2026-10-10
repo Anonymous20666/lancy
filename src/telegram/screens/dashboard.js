@@ -150,7 +150,10 @@ export function createDashboardScreen({ app }) {
       'customize your bot language ♡'
     ])));
     b.divider();
-    b.paragraph(rt.text('🌍 <b>Please select your preferred language:</b>\nAll bot responses and notifications will be personalized for you ♡'));
+    b.quote(rt.concat(
+      rt.bold('🌍 Please select your preferred language:\n'),
+      rt.text('All bot responses and notifications will be personalized for you ♡')
+    ));
     b.divider();
 
     const langRows = [

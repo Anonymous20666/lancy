@@ -17,12 +17,12 @@ export function createCloneScreen({ app }) {
     b.divider();
 
     b.heading('୨୧ what is bot cloning?', 3);
-    b.paragraph(rt.text(
-      '• 🌸 <b>Custom Branding:</b> Your bot replaces "Lancy" everywhere with your chosen name!\n' +
-      '• 🎵 <b>All Features Included:</b> High-speed music, universal downloader & Pinterest search.\n' +
-      '• 👥 <b>Group Chats:</b> Add your bot to groups for music & media with member tagging.\n' +
-      '• 🌍 <b>Multi-Language:</b> Supports 7 languages with custom audience tracking.\n' +
-      '• 📢 <b>Broadcasts:</b> Send announcements directly to all users of your bot.'
+    b.quote(rt.concat(
+      rt.text('• 🌸 '), rt.bold('Custom Branding: '), rt.text('Your bot replaces "Lancy" everywhere with your chosen name!\n'),
+      rt.text('• 🎵 '), rt.bold('All Features Included: '), rt.text('High-speed music, universal downloader & Pinterest search.\n'),
+      rt.text('• 👥 '), rt.bold('Group Chats: '), rt.text('Add your bot to groups for music & media with member tagging.\n'),
+      rt.text('• 🌍 '), rt.bold('Multi-Language: '), rt.text('Supports 7 languages with custom audience tracking.\n'),
+      rt.text('• 📢 '), rt.bold('Broadcasts: '), rt.text('Send announcements directly to all users of your bot.')
     ));
     b.divider();
 
@@ -78,11 +78,11 @@ export function createCloneScreen({ app }) {
       'choose your custom bot identity ♡'
     ])));
     b.divider();
-    b.paragraph(rt.text(
-      '🌸 <b>What name would you like your bot to have?</b>\n\n' +
-      'Instead of "Lancy", this name will appear in greetings, banners, and delivery cards!\n' +
-      '<i>Examples: Aria, Nova, Sam Music, Bella Studio</i>\n\n' +
-      '👇 Type and send your desired bot name in chat now:'
+    b.quote(rt.concat(
+      rt.bold('🌸 What name would you like your bot to have?\n\n'),
+      rt.text('Instead of "Lancy", this name will appear in greetings, banners, and delivery cards!\n'),
+      rt.italic('Examples: Aria, Nova, Sam Music, Bella Studio\n\n'),
+      rt.bold('👇 Type and send your desired bot name in chat now:')
     ));
     b.divider();
     b.buttons([
@@ -101,12 +101,12 @@ export function createCloneScreen({ app }) {
     b.divider();
 
     b.heading('୨୧ follow these 4 quick steps:', 3);
-    b.paragraph(rt.text(
-      '1. Open Telegram\'s official <b><a href="https://t.me/BotFather">@BotFather</a></b>\n' +
-      '2. Send the command <code>/newbot</code>\n' +
-      '3. Choose a display name and username ending in <code>bot</code>\n' +
-      '4. Copy the HTTP API token (e.g. <code>123456789:ABCdefGHI...</code>)\n\n' +
-      '👇 <b>Paste and send your bot token here:</b>'
+    b.quote(rt.concat(
+      rt.text('1. Open Telegram\'s official '), rt.bold('@BotFather'), rt.text('\n'),
+      rt.text('2. Send the command '), rt.code('/newbot'), rt.text('\n'),
+      rt.text('3. Choose a display name and username ending in '), rt.code('bot'), rt.text('\n'),
+      rt.text('4. Copy the HTTP API token (e.g. '), rt.code('123456789:ABCdefGHI...'), rt.text(')\n\n'),
+      rt.bold('👇 Paste and send your bot token here:')
     ));
     b.divider();
 
@@ -210,7 +210,11 @@ export function createCloneScreen({ app }) {
             `delete @${botRecord.bot_username} permanently?`
           ])));
           b.divider();
-          b.paragraph(rt.text(`Are you sure you want to stop and delete <b>@${botRecord.bot_username}</b>? This cannot be undone.`));
+          b.quote(rt.concat(
+            rt.text('Are you sure you want to stop and delete '),
+            rt.bold(`@${botRecord.bot_username}`),
+            rt.text('? This action cannot be undone.')
+          ));
           b.divider();
           b.buttons([
             richButton.callback('🗑 Yes, Delete', encodeCallback(id, 'delete', botId), { style: 'primary' }),
@@ -241,10 +245,9 @@ export function createCloneScreen({ app }) {
             `sending message via @${botRecord.bot_username} ♡`
           ])));
           b.divider();
-          b.paragraph(rt.text(
-            '👇 <b>Type and send the announcement message you want to broadcast:</b>\n\n' +
-            'HTML formatting is supported (<b>bold</b>, <i>italic</i>, etc.).\n' +
-            'It will be delivered to all active users who started your bot.'
+          b.quote(rt.concat(
+            rt.bold('👇 Type and send the announcement message you want to broadcast:\n\n'),
+            rt.text('It will be delivered to all active users who started your bot ♡')
           ));
           b.divider();
           b.buttons([
@@ -319,12 +322,12 @@ export function createCloneScreen({ app }) {
               `@${botRecord.bot_username} is running ♡`
             ])));
             b.divider();
-            b.paragraph(rt.text(
-              `✨ <b>Congratulations!</b> Your bot <b>@${botRecord.bot_username}</b> has been successfully cloned and launched!\n\n` +
-              `• 🏷 <b>Brand Name:</b> ${escapeHtml(botRecord.bot_name)}\n` +
-              `• 🚀 <b>Status:</b> Online & Polling\n` +
-              `• 🎵 <b>Features:</b> Music, Downloader, Pinterest, Group Chat & Multi-Language\n\n` +
-              `Tap the button below to start your new bot!`
+            b.quote(rt.concat(
+              rt.text('✨ '), rt.bold('Congratulations!'), rt.text(' Your bot '), rt.bold(`@${botRecord.bot_username}`), rt.text(' has been successfully cloned and launched!\n\n'),
+              rt.text('• 🏷 '), rt.bold('Brand Name: '), rt.text(`${botRecord.bot_name}\n`),
+              rt.text('• 🚀 '), rt.bold('Status: '), rt.text('Online & Polling\n'),
+              rt.text('• 🎵 '), rt.bold('Features: '), rt.text('Music, Downloader, Pinterest, Group Chat & Multi-Language\n\n'),
+              rt.italic('Tap the button below to start your new bot! ♡')
             ));
             b.divider();
             b.buttons([

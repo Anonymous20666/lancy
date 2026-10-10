@@ -733,9 +733,15 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      const ext = extname(fileInfo.file_path || '') || (info.type === 'video' ? '.mp4' : info.type === 'voice' ? '.oga' : '.mp3');
-      const buffer = await this.api.downloadFile(fileInfo.file_path);
-      const recResult = await recognizeAudio(buffer, { extension: ext });
+      const rawTitle = mediaObj.title || mediaObj.file_name || '';
+      const hintTitle = rawTitle && !/\.(mp4|mov|mp3|m4a|oga|ogg|wav)$/i.test(rawTitle) ? rawTitle : '';
+      const hintPerformer = mediaObj.performer || '';
+
+      const recResult = await recognizeAudio(buffer, {
+        extension: ext,
+        hintTitle,
+        hintPerformer
+      });
 
       if (recResult?.success && recResult.title) {
         const { title, artist } = recResult;

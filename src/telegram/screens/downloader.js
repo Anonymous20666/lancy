@@ -796,7 +796,15 @@ export function createDownloaderScreen({ app }) {
             return;
           }
 
-          const recResult = await recognizeAudio(audioBuf, { extension: '.mp3' });
+          const meta = getTrackMeta(trackKey, app.db || ctx.db) || {};
+          const hintTitle = meta.title && meta.title !== 'Audio Track' ? meta.title : '';
+          const hintPerformer = meta.performer && meta.performer !== 'Soundtrack' && meta.performer !== 'Artist' ? meta.performer : '';
+
+          const recResult = await recognizeAudio(audioBuf, {
+            extension: '.mp3',
+            hintTitle,
+            hintPerformer
+          });
           if (recResult?.success && recResult.title) {
             const { title, artist } = recResult;
             const query = `${title} ${artist || ''}`.trim();
