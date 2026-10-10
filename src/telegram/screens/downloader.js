@@ -481,21 +481,31 @@ export function createDownloaderScreen({ app }) {
           }
 
           if (!songTitle || songTitle.toLowerCase() === 'song') {
-            await ctx.api.sendMessage(
+            const errSent = await ctx.api.sendMessage(
               ctx.chatId,
-              '♡ Could not find lyrics: song title could not be determined from this card ♡\nTip: You can search lyrics directly with <code>/lyrics &lt;song name&gt;</code> ♡',
+              '<blockquote>♡ Could not find lyrics: song title could not be determined from this card ♡\nTip: You can search lyrics directly with <code>/lyrics &lt;song name&gt;</code> ♡</blockquote>',
               { parse_mode: 'HTML' }
             );
+            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
+              setTimeout(() => {
+                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
+              }, 12000)?.unref?.();
+            }
             return;
           }
 
           const lyricsRes = await getLyrics(songTitle, songArtist);
           if (!lyricsRes.found || !lyricsRes.lyrics) {
-            await ctx.api.sendMessage(
+            const errSent = await ctx.api.sendMessage(
               ctx.chatId,
-              `♡ Could not find lyrics for "<b>${escapeHtml(songTitle)}</b>" ♡\nTip: You can search lyrics directly with <code>/lyrics &lt;song&gt;</code> ♡`,
+              `<blockquote>♡ Could not find lyrics for "<b>${escapeHtml(songTitle)}</b>" ♡\nTip: You can search lyrics directly with <code>/lyrics &lt;song&gt;</code> ♡</blockquote>`,
               { parse_mode: 'HTML' }
             );
+            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
+              setTimeout(() => {
+                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
+              }, 12000)?.unref?.();
+            }
             return;
           }
 
@@ -563,8 +573,8 @@ export function createDownloaderScreen({ app }) {
           }
 
           if (!audioBuf || audioBuf.length === 0) {
-            const errorText = `୨୧ Could not retrieve the soundtrack for this video ♡\n` +
-              `Tip: You can search directly by typing <code>/play &lt;song name or lyrics&gt;</code> ♡`;
+            const errorText = `<blockquote>୨୧ Could not retrieve the soundtrack for this video ♡\n` +
+              `Tip: You can search directly by typing <code>/play &lt;song name or lyrics&gt;</code> ♡</blockquote>`;
             if (progressMsg?.message_id) {
               await ctx.api.editMessageText(ctx.chatId, progressMsg.message_id, errorText, {
                 parse_mode: 'HTML',
@@ -575,6 +585,11 @@ export function createDownloaderScreen({ app }) {
                   ]
                 }
               }).catch(() => {});
+              if (typeof ctx.api.deleteMessage === 'function') {
+                setTimeout(() => {
+                  ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
+                }, 12000)?.unref?.();
+              }
             }
             return;
           }
@@ -592,10 +607,10 @@ export function createDownloaderScreen({ app }) {
             return;
           }
 
-          const notFoundText = `୨୧ Could not recognize the music in this video soundtrack ♡\n\n` +
+          const notFoundText = `<blockquote>୨୧ Could not recognize the music in this video soundtrack ♡\n\n` +
             `💡 <b>Why this happens:</b>\n` +
             `• Background audio may be distorted, pitched, shortened, or spoken over.\n\n` +
-            `✨ <b>Know any words or lyrics?</b> Tap <b>🔍 Search by Lyrics</b> below or type <code>/play &lt;lyrics&gt;</code> to download it directly! ♡`;
+            `✨ <b>Know any words or lyrics?</b> Tap <b>🔍 Search by Lyrics</b> below or type <code>/play &lt;lyrics&gt;</code> to download it directly! ♡</blockquote>`;
 
           if (progressMsg?.message_id) {
             await ctx.api.editMessageText(ctx.chatId, progressMsg.message_id, notFoundText, {
@@ -607,6 +622,11 @@ export function createDownloaderScreen({ app }) {
                 ]
               }
             }).catch(() => {});
+            if (typeof ctx.api.deleteMessage === 'function') {
+              setTimeout(() => {
+                ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
+              }, 15000)?.unref?.();
+            }
           }
           return;
         }

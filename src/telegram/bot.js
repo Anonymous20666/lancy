@@ -409,7 +409,16 @@ export class TelegramController extends EventEmitter {
             if (total > 1) await sleep(300);
           }
         } else {
-          await this.api.sendMessage(chatId, `♡ Could not find lyrics for "<b>${escapeHtml(query)}</b>" ♡\nPlease check the spelling or send a longer lyric snippet!`, { parse_mode: 'HTML' });
+          const errSent = await this.api.sendMessage(
+            chatId,
+            `<blockquote>♡ Could not find lyrics for "<b>${escapeHtml(query)}</b>" ♡\nPlease check the spelling or send a longer lyric snippet!</blockquote>`,
+            { parse_mode: 'HTML' }
+          );
+          if (errSent?.message_id && typeof this.api.deleteMessage === 'function') {
+            setTimeout(() => {
+              this.api.deleteMessage(chatId, errSent.message_id).catch(() => {});
+            }, 12000)?.unref?.();
+          }
         }
         return;
       }
@@ -658,12 +667,12 @@ export class TelegramController extends EventEmitter {
         }
       } else {
         const failureMessage = recResult?.reason?.includes('audio track')
-          ? `୨୧ No sound or audio track found in this ${label} ♡`
-          : `୨୧ Could not recognize the music in this ${label} ♡\n\n` +
+          ? `<blockquote>୨୧ No sound or audio track found in this ${label} ♡</blockquote>`
+          : `<blockquote>୨୧ Could not recognize the music in this ${label} ♡\n\n` +
             `💡 <b>How Music Recognition Works:</b>\n` +
             `• Recognition matches <b>actual song recordings</b> playing on a speaker, radio, TV, or phone.\n` +
             `• Acoustic engines cannot match acapella voice humming without the original song track playing.\n\n` +
-            `✨ <b>Know any words or lyrics?</b> Tap <b>🔍 Search by Lyrics</b> below or type <code>/play &lt;lyrics&gt;</code> to download it directly! ♡`;
+            `✨ <b>Know any words or lyrics?</b> Tap <b>🔍 Search by Lyrics</b> below or type <code>/play &lt;lyrics&gt;</code> to download it directly! ♡</blockquote>`;
 
         if (progressMsg?.message_id) {
           await this.api.editMessageText(
@@ -682,6 +691,11 @@ export class TelegramController extends EventEmitter {
               }
             }
           ).catch(() => {});
+          if (typeof this.api.deleteMessage === 'function') {
+            setTimeout(() => {
+              this.api.deleteMessage(chatId, progressMsg.message_id).catch(() => {});
+            }, 15000)?.unref?.();
+          }
         }
         await this.sm.reset(tgId, { reason: 'recognition_failed' }).catch(() => {});
       }
