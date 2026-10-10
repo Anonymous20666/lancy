@@ -81,12 +81,20 @@ export class TelegramAPI {
     });
   }
 
+  getChat(chatId) {
+    return this.call('getChat', { chat_id: chatId });
+  }
+
   get botUsername() {
     return this.me?.username ?? '';
   }
 
   sendMessage(chatId, text, extra = {}) {
-    return this.call('sendMessage', { chat_id: chatId, text, ...extra });
+    const params = { chat_id: chatId, text, ...extra };
+    if (/https?:\/\/[^\s]+/i.test(text) && !params.link_preview_options && params.disable_web_page_preview === undefined) {
+      params.link_preview_options = { is_disabled: false, prefer_large_media: true };
+    }
+    return this.call('sendMessage', params);
   }
 
   /** Bot API 10.1+: send a Rich Message. rich_message = InputRichMessage */
@@ -105,25 +113,75 @@ export class TelegramAPI {
   }
 
   editMessageText(chatId, messageId, text, extra = {}) {
-    return this.call('editMessageText', { chat_id: chatId, message_id: messageId, text, ...extra });
+    const params = { chat_id: chatId, message_id: messageId, text, ...extra };
+    if (/https?:\/\/[^\s]+/i.test(text) && !params.link_preview_options && params.disable_web_page_preview === undefined) {
+      params.link_preview_options = { is_disabled: false, prefer_large_media: true };
+    }
+    return this.call('editMessageText', params);
   }
 
   editMessageReplyMarkup(chatId, messageId, replyMarkup) {
     return this.call('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: replyMarkup });
   }
 
+  sendMediaGroup(chatId, media, extra = {}, files = null) {
+    return this.call('sendMediaGroup', { chat_id: chatId, media, ...extra }, { files });
+  }
+
   sendPhoto(chatId, photo, extra = {}, files = null) {
+    if (Buffer.isBuffer(photo)) {
+      return this.call('sendPhoto', { chat_id: chatId, photo: 'attach://photo', ...extra }, {
+        files: { photo: { buffer: photo, filename: extra.filename ?? 'photo.jpg', contentType: 'image/jpeg' } }
+      });
+    }
     const params = { chat_id: chatId, ...extra };
     if (files?.photo) {
+      params.photo = 'attach://photo';
       return this.call('sendPhoto', params, { files });
     }
     params.photo = photo;
     return this.call('sendPhoto', params);
   }
 
+  sendVideo(chatId, video, extra = {}, files = null) {
+    if (Buffer.isBuffer(video)) {
+      return this.call('sendVideo', { chat_id: chatId, video: 'attach://video', ...extra }, {
+        files: { video: { buffer: video, filename: extra.filename ?? 'video.mp4', contentType: 'video/mp4' } }
+      });
+    }
+    const params = { chat_id: chatId, ...extra };
+    if (files?.video) {
+      params.video = 'attach://video';
+      return this.call('sendVideo', params, { files });
+    }
+    params.video = video;
+    return this.call('sendVideo', params);
+  }
+
+  sendAudio(chatId, audio, extra = {}, files = null) {
+    if (Buffer.isBuffer(audio)) {
+      return this.call('sendAudio', { chat_id: chatId, audio: 'attach://audio', ...extra }, {
+        files: { audio: { buffer: audio, filename: extra.filename ?? 'audio.mp3', contentType: 'audio/mpeg' } }
+      });
+    }
+    const params = { chat_id: chatId, ...extra };
+    if (files?.audio) {
+      params.audio = 'attach://audio';
+      return this.call('sendAudio', params, { files });
+    }
+    params.audio = audio;
+    return this.call('sendAudio', params);
+  }
+
   sendDocument(chatId, document, extra = {}, files = null) {
+    if (Buffer.isBuffer(document)) {
+      return this.call('sendDocument', { chat_id: chatId, document: 'attach://document', ...extra }, {
+        files: { document: { buffer: document, filename: extra.filename ?? 'file.bin', contentType: extra.contentType ?? 'application/octet-stream' } }
+      });
+    }
     const params = { chat_id: chatId, ...extra };
     if (files?.document) {
+      params.document = 'attach://document';
       return this.call('sendDocument', params, { files });
     }
     params.document = document;
@@ -131,6 +189,16 @@ export class TelegramAPI {
   }
 
   sendSticker(chatId, sticker, extra = {}) {
+    if (Buffer.isBuffer(sticker) || (typeof sticker === 'object' && sticker !== null && sticker.buffer)) {
+      const buf = Buffer.isBuffer(sticker) ? sticker : sticker.buffer;
+      const isVideo = extra.is_video || extra.isVideo;
+      const filename = isVideo ? 'sticker.webm' : 'sticker.webp';
+      const contentType = isVideo ? 'video/webm' : 'image/webp';
+      const { is_video, isVideo: _iv, ...cleanExtra } = extra;
+      return this.call('sendSticker', { chat_id: chatId, ...cleanExtra }, {
+        files: { sticker: { buffer: buf, filename, contentType } }
+      });
+    }
     return this.call('sendSticker', { chat_id: chatId, sticker, ...extra });
   }
 
@@ -150,6 +218,10 @@ export class TelegramAPI {
 
   pinChatMessage(chatId, messageId, { disableNotification = true } = {}) {
     return this.call('pinChatMessage', { chat_id: chatId, message_id: messageId, disable_notification: disableNotification }).catch(() => null);
+  }
+
+  getUserProfilePhotos(userId, extra = {}) {
+    return this.call('getUserProfilePhotos', { user_id: userId, ...extra });
   }
 
   getFile(fileId) {

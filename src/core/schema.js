@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS pinterest_searches (
   user_id INTEGER NOT NULL,
   query TEXT NOT NULL,
   normalized_query TEXT NOT NULL,
-  mode TEXT NOT NULL DEFAULT 'mixed',
+  mode TEXT NOT NULL DEFAULT 'normal',
   depth TEXT NOT NULL DEFAULT 'deep',
   result_count INTEGER NOT NULL DEFAULT 0,
   duplicates_found INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS pinterest_media (
   quality_score REAL NOT NULL DEFAULT 0,
   is_duplicate INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL DEFAULT 'pending', -- pending | valid | rejected | delivered
+  tg_message_id INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_pinterest_media_search ON pinterest_media(search_id);
@@ -245,4 +246,57 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_events(user_id, created_at);
+
+-- WhatsApp Sticker Imports (staging for converting WA stickers -> Telegram packs)
+CREATE TABLE IF NOT EXISTS wa_sticker_imports (
+  id TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL,
+  session_id TEXT NOT NULL,
+  sticker_type TEXT NOT NULL DEFAULT 'static',
+  count INTEGER NOT NULL DEFAULT 1,
+  data_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- User-scoped settings (multi-admin isolation)
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER NOT NULL,
+  key TEXT NOT NULL,
+  value_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, key)
+);
+
+-- AI conversation history (multi-turn memory per user)
+CREATE TABLE IF NOT EXISTS ai_conversations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL, -- 'user' | 'assistant' | 'system'
+  content TEXT NOT NULL,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ai_conversations_user ON ai_conversations(user_id, created_at);
+
+-- Autonomous scheduled sticker drops (Pinterest -> WhatsApp)
+CREATE TABLE IF NOT EXISTS scheduled_drops (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  topic TEXT NOT NULL,
+  frequency_label TEXT NOT NULL,
+  times_per_day INTEGER NOT NULL DEFAULT 1,
+  interval_hours INTEGER NOT NULL DEFAULT 12,
+  total_days INTEGER NOT NULL DEFAULT 30,
+  total_runs INTEGER NOT NULL DEFAULT 30,
+  runs_completed INTEGER NOT NULL DEFAULT 0,
+  session_id TEXT,
+  channel_jid TEXT,
+  style TEXT NOT NULL DEFAULT 'girly',
+  status TEXT NOT NULL DEFAULT 'active', -- 'active' | 'paused' | 'completed' | 'cancelled'
+  last_run_at TEXT,
+  next_run_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_drops_status ON scheduled_drops(status, next_run_at);
 `;

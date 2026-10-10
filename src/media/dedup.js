@@ -30,17 +30,51 @@ export class DedupService {
       const pin = new Set();
       const urls = new Set();
       const phashes = [];
-      for (const row of this.db.all(
-        'SELECT sha256, phash, pin_id, media_url FROM user_media_history WHERE user_id = ?', userId
-      )) {
-        if (row.sha256) sha.add(row.sha256);
-        if (row.pin_id) pin.add(row.pin_id);
-        if (row.media_url) urls.add(row.media_url);
-        if (row.phash) phashes.push({ hash: row.phash });
+      try {
+        const historyRows = this.db.all(
+          'SELECT sha256, phash, pin_id, media_url FROM user_media_history WHERE user_id = ?',
+          userId
+        );
+        for (const row of historyRows) {
+          if (row.sha256) sha.add(row.sha256);
+          if (row.pin_id) pin.add(row.pin_id);
+          if (row.media_url) urls.add(row.media_url);
+          if (row.phash) phashes.push({ hash: row.phash });
+        }
+      } catch {
+        // Table may not exist in isolated db test
+      }
+
+      try {
+        const mediaRows = this.db.all(
+          'SELECT sha256, phash, pin_id, media_url, source_url FROM pinterest_media WHERE user_id = ? AND is_duplicate = 0',
+          userId
+        );
+        for (const row of mediaRows) {
+          if (row.sha256) sha.add(row.sha256);
+          if (row.pin_id) pin.add(row.pin_id);
+          if (row.media_url) urls.add(row.media_url);
+          if (row.source_url) urls.add(row.source_url);
+          if (row.phash) phashes.push({ hash: row.phash });
+        }
+      } catch {
+        // Table may not exist in isolated db test
       }
       this.userIndexes.set(key, { sha, pin, urls, phashes });
     }
     return this.userIndexes.get(key);
+  }
+
+  /** Immediately register candidate in the per-user index so concurrent items deduplicate in real-time. */
+  registerCandidate(userId, candidate) {
+    if (userId == null) return;
+    const idx = this.#indexFor(userId);
+    const { sha256, phash, pinId, sourceUrl, mediaUrl } = candidate;
+    if (sha256) idx.sha.add(sha256);
+    if (pinId) idx.pin.add(pinId);
+    if (mediaUrl) idx.urls.add(mediaUrl);
+    if (sourceUrl) idx.urls.add(sourceUrl);
+    if (phash) idx.phashes.push({ hash: phash });
   }
 
   /**

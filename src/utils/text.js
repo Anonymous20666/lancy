@@ -6,9 +6,9 @@ export const THIN_DIVIDER = '· · · · · · · · · ·';
 
 export function truncate(str, max = 200) {
   if (!str) return '';
-  const s = String(str);
-  if (s.length <= max) return s;
-  return s.slice(0, Math.max(0, max - 1)) + '…';
+  const chars = Array.from(String(str));
+  if (chars.length <= max) return chars.join('');
+  return chars.slice(0, Math.max(0, max - 1)).join('') + '…';
 }
 
 export function box(lines, { width = 30 } = {}) {

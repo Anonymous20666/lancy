@@ -17,17 +17,22 @@ export const States = {
   MANUAL_STICKER_COLLECTION: 'MANUAL_STICKER_COLLECTION',
   PACK_PREVIEW: 'PACK_PREVIEW',
   PACK_CREATION: 'PACK_CREATION',
+  STICKER_PACK_CLONE: 'STICKER_PACK_CLONE',
   WA_PAIR_NAME: 'WA_PAIR_NAME',
   WA_PAIR_NUMBER: 'WA_PAIR_NUMBER',
   WA_PAIRING: 'WA_PAIRING',
   WA_SESSION_MENU: 'WA_SESSION_MENU',
   WA_PACK_SELECTION: 'WA_PACK_SELECTION',
   WA_CAPTION_EDITOR: 'WA_CAPTION_EDITOR',
+  WA_PACK_NAME_EDITOR: 'WA_PACK_NAME_EDITOR',
   WA_CHANNEL_SELECTION: 'WA_CHANNEL_SELECTION',
+  WA_CHANNEL_INPUT: 'WA_CHANNEL_INPUT',
   WA_FINAL_PREVIEW: 'WA_FINAL_PREVIEW',
   WA_PUBLISHING: 'WA_PUBLISHING',
   AI_CHAT: 'AI_CHAT',
-  SETTINGS: 'SETTINGS'
+  SETTINGS: 'SETTINGS',
+  URL_DOWNLOADER: 'URL_DOWNLOADER',
+  URL_DOWNLOADER_INPUT: 'URL_DOWNLOADER_INPUT'
 };
 
 export const DEFAULT_STATE_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
@@ -256,7 +261,9 @@ export class StateMachine extends EventEmitter {
     record.state = States.IDLE;
     record.context = {};
     record.history = [];
-    record.screenMessageId = null;
+    if (reason === 'clear') {
+      record.screenMessageId = null;
+    }
     this.#clearTimer(record);
     this.#persistRecord(key, record);
     this.emit('reset', { tgId: key, reason });

@@ -270,3 +270,129 @@ test('split plan never duplicates a sticker', async () => {
   assert.equal(requested, 121, 'every sticker requested exactly once');
   db.close();
 });
+
+test('WhatsAppPublisher.publish uses telegramApi .tg method directly to download and publish packs', async () => {
+  const db = new Database(':memory:');
+  const settings = fakeSettings({ 'whatsapp.publishingDelayMs': 0, 'whatsapp.retryCount': 1 });
+  const publisher = new WhatsAppPublisher({ db, settings, channels: makeChannels() });
+  const session = makeSession();
+  const [dbPack] = insertPacks(db, [makePack(1, 2, 'Toji Fushiguro')]);
+  dbPack.tg_short_name = 'toji_pack_test_by_lancybot';
+
+  // Transparent 1x1 WebP
+  const sampleWebp = Buffer.from('UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==', 'base64');
+  let getStickerSetCalled = false;
+  let getFileCalled = 0;
+  let downloadFileCalled = 0;
+
+  const fakeTelegramApi = {
+    getStickerSet: async (name) => {
+      getStickerSetCalled = true;
+      return {
+        title: 'Toji Fushiguro',
+        name,
+        stickers: [
+          { file_id: 'fid_001', emoji: '⚔️', is_animated: false, is_video: false },
+          { file_id: 'fid_002', emoji: '🔥', is_animated: false, is_video: false }
+        ]
+      };
+    },
+    getFile: async (fileId) => {
+      getFileCalled++;
+      return { file_id: fileId, file_path: `stickers/${fileId}.webp` };
+    },
+    downloadFile: async (filePath) => {
+      downloadFileCalled++;
+      return sampleWebp;
+    }
+  };
+
+  const plan = publisher.buildPlan({
+    packs: [dbPack],
+    sessionId: 'wa_test',
+    channelJids: ['120363431396805997@newsletter'],
+    caption: ''
+  });
+
+  await publisher.publish({
+    plan: { ...plan, userId: 1 },
+    session,
+    telegramApi: fakeTelegramApi
+  });
+
+  assert.ok(getStickerSetCalled, 'getStickerSet was called for pack');
+  assert.equal(getFileCalled, 2, 'getFile was called for all stickers');
+  assert.equal(downloadFileCalled, 2, 'downloadFile was called for all stickers');
+  assert.equal(session.calls.packs.length, 1, 'sticker pack was published');
+  assert.equal(session.calls.packs[0].stickers, 2, 'both stickers were published in the pack');
+  assert.equal(session.calls.packs[0].jid, '120363431396805997@newsletter');
+  db.close();
+});
+
+test('multi-pack publication drops separate preview, caption, and samples for each non-continuation pack', async () => {
+  const db = new Database(':memory:');
+  const settings = fakeSettings({ 'whatsapp.publishingDelayMs': 0, 'whatsapp.retryCount': 1 });
+  const publisher = new WhatsAppPublisher({ db, settings, channels: makeChannels() });
+
+  const calls = { packs: [], texts: [], images: [], stickers: [] };
+  const session = {
+    sessionId: 'wa_test_multi',
+    isOnline: true,
+    jid: '2348000000000@s.whatsapp.net',
+    calls,
+    sendStickerPack: async (jid, pack) => { calls.packs.push({ jid, name: pack.name, stickers: pack.stickers.length }); },
+    sendText: async (jid, text) => { calls.texts.push({ jid, text }); },
+    sendImage: async (jid, buffer, caption) => { calls.images.push({ jid, caption }); },
+    sendSticker: async (jid, buffer) => { calls.stickers.push({ jid }); }
+  };
+
+  const sampleWebp = Buffer.from('UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA==', 'base64');
+  const fakeApi = {
+    getStickerSet: async (name) => {
+      if (name.includes('sukuna')) {
+        return {
+          title: 'Sukuna Pack',
+          name,
+          stickers: [{ file_id: 'sukuna_1', emoji: '🔥', is_animated: false, is_video: false }]
+        };
+      }
+      return {
+        title: 'Ichigo Pack',
+        name,
+        stickers: [{ file_id: 'ichigo_1', emoji: '⚔️', is_animated: false, is_video: false }]
+      };
+    },
+    getFile: async (id) => ({ file_path: `stickers/${id}.webp` }),
+    downloadFile: async () => sampleWebp
+  };
+
+  const dbPacks = insertPacks(db, [
+    { id: 1, title: 'Sukuna Pack', count: 1, tg_short_name: 'sukuna_by_lancy' },
+    { id: 2, title: 'Ichigo Pack', count: 1, tg_short_name: 'ichigo_by_lancy' }
+  ]);
+
+  const plan = publisher.buildPlan({
+    packs: dbPacks,
+    sessionId: 'wa_test_multi',
+    channelJids: ['chan1@newsletter'],
+    caption: null // null triggers per-pack distinct caption generation
+  });
+
+  await publisher.publish({
+    plan: { ...plan, userId: 1 },
+    session,
+    telegramApi: fakeApi
+  });
+
+  // Both distinct packs received their own announcement image + caption
+  assert.equal(session.calls.images.length, 2, 'two distinct preview images with captions sent');
+  assert.match(session.calls.images[0].caption, /Sukuna/i, 'first caption matches Sukuna pack');
+  assert.match(session.calls.images[1].caption, /Ichigo/i, 'second caption matches Ichigo pack');
+
+  // Both distinct packs had their physical packs published
+  assert.equal(session.calls.packs.length, 2, 'both packs published');
+  assert.equal(session.calls.packs[0].name, 'Sukuna Pack');
+  assert.equal(session.calls.packs[1].name, 'Ichigo Pack');
+
+  db.close();
+});

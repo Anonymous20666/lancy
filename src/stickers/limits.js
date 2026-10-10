@@ -69,6 +69,15 @@ export function validateShortName(shortName, botUsername) {
   return name;
 }
 
+export function cleanTgTitle(title) {
+  let t = String(title ?? '').replace(/[\r\n\t]+/g, ' ').trim();
+  if (!t) t = 'Lancy Pack';
+  if (t.length > 64) {
+    t = t.slice(0, 64).trim();
+  }
+  return t;
+}
+
 export function validateTitle(title) {
   const t = String(title ?? '').trim();
   if (!t || t.length > 64) {
@@ -79,19 +88,28 @@ export function validateTitle(title) {
 
 /** Build a unique short name for a query, respecting the _by_<bot> suffix. */
 export function buildShortName({ query, botUsername, userId, taken = new Set() }) {
-  const slug = String(query ?? 'pack')
+  let slug = String(query ?? 'pack')
     .toLowerCase()
     .normalize('NFKD')
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
-    .slice(0, 40) || 'pack';
-  const suffix = `_by_${String(botUsername ?? 'bot').toLowerCase()}`;
+    .slice(0, 30) || 'pack';
+  if (!/^[a-z]/.test(slug)) {
+    slug = `p_${slug}`;
+  }
+  slug = slug.replace(/_+/g, '_').replace(/_+$/, '');
+  const cleanBot = String(botUsername ?? 'bot').toLowerCase().replace(/[^a-z0-9_]/g, '');
+  const suffix = `_by_${cleanBot}`;
+  const maxBaseLen = Math.max(1, 64 - suffix.length);
   const stamp = Date.now().toString(36).slice(-4);
-  let base = `${slug}_${stamp}`.slice(0, 64 - suffix.length);
+  let base = `${slug}_${stamp}`.slice(0, maxBaseLen).replace(/_+$/, '');
+  if (!/^[a-z]/.test(base)) base = `p_${base}`.slice(0, maxBaseLen).replace(/_+$/, '');
   let candidate = `${base}${suffix}`;
   let i = 2;
-  while (taken.has(candidate)) {
-    candidate = `${base}_${i}${suffix}`.slice(0, 64);
+  while (taken.has(candidate) || candidate.length > 64) {
+    const numSuffix = `_${i}`;
+    const fitBase = base.slice(0, Math.max(1, maxBaseLen - numSuffix.length)).replace(/_+$/, '');
+    candidate = `${fitBase}${numSuffix}${suffix}`;
     i++;
   }
   return candidate;

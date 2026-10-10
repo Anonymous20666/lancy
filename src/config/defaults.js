@@ -23,28 +23,32 @@ export const DEFAULT_SETTINGS = {
     paginationSize: 5,
     progressAnimation: true,
     previewBehavior: 'inline',   // inline | photo
-    messageCleanup: false,       // delete screen messages on navigation
+    messageCleanup: false,       // do not delete user or screen messages
     notificationPreferences: 'all', // all | errors | none
     stickerAddDelayMs: 250       // gentle pacing between addStickerToSet calls
   },
 
   whatsapp: {
     defaultSession: null,
+    defaultPackName: 'Lancy Pack',
     reconnectBehavior: 'auto',   // auto | manual
     pairingTimeoutSeconds: 120,
+    customPairingCode: 'LANCYBOT',
     mediaQuality: 'highest',     // highest | balanced
     captionDefaults: 'template', // template | ai | none
     albumSettings: 'auto',       // auto | always | never
     channelCacheMinutes: 10,
     physicalStickerPackLimit: 60, // plogme enforces max 60 per stickerPackMessage
     publishingDelayMs: 1200,
+    sampleStickersCount: 3,      // drop 2 to 5 sample stickers before pack
     retryCount: 3,
-    sendToOwnDmOnConnect: true
+    sendToOwnDmOnConnect: true,
+    prefix: '.'
   },
 
   pinterest: {
     provider: 'web',             // web | fixture
-    defaultMode: 'mixed',        // mixed | images | videos | random
+    defaultMode: 'normal',       // normal | images | videos | random
     searchDepth: 'deep',         // quick | deep | very_deep
     resultCount: 60,
     imageQuality: 'original',    // original | large | medium
@@ -60,9 +64,10 @@ export const DEFAULT_SETTINGS = {
 
   stickers: {
     defaultPackName: 'Lancy Pack',
+    packNameTemplate: "🌸♥︎xɪᴛᴛʟᴇ ʟᴀɴᴄʏ♥︎🌸\n\n{{name}}\n\n╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥s⃟❥🌸⃟╬",
     creatorName: 'Lancy',
-    packEmoji: '♡',
-    defaultStickerAmount: 30,
+    packEmoji: '🤍',
+    defaultStickerAmount: 60,
     telegramFormat: 'static',    // static | video
     imageProcessingQuality: 92,
     videoStickerBehavior: 'convert', // convert | skip | fail
@@ -81,29 +86,30 @@ export const DEFAULT_SETTINGS = {
   },
 
   captions: {
-    defaultTemplate: 'default',
-    creatorFooter: '𓆩♡𓆪 made with love by {{creator}}',
-    defaultTitle: '{{query}} Collection',
-    cta: 'download • use • enjoy ♡',
+    defaultTemplate: 'aesthetic',
+    creatorFooter: '†🤍🌷𝗟𝗔𝗡𝗖𝗬❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥𝗦🌸†',
+    defaultTitle: '{{query}}',
+    cta: '𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 • 𝐔𝐒𝐄 • 𝐄𝐍𝐉𝐎𝐘',
     separatorStyle: 'line',      // line | dots | thick | none
     emojiStyle: 'soft',          // soft | none | bold
-    aiAutoCaption: false,
+    aiAutoCaption: true,
     previewBeforePublishing: true
   },
 
   ai: {
     enabled: true,
-    provider: 'builtin',         // builtin | ollama | openai-compatible
+    assistantEnabled: true,      // toggleable AI assistant
+    provider: 'ollama',         // builtin | ollama | openai-compatible
     endpoint: 'http://127.0.0.1:11434',
-    model: '',
+    model: 'qwen2.5:1.5b',
     apiKey: '',                  // env-overridable, never shown in UI
     personality: 'lancy',
     style: 'girly',
     creativity: 0.7,
     maxTokens: 400,
-    timeoutSeconds: 30,
+    timeoutSeconds: 20,
     fallbackProvider: 'builtin',
-    autoCaption: false,
+    autoCaption: true,
     chatMode: true
   },
 
@@ -134,7 +140,7 @@ export const DEFAULT_SETTINGS = {
     database: 'data/lancy.db',
     redis: '',                   // empty = in-process cache only
     mediaCache: 'data/cache/media',
-    cacheTtlMinutes: 1440,
+    cacheTtlMinutes: 60,
     automaticCleanup: true,
     persistentSearchHistory: true
   },

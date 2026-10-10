@@ -135,12 +135,16 @@ export class BuiltinProvider {
   }
 
   #chat(input, style, seed, context) {
-    const openers = STYLE_OPENERS[style] ?? STYLE_OPENERS.girly;
-    const closers = CLOSERS[style] ?? CLOSERS.girly;
     const trimmed = String(input).trim();
-    if (!trimmed) return `${pick(openers, seed)} tell me what you need ♡`;
-    const reply = `Got it ♡ ${trimmed.length > 60 ? 'I hear you —' : 'Okay —'} I can help with captions, titles, pack names or just chatting. What are we making today?`;
-    return `${pick(openers, seed)}\n${reply}\n${pick(closers, seed + 2)}`;
+    if (!trimmed) return 'heyyy bestie ♡ tell me what’s on your mind! ✨';
+    const replies = [
+      'I hear you! What direction are you thinking of taking with that? ♡',
+      'Ooh interesting! Tell me more about that bestie ✨',
+      'I love where your head is at! What should we explore next? 🌸',
+      'Right here with you! Tell me everything ♡',
+      'Hehe I feel that! What are we vibing with today? ✨'
+    ];
+    return pick(replies, seed);
   }
 }
 

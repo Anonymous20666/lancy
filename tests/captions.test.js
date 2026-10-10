@@ -71,8 +71,23 @@ test('default template renders a full caption', () => {
     packName: 'Gojo Pack', telegramLink: 'https://t.me/addstickers/gojo_by_lancybot'
   });
   assert.match(out, /Gojo Pack/);
-  assert.match(out, /STICKERS • 100/);
-  assert.match(out, /PACKS • 02/);
+  assert.match(out, /𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 • 100/);
+  assert.match(out, /𝐏𝐀𝐂𝐊𝐒 • 02/);
+});
+
+test('aesthetic template renders ornate gothic box caption', () => {
+  const engine = makeEngine({ 'captions.defaultTemplate': 'aesthetic' });
+  const out = engine.renderDefault({
+    title: 'THE OWL HOUSE',
+    headline: 'THE OWL HOUSE STICKERS ARE OUT!',
+    stickers: 60,
+    packs: 1
+  });
+  assert.match(out, /THE OWL HOUSE/);
+  assert.match(out, /𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 • 60/);
+  assert.match(out, /𝐏𝐀𝐂𝐊𝐒 • 01/);
+  assert.match(out, /THE OWL HOUSE STICKERS ARE OUT!/);
+  assert.match(out, /𝗟𝗔𝗡𝗖𝗬/);
 });
 
 test('every builtin template is valid', () => {

@@ -41,6 +41,19 @@ export class PinterestWebProvider extends PinterestProvider {
    * @returns {Promise<{ items: object[], bookmark: string|null, page: number }>}
    */
   async search({ query, bookmark = null, signal } = {}) {
+    // 1. Try Pinterest BaseSearchResource API (modern public JSON endpoint)
+    try {
+      const apiResult = await this.#searchViaResourceApi({ query, bookmark, signal });
+      if (apiResult?.items?.length > 0) {
+        this.log.debug({ query, found: apiResult.items.length, hasMore: !!apiResult.bookmark }, 'pinterest resource api success');
+        return apiResult;
+      }
+    } catch (err) {
+      if (err.name === 'AbortError' || signal?.aborted) throw err;
+      this.log.debug({ err: err.message }, 'resource api failed, trying html fallback');
+    }
+
+    // 2. HTML extraction fallback
     const url = new URL(SEARCH_URL);
     url.searchParams.set('q', query);
     if (bookmark) url.searchParams.set('bookmark', bookmark);
@@ -55,6 +68,77 @@ export class PinterestWebProvider extends PinterestProvider {
     }
     const nextBookmark = this.#extractBookmark(state) ?? null;
     this.log.debug({ query, found: items.length, hasMore: !!nextBookmark }, 'pinterest page parsed');
+    return { items, bookmark: nextBookmark, page: bookmark ? 2 : 1 };
+  }
+
+  async #searchViaResourceApi({ query, bookmark = null, signal } = {}) {
+    const BASE_URL = 'https://www.pinterest.com';
+    const source_url = `/search/pins/?q=${encodeURIComponent(query)}&rs=typed`;
+    const userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0';
+
+    const baseHeaders = {
+      'Host': 'www.pinterest.com',
+      'Sec-Ch-Ua-Platform': '"Windows"',
+      'Sec-Ch-Ua': '"Chromium";v="137", "Not/A)Brand";v="24"',
+      'Sec-Ch-Ua-Model': '""',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'X-Requested-With': 'XMLHttpRequest',
+      'Accept': 'application/json, text/javascript, */*, q=0.01',
+      'X-Pinterest-Source-Url': source_url,
+      'X-Pinterest-Appstate': 'active',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Screen-Dpr': '1',
+      'X-Pinterest-Pws-Handler': 'www/search/[scope].js',
+      'User-Agent': userAgent,
+      'Sec-Fetch-Site': 'same-origin',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Dest': 'empty',
+      'Referer': `${BASE_URL}/`
+    };
+
+    let cookieHeader = '';
+    try {
+      const warmupRes = await fetch(`${BASE_URL}${source_url}`, {
+        headers: baseHeaders,
+        signal
+      });
+      const rawCookies = warmupRes.headers.getSetCookie ? warmupRes.headers.getSetCookie() : [warmupRes.headers.get('set-cookie')].filter(Boolean);
+      cookieHeader = rawCookies.map(c => c.split(';')[0]).join('; ');
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+    }
+
+    // NOTE: the whole payload is URL-encoded once below — never pre-encode
+    // individual fields or Pinterest searches for the literal "%20" string.
+    const payload = {
+      options: {
+        page_size: '50',
+        query,
+        redux_normalize_feed: true,
+        rs: 'typed',
+        scope: 'pins',
+        source_url,
+        ...(bookmark ? { bookmarks: [bookmark] } : {})
+      },
+      context: {}
+    };
+
+    const encodedData = encodeURIComponent(JSON.stringify(payload));
+    const apiUrl = `${BASE_URL}/resource/BaseSearchResource/get/?source_url=${encodeURIComponent(source_url)}&data=${encodedData}&_=${Date.now()}`;
+    const headers = { ...baseHeaders };
+    if (cookieHeader) headers['Cookie'] = cookieHeader;
+
+    const apiRes = await fetch(apiUrl, { headers, signal });
+    if (!apiRes.ok) return null;
+
+    const json = await apiRes.json().catch(() => null);
+    const results = json?.resource_response?.data?.results || [];
+    const items = [];
+    for (const pin of results) {
+      const item = this.#pinToCandidate(pin);
+      if (item) items.push(item);
+    }
+    const nextBookmark = json?.resource_response?.bookmark ?? null;
     return { items, bookmark: nextBookmark, page: bookmark ? 2 : 1 };
   }
 
@@ -148,22 +232,34 @@ export class PinterestWebProvider extends PinterestProvider {
     if (!pinId) return null;
     const sourceUrl = pin.link ? `https://www.pinterest.com${pin.link}` : (pin.url ?? null);
 
-    // Video first if present and playable.
-    const videoList = pin.videos?.video_list ?? pin.video_list;
+    // Video first if present and playable. Classic video pins carry
+    // `videos.video_list`; story/idea pins carry it inside a page block.
+    let videoList = pin.videos?.video_list ?? pin.video_list;
+    if (!videoList && pin.story_pin_data?.pages) {
+      for (const page of pin.story_pin_data.pages) {
+        const vb = (page?.blocks ?? []).find((blk) => blk?.video?.video_list);
+        if (vb) { videoList = vb.video.video_list; break; }
+      }
+    }
     if (videoList && typeof videoList === 'object') {
+      // Prefer progressive MP4 (V_720P etc.) over HLS, then highest resolution.
       const renditions = Object.values(videoList)
         .filter((v) => v && v.url)
-        .sort((a, b) => (b.width ?? 0) * (b.height ?? 0) - (a.width ?? 0) * (a.height ?? 0));
+        .sort((a, b) => {
+          const mp4 = (v) => (/\.mp4(\?|$)/i.test(v.url) ? 1 : 0);
+          return (mp4(b) - mp4(a)) || ((b.width ?? 0) * (b.height ?? 0) - (a.width ?? 0) * (a.height ?? 0));
+        });
       const best = renditions[0];
       if (best?.url) {
         return {
           pinId,
           sourceUrl,
           mediaUrl: best.url,
+          thumbnailUrl: best.thumbnail ?? null,
           type: 'video',
           width: best.width ?? null,
           height: best.height ?? null,
-          duration: pin.videos?.duration ?? null
+          duration: best.duration ? best.duration / 1000 : (pin.videos?.duration ?? null)
         };
       }
     }

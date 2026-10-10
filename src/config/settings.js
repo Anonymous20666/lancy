@@ -58,8 +58,46 @@ export class SettingsManager extends EventEmitter {
     return node === undefined ? fallback : node;
   }
 
+  /** Get a setting for a specific user, falling back to global settings. */
+  getForUser(userId, path, fallback = undefined) {
+    if (userId != null) {
+      const userVal = this.db.getUserSetting(Number(userId), path, undefined);
+      if (userVal !== undefined) return userVal;
+    }
+    return this.get(path, fallback);
+  }
+
   getAll() {
     return structuredClone(this.values);
+  }
+
+  /** Get all settings with per-user overrides applied. */
+  getAllForUser(userId) {
+    const globals = this.getAll();
+    if (userId == null) return globals;
+    const userOverrides = this.db.getAllUserSettings(Number(userId));
+    let current = globals;
+    for (const [path, val] of Object.entries(userOverrides)) {
+      current = applySettingPatch(current, path, val);
+    }
+    return current;
+  }
+
+  /** Set a user-scoped setting (isolated per user). */
+  setForUser(userId, path, value) {
+    if (userId != null) {
+      this.db.setUserSetting(Number(userId), path, value);
+      this.db.audit(Number(userId), 'settings.user_changed', { path, value: typeof value === 'string' && /token|key|secret/i.test(path) ? '***' : value });
+      const category = path.split('.')[0];
+      this.emit('change:user', { userId, path, value, category });
+      this.log.info({ userId, path }, 'user setting updated');
+      const ownerIds = (this.values.general?.ownerIds ?? []).map(Number);
+      if (ownerIds.includes(Number(userId))) {
+        try { this.set(path, value); } catch {}
+      }
+      return { applied: true, hotReloaded: true, restartRequired: false };
+    }
+    return this.set(path, value);
   }
 
   /**

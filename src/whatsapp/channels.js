@@ -24,42 +24,44 @@ export class ChannelService {
    * @returns {Promise<Array<{ jid, name, status, canPublish, checkedAt }>>}
    */
   async discover(session) {
-    const raw = await session.listSubscribedNewsletters();
-    const list = normalizeSubscribedResponse(raw);
+    this.log.info({ sessionId: session.sessionId }, 'discovering newsletters/channels...');
+    let list = [];
+    try {
+      const raw = await session.listSubscribedNewsletters();
+      this.log.info({ sessionId: session.sessionId, rawType: typeof raw, isArray: Array.isArray(raw) }, 'raw newsletterSubscribed response');
+      list = normalizeSubscribedResponse(raw);
+    } catch (err) {
+      this.log.warn({ sessionId: session.sessionId, err: err?.message }, 'listSubscribedNewsletters query failed — checking cached channels');
+    }
+
     const cacheTtlMs = (this.settings?.get('whatsapp.channelCacheMinutes') ?? 10) * 60 * 1000;
     const now = new Date().toISOString();
-    const channels = [];
+    const channels = new Map();
 
+    // 1. Process discovered list from live query
     for (const entry of list) {
       const jid = entry.jid;
       if (!jid || !isJidNewsletter(jid)) continue;
       let name = entry.name ?? null;
-      let status = entry.state ?? entry.status ?? null;
-      let canPublish = 'unknown';
-      let meta = {};
+      let status = entry.status ?? null;
+      let canPublish = detectPublishPermission(entry.raw ?? entry, session.jid);
+      let meta = entry.raw ?? {};
 
-      // Fresh metadata (fetch_viewer_metadata is requested by plogme).
-      try {
-        const metadata = await session.getNewsletterMetadata(jid);
-        const parsed = normalizeMetadataResponse(metadata);
-        name = name ?? parsed.name ?? null;
-        status = status ?? parsed.status ?? null;
-        meta = parsed;
-        canPublish = detectPublishPermission(metadata, session.jid);
-      } catch (error) {
-        this.log.warn({ err: error, jid }, 'channel metadata fetch failed');
-        // Fall back to cache if fresh enough.
-        const cached = this.db.get(
-          'SELECT * FROM wa_channels WHERE session_id = ? AND channel_jid = ?',
-          session.sessionId, jid
-        );
-        if (cached && Date.parse(cached.can_publish_checked_at ?? 0) > Date.now() - cacheTtlMs) {
-          canPublish = cached.can_publish;
-          name = name ?? cached.name;
+      // If permission is still unknown, try fetching fresh metadata
+      if (canPublish === 'unknown') {
+        try {
+          const metadata = await session.getNewsletterMetadata(jid);
+          const parsed = normalizeMetadataResponse(metadata);
+          name = name ?? parsed.name ?? null;
+          status = status ?? parsed.status ?? null;
+          meta = { ...meta, ...parsed };
+          canPublish = detectPublishPermission(metadata, session.jid);
+        } catch (error) {
+          this.log.warn({ err: error?.message, jid }, 'channel metadata fetch failed');
         }
       }
 
-      channels.push({ jid, name, status, canPublish, checkedAt: now, meta });
+      channels.set(jid, { jid, name, status, canPublish, checkedAt: now, meta });
       this.db.run(
         `INSERT INTO wa_channels (session_id, channel_jid, name, status, can_publish, can_publish_checked_at, meta_json)
          VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -71,12 +73,75 @@ export class ChannelService {
         session.sessionId, jid, name, status, canPublish, now, JSON.stringify(meta)
       );
     }
-    return channels;
+
+    // 2. Also include any previously cached / manually added channels for this session
+    const cachedRows = this.cached(session.sessionId);
+    for (const r of cachedRows) {
+      if (!channels.has(r.channel_jid)) {
+        let meta = {};
+        try { meta = JSON.parse(r.meta_json ?? '{}'); } catch {}
+        channels.set(r.channel_jid, {
+          jid: r.channel_jid,
+          name: r.name,
+          status: r.status,
+          canPublish: r.can_publish,
+          checkedAt: r.can_publish_checked_at,
+          meta
+        });
+      }
+    }
+
+    this.log.info({ sessionId: session.sessionId, total: channels.size }, 'channels discovery complete');
+    return [...channels.values()];
   }
 
   /** Cached channel list (fast path for the UI). */
   cached(sessionId) {
     return this.db.all('SELECT * FROM wa_channels WHERE session_id = ?', sessionId);
+  }
+
+  /**
+   * Resolve and register a channel by invite link, code, or JID.
+   * e.g.: https://whatsapp.com/channel/0029Va... or 1203631234567890@newsletter
+   */
+  async resolveChannel(session, input) {
+    if (!input || typeof input !== 'string') throw new Error('Channel link or JID is required');
+    const cleaned = input.trim();
+    let meta = null;
+    let jid = null;
+    let name = null;
+
+    if (cleaned.includes('whatsapp.com/channel/') || cleaned.includes('wa.me/channel/') || (!cleaned.includes('@') && cleaned.length < 35 && !/^\d+$/.test(cleaned))) {
+      // Invite link or invite code
+      meta = await session.getNewsletterInviteInfo(cleaned);
+      jid = meta?.id ?? meta?.jid ?? null;
+      if (jid && !jid.includes('@')) jid = `${jid}@newsletter`;
+      const parsed = normalizeMetadataResponse(meta);
+      name = parsed.name ?? meta?.thread_metadata?.name?.text ?? meta?.name ?? 'WhatsApp Channel';
+    } else {
+      // Direct JID or numeric ID
+      jid = cleaned.includes('@') ? cleaned : `${cleaned}@newsletter`;
+      meta = await session.getNewsletterMetadata(jid);
+      const parsed = normalizeMetadataResponse(meta);
+      name = parsed.name ?? meta?.thread_metadata?.name?.text ?? meta?.name ?? 'WhatsApp Channel';
+    }
+
+    if (!jid) throw new Error('Could not resolve channel JID from input');
+    const canPublish = detectPublishPermission(meta, session.jid);
+    const now = new Date().toISOString();
+
+    this.db.run(
+      `INSERT INTO wa_channels (session_id, channel_jid, name, status, can_publish, can_publish_checked_at, meta_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(session_id, channel_jid) DO UPDATE SET
+         name = excluded.name, status = excluded.status,
+         can_publish = excluded.can_publish,
+         can_publish_checked_at = excluded.can_publish_checked_at,
+         meta_json = excluded.meta_json`,
+      session.sessionId, jid, name, 'ACTIVE', canPublish, now, JSON.stringify(meta ?? {})
+    );
+
+    return { jid, name, status: 'ACTIVE', canPublish, checkedAt: now, meta: meta ?? {} };
   }
 
   /**
@@ -109,21 +174,58 @@ export class ChannelService {
 
 /** The subscribed-newsletters mex response can arrive in a few shapes. */
 export function normalizeSubscribedResponse(raw) {
-  if (!raw || typeof raw !== 'object') return [];
-  const candidates = [
-    raw.newsletters,
-    raw.threads,
-    raw.result?.newsletters,
-    raw.result?.threads,
-    raw.data?.newsletters,
-    Array.isArray(raw) ? raw : null
-  ].filter(Array.isArray);
-  const list = candidates[0] ?? [];
-  return list.map((entry) => ({
-    jid: entry.jid ?? entry.id ?? entry.newsletter_jid ?? (typeof entry === 'string' ? entry : null),
-    name: entry.name?.text ?? entry.name ?? entry.thread_metadata?.name?.text ?? null,
-    state: entry.state ?? entry.status ?? null
-  })).filter((e) => e.jid);
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.map(normalizeChannelEntry).filter(Boolean);
+
+  if (typeof raw === 'object') {
+    const list = [
+      raw.result,
+      raw.data,
+      raw.newsletters,
+      raw.threads,
+      raw.xwa2_newsletter_subscribed,
+      raw.result?.newsletters,
+      raw.result?.threads,
+      raw.data?.newsletters,
+      raw.data?.xwa2_newsletter_subscribed,
+      raw.subscribed
+    ].find(Array.isArray);
+
+    if (list) return list.map(normalizeChannelEntry).filter(Boolean);
+
+    // Deep search any array in raw
+    for (const val of Object.values(raw)) {
+      if (Array.isArray(val) && val.length > 0) {
+        return val.map(normalizeChannelEntry).filter(Boolean);
+      }
+    }
+  }
+  return [];
+}
+
+export function normalizeChannelEntry(entry) {
+  if (!entry) return null;
+  if (typeof entry === 'string') {
+    const jid = entry.includes('@') ? entry : `${entry}@newsletter`;
+    return { jid, name: null, status: null, canPublish: 'unknown', meta: {} };
+  }
+  const rawJid = entry.jid ?? entry.id ?? entry.newsletter_jid ?? entry.key?.remoteJid;
+  if (!rawJid) return null;
+  const jid = String(rawJid).includes('@') ? String(rawJid) : `${rawJid}@newsletter`;
+
+  const thread = entry.thread_metadata ?? entry;
+  const name = thread?.name?.text ?? thread?.name ?? entry.name?.text ?? entry.name ?? null;
+  const status = entry.state ?? entry.status ?? null;
+  const viewer = entry.viewer_metadata ?? thread?.viewer_metadata ?? null;
+
+  return {
+    jid,
+    name: typeof name === 'string' ? name : null,
+    status: typeof status === 'string' ? status : null,
+    viewer,
+    thread,
+    raw: entry
+  };
 }
 
 /** Normalize a newsletterMetadata response. */

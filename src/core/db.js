@@ -21,6 +21,12 @@ export class Database {
 
   migrate() {
     this.db.exec(SCHEMA_SQL);
+    try {
+      this.db.exec('ALTER TABLE pinterest_media ADD COLUMN tg_message_id INTEGER;');
+    } catch {}
+    try {
+      this.db.exec("ALTER TABLE wa_sessions ADD COLUMN prefix TEXT DEFAULT '.';");
+    } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     const current = row ? Number(row.value) : 0;
     if (current < SCHEMA_VERSION) {
@@ -40,16 +46,20 @@ export class Database {
     return stmt;
   }
 
+  #sanitize(params) {
+    return params.map((p) => (p === undefined ? null : p));
+  }
+
   run(sql, ...params) {
-    return this.prepare(sql).run(...params);
+    return this.prepare(sql).run(...this.#sanitize(params));
   }
 
   get(sql, ...params) {
-    return this.prepare(sql).get(...params);
+    return this.prepare(sql).get(...this.#sanitize(params));
   }
 
   all(sql, ...params) {
-    return this.prepare(sql).all(...params);
+    return this.prepare(sql).all(...this.#sanitize(params));
   }
 
   transaction(fn) {
@@ -96,6 +106,37 @@ export class Database {
     } catch {
       return fallback;
     }
+  }
+
+  getUserSetting(userId, key, fallback = undefined) {
+    const row = this.get('SELECT value_json FROM user_settings WHERE user_id = ? AND key = ?', userId, key);
+    if (!row) return fallback;
+    try {
+      return JSON.parse(row.value_json);
+    } catch {
+      return fallback;
+    }
+  }
+
+  setUserSetting(userId, key, value) {
+    this.run(
+      `INSERT INTO user_settings (user_id, key, value_json, updated_at) VALUES (?, ?, ?, datetime('now'))
+       ON CONFLICT(user_id, key) DO UPDATE SET value_json = excluded.value_json, updated_at = datetime('now')`,
+      userId,
+      key,
+      JSON.stringify(value)
+    );
+  }
+
+  getAllUserSettings(userId) {
+    const rows = this.all('SELECT key, value_json FROM user_settings WHERE user_id = ?', userId);
+    const result = {};
+    for (const r of rows) {
+      try {
+        result[r.key] = JSON.parse(r.value_json);
+      } catch {}
+    }
+    return result;
   }
 
   audit(userId, action, details = {}) {

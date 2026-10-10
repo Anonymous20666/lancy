@@ -33,20 +33,40 @@ export function debounce(fn, waitMs) {
 export function throttle(fn, waitMs) {
   let last = 0;
   let timer = null;
-  let lastArgs;
-  const invoke = () => {
-    last = Date.now();
-    timer = null;
-    fn(...lastArgs);
-    lastArgs = null;
-  };
-  return (...args) => {
-    const elapsed = Date.now() - last;
+  let lastArgs = null;
+
+  const throttled = (...args) => {
     lastArgs = args;
-    if (elapsed >= waitMs) {
-      invoke();
+    const now = Date.now();
+    const remaining = waitMs - (now - last);
+
+    if (remaining <= 0) {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      last = now;
+      const toCall = lastArgs;
+      lastArgs = null;
+      if (toCall) fn(...toCall);
     } else if (!timer) {
-      timer = setTimeout(invoke, waitMs - elapsed);
+      timer = setTimeout(() => {
+        timer = null;
+        last = Date.now();
+        const toCall = lastArgs;
+        lastArgs = null;
+        if (toCall) fn(...toCall);
+      }, remaining);
     }
   };
+
+  throttled.cancel = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    lastArgs = null;
+  };
+
+  return throttled;
 }

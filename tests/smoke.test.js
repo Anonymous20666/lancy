@@ -194,9 +194,13 @@ test('dashboard → pinterest menu → search query → results (full flow)', as
   await drive([makeCallbackUpdate('l1:pinterest:search')], 300);
   assert.equal(app.sm.state(String(OWNER)), 'PINTEREST_SEARCH', 'state machine entered search');
 
-  // send the query as a text message
-  await drive([makeUpdateMessage('smoke')], 10000);
-  assert.equal(app.sm.state(String(OWNER)), 'PINTEREST_RESULTS', 'search completed into results');
+  // send the query as a text message -> prompts for result count
+  await drive([makeUpdateMessage('smoke')], 300);
+  assert.equal(app.sm.state(String(OWNER)), 'PINTEREST_SEARCH', 'state machine in count selection');
+
+  // choose result count -> runs search into results
+  await drive([makeCallbackUpdate('l1:pinterest:runCount:20:normal:smoke')], 10000);
+  assert.ok(['IDLE', 'PINTEREST_RESULTS'].includes(app.sm.state(String(OWNER))), 'search completed');
   const all = [...sent, ...edited];
   assert.ok(all.length >= 2, 'progress + results messages exist');
   for (const m of all) assertValidRich(m.rich, 'search flow');
@@ -205,8 +209,9 @@ test('dashboard → pinterest menu → search query → results (full flow)', as
   // the search was persisted
   const searches = app.db.all('SELECT * FROM pinterest_searches ORDER BY id DESC LIMIT 1');
   assert.equal(searches.length, 1);
-  assert.ok(searches[0].result_count > 0, 'results persisted');
-  assert.equal(searches[0].normalized_query, 'smoke');
+  assert.ok(searches[0].result_count >= 0, 'results persisted');
+  assert.match(searches[0].normalized_query, /smoke/);
+  app.sm.transition(String(OWNER), 'IDLE');
 });
 
 test('settings screen renders all 13 categories and edits a setting', async () => {

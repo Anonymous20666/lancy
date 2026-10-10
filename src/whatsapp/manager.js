@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { existsSync } from 'node:fs';
 import { logger } from '../core/logger.js';
 import { WASession } from './session.js';
 import { ensureSessionDir, removeDir } from '../utils/paths.js';
@@ -32,11 +33,14 @@ export class WhatsAppManager extends EventEmitter {
     for (const row of rows) {
       const session = this.#hydrate(row);
       this.sessions.set(row.session_id, session);
-      if (row.status === 'online' || row.status === 'reconnecting') {
-        this.#attach(session);
-        session.start().catch((error) => {
-          this.log.error({ err: error, sessionId: row.session_id }, 'restore start failed');
-        });
+      this.#attach(session);
+      if (row.status !== 'logged_out') {
+        const credsFile = `${this.credsRoot}/sessions/${row.session_id}/creds.json`;
+        if (existsSync(credsFile)) {
+          session.start().catch((error) => {
+            this.log.error({ err: error, sessionId: row.session_id }, 'restore start failed');
+          });
+        }
       }
     }
     return rows.length;
@@ -47,9 +51,11 @@ export class WhatsAppManager extends EventEmitter {
       sessionId: row.session_id,
       name: row.name,
       phone: row.phone,
+      prefix: row.prefix ?? '.',
       credsDir: this.credsRoot,
       settings: this.settings
     });
+    session.userId = row.user_id;
     session.jid = row.jid;
     session.status = row.status === 'online' ? 'offline' : row.status; // reconnect will set online
     session.reconnectState = row.reconnect_state ?? 'idle';
@@ -82,6 +88,12 @@ export class WhatsAppManager extends EventEmitter {
       this.#persistSession(session, { status: 'reconnecting', reconnectState: 'backing_off' });
       this.emit('reconnecting', { sessionId: session.sessionId, ...info });
     });
+    session.on('command', (data) => {
+      this.emit('command', data);
+    });
+    session.on('prefixChange', (prefix) => {
+      this.db.run('UPDATE wa_sessions SET prefix = ? WHERE session_id = ?', prefix, session.sessionId);
+    });
   }
 
   #persistSession(session, patch = {}) {
@@ -108,15 +120,17 @@ export class WhatsAppManager extends EventEmitter {
     const sessionId = `wa_${randomToken(8)}`;
     ensureSessionDir(this.credsRoot, sessionId);
     this.db.run(
-      `INSERT INTO wa_sessions (user_id, session_id, name, phone, jid, status, reconnect_state, creds_path)
-       VALUES (?, ?, ?, ?, NULL, 'offline', 'idle', ?)`,
+      `INSERT INTO wa_sessions (user_id, session_id, name, phone, jid, status, reconnect_state, creds_path, prefix)
+       VALUES (?, ?, ?, ?, NULL, 'offline', 'idle', ?, '.')`,
       userId, sessionId, name, phone, `${this.credsRoot}/sessions/${sessionId}`
     );
     const session = new WASession({
       sessionId, name, phone,
+      prefix: '.',
       credsDir: this.credsRoot,
       settings: this.settings
     });
+    session.userId = userId;
     this.sessions.set(sessionId, session);
     this.#attach(session);
     this.db.audit(userId, 'wa.session.created', { sessionId, name, phone });
@@ -137,11 +151,29 @@ export class WhatsAppManager extends EventEmitter {
   }
 
   describe(session) {
+    if (!session) {
+      return {
+        sessionId: null,
+        userId: null,
+        name: 'Unknown',
+        phone: null,
+        jid: null,
+        prefix: '.',
+        status: 'offline',
+        reconnectState: 'idle',
+        pairingCode: null,
+        lastConnected: null,
+        lastDisconnect: null,
+        stats: {}
+      };
+    }
     return {
       sessionId: session.sessionId,
+      userId: session.userId ?? null,
       name: session.name,
       phone: session.phone,
       jid: session.jid,
+      prefix: session.prefix ?? '.',
       status: session.status,
       reconnectState: session.reconnectState,
       pairingCode: session.pairingCode,
@@ -158,24 +190,26 @@ export class WhatsAppManager extends EventEmitter {
     return this.describe(session);
   }
 
-  async requestPairing(sessionId, phoneDigits) {
+  async requestPairing(sessionId, phoneDigits, customPairingCode = null) {
     const session = this.get(sessionId);
     if (!session) throw new Error(`Unknown session: ${sessionId}`);
     this.db.run('UPDATE wa_sessions SET phone = ?, status = ? WHERE session_id = ?', phoneDigits, 'pairing', sessionId);
     session.phone = phoneDigits;
-    return session.requestPairingCode(phoneDigits);
+    return session.requestPairingCode(phoneDigits, customPairingCode);
   }
 
-  async logoutSession(sessionId, { deleteCreds = false } = {}) {
+  async logoutSession(sessionId, { deleteCreds = true } = {}) {
     const session = this.get(sessionId);
-    if (!session) return false;
-    await session.logout();
-    await session.destroy();
-    this.db.run('UPDATE wa_sessions SET status = ?, updated_at = datetime(\'now\') WHERE session_id = ?', 'logged_out', sessionId);
+    if (session) {
+      await session.logout().catch(() => {});
+      await session.destroy().catch(() => {});
+    }
     if (deleteCreds) {
       removeDir(`${this.credsRoot}/sessions/${sessionId}`);
       this.db.run('DELETE FROM wa_sessions WHERE session_id = ?', sessionId);
       this.sessions.delete(sessionId);
+    } else {
+      this.db.run('UPDATE wa_sessions SET status = ?, updated_at = datetime(\'now\') WHERE session_id = ?', 'logged_out', sessionId);
     }
     this.db.audit(null, 'wa.session.logout', { sessionId, deleteCreds });
     return true;

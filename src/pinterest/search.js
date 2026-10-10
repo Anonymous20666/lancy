@@ -28,7 +28,7 @@ export const SEARCH_DEPTHS = {
   very_deep: { pages: 6, target: 120 }
 };
 
-export const SEARCH_MODES = ['mixed', 'images', 'videos', 'random'];
+export const SEARCH_MODES = ['normal', 'images', 'videos', 'random'];
 
 export function normalizeQuery(query) {
   return String(query ?? '')
@@ -62,24 +62,39 @@ export class DeepSearchPipeline extends EventEmitter {
    * Run a deep search.
    * @param {object} opts { userId, query, mode, depth, signal, onProgress }
    */
-  async search({ userId, query, mode = 'mixed', depth = 'deep', signal, onProgress } = {}) {
+  async search({ userId, query, mode = 'normal', depth = 'deep', goal: requestedGoal = null, signal, onProgress } = {}) {
     const normalized = normalizeQuery(query);
     if (!normalized) throw new LancyError('♡ Tell me what to search for.', { code: 'EMPTY_QUERY' });
-    if (!SEARCH_MODES.includes(mode)) throw new LancyError(`♡ Unknown media mode: ${mode}`, { code: 'BAD_MODE' });
+    const effectiveMode = mode === 'mixed' ? 'normal' : mode;
+    if (!SEARCH_MODES.includes(effectiveMode)) throw new LancyError(`♡ Unknown media mode: ${mode}`, { code: 'BAD_MODE' });
 
     const depthCfg = SEARCH_DEPTHS[depth] ?? SEARCH_DEPTHS.deep;
-    const maxPages = this.settings?.get('pinterest.depthPages')?.[depth] ?? depthCfg.pages;
     const targetResults = this.settings?.get('pinterest.depthTargetResults')?.[depth] ?? depthCfg.target;
     const configuredTarget = this.settings?.get('pinterest.resultCount') ?? 0;
-    const goal = Math.max(targetResults, configuredTarget);
+    // Videos capped at 20 max to avoid excessive download delays; image/normal searches strictly honor requestedGoal
+    const goal = effectiveMode === 'videos'
+      ? Math.min(20, Math.max(1, Number(requestedGoal) || 20))
+      : (Number(requestedGoal) > 0 ? Number(requestedGoal) : Math.max(targetResults, configuredTarget));
+    const computedPages = effectiveMode === 'videos'
+      ? Math.min(3, Math.ceil(goal / 10) + 1)
+      : Math.max(depthCfg.pages, Math.ceil(goal / 15) + 3);
+    const maxPages = effectiveMode === 'videos'
+      ? computedPages
+      : (Number(requestedGoal) > 0 ? computedPages : (this.settings?.get('pinterest.depthPages')?.[depth] ?? computedPages));
     const maxConcurrent = Math.max(1, this.settings?.get('pinterest.maxConcurrentSearches') ?? 2);
     const timeoutMs = (this.settings?.get('pinterest.searchTimeoutSeconds') ?? 30) * 1000;
+
+    // Enhance video search queries with video intent so Pinterest returns actual video pins
+    let providerQuery = normalized;
+    if (effectiveMode === 'videos' && !/(video|edit|clip|amv|mp4|animation|motion)/i.test(normalized)) {
+      providerQuery = `${normalized} edit video`;
+    }
 
     // Persist the search record.
     const searchRow = this.db.run(
       `INSERT INTO pinterest_searches (user_id, query, normalized_query, mode, depth, result_count, duplicates_found)
        VALUES (?, ?, ?, ?, ?, 0, 0)`,
-      userId, query, normalized, mode, depth
+      userId, query, normalized, effectiveMode, depth
     );
     const searchId = Number(searchRow.lastInsertRowid);
 
@@ -99,7 +114,7 @@ export class DeepSearchPipeline extends EventEmitter {
       const pageTimeout = AbortSignal.any ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)].filter(Boolean)) : signal;
       let page;
       try {
-        page = await this.provider.search({ query: normalized, bookmark, signal: pageTimeout });
+        page = await this.provider.search({ query: providerQuery, bookmark, signal: pageTimeout });
       } catch (error) {
         if (pagesFetched === 0) throw error;
         this.log.warn({ err: error, pagesFetched }, 'pagination stopped early');
@@ -119,19 +134,47 @@ export class DeepSearchPipeline extends EventEmitter {
       this.emit('progress', { pagesFetched, collected: collected.length });
 
       // Enough raw candidates to plausibly reach the goal after filtering?
+      const targetCount = mode === 'videos'
+        ? collected.filter((i) => i.type === 'video').length
+        : mode === 'images'
+        ? collected.filter((i) => i.type === 'image').length
+        : collected.length;
       const neededRaw = Math.ceil(goal * 1.4) + 10;
-      if (!bookmark || collected.length >= neededRaw) break;
+      if (!bookmark || targetCount >= neededRaw) break;
+    }
+
+    // In normal mode, grab video candidates if none found in base results so normal search is a rich mix
+    if (effectiveMode === 'normal' && collected.filter((i) => i.type === 'video').length === 0 && !signal?.aborted) {
+      try {
+        const vidPage = await this.provider.search({ query: `${normalized} edit video`, signal });
+        for (const item of (vidPage?.items ?? [])) {
+          if (!seenPins.has(item.pinId)) {
+            seenPins.add(item.pinId);
+            collected.push({ ...item, searchId });
+          }
+        }
+      } catch { /* non-fatal */ }
+    } else if (effectiveMode === 'videos' && collected.filter((i) => i.type === 'video').length === 0 && !signal?.aborted) {
+      try {
+        const altPage = await this.provider.search({ query: `${normalized} video`, signal });
+        for (const item of (altPage?.items ?? [])) {
+          if (!seenPins.has(item.pinId)) {
+            seenPins.add(item.pinId);
+            collected.push({ ...item, searchId });
+          }
+        }
+      } catch { /* non-fatal */ }
     }
 
     // 5–6. Identify type + apply the media-mode filter.
     const modeFiltered = collected.filter((item) => {
-      if (mode === 'images') return item.type === 'image';
-      if (mode === 'videos') return item.type === 'video';
-      return true; // mixed | random
+      if (effectiveMode === 'images') return item.type === 'image';
+      if (effectiveMode === 'videos') return item.type === 'video';
+      return true; // normal | random
     });
 
-    // Random mode: shuffle for variety, then treat like mixed.
-    const ordered = mode === 'random' ? shuffle(modeFiltered) : modeFiltered;
+    // Random mode: shuffle for variety, then treat like normal.
+    const ordered = effectiveMode === 'random' ? shuffle(modeFiltered) : modeFiltered;
 
     // 7–10. Validate + hash + dedupe through the media pipeline, bounded concurrency.
     this.emit('stage', { stage: 'validating', searchId });
@@ -163,6 +206,7 @@ export class DeepSearchPipeline extends EventEmitter {
           }
           descriptor.searchId = searchId;
           descriptor.id = this.#persistMedia(userId, searchId, descriptor);
+          this.media.dedup.registerCandidate(userId, descriptor);
           valid.push(descriptor);
         } catch (error) {
           rejected.push({ candidate, error: error.message });
@@ -173,15 +217,18 @@ export class DeepSearchPipeline extends EventEmitter {
     });
     await Promise.all(workers);
 
-    // 11b. Within-search content dedupe (race-free post-pass): the same bytes
-    // served under a new pin id is still a duplicate — exact + perceptual.
+    // 11b. Within-search content dedupe (race-free post-pass): pin_id + media_url + sha256 + perceptual hash
     {
       const seenShas = new Set();
+      const seenPins = new Set();
+      const seenUrls = new Set();
       const seenPhashes = [];
       const unique = [];
       for (const descriptor of valid) {
         let dupReason = null;
-        if (descriptor.sha256 && seenShas.has(descriptor.sha256)) dupReason = 'sha256';
+        if (descriptor.pinId && seenPins.has(descriptor.pinId)) dupReason = 'pin_id';
+        else if (descriptor.mediaUrl && seenUrls.has(descriptor.mediaUrl)) dupReason = 'media_url';
+        else if (descriptor.sha256 && seenShas.has(descriptor.sha256)) dupReason = 'sha256';
         else if (descriptor.phash && seenPhashes.some((h) => isPerceptualDuplicate(descriptor.phash, h))) dupReason = 'perceptual_hash';
         if (dupReason) {
           duplicatesFound++;
@@ -193,6 +240,8 @@ export class DeepSearchPipeline extends EventEmitter {
           );
           continue;
         }
+        if (descriptor.pinId) seenPins.add(descriptor.pinId);
+        if (descriptor.mediaUrl) seenUrls.add(descriptor.mediaUrl);
         if (descriptor.sha256) seenShas.add(descriptor.sha256);
         if (descriptor.phash) seenPhashes.push(descriptor.phash);
         unique.push(descriptor);

@@ -62,6 +62,20 @@ export class MediaCache {
     return this.index[sha256] ?? null;
   }
 
+  pin(sha256) {
+    if (this.index[sha256]) {
+      this.index[sha256].pinned = true;
+      this.#saveIndex();
+    }
+  }
+
+  unpin(sha256) {
+    if (this.index[sha256]) {
+      this.index[sha256].pinned = false;
+      this.#saveIndex();
+    }
+  }
+
   /** Remove entries older than ttlMinutes that are not pinned. */
   cleanup(ttlMinutes = 1440) {
     const cutoff = Date.now() - ttlMinutes * 60 * 1000;

@@ -3,18 +3,21 @@
  * never random spam. The pack's configured emoji always wins when set.
  */
 
+const GIRLY_EMOJIS = ['🌸', '🎀', '💖', '✨', '🧸', '🍓', '🌷', '🧁', '🤍', '🐇', '🫧', '🩰', '🪞', '🍰', '💌', '💫'];
+
 const MOOD_EMOJIS = {
-  cute: ['♡', '🥺', '🌸', '✨', '🐰', '💗', '☁️', '🎀'],
+  girly: GIRLY_EMOJIS,
+  cute: ['🤍', '🥺', '🌸', '✨', '🐰', '💗', '☁️', '🎀', '🧸', '🌷', '🫧'],
   funny: ['😭', '💀', '😂', '🤡', '😹', '🫠', '🙃', '😮‍💨'],
   rage: ['😤', '💢', '😾', '🔥', '⚡', '😡', '🗯️', '💥'],
   sad: ['😿', '💔', '😞', '🌧️', '🖤', '🥀', '😔', '💧'],
-  love: ['🥰', '😘', '💕', '💞', '💘', '❤️‍🔥', '🫶', '🌹'],
+  love: ['🥰', '😘', '💕', '💞', '💘', '❤️‍🔥', '🫶', '🌹', '💌'],
   chaos: ['🌀', '🤪', '👁️', '🗿', '🛸', '🧠', '⚠️', '🚨'],
   cool: ['😎', '🕶️', '🧊', '🖤', '✨', '🐍', '🌙', '⭐'],
-  anime: ['⚡', '🌸', '👊', '💫', '🎌', '🗾', '🔥', '💢']
+  anime: ['⚡', '🌸', '👊', '💫', '🎌', '🗾', '🔥', '💢', '✨']
 };
 
-const ALL = [...new Set(Object.values(MOOD_EMOJIS).flat())];
+const ALL = [...new Set([...GIRLY_EMOJIS, ...Object.values(MOOD_EMOJIS).flat()])];
 
 const QUERY_MOODS = [
   [/cute|kawaii|soft|adorable|fluff/, 'cute'],
@@ -37,9 +40,10 @@ export function moodForQuery(query) {
 
 /** Pick 1–3 emojis for a sticker, deterministic per index + mood. */
 export function emojisForSticker({ query = '', packEmoji = null, index = 0, assignment = 'auto' } = {}) {
-  if (assignment === 'pack' && packEmoji) return [packEmoji];
+  const cleanPackEmoji = packEmoji === '♡' ? '🤍' : packEmoji;
+  if (assignment === 'pack' && cleanPackEmoji) return [cleanPackEmoji];
   if (assignment === 'first') return [ALL[index % ALL.length]];
-  if (packEmoji) return [packEmoji, ...pickMoodEmojis(query, index).slice(0, 1)];
+  if (cleanPackEmoji) return [cleanPackEmoji, ...pickMoodEmojis(query, index).slice(0, 1)];
   return pickMoodEmojis(query, index).slice(0, 2);
 }
 

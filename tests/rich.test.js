@@ -51,10 +51,11 @@ test('buttons block caps at 8 per row and supports styles', () => {
   const buttons = Array.from({ length: 10 }, (_, i) => richButton.callback(`b${i}`, `l1:x:y:${i}`));
   const blk = block.buttons(buttons);
   assert.equal(blk.buttons.length, RICH_LIMITS.maxButtonsPerRow);
+  assert.equal(blk.buttons[0].style, 'primary');
   const danger = richButton.callback('Delete', 'l1:x:del', { style: 'danger' });
   assert.equal(danger.style, 'danger');
   const link = richButton.url('Open', 'https://t.me/addstickers/x');
-  assert.equal(link.style, 'link');
+  assert.equal(link.style, 'primary');
   assert.equal(link.url, 'https://t.me/addstickers/x');
 });
 
@@ -82,6 +83,19 @@ test('collectAttachmentRefs finds attach:// references', () => {
   const rich = new RichMessageBuilder().photo('attach://preview_0').photo('attach://preview_1').toJSON();
   const refs = collectAttachmentRefs(rich);
   assert.deepEqual([...refs.keys()].sort(), ['preview_0', 'preview_1']);
+});
+
+test('collage and slideshow blocks build valid albums and collect attachments', () => {
+  const b = new RichMessageBuilder();
+  b.collage(['attach://c_0', 'attach://c_1']);
+  b.slideshow(['attach://s_0', 'attach://s_1']);
+  const json = b.toJSON();
+  assert.equal(json.blocks[0].type, 'collage');
+  assert.equal(json.blocks[0].blocks.length, 2);
+  assert.equal(json.blocks[1].type, 'slideshow');
+  assert.equal(json.blocks[1].blocks.length, 2);
+  const refs = collectAttachmentRefs(json);
+  assert.deepEqual([...refs.keys()].sort(), ['c_0', 'c_1', 's_0', 's_1']);
 });
 
 test('validate enforces block and char limits', () => {

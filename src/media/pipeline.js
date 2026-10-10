@@ -7,7 +7,8 @@ import { probeImage, probeVideo, perceptualHash, hashBundle } from './convert.js
 import { sha256Hex } from '../utils/hash.js';
 import { withRetry } from '../utils/retry.js';
 import { ensureDir, removeDir } from '../utils/paths.js';
-import { writeFileSync, mkdtempSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdtempSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -33,6 +34,9 @@ export class MediaPipeline {
   /** Download a URL with size cap, timeout and retries. Returns a Buffer. */
   async download(url, { maxBytes, timeoutMs = 30000, signal } = {}) {
     const cap = maxBytes ?? this.settings?.get('media.maxDownloadBytes') ?? 60 * 1024 * 1024;
+    if (url && /\.m3u8(\?|$)/i.test(url)) {
+      return this.#downloadHls(url, { maxBytes: cap, timeoutMs, signal });
+    }
     return withRetry(async () => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -81,6 +85,51 @@ export class MediaPipeline {
     }, { attempts: this.settings?.get('performance.retryCount') ?? 3, shouldRetry: (e) => e.retryable !== false });
   }
 
+  async #downloadHls(url, { maxBytes, timeoutMs = 30000, signal } = {}) {
+    const ffmpegPath = this.settings?.get('media.ffmpegPath') || 'ffmpeg';
+    const tmpDir = mkdtempSync(join(tmpdir(), 'lancy-hls-'));
+    const outFile = join(tmpDir, 'stream.mp4');
+    try {
+      await new Promise((resolve, reject) => {
+        const proc = spawn(ffmpegPath, [
+          '-y',
+          '-i', url,
+          '-t', '30',
+          '-c', 'copy',
+          '-bsf:a', 'aac_adtstoasc',
+          outFile
+        ]);
+        const timer = setTimeout(() => {
+          proc.kill('SIGKILL');
+          reject(new Error('HLS stream download timed out'));
+        }, timeoutMs);
+        const onAbort = () => {
+          proc.kill('SIGKILL');
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+        signal?.addEventListener('abort', onAbort, { once: true });
+        proc.on('close', (code) => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          if (code === 0 && existsSync(outFile)) resolve();
+          else reject(new Error(`ffmpeg exited with code ${code}`));
+        });
+        proc.on('error', (err) => {
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          reject(err);
+        });
+      });
+      const buffer = readFileSync(outFile);
+      if (maxBytes && buffer.length > maxBytes) {
+        throw new Error(`Downloaded video stream exceeded cap: ${buffer.length} > ${maxBytes}`);
+      }
+      return buffer;
+    } finally {
+      removeDir(tmpDir);
+    }
+  }
+
   /**
    * Full pipeline for one candidate media item.
    * Returns a rich descriptor or throws LancyError with a friendly message.
@@ -104,7 +153,7 @@ export class MediaPipeline {
         try {
           const p = join(dir, 'probe.bin');
           writeFileSync(p, buf);
-          return probeVideo(p, this.settings?.get('media.ffmpegPath') ?? '');
+          return await probeVideo(p, this.settings?.get('media.ffmpegPath') ?? '');
         } finally {
           removeDir(dir);
         }
@@ -118,8 +167,9 @@ export class MediaPipeline {
       throw LancyError.wrap(error, '♡ That media file looked broken, so I skipped it.');
     }
 
-    // 3. HASH (sha256 + perceptual hash for images)
-    const { sha256, phash } = await hashBundle(buffer).catch(() => ({ sha256: sha256Hex(buffer), phash: null }));
+    // 3. HASH (sha256 + perceptual hash for images and videos)
+    const { sha256, phash } = await hashBundle(buffer, { configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? '' })
+      .catch(() => ({ sha256: sha256Hex(buffer), phash: null }));
 
     // 4. DUPLICATE CHECK (per-user history + global registry)
     const identities = { sha256, phash, pinId, sourceUrl, mediaUrl: url };

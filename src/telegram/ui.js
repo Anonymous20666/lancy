@@ -9,22 +9,34 @@ import { progressBar, formatBytes, formatDateTime, truncate, pluralize } from '.
 
 export const ACCENT = '♡';
 export const SPARK = '✦';
+export const TEDDY = 'ʕ•ᴥ•ʔ';
+export const TEDDY_CUTE = '૮꒰ ˶• ༝ •˶꒱ა';
+export const GOTHIC_CROSS = '♰';
+export const GOTHIC_STAR = '⛧';
+export const BOW = '୨୧';
+export const WINGS = '𓆩♡𓆪';
+export const SPARKLE = '₊˚⊹♡';
 
-export function header(title, { emoji = SPARK } = {}) {
+export function header(title, { emoji = WINGS } = {}) {
   return [`${emoji} ${String(title).toUpperCase()} ${emoji}`];
 }
 
 export function banner(lines) {
-  // ╭───╮ boxed banner for hero moments (dashboard, completion)
-  const width = Math.max(...lines.map((l) => [...l].length), 24);
-  const top = `╭${'─'.repeat(width + 2)}╮`;
-  const bottom = `╰${'─'.repeat(width + 2)}╯`;
-  const body = lines.map((l) => {
-    const len = [...l].length;
-    const left = Math.floor((width - len) / 2);
-    return `│${' '.repeat(left + 1)}${l}${' '.repeat(width - len - left + 1)}│`;
-  });
+  // Ornate gothic/girly heavy aesthetic header
+  const textLines = lines.map(String);
+  const top = `୨୧ ━━━ 𓆩♡𓆪 ━━━━━━━━━━━━━━ 𓆩♡𓆪 ━━━ ୨୧`;
+  const bottom = `୨୧ ━━━━━━━━━ ૮꒰ ˶• ༝ •˶꒱ა ━━━━━━━━━ ୨୧`;
+  const body = textLines.map((l) => `    ₊˚⊹♡  ${l}  ˙ᵕ˙`);
   return [top, ...body, bottom].join('\n');
+}
+
+export function gothicCard(title, subtitle) {
+  return [
+    `୨୧ ━━━━━━━ 𓆩♡𓆪 ━━━━━━━ ୨୧`,
+    `   ⛧ ${String(title).toUpperCase()} ⛧`,
+    subtitle ? `   ૮꒰ ˶• ༝ •˶꒱ა ${subtitle}` : '',
+    `୨୧ ━━━━━━━━━━━━━━━━━━━━ ୨୧`
+  ].filter(Boolean).join('\n');
 }
 
 /** Status dot for sessions/channels. */
@@ -62,8 +74,8 @@ export function kvTable(pairs) {
 /** Standard navigation buttons for rich messages. */
 export function navButtons(screen, { back = true, cancel = false, home = false } = {}) {
   const buttons = [];
-  if (back) buttons.push(richButton.callback(`${ACCENT} Back`, encodeCallback(screen, 'back')));
-  if (home) buttons.push(richButton.callback(`${SPARK} Home`, encodeCallback('dashboard', 'open')));
+  if (back) buttons.push(richButton.callback('« Back', encodeCallback(screen, 'back'), { style: 'primary' }));
+  if (home) buttons.push(richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' }));
   if (cancel) buttons.push(richButton.callback('✕ Cancel', encodeCallback(screen, 'cancel'), { style: 'danger' }));
   return buttons;
 }
@@ -71,9 +83,9 @@ export function navButtons(screen, { back = true, cancel = false, home = false }
 /** Paginator buttons. */
 export function pagerButtons(screen, page, totalPages, extra = []) {
   const row = [];
-  if (page > 0) row.push(richButton.callback('← Prev', encodeCallback(screen, 'page', page - 1)));
+  if (page > 0) row.push(richButton.callback('← Prev', encodeCallback(screen, 'page', page - 1), { style: 'primary' }));
   row.push(...extra);
-  if (page < totalPages - 1) row.push(richButton.callback('Next →', encodeCallback(screen, 'page', page + 1)));
+  if (page < totalPages - 1) row.push(richButton.callback('Next →', encodeCallback(screen, 'page', page + 1), { style: 'primary' }));
   return row;
 }
 
@@ -104,9 +116,9 @@ export function packCard(pack, { timeZone } = {}) {
 export function inlinePager(screen, page, totalPages) {
   const rows = [];
   const row = [];
-  if (page > 0) row.push(ikButton('← Prev', encodeCallback(screen, 'page', page - 1)));
-  row.push(ikButton(`${page + 1} / ${totalPages}`, encodeCallback(screen, 'noop')));
-  if (page < totalPages - 1) row.push(ikButton('Next →', encodeCallback(screen, 'page', page + 1)));
+  if (page > 0) row.push(ikButton('← Prev', encodeCallback(screen, 'page', page - 1), { style: 'primary' }));
+  row.push(ikButton(`${page + 1} / ${totalPages}`, encodeCallback(screen, 'noop'), { style: 'primary' }));
+  if (page < totalPages - 1) row.push(ikButton('Next →', encodeCallback(screen, 'page', page + 1), { style: 'primary' }));
   rows.push(row);
   return inlineKeyboard(rows);
 }

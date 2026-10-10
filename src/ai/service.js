@@ -78,9 +78,9 @@ export class AIService extends EventEmitter {
 
   #config() {
     return {
-      provider: this.settings?.get('ai.provider') ?? 'builtin',
-      endpoint: this.settings?.get('ai.endpoint') ?? 'http://127.0.0.1:11434',
-      model: this.settings?.get('ai.model') ?? '',
+      provider: this.settings?.get('ai.provider') || 'ollama',
+      endpoint: this.settings?.get('ai.endpoint') || 'http://127.0.0.1:11434',
+      model: this.settings?.get('ai.model') || 'qwen2.5:0.5b',
       apiKey: this.settings?.get('ai.apiKey') ?? '',
       timeoutMs: (this.settings?.get('ai.timeoutSeconds') ?? 30) * 1000
     };
@@ -93,14 +93,15 @@ export class AIService extends EventEmitter {
   }
 
   get providerName() {
-    return this.settings?.get('ai.provider') ?? 'builtin';
+    return this.settings?.get('ai.provider') ?? 'ollama';
   }
 
   async status() {
     if (!this.enabled) return { enabled: false, provider: 'disabled', available: false };
     if (this.providerName === 'builtin') return { enabled: true, provider: 'builtin', available: true, local: true };
+    this.start();
     try {
-      const available = await this.#send({ type: 'probe' }).then((r) => r.result, () => false);
+      const available = await this.#send({ type: 'probe' }).then((r) => Boolean(r), () => false);
       return { enabled: true, provider: this.providerName, available, local: true };
     } catch {
       return { enabled: true, provider: this.providerName, available: false, local: true };

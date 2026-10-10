@@ -1,5 +1,5 @@
 import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
-import { navButtons, ACCENT, SPARK } from '../ui.js';
+import { navButtons, banner, ACCENT, SPARK } from '../ui.js';
 
 /** Help / About — what Lancy is, how the workflow fits together. */
 export function createHelpScreen({ app }) {
@@ -8,33 +8,36 @@ export function createHelpScreen({ app }) {
   function render(ctx) {
     const { settings } = ctx;
     const b = new RichMessageBuilder();
-    b.heading(`${SPARK} HELP & ABOUT`, 1);
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 HELP & ABOUT 𓆩♡𓆪',
+      'your complete aesthetic studio ♡'
+    ])));
     b.divider();
     b.paragraph(rt.concat(
       rt.bold('✦ Lancy Bot'),
-      rt.text(' is your personal control center. Telegram is the brain — WhatsApp is just where the stickers go out ♡')
+      rt.text(' is your personal control center. Telegram is the brain — WhatsApp is where your packs shine ♡')
     ));
     b.spacer();
-    b.heading(`${ACCENT} the workflow`, 3);
+    b.heading('୨୧ the workflow', 3);
     b.list([
-      'search Pinterest deep & duplicate-free',
-      'turn the best media into Telegram sticker packs',
-      'preview everything before it ships',
-      'publish to WhatsApp sessions & channels with a beautiful caption'
+      'ʕ•ᴥ•ʔ search Pinterest deep & duplicate-free',
+      '˙ᵕ˙ turn the best aesthetic picks into TG sticker packs',
+      '૮꒰ ˶• ༝ •˶꒱ა preview HD albums before anything ships',
+      '₊˚⊹♡ publish to WhatsApp sessions & channels with custom captions'
     ]);
     b.spacer();
-    b.heading(`${ACCENT} good to know`, 3);
+    b.heading('𓆩♡𓆪 good to know', 3);
     b.list([
-      'every media item is hashed (SHA-256 + perceptual) — you will not see the same image twice',
-      'WhatsApp packs split automatically at the physical limit (60)',
-      'nothing is ever published without your final POST ♡',
-      'WhatsApp credentials stay on the server, isolated per session'
+      'ʕ•ᴥ•ʔ every media item is hashed (SHA-256 + pHash) — no twin images',
+      '˙ᵕ˙ WhatsApp packs split automatically at the physical limit (60)',
+      '୨୧ nothing is ever published without your final POST approval ♡',
+      '₊˚⊹♡ credentials stay encrypted on your server, isolated per session'
     ]);
     b.spacer();
-    b.heading(`${ACCENT} commands`, 3);
+    b.heading('⛧ commands', 3);
     b.table([
       [{ text: rt.bold('/start'), align: 'left', valign: 'middle' }, { text: 'open the dashboard', align: 'left', valign: 'middle' }],
-      [{ text: rt.bold('/cancel'), align: 'left', valign: 'middle' }, { text: 'cancel the current flow', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/cancel'), align: 'left', valign: 'middle' }, { text: 'cancel current flow', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/help'), align: 'left', valign: 'middle' }, { text: 'this screen', align: 'left', valign: 'middle' }]
     ], { compact: true });
     b.divider();
@@ -48,8 +51,7 @@ export function createHelpScreen({ app }) {
     id,
     async open(ctx) {
       const rich = render(ctx);
-      if (ctx.messageId && ctx.message) await ctx.editScreen(rich);
-      else await ctx.replyRich(rich);
+      await ctx.editScreen(rich);
     },
     async handle(ctx, action) {
       if (action === 'open') await this.open(ctx);

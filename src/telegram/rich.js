@@ -38,12 +38,17 @@ export const rt = {
   customEmoji: (alternativeText, customEmojiId) => ({ type: 'custom_emoji', alternative_text: alternativeText, custom_emoji_id: String(customEmojiId) })
 };
 
+import { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText } from './customEmoji.js';
+
+export { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText };
+
 /** Flatten RichText to plain string (for length checks / previews). */
 export function richTextToString(text) {
   if (text == null) return '';
   if (typeof text === 'string') return text;
   if (Array.isArray(text)) return text.map(richTextToString).join('');
   if (typeof text === 'object') {
+    if (typeof text.alternative_text === 'string') return text.alternative_text;
     if (typeof text.text === 'string' || Array.isArray(text.text) || typeof text.text === 'object') {
       return richTextToString(text.text);
     }
@@ -62,7 +67,10 @@ export const block = {
   divider: () => ({ type: 'divider' }),
   buttons: (buttons, align = 'center') => ({
     type: 'buttons',
-    buttons: buttons.slice(0, RICH_LIMITS.maxButtonsPerRow),
+    buttons: buttons.slice(0, RICH_LIMITS.maxButtonsPerRow).map((btn) => ({
+      ...btn,
+      style: btn.style ?? 'primary'
+    })),
     align
   }),
   table: (rows, { bordered = true, striped = false, compact = true, caption } = {}) => ({
@@ -85,11 +93,13 @@ export const block = {
   expandableBlockquote: (text, credit) => ({ type: 'expandable_blockquote', text, ...(credit ? { credit } : {}) }),
   pullquote: (text, credit) => ({ type: 'pullquote', text, ...(credit ? { credit } : {}) }),
   details: (summary, blocks, isOpen = false) => ({ type: 'details', summary, blocks, is_open: isOpen }),
-  photo: (media, caption) => ({ type: 'photo', photo: media, ...(caption ? { caption: { text: caption } } : {}) }),
-  video: (media, caption) => ({ type: 'video', video: media, ...(caption ? { caption: { text: caption } } : {}) }),
-  animation: (media, caption) => ({ type: 'animation', animation: media, ...(caption ? { caption: { text: caption } } : {}) }),
-  audio: (media, caption) => ({ type: 'audio', audio: media, ...(caption ? { caption: { text: caption } } : {}) }),
-  document: (media, caption) => ({ type: 'document', document: media, ...(caption ? { caption: { text: caption } } : {}) })
+  photo: (media, caption) => ({ type: 'photo', photo: typeof media === 'object' && media !== null ? media : { type: 'photo', media }, ...(caption ? { caption: { text: caption } } : {}) }),
+  video: (media, caption) => ({ type: 'video', video: typeof media === 'object' && media !== null ? media : { type: 'video', media }, ...(caption ? { caption: { text: caption } } : {}) }),
+  animation: (media, caption) => ({ type: 'animation', animation: typeof media === 'object' && media !== null ? media : { type: 'animation', media }, ...(caption ? { caption: { text: caption } } : {}) }),
+  audio: (media, caption) => ({ type: 'audio', audio: typeof media === 'object' && media !== null ? media : { type: 'audio', media }, ...(caption ? { caption: { text: caption } } : {}) }),
+  document: (media, caption) => ({ type: 'document', document: typeof media === 'object' && media !== null ? media : { type: 'document', media }, ...(caption ? { caption: { text: caption } } : {}) }),
+  collage: (blocks, caption) => ({ type: 'collage', blocks: blocks.map((b) => typeof b === 'string' ? block.photo(b) : b), ...(caption ? { caption: { text: caption } } : {}) }),
+  slideshow: (blocks, caption) => ({ type: 'slideshow', blocks: blocks.map((b) => typeof b === 'string' ? block.photo(b) : b), ...(caption ? { caption: { text: caption } } : {}) })
 };
 
 function clampSize(size) {
@@ -114,14 +124,14 @@ function normalizeCell(cell) {
 // ── RichMessageButton ─────────────────────────────────────────────────────
 
 export const richButton = {
-  callback: (text, callbackData, { style } = {}) => ({
+  callback: (text, callbackData, { style = 'primary' } = {}) => ({
     text: rt.text(text),
     callback_data: callbackData,
-    ...(style ? { style } : {})
+    style
   }),
-  url: (text, url, { style = 'link' } = {}) => ({ text: rt.text(text), url, style }),
-  copy: (text, copyText, { style } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, ...(style ? { style } : {}) }),
-  disabled: (text) => ({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' } })
+  url: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), url, style }),
+  copy: (text, copyText, { style = 'primary' } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, style }),
+  disabled: (text) => ({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' }, style: 'primary' })
 };
 
 // ── InputRichMessage builder ──────────────────────────────────────────────
@@ -151,9 +161,25 @@ export class RichMessageBuilder {
     this.blocks.push(block.blockquote(Array.isArray(blocksOrText) ? blocksOrText : [block.paragraph(blocksOrText)], credit));
     return this;
   }
+  quote(blocksOrText, credit) {
+    return this.blockquote(blocksOrText, credit);
+  }
+  expandableBlockquote(text, credit) {
+    this.blocks.push(block.expandableBlockquote(text, credit));
+    return this;
+  }
+  pullquote(text, credit) {
+    this.blocks.push(block.pullquote(text, credit));
+    return this;
+  }
   details(summary, blocks, isOpen) { this.blocks.push(block.details(summary, blocks, isOpen)); return this; }
   photo(media, caption) { this.blocks.push(block.photo(media, caption)); return this; }
   video(media, caption) { this.blocks.push(block.video(media, caption)); return this; }
+  audio(media, caption) { this.blocks.push(block.audio(media, caption)); return this; }
+  animation(media, caption) { this.blocks.push(block.animation(media, caption)); return this; }
+  document(media, caption) { this.blocks.push(block.document(media, caption)); return this; }
+  collage(items, caption) { this.blocks.push(block.collage(items, caption)); return this; }
+  slideshow(items, caption) { this.blocks.push(block.slideshow(items, caption)); return this; }
   spacer() { this.blocks.push(block.paragraph('')); return this; }
 
   /** A "card": heading + divider + key/value table — Lancy's signature look. */
@@ -181,9 +207,9 @@ export class RichMessageBuilder {
     return this.blocks.reduce((sum, b) => sum + blockTextLength(b), 0);
   }
 
-  toJSON() {
+  toJSON({ useCustomEmojis = true } = {}) {
     return {
-      blocks: this.blocks,
+      blocks: useCustomEmojis ? applyCustomEmojisToBlocks(this.blocks) : this.blocks,
       ...(this.rtl ? { is_rtl: true } : {}),
       skip_entity_detection: this.skipEntityDetection
     };
@@ -219,6 +245,10 @@ function blockTextLength(b) {
       return b.cells.flat().reduce((s, c) => s + (c.text ? richTextToString(c.text).length : 0), 0);
     case 'details':
       return richTextToString(b.summary).length + (b.blocks?.reduce((s, x) => s + blockTextLength(x), 0) ?? 0);
+    case 'blockquote':
+      return b.blocks?.reduce((s, x) => s + blockTextLength(x), 0) ?? 0;
+    case 'expandable_blockquote':
+      return richTextToString(b.text ?? b.blocks).length + (b.credit ? richTextToString(b.credit).length : 0);
     default:
       return 0;
   }
@@ -233,7 +263,8 @@ export function inlineKeyboard(rows) {
         const out = { text: btn.text };
         if (btn.callback_data !== undefined) out.callback_data = btn.callback_data;
         if (btn.url !== undefined) out.url = btn.url;
-        if (btn.style) out.style = btn.style; // danger | success | primary
+        if (btn.copy_text !== undefined) out.copy_text = btn.copy_text;
+        out.style = btn.style ?? 'primary'; // danger | success | primary
         if (btn.disabled) out.disabled = btn.disabled;
         if (btn.switch_inline_query !== undefined) out.switch_inline_query = btn.switch_inline_query;
         if (btn.web_app) out.web_app = btn.web_app;
@@ -244,7 +275,7 @@ export function inlineKeyboard(rows) {
 }
 
 export function ikButton(text, callbackData, opts = {}) {
-  return { text, callback_data: callbackData, ...opts };
+  return { text, callback_data: callbackData, style: 'primary', ...opts };
 }
 
 // ── Callback data codec ───────────────────────────────────────────────────

@@ -35,7 +35,7 @@ export class TelegramStickerService {
     if (type === 'video') {
       return toTelegramVideoSticker(descriptor.buffer, {
         maxBytes: resolveLimits(this.settings, 'video').maxBytes,
-        maxDuration: this.settings?.get('stickers.videoMaxDurationSeconds') ?? 10,
+        maxDuration: Math.min(3, Math.max(1, Number(this.settings?.get('stickers.videoMaxDurationSeconds')) || 3)),
         configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? ''
       });
     }
@@ -74,11 +74,15 @@ export class TelegramStickerService {
     const initial = items.slice(0, initialCount);
     const rest = items.slice(initialCount);
 
-    const inputSticker = (item) => ({
-      sticker: { buffer: item.buffer, filename: `sticker.${typeLabel === 'video' ? 'webm' : 'webp'}` },
-      format: typeLabel,
-      emoji_list: item.emoji?.length ? item.emoji : ['♡']
-    });
+    const inputSticker = (item) => {
+      const rawEmojis = (item.emoji?.length ? item.emoji : ['🤍']).map((e) => (e === '♡' ? '🤍' : e));
+      const validEmojis = rawEmojis.filter(Boolean);
+      return {
+        sticker: { buffer: item.buffer, filename: `sticker.${typeLabel === 'video' ? 'webm' : 'webp'}` },
+        format: typeLabel,
+        emoji_list: validEmojis.length ? validEmojis : ['🤍']
+      };
+    };
 
     onProgress?.({ stage: 'creating', done: 0, total: items.length });
     let created;
@@ -111,15 +115,24 @@ export class TelegramStickerService {
     // Add the rest one by one, with gentle pacing and live progress.
     let done = initial.length;
     for (const item of rest) {
+      let added = false;
       try {
         await withRetry(() => this.api.addStickerToSet({ userId, name, sticker: inputSticker(item) }), {
-          attempts: this.settings?.get('whatsapp.retryCount') ?? 3,
+          attempts: 2,
           onRetry: () => onProgress?.({ stage: 'adding', done, total: items.length })
         });
+        added = true;
       } catch (error) {
-        throw this.#friendlyStickerError(error, `add sticker ${done + 1}`);
+        this.log?.warn?.({ err: error?.message, done }, 'addStickerToSet failed, retrying with fallback emoji');
+        try {
+          const fallback = { ...inputSticker(item), emoji_list: ['🤍'] };
+          await this.api.addStickerToSet({ userId, name, sticker: fallback });
+          added = true;
+        } catch (fbErr) {
+          this.log?.warn?.({ err: fbErr?.message, done }, 'skipped unaddable sticker item');
+        }
       }
-      done++;
+      if (added) done++;
       onProgress?.({ stage: 'adding', done, total: items.length });
       const delay = this.settings?.get('telegram.stickerAddDelayMs') ?? 250;
       if (delay > 0) await sleep(delay);
@@ -164,13 +177,15 @@ export class TelegramStickerService {
     let done = 0;
     for (const item of usable) {
       try {
+        const rawEmojis = (item.emoji?.length ? item.emoji : ['🤍']).map((e) => (e === '♡' ? '🤍' : e));
+        const validEmojis = rawEmojis.filter(Boolean);
         await this.api.addStickerToSet({
           userId,
           name,
           sticker: {
             sticker: { buffer: item.buffer, filename: `sticker.${stickerType === 'video' ? 'webm' : 'webp'}` },
             format: stickerType === 'video' ? 'video' : 'static',
-            emoji_list: item.emoji?.length ? item.emoji : ['♡']
+            emoji_list: validEmojis.length ? validEmojis : ['🤍']
           }
         });
       } catch (error) {
@@ -233,12 +248,16 @@ export class TelegramStickerService {
 /** Prepare sticker items from media descriptors (conversion + emoji). */
 export async function prepareStickerItems(descriptors, { stickerService, query = '', stickerType = 'static', onProgress } = {}) {
   const assignment = stickerService.settings?.get('stickers.emojiAssignment') ?? 'auto';
-  const packEmoji = stickerService.settings?.get('stickers.packEmoji') ?? '♡';
+  const rawPackEmoji = stickerService.settings?.get('stickers.packEmoji') ?? '🤍';
+  const packEmoji = rawPackEmoji === '♡' ? '🤍' : rawPackEmoji;
   const items = [];
   let done = 0;
   for (const descriptor of descriptors) {
     const converted = await stickerService.convertForTelegram(descriptor, { type: stickerType });
-    const emoji = emojisForSticker({ query, packEmoji, index: done, assignment });
+    const rawEmoji = (Array.isArray(descriptor.emoji) && descriptor.emoji.length)
+      ? descriptor.emoji
+      : (descriptor.emoji ? [descriptor.emoji] : emojisForSticker({ query, packEmoji, index: done, assignment }));
+    const emoji = rawEmoji.map((e) => (e === '♡' ? '🤍' : e)).filter(Boolean);
     items.push({
       buffer: converted.buffer,
       emoji,
