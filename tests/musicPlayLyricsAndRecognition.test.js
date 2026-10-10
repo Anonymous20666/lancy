@@ -368,5 +368,13 @@ test('Clean Metadata Handles Truncated Titles and Dashes: preserves song name', 
   const meta3 = cleanSongMetadata('Adele — Hello (Lyrics)', 'Rare Vibes');
   assert.equal(meta3.title, 'Hello');
   assert.equal(meta3.artist, 'Adele');
+
+  const meta4 = cleanSongMetadata('@NewMusicFriday - Future - My Collection (HNDRXX)', '@NewMusicFriday');
+  assert.equal(meta4.title, 'My Collection (HNDRXX)');
+  assert.equal(meta4.artist, 'Future');
+
+  const meta5 = cleanSongMetadata('@RapCity: Kendrick Lamar - DNA.', '@RapCity');
+  assert.equal(meta5.title, 'DNA');
+  assert.equal(meta5.artist, 'Kendrick Lamar');
 });
 

@@ -260,6 +260,7 @@ export function createDownloaderScreen({ app }) {
       }
 
       // 2. Embed Audio / Music Track inside the same Rich Message!
+      const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result.artist);
       if (audioTrack && audioTrack.buffer) {
         const audioField = 'audio_track';
         files[audioField] = {
@@ -267,19 +268,22 @@ export function createDownloaderScreen({ app }) {
           filename: audioTrack.filename || `${(title || 'soundtrack').replace(/[^\w\s-]/g, '') || 'soundtrack'}.mp3`,
           contentType: 'audio/mpeg'
         };
-        b.audio(`attach://${audioField}`, '🎵 Background Audio / Sound Track (MP3) ♡');
+        if (isMusic) {
+          b.audio(`attach://${audioField}`);
+        } else {
+          b.audio(`attach://${audioField}`, '🎵 Extracted Video Soundtrack (MP3) ♡');
+        }
       }
 
       // 3. Metadata Table
       b.divider();
-      const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result.artist);
       const videoCount = mediaItems.filter((m) => m.type === 'video').length;
       const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
 
       if (isMusic) {
         const musicRows = [
           ['📱 Platform', 'SPOTIFY / MUSIC ♡'],
-          ['🎵 Title', truncate(result.title || title, 36)],
+          ['🎵 Title', truncate(result.title || title, 40)],
           ['🎧 Artist', truncate(result.artist || result.author || 'Spotify', 36)]
         ];
         if (result.album) musicRows.push(['💿 Album', truncate(result.album, 36)]);

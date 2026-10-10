@@ -778,6 +778,60 @@ export class MediaDownloader {
   }
 
   /**
+   * Fast CBR 192k MP3 re-encoding with clean ID3v2.3 tags
+   * Strips all bloated YouTube descriptions and ensures instant 0ms playback in mobile ExoPlayer / Telegram
+   */
+  async #optimizeAudioToCbrMp3(input, { title = '', artist = '', album = '', year = '' } = {}) {
+    const tempDir = join(tmpdir(), `lancy_cbr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+    mkdirSync(tempDir, { recursive: true });
+
+    let inPath;
+    if (typeof input === 'string') {
+      inPath = input;
+    } else if (Buffer.isBuffer(input)) {
+      inPath = join(tempDir, 'input_raw');
+      writeFileSync(inPath, input);
+    } else {
+      return input;
+    }
+
+    const outPath = join(tempDir, 'optimized.mp3');
+    try {
+      const cleaned = cleanSongMetadata(title, artist);
+      let optTitle = cleaned.title || title || 'Audio Track';
+      if (optTitle.length > 45) {
+        optTitle = `${optTitle.slice(0, 42).trim()}…`;
+      }
+      const optArtist = cleaned.artist || artist || 'Spotify';
+
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', inPath,
+        '-map_metadata', '-1',
+        '-c:a', 'libmp3lame',
+        '-b:a', '192k',
+        '-ar', '44100',
+        '-id3v2_version', '3',
+        '-metadata', `title=${optTitle}`,
+        '-metadata', `artist=${optArtist}`,
+        ...(album ? ['-metadata', `album=${album}`] : []),
+        ...(year ? ['-metadata', `date=${year}`] : []),
+        outPath
+      ], { timeout: 30000 });
+
+      if (existsSync(outPath) && statSync(outPath).size > 1000) {
+        return readFileSync(outPath);
+      }
+    } catch (err) {
+      this.log.warn({ err: err.message }, 'Failed to optimize audio with ffmpeg, using original');
+    } finally {
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+
+    return Buffer.isBuffer(input) ? input : (existsSync(input) ? readFileSync(input) : null);
+  }
+
+  /**
    * Spotify Downloader: Metadata, Cover Art & Audio
    */
   async #downloadSpotify(url, { onProgress }) {
@@ -863,7 +917,8 @@ export class MediaDownloader {
         const best = res.formats[0];
         const musRes = await fetch(best.url, { signal: AbortSignal.timeout(30000) });
         if (musRes.ok) {
-          const buf = Buffer.from(await musRes.arrayBuffer());
+          let buf = Buffer.from(await musRes.arrayBuffer());
+          buf = await this.#optimizeAudioToCbrMp3(buf, { title, artist, album, year });
           const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
           return {
             sourceUrl: url,
@@ -923,8 +978,6 @@ export class MediaDownloader {
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--embed-metadata',
-            '--postprocessor-args', 'ffmpeg:-write_xing 1 -id3v2_version 3',
             '-o', join(tempDir, '%(title).60s.%(ext)s'),
             `ytsearch1:${query}`
           ], { timeout: 60000 });
@@ -936,8 +989,6 @@ export class MediaDownloader {
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--embed-metadata',
-            '--postprocessor-args', 'ffmpeg:-write_xing 1 -id3v2_version 3',
             '-o', join(tempDir, '%(title).60s.%(ext)s'),
             `scsearch1:${query}`
           ], { timeout: 60000 });
@@ -945,9 +996,14 @@ export class MediaDownloader {
         }
 
         const files = readdirSync(tempDir);
-        const audioFile = files.find((f) => f.endsWith('.mp3'));
+        const audioFile = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
         if (audioFile) {
-          const audioBuf = readFileSync(join(tempDir, audioFile));
+          const audioBuf = await this.#optimizeAudioToCbrMp3(join(tempDir, audioFile), {
+            title,
+            artist,
+            album,
+            year
+          });
           const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
           return {
             sourceUrl: url,
@@ -1070,8 +1126,6 @@ export class MediaDownloader {
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--embed-metadata',
-            '--postprocessor-args', 'ffmpeg:-write_xing 1 -id3v2_version 3',
             '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
@@ -1095,8 +1149,6 @@ export class MediaDownloader {
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--embed-metadata',
-            '--postprocessor-args', 'ffmpeg:-write_xing 1 -id3v2_version 3',
             '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
@@ -1117,8 +1169,6 @@ export class MediaDownloader {
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--embed-metadata',
-            '--postprocessor-args', 'ffmpeg:-write_xing 1 -id3v2_version 3',
             '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
@@ -1131,12 +1181,20 @@ export class MediaDownloader {
       }
 
       const files = readdirSync(tempDir);
-      const audioFile = files.find((f) => f.endsWith('.mp3'));
+      const audioFile = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
       if (!audioFile) {
         throw new Error(`Could not download audio for "${clean}". Please check spelling and try again ♡`);
       }
 
-      const audioBuf = readFileSync(join(tempDir, audioFile));
+      const finalClean = cleanSongMetadata(trackTitle, trackAuthor);
+      if (finalClean.title) trackTitle = finalClean.title;
+      if (finalClean.artist) trackAuthor = finalClean.artist;
+
+      const audioBuf = await this.#optimizeAudioToCbrMp3(join(tempDir, audioFile), {
+        title: trackTitle,
+        artist: trackAuthor,
+        year: trackYear
+      });
 
       let coverBuf = null;
       const thumbFile = files.find((f) => /\.(webp|jpg|jpeg|png)$/i.test(f));

@@ -12,6 +12,19 @@ export function cleanSongMetadata(rawTitle, rawArtist = '') {
   let raw = String(rawTitle || '').trim();
   let artist = String(rawArtist || '').trim();
 
+  // 0. Remove YouTube/channel handles from beginning of raw title (e.g. "@NewMusicFriday - ", "@RapCity: ")
+  raw = raw.replace(/^@[\w\.-]+\s*[-–—:|]\s*/i, '').trim();
+  if (/^@[\w\.-]+$/i.test(artist)) {
+    artist = '';
+  }
+
+  // If artist looks like a channel name or promotional handle rather than recording artist
+  if (/^@/i.test(artist) || /\b(channel|records|music friday|vevo|topic|promo|entertainment|lyrics\s*hub|vibes)\b/i.test(artist)) {
+    if (/[-–—:]/.test(raw)) {
+      artist = '';
+    }
+  }
+
   // 1. Remove trailing ellipsis or dots (e.g. from UI truncation)
   raw = raw.replace(/[…\.]+\s*$/, '').trim();
 
@@ -25,9 +38,9 @@ export function cleanSongMetadata(rawTitle, rawArtist = '') {
   raw = raw.replace(/\s*[([{\-]\s*(?:official\s*(?:music\s*)?(?:video|audio)|video|audio|extended(?:\s*version)?|lyric(?:s)?(?:\s*video)?|visualizer|remix|mv|hd|hq|4k|explicit|clean|remaster(?:ed)?|live)[^)\]}]*[)\]}]/gi, '');
   raw = raw.replace(/\s*\|\s*.*$/g, '');
 
-  // 5. If raw title is "Artist - Song Title" or "Song Title - Artist" (handles Unicode dashes -, –, —)
-  if (/[-–—]/.test(raw)) {
-    const parts = raw.split(/\s+[-–—]\s+/);
+  // 5. If raw title is "Artist - Song Title" or "Song Title - Artist" (handles Unicode dashes -, –, — and colon :)
+  if (/[-–—:]/.test(raw)) {
+    const parts = raw.split(/\s*[-–—:]\s*/);
     if (parts.length >= 2) {
       const left = parts[0].trim();
       const right = parts.slice(1).join(' - ').trim();

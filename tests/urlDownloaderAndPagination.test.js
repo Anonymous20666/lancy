@@ -534,6 +534,8 @@ test('Downloader Screen & MediaDownloader: music search query delivers Spotify M
   assert.ok(deliveredFiles, 'delivered files must exist');
   assert.ok(deliveredFiles.audio_track, 'audio_track file must be included in delivery');
   assert.ok(deliveredFiles.photo_0, 'cover art photo must be included in delivery');
+  const audioBlock = deliveredRich.blocks.find((b) => b.type === 'audio');
+  assert.equal(audioBlock?.caption, undefined, 'Music audio block has no caption to avoid vertical collision with player and table');
 
   db.close();
 });
