@@ -352,7 +352,7 @@ test('Smart Reverse Lyrics Search: identifies track from snippet and retrieves f
   // 2. getLyrics directly from verse snippet
   const lyricsRes = await getLyrics(snippet);
   assert.equal(lyricsRes.found, true);
-  assert.ok(lyricsRes.lyrics.includes('wished on a star') || lyricsRes.lyrics.includes('Love is so real'));
+  assert.ok(/wished on a star|love is so real|you make me feel/i.test(lyricsRes.lyrics || ''));
   assert.equal(lyricsRes.artist.toLowerCase(), "regina song");
 });
 

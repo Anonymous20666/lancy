@@ -192,10 +192,10 @@ test('WhatsApp DM supports @lid user IDs and fromMe self-chat', async () => {
   const session = {
     sessionId: 'wa_lid_sess',
     name: 'Self Chat',
-    jid: '2348164167112@s.whatsapp.net',
+    jid: '2348000000001@s.whatsapp.net',
     sendText: async (jid, text) => { sends.push({ jid, text }); }
   };
-  const app = { db, env: { OWNER_IDS: '8380969639' }, settings: fakeSettings() };
+  const app = { db, env: { OWNER_IDS: '1001' }, settings: fakeSettings() };
   const handler = new InboundHandler({ app });
 
   // Paired phone DM using LID identity
@@ -221,13 +221,13 @@ test('WhatsApp DM falls back to session.jid if sending to @lid throws', async ()
   const session = {
     sessionId: 'wa_fallback_sess',
     name: 'Fallback Chat',
-    jid: '2348164167112@s.whatsapp.net',
+    jid: '2348000000001@s.whatsapp.net',
     sendText: async (jid, text) => {
       if (jid.endsWith('@lid')) throw new Error('Cannot route LID stanza');
       sends.push({ jid, text });
     }
   };
-  const app = { db, env: { OWNER_IDS: '8380969639' }, settings: fakeSettings() };
+  const app = { db, env: { OWNER_IDS: '1001' }, settings: fakeSettings() };
   const handler = new InboundHandler({ app });
 
   await handler.handle({
@@ -241,7 +241,7 @@ test('WhatsApp DM falls back to session.jid if sending to @lid throws', async ()
   });
 
   assert.equal(sends.length, 1);
-  assert.equal(sends[0].jid, '2348164167112@s.whatsapp.net');
+  assert.equal(sends[0].jid, '2348000000001@s.whatsapp.net');
   assert.ok(sends[0].text.includes('LANCY WA HELPER'));
   db.close();
 });
@@ -270,7 +270,7 @@ test('WhatsApp DM .tg command splits >60 stickers into Part 01 and Part 02', asy
 
   const app = {
     db,
-    env: { OWNER_IDS: '8380969639' },
+    env: { OWNER_IDS: '1001' },
     settings: fakeSettings(),
     telegram: {
       api: {
@@ -324,7 +324,7 @@ test('WhatsApp DM .s command converts image into 512x512 WhatsApp sticker', asyn
 
   const app = {
     db,
-    env: { OWNER_IDS: '8380969639' },
+    env: { OWNER_IDS: '1001' },
     settings: fakeSettings()
   };
 
@@ -351,7 +351,7 @@ test('WhatsApp DM .s command converts image into 512x512 WhatsApp sticker', asyn
 
 test('StickerPackService deletePack and clearAllPacks clean up database correctly', async () => {
   const db = new Database(':memory:');
-  const userId = 8380969639;
+  const userId = 1001;
 
   // Insert two test packs
   db.run(`INSERT INTO sticker_packs (id, user_id, tg_short_name, tg_title, count, source, sticker_type, link)

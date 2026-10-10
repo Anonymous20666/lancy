@@ -29,7 +29,7 @@ test('WhatsApp logout completely deletes credentials directory and database reco
   const settings = new SettingsManager(db);
   const manager = new WhatsAppManager({ db, settings, credsRoot: tmpRoot });
 
-  const userId = 8380969639;
+  const userId = 1001;
   const session = await manager.createSession({ userId, name: 'Lancy Test', phone: '2348012345678' });
   const sessionId = session.sessionId;
 
@@ -60,7 +60,7 @@ test('WhatsApp screen logout callback triggers full cleanup and redirects to emp
   const manager = new WhatsAppManager({ db, settings, credsRoot: tmpRoot });
   const sm = new StateMachine({ db });
 
-  const userId = 8380969639;
+  const userId = 1001;
   const session = await manager.createSession({ userId, name: 'Main', phone: '2348012345678' });
   const sessionId = session.sessionId;
 
@@ -98,7 +98,7 @@ test('WhatsApp screen logout callback triggers full cleanup and redirects to emp
 test('dedup index includes pinterest_media so videos and pics never repeat across searches', () => {
   const db = new Database(':memory:');
   const dedup = new DedupService(db);
-  const userId = 8380969639;
+  const userId = 1001;
 
   // Insert a video pick into pinterest_media from previous search
   db.run(
@@ -281,7 +281,7 @@ test('ChannelService resolves channel by invite link or direct JID and persists 
 
   const mockSession = {
     sessionId: 'wa_test_session',
-    jid: '2348164167112@s.whatsapp.net',
+    jid: '2348000000001@s.whatsapp.net',
     getNewsletterInviteInfo: async (codeOrUrl) => ({
       id: '12036355555555555@newsletter',
       thread_metadata: { name: { text: 'Pappy Aesthetic World' } },
@@ -377,7 +377,7 @@ test('WhatsAppPublisher.publish sends caption first and publishes sticker pack t
   const callLog = [];
   const mockSession = {
     sessionId: 'wa_test_sess',
-    jid: '2348164167112@s.whatsapp.net',
+    jid: '2348000000001@s.whatsapp.net',
     isOnline: true,
     sendText: async (jid, text) => {
       callLog.push({ type: 'text', jid, text });
@@ -421,12 +421,12 @@ test('WhatsApp screen post_confirm executes publish without throwing and uses pe
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
   const sm = new StateMachine();
-  const userId = 8380969639;
+  const userId = 1001;
 
   let publishedPlan = null;
   const mockSession = {
     sessionId: 'wa_sess_1',
-    jid: '2348164167112@s.whatsapp.net',
+    jid: '2348000000001@s.whatsapp.net',
     isOnline: true,
     status: 'online'
   };
@@ -434,7 +434,7 @@ test('WhatsApp screen post_confirm executes publish without throwing and uses pe
   const mockManager = {
     listForUser: () => [mockSession],
     get: (id) => (id === 'wa_sess_1' ? mockSession : null),
-    describe: () => ({ name: 'Test WA', phone: '2348164167112' })
+    describe: () => ({ name: 'Test WA', phone: '2348000000001' })
   };
 
   const mockPacks = {

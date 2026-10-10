@@ -94,7 +94,7 @@ test('E2E: toTelegramVideoSticker enforces Telegram limits (≤ 3.0s, ≤ 256 KB
 
 test('E2E: History search retrieval loads directly from SQLite in < 50ms without scraping', async () => {
   const db = new Database(':memory:');
-  const userId = 8380969639;
+  const userId = 1001;
 
   // Insert a past search and 20 media items
   const ins = db.run(

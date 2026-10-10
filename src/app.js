@@ -276,7 +276,7 @@ export class LancyApp {
             writeFileSync(resultFile, JSON.stringify({ error: 'Session not online or not found' }));
             return;
           }
-          const userId = Number(data.userId ?? 8380969639);
+          const userId = Number(data.userId ?? this.settings.get('general.ownerIds')?.[0] ?? 1001);
           const pack = (data.packId ? this.packs.getPack(userId, data.packId) : null) ?? (this.packs.listPacks(userId, { limit: 1 }).packs[0]);
           if (!pack) {
             writeFileSync(resultFile, JSON.stringify({ error: 'Pack not found' }));

@@ -48,16 +48,16 @@ test('dashboard screen fetches user pfp and adds hero photo block', async () => 
   const dashboard = createDashboardScreen({ app });
 
   const ctx = {
-    tgId: 8380969639,
-    chatId: 8380969639,
+    tgId: 1001,
+    chatId: 1001,
     user: { first_name: 'TestUser' },
     api: mockApi,
     db,
     settings,
     sm,
     forceNew: true,
-    sendRichMessage: (rich, extra, files) => mockApi.sendRichMessage(8380969639, rich, extra, files),
-    editScreen: (rich, extra, files) => mockApi.editMessageRich(8380969639, 100, rich, extra, files)
+    sendRichMessage: (rich, extra, files) => mockApi.sendRichMessage(1001, rich, extra, files),
+    editScreen: (rich, extra, files) => mockApi.editMessageRich(1001, 100, rich, extra, files)
   };
 
   await dashboard.open(ctx, { forceNew: true });

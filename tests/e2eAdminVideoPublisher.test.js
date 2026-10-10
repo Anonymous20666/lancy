@@ -100,7 +100,7 @@ test('StickerPackService.listAvailablePacks strictly separates static and video 
 test('General Owner can allocate and remove admins via /addadmin and /deladmin', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
-  settings.set('general.ownerIds', [8380969639]);
+  settings.set('general.ownerIds', [1001]);
 
   const sentMessages = [];
   const fakeApi = {
@@ -123,7 +123,7 @@ test('General Owner can allocate and remove admins via /addadmin and /deladmin',
   await bot._handleCommandForTest?.('/addadmin 12345', 8831887192, 8831887192) ?? null;
 
   // Verify permission check logic
-  assert.ok(bot.isOwner(8380969639));
+  assert.ok(bot.isOwner(1001));
   assert.ok(!bot.isOwner(8831887192));
 
   // 2. Owner adds admin 8831887192
