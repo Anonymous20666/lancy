@@ -276,8 +276,15 @@ export function createPinterestScreen({ app }) {
 
       result.mode = mode;
       const rich = resultsRich(result, previewBlocks.length, totalMedia, previewBlocks, 0);
-      const files = previewBlocks.length > 0 ? mediaFiles : null;
-      await tracker.finish(rich, files);
+      try {
+        await tracker.finish(rich, files);
+      } catch (finishErr) {
+        if (/PHOTO_INVALID_DIMENSIONS|IMAGE_PROCESS_FAILED/i.test(finishErr?.message)) {
+          await tracker.finish(rich, null);
+        } else {
+          throw finishErr;
+        }
+      }
       if (tracker.messageId) {
         app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
         app.telegram.userScreenMessage?.set(sctx.tgId, { chatId, messageId: tracker.messageId });
