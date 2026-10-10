@@ -776,7 +776,7 @@ test('Inline Query: handles @bot query with live music search and returns articl
   assert.ok(inlineAnswers, 'answerInlineQuery called for empty query');
   assert.equal(inlineAnswers.inline_query_id, 'iq_1');
   assert.ok(inlineAnswers.results.length >= 3, '3 suggestion articles returned');
-  assert.match(inlineAnswers.results[0].title, /Live Music Search/);
+  assert.match(inlineAnswers.results[0].title, /Music/);
 
   // 2. Music query: "ransom"
   inlineAnswers = null;

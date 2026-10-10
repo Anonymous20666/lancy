@@ -155,6 +155,7 @@ ${stickerSection}
 📱 LIVE INLINE SEARCH EVERYWHERE
 • Type ${botTag} <song name> in ANY chat or group!
 • Preview tracks with album art in real-time and drop music directly into any conversation without leaving the chat!
+• (Tip: Cloned bots must have /setinline enabled in @BotFather to activate live search in chats)
 
 🤖 BRING YOUR OWN BOT (/clone in 60s)
 • Want your own private bot? Send /clone in private DM to launch your branded clone with your own name, multi-language support (7 languages!), and audience broadcasting!

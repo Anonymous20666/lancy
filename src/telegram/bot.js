@@ -151,8 +151,12 @@ export class TelegramController extends EventEmitter {
   async start() {
     const me = await this.api.getMe();
     this.botUsername = me.username;
+    this.supportsInline = Boolean(me.supports_inline_queries);
     this.settings.values.telegram.botUsername = me.username;
-    this.log.info({ bot: `@${me.username}` }, 'telegram connected');
+    this.log.info({ bot: `@${me.username}`, supportsInline: this.supportsInline }, 'telegram connected');
+    if (!this.supportsInline) {
+      this.log.warn({ bot: `@${me.username}` }, 'Inline mode is disabled in @BotFather. Send /setinline to @BotFather to enable live @bot search in chats.');
+    }
 
     // Register slash commands so typing / displays suggestions
     await this.registerCommands();
@@ -396,25 +400,25 @@ export class TelegramController extends EventEmitter {
     const botTag = this.botUsername ? `@${this.botUsername}` : '';
 
     try {
-      // 1. If query is empty: provide intuitive entrypoint cards
+      // 1. If query is empty: provide intuitive entrypoint cards (Shazam style)
       if (!rawText) {
         const defaultResults = [
           {
             type: 'article',
             id: 'hint_play',
-            title: `🎵 ${botName} Live Music Search`,
-            description: 'Type any song name, artist, or lyrics to search and stream ♡',
+            title: '🎵 Music 🎵',
+            description: 'Enter your search term (e.g. song name, artist, album) ♡',
             thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
             thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
             input_message_content: {
-              message_text: `<blockquote>🎵 <b>${botName} Music</b>\nType <code>/play &lt;song&gt;</code> or type <code>@${this.botUsername || 'bot'} &lt;song&gt;</code> to stream any song instantly! ♡</blockquote>`,
+              message_text: `<blockquote>🎵 <b>${botName} Music Search</b>\nType <code>@${this.botUsername || 'bot'} &lt;song name&gt;</code> in any chat to search and stream songs live! ♡</blockquote>`,
               parse_mode: 'HTML'
             }
           },
           {
             type: 'article',
             id: 'hint_download',
-            title: `📥 ${botName} Universal Downloader`,
+            title: '📥 Universal Downloader 📥',
             description: 'Paste any TikTok, Instagram Reel, YouTube, or Pinterest link ♡',
             thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
             thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
@@ -426,7 +430,7 @@ export class TelegramController extends EventEmitter {
           {
             type: 'article',
             id: 'hint_pinterest',
-            title: `🔍 ${botName} Pinterest Search`,
+            title: '🔍 Pinterest Search 🔍',
             description: 'Type "pint <topic>" or "search <topic>" to search HD aesthetic photos ♡',
             thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
             thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
@@ -440,8 +444,8 @@ export class TelegramController extends EventEmitter {
         await this.api.call('answerInlineQuery', {
           inline_query_id: qId,
           results: defaultResults,
-          cache_time: 30,
-          is_personal: true
+          cache_time: 10,
+          is_personal: false
         });
         return;
       }

@@ -126,12 +126,13 @@ export function createCloneScreen({ app }) {
     ])));
     b.divider();
 
-    b.heading('୨୧ follow these 4 quick steps:', 3);
+    b.heading('୨୧ follow these quick steps in @BotFather:', 3);
     b.quote(rt.concat(
       rt.text('1. Open Telegram\'s official '), rt.bold('@BotFather'), rt.text('\n'),
-      rt.text('2. Send the command '), rt.code('/newbot'), rt.text('\n'),
-      rt.text('3. Choose a display name and username ending in '), rt.code('bot'), rt.text('\n'),
-      rt.text('4. Copy the HTTP API token (e.g. '), rt.code('123456789:ABCdefGHI...'), rt.text(')\n\n'),
+      rt.text('2. Send '), rt.code('/newbot'), rt.text(' to create your bot name & username\n'),
+      rt.text('3. Copy the HTTP API token (e.g. '), rt.code('123456789:ABCdefGHI...'), rt.text(')\n\n'),
+      rt.bold('⚡ Enable Live @bot Search (Shazam Style):\n'),
+      rt.text('4. Send '), rt.code('/setinline'), rt.text(' to @BotFather → select your bot → enter placeholder: '), rt.code('Search music, videos...'), rt.text('\n\n'),
       rt.bold('👇 Paste and send your bot token here:')
     ));
     b.divider();
@@ -148,6 +149,9 @@ export function createCloneScreen({ app }) {
   function renderManageScreen(ctx, botRecord) {
     const isOnline = botRecord.status === 'active';
     const userCount = app.db.get('SELECT COUNT(*) AS c FROM bot_users WHERE bot_id = ?', botRecord.id)?.c ?? 0;
+    const runningBot = app.multiBotManager?.runningBots.get(botRecord.id);
+    const supportsInline = runningBot?.controller?.supportsInline ?? false;
+
     const b = new RichMessageBuilder();
     b.paragraph(rt.bold(banner([
       `𓆩♡𓆪 MANAGE @${botRecord.bot_username.toUpperCase()} 𓆩♡𓆪`,
@@ -159,10 +163,21 @@ export function createCloneScreen({ app }) {
       ['🏷 Bot Name', botRecord.bot_name],
       ['🤖 Username', `@${botRecord.bot_username}`],
       ['⚡ Status', `${statusDot(isOnline ? 'online' : 'offline')} ${botRecord.status.toUpperCase()}`],
+      ['🔍 Live Search', supportsInline ? '✓ Enabled' : '⚠️ Disabled (needs /setinline)'],
       ['👥 Total Users', `${userCount} active users`],
       ['📅 Created', botRecord.created_at?.slice(0, 10) || 'Recently']
     ]), { compact: true });
     b.divider();
+
+    if (!supportsInline) {
+      b.quote(rt.concat(
+        rt.bold('💡 Enable Live @bot Search in Chats:\n'),
+        rt.text('To allow users to type '), rt.code(`@${botRecord.bot_username}`),
+        rt.text(' anywhere for live music search, send '), rt.code('/setinline'),
+        rt.text(' to @BotFather and set placeholder to '), rt.code('Search music...')
+      ));
+      b.divider();
+    }
 
     b.buttons([
       richButton.url(`🚀 Open @${botRecord.bot_username}`, `https://t.me/${botRecord.bot_username}`),
@@ -378,6 +393,10 @@ export function createCloneScreen({ app }) {
               rt.text('• 🏷 '), rt.bold('Brand Name: '), rt.text(`${botRecord.bot_name}\n`),
               rt.text('• 🚀 '), rt.bold('Status: '), rt.text('Online & Polling\n'),
               rt.text('• 🎵 '), rt.bold('Features: '), rt.text('Music, Downloader, Pinterest, Group Chat & Multi-Language\n\n'),
+              rt.bold('⚡ Enable Live @bot Search (Shazam Style):\n'),
+              rt.text('To search music in any chat by typing '), rt.code(`@${botRecord.bot_username}`),
+              rt.text(', send '), rt.code('/setinline'), rt.text(` to @BotFather, select `), rt.code(`@${botRecord.bot_username}`),
+              rt.text(' and enter placeholder: '), rt.code('Search music...'), rt.text('\n\n'),
               rt.italic('Tap the button below to start your new bot! ♡')
             ));
             b.divider();
