@@ -124,6 +124,48 @@ export function createDashboardScreen({ app }) {
     }
     b.divider();
 
+    // Heads up & Addictive Expandable Guide explaining all bot powers
+    const botTag = ctx.bot?.botUsername ? `@${ctx.bot.botUsername}` : '@bot';
+    b.paragraph(rt.bold('✨ Heads up! Tap the card below to see everything I can do for you ♡'));
+    const stickerSection = isGroup
+      ? `🎀 STICKER STUDIO\n• Turn any picture, Pinterest pin, or meme into Telegram sticker packs in one click.`
+      : `🎀 STICKER STUDIO & WHATSAPP SYNC\n• Turn any picture, Pinterest pin, or meme into Telegram sticker packs in one click.\n• Seamlessly publish sticker packs to your paired WhatsApp sessions and announcement channels.`;
+
+    const guideText =
+`✨ Welcome to your ultimate aesthetic all-in-one companion! Tap to uncover all superpowers:
+
+🎵 HIGH-SPEED MUSIC & MP3 STREAMING
+• Type /play <song> or /music <song> to stream & download high-speed 320k MP3s with official cover art!
+• Need the file in your music player? Tap "🎵 Send Audio File" to save the raw audio directly into Telegram.
+• Tap "📜 Lyrics" to sing along with synchronized, expandable lyrics cards!
+• Heard a fire song in a video or voice note? Just reply or forward it to the bot — our Shazam recognizer identifies it instantly!
+
+📥 UNIVERSAL HD MEDIA DOWNLOADER (/grab or /download)
+• Paste ANY link or type /grab <link> from TikTok (no watermark!), Instagram Reels, YouTube Shorts, Twitter/X, Pinterest, or Facebook.
+• The bot grabs crystal-clear HD video or photo albums in seconds.
+• If the video has a soundtrack or background song, the MP3 audio track is automatically extracted and delivered right alongside it!
+
+🔍 PINTEREST HD AESTHETIC STUDIO (/search or /pint)
+• Search millions of aesthetic wallpapers, anime art, fashion, and video loops.
+• Choose your style: photos or video loops, depth, and pick your batch size (10 to 150+ picks!).
+• Browse through albums with smooth ← Prev / Next → pagination and download your favorites in original quality.
+
+${stickerSection}
+
+📱 LIVE INLINE SEARCH EVERYWHERE
+• Type ${botTag} <song name> in ANY chat or group!
+• Preview tracks with album art in real-time and drop music directly into any conversation without leaving the chat!
+
+🤖 BRING YOUR OWN BOT (/clone in 60s)
+• Want your own private bot? Send /clone in private DM to launch your branded clone with your own name, multi-language support (7 languages!), and audience broadcasting!
+
+👥 GROUP CHATS & MULTITASKING
+• Add the bot to your group chats for shared music drops, media downloads, and Pinterest searches.
+• Zero spam: tag ${botTag} or use /play to search, keeping your chats clean and conflict-free!`;
+
+    b.expandableBlockquote(guideText);
+    b.divider();
+
     // Primary navigation — grouped rows.
     b.heading('୨୧ quick actions', 3);
     if (isGroup) {

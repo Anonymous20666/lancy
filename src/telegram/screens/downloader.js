@@ -152,7 +152,7 @@ export function createDownloaderScreen({ app }) {
     ));
     b.divider();
     b.quote(rt.text(
-      '✨ Send any media link OR type any song title/artist to search music!\n' +
+      '✨ Send any media link, type /grab <link>, or type any song title/artist to search music!\n' +
       '🎧 If background music or sound is present, Lancy extracts and delivers the MP3 audio track automatically ♡'
     ));
     b.divider();

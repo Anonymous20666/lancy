@@ -652,15 +652,18 @@ export function createPinterestScreen({ app }) {
           await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
         }
         if (sctx.context.stage === 'historySearch') {
-          return showHistory(sctx, 0, text);
+          await showHistory(sctx, 0, text);
+          return true;
         }
         if (sctx.context.stage === 'count') {
           const parsed = parseInt(text, 10);
           if (!isNaN(parsed) && parsed > 0) {
-            return runSearch(sctx, sctx.context.query, parsed);
+            await runSearch(sctx, sctx.context.query, parsed);
+            return true;
           }
         }
-        return askCount(sctx, text, sctx.context.mode || 'normal');
+        await askCount(sctx, text, sctx.context.mode || 'normal');
+        return true;
       },
       onTimeout: async (sctx) => {
         await (sctx.api || app.telegram.api).sendMessage(sctx.chatId, '♡ search timed out — send a new query whenever you are ready.').catch(() => {});
@@ -740,7 +743,14 @@ export function createPinterestScreen({ app }) {
           const mode = args[1] || 'normal';
           const query = args[2] || '';
           const sctx = ctx.sm.ctxFor(ctx.tgId);
-          sctx.update({ mode, query, goal: count });
+          const clickedMsgId = ctx.query?.message?.message_id;
+          if (clickedMsgId) {
+            sctx.screenMessageId = clickedMsgId;
+            sctx.update({ mode, query, goal: count, screenMessageId: clickedMsgId });
+            ctx.controller?.userScreenMessage?.set(ctx.tgId, { chatId: ctx.chatId, messageId: clickedMsgId });
+          } else {
+            sctx.update({ mode, query, goal: count });
+          }
           return runSearch(sctx, query, count);
         }
         case 'customCount': {

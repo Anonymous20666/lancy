@@ -170,6 +170,7 @@ export class TelegramController extends EventEmitter {
 
     const groupCommands = [
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
+      { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
       { command: 'search', description: '🔍 Search Pinterest (HD photos & aesthetic art)' },
       { command: 'music', description: '🎧 Fast music & Spotify track search' },
@@ -183,6 +184,7 @@ export class TelegramController extends EventEmitter {
     const privateCommands = [
       { command: 'start', description: `✦ Open ${botName} aesthetic dashboard` },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
+      { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
       { command: 'search', description: '🔍 Search Pinterest (HD photos & videos)' },
       { command: 'music', description: '🎧 Fast music & Spotify track search' },
@@ -795,7 +797,7 @@ export class TelegramController extends EventEmitter {
         updateScreenMsg(sent);
         return;
       }
-      if (command === '/download' || command === '/dl' || command === '/music' || command === '/song' || command === '/play') {
+      if (command === '/download' || command === '/dl' || command === '/grab' || command === '/music' || command === '/song' || command === '/play') {
         const replyMedia = extractMediaForMusicRecognition(message.reply_to_message);
         if (replyMedia && replyMedia.obj?.file_id) {
           const ctx = this.#ctx(tgId, { message });
@@ -816,7 +818,8 @@ export class TelegramController extends EventEmitter {
           await this.api.sendMessage(
             chatId,
             `୨୧ Please provide a valid media link starting with http:// or https:// ♡\n` +
-            `Tip: To search & play music, use 🎵 Play Music from the menu or type <code>/play &lt;song name&gt;</code> ♡`,
+            `Tip: To download media, use <code>/grab &lt;link&gt;</code> or <code>/download &lt;link&gt;</code> ♡\n` +
+            `Tip: To search & play music, use <code>/play &lt;song name&gt;</code> ♡`,
             { parse_mode: 'HTML' }
           );
         } else {
@@ -1018,35 +1021,48 @@ export class TelegramController extends EventEmitter {
         }
       }
 
+      const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+      const isPrivate = !isGroup;
+
+      const replyMsgFrom = message.reply_to_message?.from;
+      const isReplyToBot = Boolean(
+        message.reply_to_message && (
+          !replyMsgFrom ||
+          replyMsgFrom.is_bot ||
+          (this.api.me?.id && replyMsgFrom.id === this.api.me.id) ||
+          (this.botUsername && replyMsgFrom.username?.toLowerCase() === this.botUsername.toLowerCase())
+        )
+      );
+      const botUsername = (this.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
+      const isTag = Boolean(
+        /\blancy\b/i.test(text) ||
+        (botUsername && new RegExp(`@?${botUsername}\\b`, 'i').test(text))
+      );
+
+      // In DM (private chat): state inputs work directly without needing to quote or tag!
+      // In Group Chat: interactive prompt input requires replying to the bot or tagging @bot
+      // to avoid chat conflicts when group members talk with each other.
+      const shouldHandleState = isPrivate || isReplyToBot || isTag;
       const ctx = this.#ctx(tgId, { message });
-      const handled = await this.sm.handleMessage(tgId, { ...message, chatId }, ctx);
+      const handled = shouldHandleState ? await this.sm.handleMessage(tgId, { ...message, chatId }, ctx) : false;
       if (!handled) {
         if (text) {
           // Check if message is a reply to the bot's prompt cards in group or private chat:
-          const replyMsgFrom = message.reply_to_message?.from;
-          const isReplyToBot = Boolean(
-            message.reply_to_message && (
-              !replyMsgFrom ||
-              replyMsgFrom.is_bot ||
-              (this.api.me?.id && replyMsgFrom.id === this.api.me.id) ||
-              (this.botUsername && replyMsgFrom.username?.toLowerCase() === this.botUsername.toLowerCase())
-            )
-          );
-          if (isReplyToBot) {
-            const promptText = String(message.reply_to_message.text || message.reply_to_message.caption || '');
-            if (/PLAY & DOWNLOAD MUSIC|how to play & download|Search Music Live|song title & artist/i.test(promptText)) {
+          if (isReplyToBot || isPrivate) {
+            const promptText = String(message.reply_to_message?.text || message.reply_to_message?.caption || '');
+            if (isReplyToBot && /PLAY & DOWNLOAD MUSIC|how to play & download|Search Music Live|song title & artist/i.test(promptText)) {
               const downloaderScreen = this.screens.get('downloader');
               if (downloaderScreen?.executeDownload) {
-                const ctx = this.#ctx(tgId, { message }, { forceNew: true });
-                await downloaderScreen.executeDownload(ctx, text);
+                const dlCtx = this.#ctx(tgId, { message }, { forceNew: true });
+                await downloaderScreen.executeDownload(dlCtx, text);
                 return;
               }
             }
-            if (/URL DOWNLOADER|valid media link/i.test(promptText)) {
+            if (isReplyToBot && /URL DOWNLOADER|valid media link/i.test(promptText)) {
               const downloaderScreen = this.screens.get('downloader');
               if (downloaderScreen?.executeDownload) {
-                const ctx = this.#ctx(tgId, { message }, { forceNew: true });
-                await downloaderScreen.executeDownload(ctx, text);
+                const dlCtx = this.#ctx(tgId, { message }, { forceNew: true });
+                await downloaderScreen.executeDownload(dlCtx, text);
                 return;
               }
             }
@@ -1060,37 +1076,31 @@ export class TelegramController extends EventEmitter {
             if (isKnownMedia) {
               const downloaderScreen = this.screens.get('downloader');
               if (downloaderScreen?.executeDownload) {
-                const ctx = this.#ctx(tgId, { message });
-                await downloaderScreen.executeDownload(ctx, url);
+                const dlCtx = this.#ctx(tgId, { message });
+                await downloaderScreen.executeDownload(dlCtx, url);
                 return;
               }
             }
           }
 
+          // AI assistant: ONLY responds in private DM (never in group chat!)
           const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
-          const isPrivate = message.chat?.type === 'private';
-          const botUsername = (this.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
-          const botId = this.api.me?.id;
-          const replyFrom = message.reply_to_message?.from;
-          const isQuote = Boolean(
-            message.reply_to_message && (
-              !replyFrom ||
-              replyFrom.is_bot ||
-              (botId && replyFrom.id === botId) ||
-              (botUsername && replyFrom.username && replyFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
-              (isPrivate && replyFrom.id && replyFrom.id !== Number(tgId))
-            )
-          );
-          const isTag = Boolean(
-            /\blancy\b/i.test(text) ||
-            new RegExp(`@?${botUsername}\\b`, 'i').test(text)
-          );
-          // In private chats (DM), AI assistant ONLY replies if the user explicitly quotes her message.
-          // In group chats, replies if quoted or tagged.
-          const shouldReply = enabled && (isPrivate ? isQuote : (isQuote || isTag));
-          if (shouldReply && this.app?.assistant) {
-            const ctx = this.#ctx(tgId, { message });
-            await this.app.assistant.handleMessage({ ctx, message, text });
+          if (isPrivate && enabled && this.app?.assistant) {
+            const replyFrom = message.reply_to_message?.from;
+            const isQuote = Boolean(
+              message.reply_to_message && (
+                !replyFrom ||
+                replyFrom.is_bot ||
+                (this.api.me?.id && replyFrom.id === this.api.me.id) ||
+                (botUsername && replyFrom.username && replyFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
+                (replyFrom.id && replyFrom.id !== Number(tgId))
+              )
+            );
+            const shouldReply = isQuote || isTag;
+            if (shouldReply) {
+              const aiCtx = this.#ctx(tgId, { message });
+              await this.app.assistant.handleMessage({ ctx: aiCtx, message, text });
+            }
           }
         }
       }
@@ -1278,9 +1288,14 @@ export class TelegramController extends EventEmitter {
           (queryMessage && this.isMediaDeliveryMessage(queryMessage)) ||
           (queryMessage?.message_id && this.isMediaDeliveryMessageId(queryMessage.message_id));
 
-        // If fromMedia, forceNew, or NOT an inline button callback, or the current message contains delivered media:
-        // ALWAYS send a fresh rich message so the user never loses their video, photo, or audio!
-        if (isMediaDelivery || !queryMessage) {
+        const activeScreenMsgId = queryMessage?.message_id ||
+          this.userScreenMessage.get(tgId)?.messageId ||
+          this.sm?.for(tgId)?.screenMessageId ||
+          this.sm?.context?.(tgId)?.screenMessageId;
+
+        // If fromMedia, forceNew, the current message contains delivered media, or no existing screen message:
+        // send a fresh rich message so the user never loses their video, photo, or audio!
+        if (isMediaDelivery || !activeScreenMsgId) {
           const sent = await this.api.sendRichMessage(chatId, rich, extra, files);
           if (sent?.message_id) {
             this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
@@ -1293,8 +1308,8 @@ export class TelegramController extends EventEmitter {
           return sent;
         }
 
-        // When the action was triggered by clicking an inline button on a normal menu:
-        const targetMsgId = queryMessage.message_id;
+        // When we have an active screen message (either from callback query or prior prompt):
+        const targetMsgId = activeScreenMsgId;
         const targetChatId = chatId;
 
         try {
