@@ -14,17 +14,31 @@ import { sleep, parseDurationToSeconds } from '../../utils/time.js';
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
 
-// Global cache for video soundtracks: trackKey -> Buffer
+// Global cache for track audio and metadata: audioKey -> Buffer / Object
 const trackAudioCache = new Map();
+const audioMetaCache = new Map();
 
-function saveTrackAudio(key, buffer) {
+function saveTrackAudio(key, buffer, meta = null, thumb = null) {
   if (trackAudioCache.size > 50) {
     const oldestKey = trackAudioCache.keys().next().value;
     trackAudioCache.delete(oldestKey);
+    audioMetaCache.delete(oldestKey);
   }
   trackAudioCache.set(key, buffer);
+  if (meta) {
+    const fullMeta = { ...meta, ...(thumb ? { thumb } : {}) };
+    audioMetaCache.set(key, fullMeta);
+  }
   try {
     writeFileSync(join(tmpdir(), `lancy_track_${key}.mp3`), buffer);
+    if (meta) {
+      const serializableMeta = { ...meta };
+      delete serializableMeta.thumb;
+      writeFileSync(join(tmpdir(), `lancy_meta_${key}.json`), JSON.stringify(serializableMeta));
+    }
+    if (thumb) {
+      writeFileSync(join(tmpdir(), `lancy_thumb_${key}.jpg`), thumb);
+    }
   } catch {}
 }
 
@@ -40,6 +54,36 @@ function getTrackAudio(key) {
     } catch {}
   }
   return buf;
+}
+
+function getTrackMeta(key, db = null) {
+  let meta = audioMetaCache.get(key);
+  if (!meta && key) {
+    try {
+      const metaPath = join(tmpdir(), `lancy_meta_${key}.json`);
+      if (existsSync(metaPath)) {
+        meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+      }
+    } catch {}
+    if (!meta && db) {
+      try {
+        const row = db.get?.('SELECT value_json FROM bot_settings WHERE key = ?', `audio_meta_${key}`);
+        if (row?.value_json) {
+          meta = JSON.parse(row.value_json);
+        }
+      } catch {}
+    }
+    if (meta) {
+      try {
+        const thumbPath = join(tmpdir(), `lancy_thumb_${key}.jpg`);
+        if (existsSync(thumbPath)) {
+          meta.thumb = readFileSync(thumbPath);
+        }
+      } catch {}
+      audioMetaCache.set(key, meta);
+    }
+  }
+  return meta;
 }
 
 export function createDownloaderScreen({ app }) {
@@ -342,9 +386,36 @@ export function createDownloaderScreen({ app }) {
       b.divider();
 
       // 4. Action Buttons
-      const buttons = [
-        richButton.callback('📥 Download Link', encodeCallback(id, 'input', ['from_media']), { style: 'primary' })
-      ];
+      const photoItem = mediaItems.find((m) => m.type === 'photo');
+      const thumbBuf = photoItem?.buffer || null;
+
+      let audioKey = null;
+      if (audioTrack && audioTrack.buffer) {
+        audioKey = Math.random().toString(36).slice(2, 8);
+        const parsedDuration = parseDurationToSeconds(audioTrack.duration || result.duration);
+        const audioMeta = {
+          title: audioTrack.title || result.title || title || 'Audio Track',
+          performer: audioTrack.performer || result.artist || result.author || (isMusic ? 'Spotify' : 'Soundtrack'),
+          duration: parsedDuration > 0 ? parsedDuration : undefined,
+          filename: audioTrack.filename || `${(title || 'soundtrack').replace(/[^\w\s-]/g, '') || 'soundtrack'}.mp3`
+        };
+        saveTrackAudio(audioKey, audioTrack.buffer, audioMeta, thumbBuf);
+        const db = app.db || ctx.db;
+        try {
+          db?.run?.(
+            'INSERT OR REPLACE INTO bot_settings (key, value_json) VALUES (?, ?)',
+            `audio_meta_${audioKey}`,
+            JSON.stringify(audioMeta)
+          );
+        } catch {}
+      }
+
+      const audioActionRow = [];
+      if (audioKey) {
+        audioActionRow.push(
+          richButton.callback('🎵 Send Audio File', encodeCallback(id, 'send_audio', audioKey), { style: 'primary' })
+        );
+      }
       if (isMusic) {
         const lyricKey = Math.random().toString(36).slice(2, 8);
         const songMeta = {
@@ -360,16 +431,29 @@ export function createDownloaderScreen({ app }) {
             JSON.stringify(songMeta)
           );
         } catch {}
-        buttons.push(richButton.callback('📜 Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' }));
-      } else if (audioTrack && audioTrack.buffer) {
-        const trackKey = Math.random().toString(36).slice(2, 8);
-        saveTrackAudio(trackKey, audioTrack.buffer);
-        buttons.push(richButton.callback('🎧 Identify Song', encodeCallback(id, 'identify', trackKey), { style: 'primary' }));
+        audioActionRow.push(
+          richButton.callback('📜 Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' })
+        );
+      } else if (audioKey) {
+        audioActionRow.push(
+          richButton.callback('🎧 Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
+        );
       }
+
+      if (audioActionRow.length > 0) {
+        b.buttons(audioActionRow);
+      }
+
+      const mediaRow = [
+        richButton.callback('📥 Download Link', encodeCallback(id, 'input', ['from_media']), { style: 'primary' })
+      ];
       if (photoCount > 0) {
-        buttons.push(richButton.callback('✦ Make Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' }));
+        mediaRow.push(
+          richButton.callback('✦ Make Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' })
+        );
       }
-      b.buttons(buttons);
+      b.buttons(mediaRow);
+
       b.buttons([
         richButton.callback('🎵 Play Another', encodeCallback(id, 'play', ['from_media']), { style: 'primary' }),
         richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']))
@@ -534,6 +618,117 @@ export function createDownloaderScreen({ app }) {
 
             if (total > 1) {
               await sleep(300);
+            }
+          }
+          return;
+        }
+        case 'send_audio': {
+          const audioKey = args[0];
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎵 Sending audio file… ♡' }).catch(() => {});
+          }
+
+          let audioBuf = getTrackAudio(audioKey);
+          if (!audioBuf) {
+            const msg = ctx.query?.message;
+            const audioFileId = msg?.audio?.file_id || msg?.voice?.file_id;
+            if (audioFileId) {
+              try {
+                const fileInfo = await ctx.api.getFile(audioFileId);
+                if (fileInfo?.file_path) {
+                  audioBuf = await ctx.api.downloadFile(fileInfo.file_path);
+                }
+              } catch {}
+            }
+          }
+
+          if (!audioBuf || audioBuf.length === 0) {
+            const errSent = await ctx.api.sendMessage(
+              ctx.chatId,
+              '<blockquote>♡ Could not find audio file cache for this track ♡\nTip: You can re-download it or search directly with <code>/play &lt;song&gt;</code> ♡</blockquote>',
+              { parse_mode: 'HTML' }
+            );
+            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
+              setTimeout(() => {
+                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
+              }, 12000)?.unref?.();
+            }
+            return;
+          }
+
+          const meta = getTrackMeta(audioKey, app.db || ctx.db) || {};
+          let songTitle = meta.title;
+          let songPerformer = meta.performer || meta.artist;
+
+          if (!songTitle || songTitle === 'Audio Track') {
+            const msgText = String(ctx.query?.message?.text || ctx.query?.message?.caption || '');
+            const titleMatch = msgText.match(/🎵\s*Title\s*\n\s*([^\n]+)/i);
+            const artistMatch = msgText.match(/🎧\s*Artist\s*\n\s*([^\n]+)/i);
+            if (titleMatch && titleMatch[1]) {
+              songTitle = titleMatch[1].replace(/[…\.]+$/, '').trim();
+            }
+            if (artistMatch && artistMatch[1]) {
+              songPerformer = artistMatch[1].replace(/[…\.]+$/, '').trim();
+            }
+          }
+
+          songTitle = songTitle || 'Audio Track';
+          songPerformer = songPerformer || 'Artist';
+
+          await ctx.api.sendChatAction(ctx.chatId, 'upload_document').catch(() => {});
+
+          const cleanFilename = meta.filename || `${songTitle.replace(/[^\w\s-]/g, '') || 'audio'}.mp3`;
+          const caption = `🎵 <b>${escapeHtml(songTitle)}</b>` +
+            (songPerformer && songPerformer !== 'Artist' ? ` — <i>${escapeHtml(songPerformer)}</i>` : '') +
+            ` ♡`;
+
+          try {
+            const sentAudio = await ctx.api.sendAudio(
+              ctx.chatId,
+              audioBuf,
+              {
+                title: songTitle,
+                performer: songPerformer,
+                ...(meta.duration ? { duration: meta.duration } : {}),
+                ...(meta.thumb ? { thumbnail: meta.thumb } : {}),
+                filename: cleanFilename,
+                caption,
+                parse_mode: 'HTML'
+              }
+            );
+            if (sentAudio?.message_id) {
+              (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sentAudio.message_id);
+              app.telegram?.markMediaDeliveryMessage?.(sentAudio.message_id);
+            }
+          } catch (err) {
+            log.warn({ err, audioKey }, 'sendAudio failed, falling back to document');
+            try {
+              const sentDoc = await ctx.api.sendDocument(
+                ctx.chatId,
+                audioBuf,
+                {
+                  filename: cleanFilename,
+                  caption,
+                  parse_mode: 'HTML',
+                  contentType: 'audio/mpeg'
+                }
+              );
+              if (sentDoc?.message_id) {
+                (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sentDoc.message_id);
+                app.telegram?.markMediaDeliveryMessage?.(sentDoc.message_id);
+              }
+            } catch (docErr) {
+              log.error({ docErr, audioKey }, 'sendAudio and sendDocument both failed');
+              const errSent = await ctx.api.sendMessage(
+                ctx.chatId,
+                '<blockquote>♡ Could not send audio file right now. Please try again in a moment ♡</blockquote>',
+                { parse_mode: 'HTML' }
+              );
+              if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
+                setTimeout(() => {
+                  ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
+                }, 12000)?.unref?.();
+              }
             }
           }
           return;

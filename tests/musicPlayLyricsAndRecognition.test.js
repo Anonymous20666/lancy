@@ -467,3 +467,155 @@ test('Video Download with AudioTrack renders 🎧 Identify Song button and handl
   db.close();
 });
 
+test('Media Delivery Card: renders 🎵 Send Audio File button and handle("send_audio") sends standard Telegram audio', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  let deliveredRich = null;
+  let sentAudioArgs = null;
+  let answerCallbackQueryCalled = false;
+  const markedMediaMessages = [];
+
+  const fakeAudioTrackBuf = Buffer.from('ID3_test_mp3_audio_track_data');
+  const fakeThumbBuf = Buffer.from('fake_jpeg_thumbnail_data');
+
+  const mockApi = {
+    answerCallbackQuery: async (id, opts) => {
+      answerCallbackQueryCalled = true;
+      return true;
+    },
+    sendChatAction: async () => true,
+    sendMessage: async (chatId, text, opts) => ({ message_id: 888 }),
+    sendAudio: async (chatId, audio, opts) => {
+      sentAudioArgs = { chatId, audio, opts };
+      return { message_id: 999 };
+    },
+    sendDocument: async (chatId, doc, opts) => ({ message_id: 1001 }),
+    sendRichMessage: async (_c, rich) => {
+      deliveredRich = rich;
+      return { message_id: 777 };
+    }
+  };
+
+  const app = {
+    telegram: {
+      api: mockApi,
+      controller: {
+        markMediaDeliveryMessage: (id) => markedMediaMessages.push(id)
+      }
+    },
+    mediaDownloader: {
+      download: async () => ({
+        platform: 'spotify',
+        title: 'As It Was',
+        artist: 'Harry Styles',
+        duration: '2:47',
+        mediaItems: [{ type: 'photo', buffer: fakeThumbBuf }],
+        audioTrack: {
+          buffer: fakeAudioTrackBuf,
+          title: 'As It Was',
+          performer: 'Harry Styles',
+          duration: '2:47',
+          filename: 'Harry Styles - As It Was.mp3'
+        }
+      })
+    }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  const mockCtx = {
+    tgId: '100',
+    chatId: 100,
+    db,
+    settings,
+    sm,
+    api: mockApi,
+    controller: app.telegram.controller
+  };
+
+  // 1. Download media with audio track
+  await downloader.executeDownload(mockCtx, 'As It Was Harry Styles');
+  assert.ok(deliveredRich, 'Media card was delivered');
+
+  // Verify "🎵 Send Audio File" button exists
+  const allButtons = deliveredRich.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  const sendAudioBtn = allButtons.find((btn) => btn.callback_data.includes(':send_audio:'));
+  assert.ok(sendAudioBtn, 'Action buttons include 🎵 Send Audio File button');
+  const btnText = typeof sendAudioBtn.text === 'string' ? sendAudioBtn.text : JSON.stringify(sendAudioBtn.text);
+  assert.ok(btnText.includes('Send Audio File'), 'Button label contains Send Audio File');
+
+  // Extract audioKey
+  const parts = sendAudioBtn.callback_data.split(':');
+  const audioKey = parts[3];
+  assert.ok(audioKey, 'Audio key is present in callback data');
+
+  // 2. Click "🎵 Send Audio File"
+  const cbCtx = {
+    ...mockCtx,
+    query: { id: 'cb_query_audio_1', message: { message_id: 777 } }
+  };
+  await downloader.handle(cbCtx, 'send_audio', [audioKey]);
+
+  assert.equal(answerCallbackQueryCalled, true, 'answerCallbackQuery called with status message');
+  assert.ok(sentAudioArgs, 'api.sendAudio was called');
+  assert.equal(sentAudioArgs.chatId, 100);
+  assert.deepEqual(sentAudioArgs.audio, fakeAudioTrackBuf, 'Correct audio buffer sent');
+  assert.equal(sentAudioArgs.opts.title, 'As It Was');
+  assert.equal(sentAudioArgs.opts.performer, 'Harry Styles');
+  assert.equal(sentAudioArgs.opts.filename, 'Harry Styles - As It Was.mp3');
+  assert.equal(sentAudioArgs.opts.duration, 167);
+  assert.deepEqual(sentAudioArgs.opts.thumbnail, fakeThumbBuf, 'Thumbnail attached to sendAudio');
+  assert.ok(sentAudioArgs.opts.caption.includes('As It Was'), 'Caption includes title');
+  assert.ok(markedMediaMessages.includes(999), 'Sent audio message marked as permanent delivery');
+
+  db.close();
+});
+
+test('TelegramAPI: sendAudio packages audio buffer and optional thumbnail buffer in multipart form', async () => {
+  const { TelegramAPI } = await import('../src/telegram/api.js');
+  const api = new TelegramAPI('test-token');
+
+  let callMethod = null;
+  let callParams = null;
+  let callFiles = null;
+
+  api.call = async (method, params, opts) => {
+    callMethod = method;
+    callParams = params;
+    callFiles = opts?.files;
+    return { ok: true, result: { message_id: 1234 } };
+  };
+
+  const audioBuf = Buffer.from('fake_mp3_data');
+  const thumbBuf = Buffer.from('fake_thumb_data');
+
+  await api.sendAudio(100, audioBuf, {
+    title: 'Song Title',
+    performer: 'Artist Name',
+    duration: 180,
+    filename: 'track.mp3',
+    thumbnail: thumbBuf,
+    caption: '<b>Track</b>',
+    parse_mode: 'HTML'
+  });
+
+  assert.equal(callMethod, 'sendAudio');
+  assert.equal(callParams.chat_id, 100);
+  assert.equal(callParams.audio, 'attach://audio');
+  assert.equal(callParams.thumbnail, 'attach://thumbnail');
+  assert.equal(callParams.title, 'Song Title');
+  assert.equal(callParams.performer, 'Artist Name');
+  assert.equal(callParams.duration, 180);
+  assert.equal(callParams.caption, '<b>Track</b>');
+  assert.equal(callParams.parse_mode, 'HTML');
+
+  assert.ok(callFiles.audio, 'files.audio is present');
+  assert.deepEqual(callFiles.audio.buffer, audioBuf);
+  assert.equal(callFiles.audio.filename, 'track.mp3');
+  assert.equal(callFiles.audio.contentType, 'audio/mpeg');
+
+  assert.ok(callFiles.thumbnail, 'files.thumbnail is present');
+  assert.deepEqual(callFiles.thumbnail.buffer, thumbBuf);
+  assert.equal(callFiles.thumbnail.contentType, 'image/jpeg');
+});
+

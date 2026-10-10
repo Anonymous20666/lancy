@@ -159,32 +159,49 @@ export class TelegramAPI {
   }
 
   sendAudio(chatId, audio, extra = {}, files = null) {
+    const { filename = 'audio.mp3', thumbnail = null, ...restExtra } = extra;
+    const allFiles = files ? { ...files } : {};
+    const params = { chat_id: chatId, ...restExtra };
+
     if (Buffer.isBuffer(audio)) {
-      return this.call('sendAudio', { chat_id: chatId, audio: 'attach://audio', ...extra }, {
-        files: { audio: { buffer: audio, filename: extra.filename ?? 'audio.mp3', contentType: 'audio/mpeg' } }
-      });
-    }
-    const params = { chat_id: chatId, ...extra };
-    if (files?.audio) {
       params.audio = 'attach://audio';
-      return this.call('sendAudio', params, { files });
+      allFiles.audio = { buffer: audio, filename, contentType: 'audio/mpeg' };
+    } else if (allFiles.audio) {
+      params.audio = 'attach://audio';
+    } else {
+      params.audio = audio;
     }
-    params.audio = audio;
+
+    if (Buffer.isBuffer(thumbnail)) {
+      params.thumbnail = 'attach://thumbnail';
+      allFiles.thumbnail = { buffer: thumbnail, filename: 'thumb.jpg', contentType: 'image/jpeg' };
+    } else if (thumbnail) {
+      params.thumbnail = thumbnail;
+    }
+
+    if (Object.keys(allFiles).length > 0) {
+      return this.call('sendAudio', params, { files: allFiles });
+    }
     return this.call('sendAudio', params);
   }
 
   sendDocument(chatId, document, extra = {}, files = null) {
+    const { filename = 'file.bin', contentType = 'application/octet-stream', ...restExtra } = extra;
+    const allFiles = files ? { ...files } : {};
+    const params = { chat_id: chatId, ...restExtra };
+
     if (Buffer.isBuffer(document)) {
-      return this.call('sendDocument', { chat_id: chatId, document: 'attach://document', ...extra }, {
-        files: { document: { buffer: document, filename: extra.filename ?? 'file.bin', contentType: extra.contentType ?? 'application/octet-stream' } }
-      });
-    }
-    const params = { chat_id: chatId, ...extra };
-    if (files?.document) {
       params.document = 'attach://document';
-      return this.call('sendDocument', params, { files });
+      allFiles.document = { buffer: document, filename, contentType };
+    } else if (allFiles.document) {
+      params.document = 'attach://document';
+    } else {
+      params.document = document;
     }
-    params.document = document;
+
+    if (Object.keys(allFiles).length > 0) {
+      return this.call('sendDocument', params, { files: allFiles });
+    }
     return this.call('sendDocument', params);
   }
 
