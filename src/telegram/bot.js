@@ -336,14 +336,22 @@ export class TelegramController extends EventEmitter {
 
         await this.sm.reset(tgId, { reason: 'command' });
         const downloaderScreen = this.screens.get('downloader');
+        const isMusicCommand = command === '/play' || command === '/music' || command === '/song';
         const targetUrl = rest.find((arg) => /^https?:\/\//i.test(arg));
         if (targetUrl) {
           await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), targetUrl);
-        } else if (rest.length > 0) {
+        } else if (rest.length > 0 && isMusicCommand) {
           const query = rest.join(' ').trim();
           await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), query);
+        } else if (rest.length > 0 && !isMusicCommand) {
+          await this.api.sendMessage(
+            chatId,
+            `୨୧ Please provide a valid media link starting with http:// or https:// ♡\n` +
+            `Tip: To search & play music, use 🎵 Play Music from the menu or type <code>/play &lt;song name&gt;</code> ♡`,
+            { parse_mode: 'HTML' }
+          );
         } else {
-          if (command === '/play' || command === '/music' || command === '/song') {
+          if (isMusicCommand) {
             const ctx = this.#ctx(tgId, { message }, { forceNew: true });
             const sent = await downloaderScreen?.handle(ctx, 'play', []);
             updateScreenMsg(sent);
@@ -524,8 +532,8 @@ export class TelegramController extends EventEmitter {
       const recMedia = extractMediaForMusicRecognition(message);
       if (recMedia && recMedia.obj?.file_id) {
         const currentState = this.sm.state(tgId);
-        // Unless user is explicitly adding items to a manual sticker collection, recognize music:
-        if (currentState !== States.MANUAL_STICKER_COLLECTION) {
+        // Only recognize music if user is explicitly in the downloader or music input flow
+        if (currentState === States.URL_DOWNLOADER_INPUT || currentState === States.MUSIC_SEARCH_INPUT) {
           const ctx = this.#ctx(tgId, { message });
           await this.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
           return;
@@ -552,13 +560,26 @@ export class TelegramController extends EventEmitter {
 
           const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
           const isPrivate = message.chat?.type === 'private';
-          const isQuote = Boolean(message.reply_to_message);
-          const botUsername = (this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
+          const botUsername = (this.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
+          const botId = this.api.me?.id;
+          const replyFrom = message.reply_to_message?.from;
+          const isQuote = Boolean(
+            message.reply_to_message && (
+              !replyFrom ||
+              replyFrom.is_bot ||
+              (botId && replyFrom.id === botId) ||
+              (botUsername && replyFrom.username && replyFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
+              (isPrivate && replyFrom.id && replyFrom.id !== Number(tgId))
+            )
+          );
           const isTag = Boolean(
             /\blancy\b/i.test(text) ||
             new RegExp(`@?${botUsername}\\b`, 'i').test(text)
           );
-          if (enabled && (isPrivate || isQuote || isTag) && this.app?.assistant) {
+          // In private chats (DM), AI assistant ONLY replies if the user explicitly quotes her message.
+          // In group chats, replies if quoted or tagged.
+          const shouldReply = enabled && (isPrivate ? isQuote : (isQuote || isTag));
+          if (shouldReply && this.app?.assistant) {
             const ctx = this.#ctx(tgId, { message });
             await this.app.assistant.handleMessage({ ctx, message, text });
           }

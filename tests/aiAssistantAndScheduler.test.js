@@ -329,39 +329,45 @@ test('LancyAssistant parses [ACTION: search_images query="..."] from LLM generat
   db.close();
 });
 
-test('Telegram bot only invokes AI assistant when message quotes the bot or tags the bot', async () => {
+test('Telegram bot only invokes AI assistant when message quotes the bot (in private) or tags/quotes (in group)', async () => {
   const db = new Database(':memory:');
   const app = makeMockApp(db);
 
-  function shouldTriggerAI(message, text, botUsername = 'Lancy_easy_bot', botId = 999) {
-    const isQuote = Boolean(
-      message.reply_to_message?.from?.is_bot ||
-      (botId && message.reply_to_message?.from?.id === botId) ||
-      (botUsername && message.reply_to_message?.from?.username?.toLowerCase() === botUsername.toLowerCase())
-    );
+  function shouldTriggerAI(message, text, isPrivate = true, botUsername = 'Lancy_easy_bot', botId = 999) {
     const cleanBotName = botUsername.replace(/^@/, '');
+    const replyFrom = message.reply_to_message?.from;
+    const isQuote = Boolean(
+      message.reply_to_message && (
+        !replyFrom ||
+        replyFrom.is_bot ||
+        (botId && replyFrom.id === botId) ||
+        (cleanBotName && replyFrom.username && replyFrom.username.toLowerCase() === cleanBotName.toLowerCase())
+      )
+    );
     const isTag = Boolean(
       /\blancy\b/i.test(text) ||
       new RegExp(`@?${cleanBotName}\\b`, 'i').test(text)
     );
-    return isQuote || isTag;
+    return isPrivate ? isQuote : (isQuote || isTag);
   }
 
-  // 1. Regular messages without quote or tag -> must NOT trigger AI
-  assert.equal(shouldTriggerAI({}, 'Hey'), false);
-  assert.equal(shouldTriggerAI({}, 'M good'), false);
-  assert.equal(shouldTriggerAI({}, 'What are you doing?'), false);
+  // 1. In private chat: Regular messages without quote -> must NOT trigger AI
+  assert.equal(shouldTriggerAI({}, 'Hey', true), false);
+  assert.equal(shouldTriggerAI({}, 'M good', true), false);
+  assert.equal(shouldTriggerAI({}, 'What are you doing?', true), false);
+  assert.equal(shouldTriggerAI({}, 'hey lancy', true), false, 'In private chat, unquoted text must not trigger AI');
 
-  // 2. Tagged with "lancy" or "@Lancy_easy_bot" -> triggers AI
-  assert.equal(shouldTriggerAI({}, 'hey lancy'), true);
-  assert.equal(shouldTriggerAI({}, '@Lancy_easy_bot what is solo leveling?'), true);
-
-  // 3. Quoting/replying to the bot message -> triggers AI
+  // 2. In private chat: Quoting the bot message -> triggers AI
   const quoteMsg = {
     reply_to_message: { from: { id: 999, is_bot: true, username: 'Lancy_easy_bot' } }
   };
-  assert.equal(shouldTriggerAI(quoteMsg, 'M good'), true);
-  assert.equal(shouldTriggerAI(quoteMsg, 'Send the pic'), true);
+  assert.equal(shouldTriggerAI(quoteMsg, 'M good', true), true);
+  assert.equal(shouldTriggerAI(quoteMsg, 'Send the pic', true), true);
+
+  // 3. In group chat: Tagging the bot -> triggers AI
+  assert.equal(shouldTriggerAI({}, 'hey lancy', false), true);
+  assert.equal(shouldTriggerAI({}, '@Lancy_easy_bot what is solo leveling?', false), true);
+  assert.equal(shouldTriggerAI({}, 'Hey everyone', false), false);
 
   db.close();
 });

@@ -401,15 +401,15 @@ export function createDownloaderScreen({ app }) {
           if (fromMedia) return ctx.replyRich(renderMainMenu(ctx));
           return this.open(ctx);
         case 'input':
-          await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT);
+          await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT, { context: { mode: 'url' } });
           if (fromMedia) return ctx.replyRich(renderInputPrompt());
           return ctx.editScreen(renderInputPrompt());
         case 'play':
-          await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT);
+          await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
           if (fromMedia) return ctx.replyRich(renderMusicSearchPrompt());
           return ctx.editScreen(renderMusicSearchPrompt());
         case 'recognize':
-          await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT);
+          await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
           if (fromMedia) return ctx.replyRich(renderAudioRecognitionPrompt());
           return ctx.editScreen(renderAudioRecognitionPrompt());
         case 'lyrics': {
@@ -510,6 +510,75 @@ export function createDownloaderScreen({ app }) {
       sm.register(States.URL_DOWNLOADER_INPUT, {
         onEnter: async (sctx) => {
           // Handled in handle('input')
+        },
+        onMessage: async (sctx, message) => {
+          const recMedia = extractMediaForMusicRecognition(message);
+          if (recMedia && recMedia.obj?.file_id) {
+            const controller = app.telegram?.controller;
+            if (controller?.handleAudioRecognition) {
+              const ctx = {
+                ...sctx,
+                chatId: message.chat?.id || sctx.chatId,
+                tgId: sctx.tgId || String(message.from?.id),
+                api: app.telegram.api,
+                message
+              };
+              await controller.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
+              return true;
+            }
+          }
+
+          const text = String(message.text || message.caption || '').trim();
+          if (!text) return true;
+          const match = text.match(/https?:\/\/[^\s]+/i);
+          if (sctx.context?.mode === 'url' && !match) {
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(banner([
+              '𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪',
+              'valid link required ♡'
+            ])));
+            b.divider();
+            b.paragraph(rt.text('୨୧ Please provide a valid media link starting with http:// or https:// ♡'));
+            b.quote(rt.italic('Tip: To search and download music by song name or lyrics, tap 🎵 Play Music below or type /play <song>!'));
+            b.divider();
+            b.buttons([
+              richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
+              richButton.callback('« Downloader', encodeCallback(id, 'open'))
+            ]);
+            b.buttons([
+              richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+            ]);
+            b.validate();
+            await app.telegram.api.sendRichMessage(sctx.chatId, b.toJSON()).catch(async () => {
+              await app.telegram.api.sendMessage(
+                sctx.chatId,
+                `୨୧ Please provide a valid media link starting with http:// or https:// ♡\n` +
+                `Tip: To search & play music, use 🎵 Play Music from the menu or type /play <song name> ♡`
+              ).catch(() => {});
+            });
+            return true;
+          }
+
+          const target = match ? match[0] : text;
+          const dlCtx = {
+            ...sctx,
+            controller: app.telegram?.controller,
+            api: app.telegram?.api,
+            chatId: message.chat?.id || sctx.chatId,
+            tgId: sctx.tgId || String(message.from?.id),
+            message
+          };
+          await executeDownload(dlCtx, target);
+          return true;
+        },
+        onCancel: async (sctx) => {
+          await sctx.reset?.({ reason: 'cancelled' });
+        }
+      });
+
+      sm.register(States.MUSIC_SEARCH_INPUT, {
+        onEnter: async (sctx) => {
+          // Handled in handle('play')
         },
         onMessage: async (sctx, message) => {
           const recMedia = extractMediaForMusicRecognition(message);
