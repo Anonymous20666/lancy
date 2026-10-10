@@ -314,38 +314,20 @@ export function createDownloaderScreen({ app }) {
           b.photo(`attach://${field}`);
         }
       } else if (mediaItems.length > 1) {
-        const allPhotos = mediaItems.every((m) => m.type === 'photo');
-        if (allPhotos) {
-          // Chunk photos into collages (up to 10 per collage)
-          for (let i = 0; i < mediaItems.length; i += 10) {
-            const chunk = mediaItems.slice(i, i + 10);
-            const chunkBlocks = chunk.map((item, idx) => {
-              const globalIdx = i + idx;
-              const field = `photo_${globalIdx}`;
-              files[field] = {
-                buffer: item.buffer,
-                filename: item.filename || `${field}.jpg`,
-                contentType: item.mimeType || 'image/jpeg'
-              };
-              return block.photo(`attach://${field}`);
-            });
-            b.collage(chunkBlocks);
-          }
-        } else {
-          // Mixed videos and photos
-          mediaItems.slice(0, 10).forEach((item, idx) => {
-            const field = `${item.type}_${idx}`;
+        // Chunk media into swipeable slideshows (up to 10 items per slideshow)
+        for (let i = 0; i < mediaItems.length; i += 10) {
+          const chunk = mediaItems.slice(i, i + 10);
+          const chunkBlocks = chunk.map((item, idx) => {
+            const globalIdx = i + idx;
+            const field = `${item.type}_${globalIdx}`;
             files[field] = {
               buffer: item.buffer,
               filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
               contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
             };
-            if (item.type === 'video') {
-              b.video(`attach://${field}`);
-            } else {
-              b.photo(`attach://${field}`);
-            }
+            return item.type === 'video' ? block.video(`attach://${field}`) : block.photo(`attach://${field}`);
           });
+          b.slideshow(chunkBlocks);
         }
       }
 

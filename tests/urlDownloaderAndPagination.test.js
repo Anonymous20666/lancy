@@ -396,6 +396,70 @@ test('Downloader Screen delivers video, photos and audio inside ONE unified Rich
   db.close();
 });
 
+test('Downloader Screen delivers multi-photo carousel as swipeable slideshow instead of album collage', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let finalRich = null;
+  let finalFiles = null;
+
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      finalRich = rich;
+      finalFiles = files;
+      return { message_id: 101 };
+    },
+    editMessageText: async (chatId, msgId, text, extra, files) => {
+      finalRich = extra?.rich_message;
+      finalFiles = files;
+      return { message_id: msgId };
+    },
+    sendChatAction: async () => true
+  };
+
+  const fakeDownloader = {
+    download: async () => ({
+      platform: 'tiktok',
+      title: 'Aesthetic Slideshow',
+      mediaItems: [
+        { type: 'photo', buffer: Buffer.from('photo-1'), filename: 'p1.jpg', mimeType: 'image/jpeg' },
+        { type: 'photo', buffer: Buffer.from('photo-2'), filename: 'p2.jpg', mimeType: 'image/jpeg' },
+        { type: 'photo', buffer: Buffer.from('photo-3'), filename: 'p3.jpg', mimeType: 'image/jpeg' }
+      ]
+    })
+  };
+
+  const dlScreen = createDownloaderScreen({
+    app: {
+      telegram: { api: mockApi },
+      mediaDownloader: fakeDownloader
+    }
+  });
+
+  const ctx = {
+    tgId: '123456',
+    chatId: 123456,
+    messageId: 51,
+    settings,
+    sm,
+    api: mockApi
+  };
+
+  await dlScreen.executeDownload(ctx, 'https://vm.tiktok.com/slideshow_test');
+
+  assert.ok(finalRich, 'rich message must be delivered');
+  const slideshowBlock = finalRich.blocks.find((b) => b.type === 'slideshow');
+  assert.ok(slideshowBlock, 'media carousel must be sent as slideshow');
+  assert.equal(slideshowBlock.blocks.length, 3, 'slideshow must contain all 3 photos');
+  assert.equal(finalRich.blocks.some((b) => b.type === 'collage'), false, 'must NOT be sent as collage album');
+  assert.ok(finalFiles.photo_0);
+  assert.ok(finalFiles.photo_1);
+  assert.ok(finalFiles.photo_2);
+
+  db.close();
+});
+
 test('TelegramController editScreen: sends a fresh rich message when navigating away from a delivered media card', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
