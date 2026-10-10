@@ -50,6 +50,15 @@ test('TelegramController: live inline search returns entrypoint cards on empty q
   assert.match(inlineAnswer.results[2].title, /Pinterest Search/);
   assert.ok(inlineAnswer.results[0].thumbnail_url, 'should include thumbnail_url');
   assert.ok(inlineAnswer.results[0].thumb_url, 'should include thumb_url');
+  for (const res of inlineAnswer.results) {
+    if (res.reply_markup?.inline_keyboard) {
+      for (const row of res.reply_markup.inline_keyboard) {
+        for (const btn of row) {
+          assert.equal(btn.style, 'primary', `button "${btn.text}" must have primary style`);
+        }
+      }
+    }
+  }
 
   db.close();
 });
@@ -70,6 +79,25 @@ test('TelegramController: live inline search returns instant tracks with bot tag
       return { ok: true };
     }
   };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+  db.prepare('INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)').run(
+    'fe!n travis scott',
+    'CQACAgQAAxkDAAIDUmrKn92mh3oNparAAXmX00Jt_RK2AAIWIQACZahRUsuQ4WTCVUcWPQQ',
+    'FE!N',
+    'Travis Scott',
+    191
+  );
 
   const controller = new TelegramController({
     api: fakeApi,
@@ -97,8 +125,20 @@ test('TelegramController: live inline search returns instant tracks with bot tag
   const firstResult = inlineAnswer.results[0];
   assert.ok(firstResult.title, 'first result must have title');
   assert.equal(firstResult.type, 'audio', 'first result must deliver native audio type');
-  assert.ok(firstResult.audio_url || firstResult.audio_file_id, 'must deliver real audio stream or audio_file_id');
+  assert.equal(firstResult.audio_file_id, 'CQACAgQAAxkDAAIDUmrKn92mh3oNparAAXmX00Jt_RK2AAIWIQACZahRUsuQ4WTCVUcWPQQ');
+  assert.equal(firstResult.audio_duration, 191, 'audio duration must be set to 191s');
+  assert.equal(firstResult.reply_markup?.inline_keyboard?.[0]?.[0]?.style, 'primary', 'inline button must have primary style');
   assert.ok(firstResult.reply_markup?.inline_keyboard?.[0]?.[0]?.url, 'must include deep-link download button');
+
+  for (const res of inlineAnswer.results) {
+    if (res.reply_markup?.inline_keyboard) {
+      for (const row of res.reply_markup.inline_keyboard) {
+        for (const btn of row) {
+          assert.equal(btn.style, 'primary', `button "${btn.text}" must have primary style`);
+        }
+      }
+    }
+  }
 
   db.close();
 });

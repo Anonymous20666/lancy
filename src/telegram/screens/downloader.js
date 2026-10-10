@@ -513,7 +513,7 @@ export function createDownloaderScreen({ app }) {
 
       b.buttons([
         richButton.callback('🎵 Play Another', encodeCallback(id, 'play', ['from_media']), { style: 'primary' }),
-        richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']))
+        richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']), { style: 'primary' })
       ]);
       b.footer(rt.italic(`Delivered with aesthetic love by ${ctx.botName || 'Lancy Bot'} ♡`));
       b.validate();
