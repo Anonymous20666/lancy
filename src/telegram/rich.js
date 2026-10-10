@@ -333,11 +333,11 @@ export class RichMessageBuilder {
 
   /**
    * Append blocks from structured HTML markup.
-   * Supports: <header>, <h1>, <h2>, <h3>, <p>, <blockquote>, <pre>, <hr>, <divider>
+   * Supports: <header>, <h1>, <h2>, <h3>, <p>, <blockquote>, <pre>, <footer>, <hr>, <divider>, <tg-button-row>, <img>
    */
   html(htmlContent) {
     if (typeof htmlContent !== 'string') return this;
-    const blockRegex = /<(header|h1|h2|h3|p|blockquote|pre|hr|divider)([^>]*)>([\s\S]*?)<\/\1>|<(hr|divider)\s*\/?>/gi;
+    const blockRegex = /<(header|h1|h2|h3|p|blockquote|pre|footer|hr|divider|tg-button-row)([^>]*)>([\s\S]*?)<\/\1>|<(hr|divider|img)([^>]*)\/?>/gi;
     let lastIndex = 0;
     let match;
 
@@ -349,7 +349,7 @@ export class RichMessageBuilder {
       }
 
       const tagName = (match[1] || match[4] || '').toLowerCase();
-      const rawAttrs = match[2] || '';
+      const rawAttrs = match[2] || match[5] || '';
       const inner = (match[3] || '').trim();
 
       if (tagName === 'header' || tagName === 'h1') {
@@ -369,8 +369,43 @@ export class RichMessageBuilder {
       } else if (tagName === 'pre') {
         const langMatch = rawAttrs.match(/language=["']([^"']+)["']/i);
         this.pre(inner, langMatch ? langMatch[1] : undefined);
+      } else if (tagName === 'footer') {
+        this.footer(parseHtmlToRichText(inner));
+      } else if (tagName === 'img') {
+        const srcMatch = rawAttrs.match(/src=["']([^"']+)["']/i);
+        if (srcMatch) this.photo(srcMatch[1]);
       } else if (tagName === 'hr' || tagName === 'divider') {
         this.divider();
+      } else if (tagName === 'tg-button-row') {
+        const alignMatch = rawAttrs.match(/align=["']([^"']+)["']/i);
+        const align = alignMatch ? alignMatch[1] : 'center';
+        const buttonRegex = /<tg-button([^>]*)>([\s\S]*?)<\/tg-button>/gi;
+        const rowButtons = [];
+        let btnMatch;
+        while ((btnMatch = buttonRegex.exec(inner)) !== null) {
+          const btnAttrs = btnMatch[1];
+          const btnContent = btnMatch[2].trim();
+          const parsedBtnText = parseHtmlToRichText(btnContent);
+
+          const typeMatch = btnAttrs.match(/type=["']([^"']+)["']/i);
+          const type = typeMatch ? typeMatch[1].toLowerCase() : 'callback_data';
+
+          const styleMatch = btnAttrs.match(/style=["']([^"']+)["']/i);
+          const style = styleMatch ? styleMatch[1] : 'primary';
+
+          if (type === 'url') {
+            const urlMatch = btnAttrs.match(/url=["']([^"']+)["']/i);
+            rowButtons.push(richButton.url(parsedBtnText, urlMatch ? urlMatch[1] : '', { style }));
+          } else if (type === 'disabled') {
+            rowButtons.push(richButton.disabled(parsedBtnText));
+          } else {
+            const dataMatch = btnAttrs.match(/data=["']([^"']+)["']/i);
+            rowButtons.push(richButton.callback(parsedBtnText, dataMatch ? dataMatch[1] : 'noop', { style }));
+          }
+        }
+        if (rowButtons.length > 0) {
+          this.buttons(rowButtons, align);
+        }
       }
 
       lastIndex = blockRegex.lastIndex;
@@ -382,6 +417,12 @@ export class RichMessageBuilder {
     }
 
     return this;
+  }
+
+  static fromHtml(htmlContent) {
+    const b = new RichMessageBuilder();
+    b.html(htmlContent);
+    return b;
   }
 
   /** Validate against Bot API limits. Throws with a clear message. */
@@ -537,3 +578,50 @@ export function buildFileMap(buffers, { prefix = 'file', contentType = 'applicat
   }
   return files;
 }
+
+// ── HTML-based Rich Message builders ──────────────────────────────────────
+
+export function stripMarkup(str) {
+  return String(str ?? '').replace(/<[^>]*>/g, '');
+}
+
+export function escapeHtml(str) {
+  return String(str ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+export function richButtonHtml(button) {
+  const label = escapeHtml(button.text);
+  const emoji = button.emojiId ? `<tg-emoji emoji-id="${button.emojiId}">⭐</tg-emoji> ` : '';
+  const style = button.style ? ` style="${escapeHtml(button.style)}"` : '';
+  if (button.action?.callback_data || button.callback_data) {
+    const data = escapeHtml(button.action?.callback_data || button.callback_data);
+    return `<tg-button type="callback_data"${style} data="${data}">${emoji}${label}</tg-button>`;
+  }
+  if (button.action?.url || button.url) {
+    const url = escapeHtml(button.action?.url || button.url);
+    return `<tg-button type="url"${style} url="${url}">${emoji}${label}</tg-button>`;
+  }
+  return `<tg-button type="disabled"${style}>${emoji}${label}</tg-button>`;
+}
+
+export function richMessage({ header, body, footer, quote, pre, bold, italic, buttons, image } = {}) {
+  const parts = [];
+  if (image) parts.push(`<img src="${escapeHtml(image)}"/>`);
+  if (header) parts.push(`<h2>${escapeHtml(stripMarkup(header))}</h2>`);
+  if (body) parts.push(/^\s*<(p|pre|blockquote|ul|ol|aside|details)\b/i.test(body) ? body : `<p>${body}</p>`);
+  if (bold) parts.push(`<p><b>${escapeHtml(stripMarkup(bold))}</b></p>`);
+  if (italic) parts.push(`<p><i>${escapeHtml(stripMarkup(italic))}</i></p>`);
+  if (quote) parts.push(`<blockquote>${quote}</blockquote>`);
+  if (pre) parts.push(`<pre>${escapeHtml(stripMarkup(pre))}</pre>`);
+  if (footer) parts.push(`<footer>${footer}</footer>`);
+  for (const row of buttons || []) {
+    parts.push(`<tg-button-row align="center">${row.map(richButtonHtml).join(" ")}</tg-button-row>`);
+  }
+  return { html: parts.filter(Boolean).join("\n") };
+}
+

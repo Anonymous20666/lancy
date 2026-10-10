@@ -2,7 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   RichMessageBuilder, rt, richButton, block, encodeCallback, decodeCallback,
-  inlineKeyboard, collectAttachmentRefs, RICH_LIMITS, richTextToString
+  inlineKeyboard, collectAttachmentRefs, RICH_LIMITS, richTextToString,
+  richButtonHtml, richMessage, stripMarkup
 } from '../src/telegram/rich.js';
 
 test('builder produces valid InputRichMessage JSON', () => {
@@ -169,4 +170,56 @@ test('Bot API 10.3: b.html parses block-level HTML tags into RichBlocks', () => 
   assert.equal(json.blocks[1].type, 'paragraph');
   assert.equal(json.blocks[2].type, 'divider');
   assert.equal(json.blocks[3].type, 'expandable_blockquote');
+});
+
+test('Bot API 10.3: richButtonHtml and richMessage produce structured HTML with buttons and emojis', () => {
+  const btn = {
+    text: 'Play Song',
+    emojiId: '5472164874886846699',
+    style: 'primary',
+    action: { callback_data: 'l1:downloader:play:track1' }
+  };
+  const btnHtml = richButtonHtml(btn);
+  assert.match(btnHtml, /<tg-button type="callback_data" style="primary" data="l1:downloader:play:track1">/);
+  assert.match(btnHtml, /<tg-emoji emoji-id="5472164874886846699">⭐<\/tg-emoji>/);
+  assert.match(btnHtml, /Play Song<\/tg-button>/);
+
+  const msg = richMessage({
+    header: 'SPOTIFY / MUSIC',
+    body: 'High-speed audio streaming',
+    quote: '🎵 Starboy — The Weeknd',
+    footer: 'Delivered with aesthetic love ♡',
+    buttons: [
+      [
+        btn,
+        { text: 'Telegram Link', action: { url: 'https://t.me/Lancy_easy_bot' } }
+      ]
+    ]
+  });
+
+  assert.ok(typeof msg.html === 'string');
+  assert.match(msg.html, /<h2>SPOTIFY \/ MUSIC<\/h2>/);
+  assert.match(msg.html, /<p>High-speed audio streaming<\/p>/);
+  assert.match(msg.html, /<blockquote>🎵 Starboy — The Weeknd<\/blockquote>/);
+  assert.match(msg.html, /<footer>Delivered with aesthetic love ♡<\/footer>/);
+  assert.match(msg.html, /<tg-button-row align="center">/);
+
+  // Parse HTML into InputRichMessage blocks using fromHtml
+  const b = RichMessageBuilder.fromHtml(msg.html);
+  const json = b.toJSON();
+
+  assert.equal(json.blocks[0].type, 'heading');
+  assert.equal(json.blocks[0].size, 2);
+  assert.equal(json.blocks[0].text, 'SPOTIFY / MUSIC');
+
+  assert.equal(json.blocks[1].type, 'paragraph');
+  assert.equal(json.blocks[1].text, 'High-speed audio streaming');
+
+  assert.equal(json.blocks[2].type, 'blockquote');
+  assert.equal(json.blocks[3].type, 'footer');
+
+  assert.equal(json.blocks[4].type, 'buttons');
+  assert.equal(json.blocks[4].buttons.length, 2);
+  assert.equal(json.blocks[4].buttons[0].callback_data, 'l1:downloader:play:track1');
+  assert.equal(json.blocks[4].buttons[1].url, 'https://t.me/Lancy_easy_bot');
 });

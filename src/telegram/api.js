@@ -1,5 +1,6 @@
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
+import { RichMessageBuilder } from './rich.js';
 
 /**
  * Minimal, precise Telegram Bot API client (Bot API 10.3).
@@ -97,17 +98,29 @@ export class TelegramAPI {
     return this.call('sendMessage', params);
   }
 
-  /** Bot API 10.1+: send a Rich Message. rich_message = InputRichMessage */
+  /** Bot API 10.1+: send a Rich Message. rich_message = InputRichMessage or { html: '...' } */
   sendRichMessage(chatId, richMessage, extra = {}, files = null) {
-    return this.call('sendRichMessage', { chat_id: chatId, rich_message: richMessage, ...extra }, { files });
+    let payload = richMessage;
+    if (typeof richMessage === 'string') {
+      payload = RichMessageBuilder.fromHtml(richMessage).toJSON();
+    } else if (richMessage && typeof richMessage.html === 'string') {
+      payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
+    }
+    return this.call('sendRichMessage', { chat_id: chatId, rich_message: payload, ...extra }, { files });
   }
 
   /** Edit a message's rich content (Bot API 10.1+ rich_message param). */
   editMessageRich(chatId, messageId, richMessage, extra = {}, files = null) {
+    let payload = richMessage;
+    if (typeof richMessage === 'string') {
+      payload = RichMessageBuilder.fromHtml(richMessage).toJSON();
+    } else if (richMessage && typeof richMessage.html === 'string') {
+      payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
+    }
     return this.call('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
-      rich_message: richMessage,
+      rich_message: payload,
       ...extra
     }, { files });
   }
