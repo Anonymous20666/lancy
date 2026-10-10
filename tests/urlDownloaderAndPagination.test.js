@@ -669,5 +669,99 @@ test('MediaDownloader: detects Instagram profile URLs and guides user to specifi
   );
 });
 
+test('Downloader Screen: photo delivery includes "Turn to Sticker" button and handles to_sticker callback', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let deliveredRich = null;
+  const sentStickers = [];
+  const repliedRich = [];
+
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      deliveredRich = rich;
+      return { message_id: 100 };
+    },
+    editMessageText: async (chatId, msgId, text, extra, files) => {
+      return { message_id: msgId };
+    },
+    sendChatAction: async () => true,
+    sendSticker: async (chatId, stickerBuf, opts) => {
+      sentStickers.push({ chatId, stickerBuf, opts });
+      return { message_id: 555 };
+    },
+    answerCallbackQuery: async () => true,
+    sendMessage: async () => ({ message_id: 666 })
+  };
+
+  const png1x1 = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+    'base64'
+  );
+
+  const fakeDownloader = {
+    detectPlatform: () => 'pinterest',
+    download: async () => ({
+      platform: 'pinterest',
+      title: 'Aesthetic Wallpaper',
+      mediaItems: [
+        {
+          type: 'photo',
+          buffer: png1x1,
+          filename: 'photo1.png'
+        }
+      ]
+    })
+  };
+
+  const dlScreen = createDownloaderScreen({
+    app: {
+      telegram: { api: mockApi, markMediaDeliveryMessage: () => {} },
+      mediaDownloader: fakeDownloader,
+      db
+    }
+  });
+
+  const ctx = {
+    tgId: '12345',
+    chatId: 12345,
+    db,
+    settings,
+    sm,
+    api: mockApi,
+    sendRichMessage: async (rich) => { deliveredRich = rich; return { message_id: 111 }; },
+    replyRich: async (rich) => { repliedRich.push(rich); return { message_id: 222 }; }
+  };
+
+  await dlScreen.executeDownload(ctx, 'https://pinterest.com/pin/123');
+  assert.ok(deliveredRich, 'delivery rich message must exist');
+
+  // Verify "Turn to Sticker" button exists in delivery buttons
+  const buttons = deliveredRich.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  const stickerBtn = buttons.find((btn) => {
+    const txt = typeof btn.text === 'string' ? btn.text : JSON.stringify(btn.text);
+    return txt.includes('Turn to Sticker');
+  });
+  assert.ok(stickerBtn, 'Must render Turn to Sticker button');
+
+  // Extract imageKey from callback data
+  // format: "l1:downloader:to_sticker:<imageKey>:from_media"
+  const cbData = stickerBtn.callback_data;
+  const parts = cbData.split(':');
+  const imageKey = parts[3];
+  assert.ok(imageKey, 'imageKey must be encoded in callback');
+
+  // Now trigger the 'to_sticker' handler
+  await dlScreen.handle(ctx, 'to_sticker', [imageKey, 'from_media']);
+
+  assert.equal(sentStickers.length, 1, 'sendSticker must be called with converted sticker');
+  assert.ok(sentStickers[0].stickerBuf.length > 0, 'sticker buffer must not be empty');
+  assert.equal(repliedRich.length, 1, 'rich confirmation message must be replied');
+
+  db.close();
+});
+
+
 
 

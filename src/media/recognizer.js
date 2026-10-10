@@ -74,8 +74,8 @@ export async function verifyWithCatalog(title, artist, { hintTitle = '', hintPer
             const titleMatch = itemTitle.includes(targetTitle) || targetTitle.includes(itemTitle);
             const artistMatch = !targetArtist || itemArtist.includes(targetArtist) || targetArtist.includes(itemArtist);
 
-            // Must match title and artist OR have a strong popularity rank (>= 10,000)
-            if ((titleMatch && artistMatch && (item.rank ?? 0) >= 10000) || (titleMatch && (item.rank ?? 0) >= 40000)) {
+            // Verified if title and artist match, or title matches with reasonable rank
+            if ((titleMatch && artistMatch) || (titleMatch && (item.rank ?? 0) >= 20000)) {
               return {
                 verified: true,
                 engine: 'catalog:deezer',
@@ -147,7 +147,7 @@ export async function verifyWithCatalog(title, artist, { hintTitle = '', hintPer
         const data = await res.json();
         if (Array.isArray(data.data) && data.data.length > 0) {
           const top = data.data[0];
-          if ((top.rank ?? 0) >= 30000) {
+          if ((top.rank ?? 0) >= 10000) {
             return {
               verified: true,
               engine: 'catalog:hint',
@@ -258,23 +258,21 @@ export async function recognizeAudio(input, { timeoutMs = 25000, extension = '',
                   const year = songSection?.metadata?.find((m) => m.title === 'Released')?.text;
                   const artwork = track.images?.coverart || track.images?.background || null;
 
-                  // Cross-verify with streaming catalogs to ensure it's not a fake or obscure collision
+                  // Cross-verify with streaming catalogs to enrich and confirm metadata
                   const verified = await verifyWithCatalog(track.title, track.subtitle, { hintTitle, hintPerformer });
-                  if (verified) {
-                    log.info({ title: verified.title, artist: verified.artist, rank: verified.rank }, 'song recognized and verified in catalog');
-                    return {
-                      success: true,
-                      engine: verified.engine || 'shazam+catalog',
-                      title: verified.title || track.title,
-                      artist: verified.artist || track.subtitle || 'Unknown Artist',
-                      album: verified.album || album || null,
-                      year: verified.year || year || null,
-                      artwork: verified.artwork || artwork || null,
-                      songUrl: track.url || null,
-                      rank: verified.rank || 0,
-                      verified: true
-                    };
-                  }
+                  log.info({ title: verified?.title || track.title, artist: verified?.artist || track.subtitle, verified: !!verified }, 'song recognized by Shazam');
+                  return {
+                    success: true,
+                    engine: verified?.engine || 'shazam',
+                    title: verified?.title || track.title,
+                    artist: verified?.artist || track.subtitle || 'Unknown Artist',
+                    album: verified?.album || album || null,
+                    year: verified?.year || year || null,
+                    artwork: verified?.artwork || artwork || null,
+                    songUrl: track.url || null,
+                    rank: verified?.rank || 50000,
+                    verified: Boolean(verified)
+                  };
                 }
               }
             } catch {}
@@ -296,21 +294,19 @@ export async function recognizeAudio(input, { timeoutMs = 25000, extension = '',
           const artwork = track.images?.coverart || track.images?.background || null;
 
           const verified = await verifyWithCatalog(track.title, track.subtitle, { hintTitle, hintPerformer });
-          if (verified) {
-            log.info({ title: verified.title, artist: verified.artist, rank: verified.rank }, 'song recognized via Shazam fallback and verified');
-            return {
-              success: true,
-              engine: verified.engine || 'shazam+catalog',
-              title: verified.title || track.title,
-              artist: verified.artist || track.subtitle || 'Unknown Artist',
-              album: verified.album || album || null,
-              year: verified.year || year || null,
-              artwork: verified.artwork || artwork || null,
-              songUrl: track.url || null,
-              rank: verified.rank || 0,
-              verified: true
-            };
-          }
+          log.info({ title: verified?.title || track.title, artist: verified?.artist || track.subtitle, verified: !!verified }, 'song recognized via Shazam fallback');
+          return {
+            success: true,
+            engine: verified?.engine || 'shazam:lib',
+            title: verified?.title || track.title,
+            artist: verified?.artist || track.subtitle || 'Unknown Artist',
+            album: verified?.album || album || null,
+            year: verified?.year || year || null,
+            artwork: verified?.artwork || artwork || null,
+            songUrl: track.url || null,
+            rank: verified?.rank || 50000,
+            verified: Boolean(verified)
+          };
         }
       } catch (shazamErr) {
         log.debug({ err: shazamErr.message }, 'node-shazam recognition attempt failed or timed out');
@@ -408,30 +404,63 @@ export async function recognizeAudio(input, { timeoutMs = 25000, extension = '',
         if (audData?.status === 'success' && audData?.result?.title) {
           const res = audData.result;
           const verified = await verifyWithCatalog(res.title, res.artist, { hintTitle, hintPerformer });
-          if (verified) {
-            log.info({ title: verified.title, artist: verified.artist, rank: verified.rank }, 'song recognized via AudD and verified in catalog');
-            return {
-              success: true,
-              engine: verified.engine || 'audd+catalog',
-              title: verified.title,
-              artist: verified.artist || res.artist || 'Unknown Artist',
-              album: verified.album || res.album || null,
-              year: verified.year || res.release_date?.slice(0, 4) || null,
-              artwork: verified.artwork || null,
-              songUrl: res.song_link || null,
-              rank: verified.rank || 0,
-              verified: true
-            };
-          }
+          log.info({ title: verified?.title || res.title, artist: verified?.artist || res.artist, verified: !!verified }, 'song recognized via AudD');
+          return {
+            success: true,
+            engine: verified?.engine || 'audd',
+            title: verified?.title || res.title,
+            artist: verified?.artist || res.artist || 'Unknown Artist',
+            album: verified?.album || res.album || null,
+            year: verified?.year || res.release_date?.slice(0, 4) || null,
+            artwork: verified?.artwork || null,
+            songUrl: res.song_link || null,
+            rank: verified?.rank || 50000,
+            verified: Boolean(verified)
+          };
         }
       }
     } catch (audErr) {
       log.debug({ err: audErr.message }, 'AudD fallback attempt failed');
     }
 
-    // 4. Fallback: Soundtrack metadata hint cross-verified against catalog
+    // 4. Engine C: Embedded Audio Metadata Tags (ID3 / Vorbis / MP4 Atoms)
+    try {
+      const { stdout: probeOut } = await execFileAsync('ffprobe', [
+        '-v', 'quiet',
+        '-print_format', 'json',
+        '-show_format',
+        inputFile
+      ], { timeout: 5000 });
+      if (probeOut) {
+        const pJson = JSON.parse(probeOut);
+        const tags = pJson?.format?.tags || {};
+        const embeddedTitle = tags.title || tags.TITLE || tags.track || tags.TRACK;
+        const embeddedArtist = tags.artist || tags.ARTIST || tags.performer || tags.PERFORMER || tags.album_artist || tags.ALBUM_ARTIST;
+        if (embeddedTitle && embeddedTitle.length >= 2 && !/^(audio|track|voice|unknown|rec|\d+)/i.test(embeddedTitle.trim())) {
+          const verified = await verifyWithCatalog(embeddedTitle, embeddedArtist || '', { hintTitle, hintPerformer });
+          if (verified) {
+            log.info({ title: verified.title, artist: verified.artist }, 'song recognized via embedded audio tags');
+            return {
+              success: true,
+              engine: verified.engine || 'tags+catalog',
+              title: verified.title,
+              artist: verified.artist,
+              album: verified.album,
+              year: verified.year,
+              artwork: verified.artwork,
+              songUrl: null,
+              rank: verified.rank || 0,
+              verified: true
+            };
+          }
+        }
+      }
+    } catch {}
+
+    // 5. Engine D: Soundtrack metadata hint & clean filename heuristics
     if (hintTitle && !/^original\s*sound/i.test(hintTitle.trim())) {
-      const hintVerified = await verifyWithCatalog(hintTitle, hintPerformer, { hintTitle, hintPerformer });
+      const cleanHint = hintTitle.replace(/\.(mp3|m4a|wav|ogg|mp4|mov|webm)$/i, '').replace(/_/g, ' ').trim();
+      const hintVerified = await verifyWithCatalog(cleanHint, hintPerformer, { hintTitle: cleanHint, hintPerformer });
       if (hintVerified) {
         log.info({ title: hintVerified.title, artist: hintVerified.artist, rank: hintVerified.rank }, 'song verified via media soundtrack hint');
         return {

@@ -10,6 +10,7 @@ import { truncate } from '../../utils/text.js';
 import { getLyrics, formatBlockquoteLyrics, chunkLyrics, escapeHtml } from '../../media/lyrics.js';
 import { extractMediaForMusicRecognition, recognizeAudio } from '../../media/recognizer.js';
 import { sleep, parseDurationToSeconds } from '../../utils/time.js';
+import { toTelegramStaticSticker } from '../../media/convert.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -17,6 +18,42 @@ const lyricsCache = new Map();
 // Global cache for track audio and metadata: audioKey -> Buffer / Object
 const trackAudioCache = new Map();
 const audioMetaCache = new Map();
+const imageStickerCache = new Map();
+
+function saveMediaImages(key, items) {
+  if (imageStickerCache.size > 50) {
+    const oldestKey = imageStickerCache.keys().next().value;
+    imageStickerCache.delete(oldestKey);
+  }
+  imageStickerCache.set(key, items);
+  try {
+    for (let i = 0; i < Math.min(items.length, 15); i++) {
+      writeFileSync(join(tmpdir(), `lancy_img_${key}_${i}.jpg`), items[i].buffer);
+    }
+    writeFileSync(join(tmpdir(), `lancy_img_${key}_meta.json`), JSON.stringify({ count: Math.min(items.length, 15) }));
+  } catch {}
+}
+
+function getMediaImages(key) {
+  let items = imageStickerCache.get(key);
+  if (!items && key) {
+    try {
+      const metaPath = join(tmpdir(), `lancy_img_${key}_meta.json`);
+      if (existsSync(metaPath)) {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+        items = [];
+        for (let i = 0; i < (meta.count || 0); i++) {
+          const imgPath = join(tmpdir(), `lancy_img_${key}_${i}.jpg`);
+          if (existsSync(imgPath)) {
+            items.push({ buffer: readFileSync(imgPath) });
+          }
+        }
+        if (items.length > 0) imageStickerCache.set(key, items);
+      }
+    } catch {}
+  }
+  return items || [];
+}
 
 function saveTrackAudio(key, buffer, meta = null, thumb = null) {
   if (trackAudioCache.size > 50) {
@@ -391,7 +428,14 @@ export function createDownloaderScreen({ app }) {
 
       // 4. Action Buttons
       const photoItem = mediaItems.find((m) => m.type === 'photo');
+      const photoItems = mediaItems.filter((m) => m.type === 'photo');
       const thumbBuf = photoItem?.buffer || null;
+
+      let imageKey = null;
+      if (photoItems.length > 0) {
+        imageKey = Math.random().toString(36).slice(2, 8);
+        saveMediaImages(imageKey, photoItems);
+      }
 
       let audioKey = null;
       if (audioTrack && audioTrack.buffer) {
@@ -451,9 +495,16 @@ export function createDownloaderScreen({ app }) {
       const mediaRow = [
         richButton.callback('📥 Download Link', encodeCallback(id, 'input', ['from_media']), { style: 'primary' })
       ];
-      if (photoCount > 0) {
+      if (photoCount > 0 && imageKey) {
         mediaRow.push(
-          richButton.callback('✦ Make Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' })
+          richButton.callback(
+            photoCount > 1 ? `🎨 Turn to Sticker (${photoCount})` : '🎨 Turn to Sticker',
+            encodeCallback(id, 'to_sticker', imageKey, 'from_media'),
+            { style: 'primary' }
+          )
+        );
+        mediaRow.push(
+          richButton.callback('✦ Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' })
         );
       }
       b.buttons(mediaRow);
@@ -834,6 +885,69 @@ export function createDownloaderScreen({ app }) {
                 ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
               }, 15000)?.unref?.();
             }
+          }
+          return;
+        }
+        case 'to_sticker': {
+          const imageKey = (args[0] || '').split(',')[0];
+          let images = getMediaImages(imageKey);
+
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎨 Turning into sticker(s)… ♡' }).catch(() => {});
+          }
+
+          if (!images || images.length === 0) {
+            const replyMsg = ctx.query?.message;
+            if (Array.isArray(replyMsg?.photo) && replyMsg.photo.length > 0) {
+              try {
+                const bestPhoto = replyMsg.photo[replyMsg.photo.length - 1];
+                const fileInfo = await ctx.api.getFile(bestPhoto.file_id);
+                if (fileInfo?.file_path) {
+                  const buf = await ctx.api.downloadFile(fileInfo.file_path);
+                  if (buf) images = [{ buffer: buf }];
+                }
+              } catch {}
+            }
+          }
+
+          if (!images || images.length === 0) {
+            await ctx.api.sendMessage(
+              ctx.chatId,
+              '<blockquote>♡ Could not retrieve image buffer for sticker conversion. Send the photo directly to me and I will turn it into a sticker! ♡</blockquote>',
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return;
+          }
+
+          let successCount = 0;
+          for (let i = 0; i < Math.min(images.length, 10); i++) {
+            try {
+              const stickerRes = await toTelegramStaticSticker(images[i].buffer);
+              if (stickerRes?.buffer) {
+                await ctx.api.sendSticker(ctx.chatId, stickerRes.buffer, { emoji: '✨' });
+                successCount++;
+              }
+            } catch (err) {
+              log.debug({ err: err?.message, idx: i }, 'failed to convert image to sticker');
+            }
+          }
+
+          if (successCount > 0) {
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(`✨ Created ${successCount} aesthetic sticker${successCount > 1 ? 's' : ''}! ♡`));
+            b.paragraph(rt.text('Delivered directly above as native Telegram stickers ˙ᵕ˙'));
+            b.divider();
+            b.buttons([
+              richButton.callback('✦ Save to Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' }),
+              richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']))
+            ]);
+            await ctx.replyRich(b.toJSON()).catch(() => {});
+          } else {
+            await ctx.api.sendMessage(
+              ctx.chatId,
+              '<blockquote>✕ Could not convert image to sticker format. Please try another image ♡</blockquote>',
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
           }
           return;
         }

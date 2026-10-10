@@ -697,4 +697,30 @@ test('RichMessageBuilder: b.quote correctly wraps rich text arrays in paragraph 
   assert.equal(bq.blocks[0].text[1], 'Description', 'second rich text item is string');
 });
 
+test('Audio Recognizer: extractMediaForMusicRecognition and catalog verification', async () => {
+  const { extractMediaForMusicRecognition, verifyWithCatalog } = await import('../src/media/recognizer.js');
+
+  // 1. Media extraction from various message payloads
+  assert.equal(extractMediaForMusicRecognition({ voice: { file_id: '123' } })?.type, 'voice');
+  assert.equal(extractMediaForMusicRecognition({ audio: { file_id: '456' } })?.type, 'audio');
+  assert.equal(extractMediaForMusicRecognition({ video: { file_id: '789' } })?.type, 'video');
+  assert.equal(extractMediaForMusicRecognition({ video_note: { file_id: '101' } })?.type, 'video_note');
+  assert.equal(extractMediaForMusicRecognition({
+    document: { file_id: '202', mime_type: 'audio/mpeg', file_name: 'track.mp3' }
+  })?.type, 'audio');
+  assert.equal(extractMediaForMusicRecognition({
+    document: { file_id: '303', mime_type: 'video/mp4', file_name: 'clip.mp4' }
+  })?.type, 'video');
+  assert.equal(extractMediaForMusicRecognition({ text: 'just text' }), null);
+
+  // 2. verifyWithCatalog handles catalog query safely
+  const catalogRes = await verifyWithCatalog('Starboy', 'The Weeknd');
+  if (catalogRes) {
+    assert.equal(catalogRes.verified, true);
+    assert.ok(catalogRes.title.toLowerCase().includes('starboy'));
+    assert.ok(catalogRes.artist.toLowerCase().includes('weeknd'));
+  }
+});
+
+
 
