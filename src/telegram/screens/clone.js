@@ -55,10 +55,11 @@ export function createCloneScreen({ app }) {
     b.table(kvTable(rows), { compact: true });
     b.divider();
 
-    // Buttons for each bot
-    for (const bot of bots.slice(0, 4)) {
+    // Buttons for each bot: Manage & Remove
+    for (const bot of bots.slice(0, 6)) {
       b.buttons([
-        richButton.callback(`⚙ Manage @${bot.bot_username}`, encodeCallback(id, 'manage', bot.id), { style: 'primary' })
+        richButton.callback(`⚙ Manage @${bot.bot_username}`, encodeCallback(id, 'manage', bot.id), { style: 'primary' }),
+        richButton.callback(`🗑 Remove`, encodeCallback(id, 'delete_confirm', bot.id), { style: 'danger' })
       ]);
     }
 
@@ -67,6 +68,31 @@ export function createCloneScreen({ app }) {
       richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
     ]);
     b.footer(rt.italic('Delivered with aesthetic love ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderRmPicker(ctx, bots) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '🗑 REMOVE A CLONED BOT 🗑',
+      'select which bot to delete ♡'
+    ])));
+    b.divider();
+    b.quote(rt.concat(
+      rt.bold('Choose which bot you want to remove:\n\n'),
+      rt.text('Its polling process will stop immediately and its token will be removed.')
+    ));
+    b.divider();
+    for (const bot of bots) {
+      b.buttons([
+        richButton.callback(`🗑 Delete @${bot.bot_username}`, encodeCallback(id, 'delete_confirm', bot.id), { style: 'danger' })
+      ]);
+    }
+    b.buttons([
+      richButton.callback('« Cancel', encodeCallback(id, 'open'))
+    ]);
+    b.footer(rt.italic('This action stops the bot permanently ♡'));
     b.validate();
     return b.toJSON();
   }
@@ -199,7 +225,16 @@ export function createCloneScreen({ app }) {
           return ctx.editScreen(renderManageScreen(ctx, botRecord));
         }
 
-        case 'delete_confirm': {
+        case 'rm_picker': {
+          const bots = app.multiBotManager?.getBotsForOwner(ctx.tgId) ?? [];
+          if (bots.length === 0) return this.open(ctx);
+          if (bots.length === 1) return this.handle(ctx, 'delete_confirm', [bots[0].id]);
+          if (ctx.fromMedia || ctx.forceNew) return ctx.replyRich(renderRmPicker(ctx, bots));
+          return ctx.editScreen(renderRmPicker(ctx, bots));
+        }
+
+        case 'delete_confirm':
+        case 'rm_confirm': {
           const botId = Number(args[0]);
           const botRecord = app.multiBotManager?.getBotById(botId);
           if (!botRecord) return this.open(ctx);
@@ -217,16 +252,25 @@ export function createCloneScreen({ app }) {
           ));
           b.divider();
           b.buttons([
-            richButton.callback('🗑 Yes, Delete', encodeCallback(id, 'delete', botId), { style: 'primary' }),
-            richButton.callback('« Cancel', encodeCallback(id, 'manage', botId))
+            richButton.callback('🗑 Yes, Delete', encodeCallback(id, 'delete', botId), { style: 'danger' }),
+            richButton.callback('« Cancel', encodeCallback(id, 'open'))
           ]);
           b.validate();
+          if (ctx.fromMedia || ctx.forceNew) return ctx.replyRich(b.toJSON());
           return ctx.editScreen(b.toJSON());
         }
 
-        case 'delete': {
+        case 'delete':
+        case 'rm': {
           const botId = Number(args[0]);
+          const botRecord = app.multiBotManager?.getBotById(botId);
           await app.multiBotManager?.deleteBot(botId, ctx.tgId);
+          if (ctx.query?.id) {
+            await ctx.api?.answerCallbackQuery(ctx.query.id, {
+              text: botRecord?.bot_username ? `✓ Deleted @${botRecord.bot_username} ♡` : '✓ Bot deleted ♡',
+              showAlert: true
+            }).catch(() => {});
+          }
           return this.open(ctx);
         }
 

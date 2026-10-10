@@ -317,7 +317,12 @@ export class TelegramController extends EventEmitter {
     const chatId = message.chat.id;
 
     // Commands
-    const text = message.text ?? '';
+    const rawText = message.text ?? '';
+    let text = rawText.trim();
+    if (/^(rm\s*bot|remove\s*bot|delete\s*bot)(\s+.*)?$/i.test(text)) {
+      text = text.replace(/^(rm\s*bot|remove\s*bot|delete\s*bot)/i, '/rmbot');
+    }
+
     if (text.startsWith('/')) {
       const [cmd, ...rest] = text.split(/\s+/);
       const command = cmd.toLowerCase().split('@')[0];
@@ -366,6 +371,80 @@ export class TelegramController extends EventEmitter {
         const cloneScreen = this.screens.get('clone');
         const sent = await cloneScreen?.open(this.#ctx(tgId, { message }, { forceNew: true }));
         updateScreenMsg(sent);
+        return;
+      }
+
+      if (command === '/rmbot' || command === '/rm_bot' || command === '/deletebot' || command === '/removebot' || command === '/delbot') {
+        if (isGroup) {
+          const notice = await this.api.sendMessage(
+            chatId,
+            `<blockquote>🤖 To manage or remove your cloned bots, please open a private DM with the bot! ♡</blockquote>`,
+            { parse_mode: 'HTML' }
+          );
+          if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+            setTimeout(() => {
+              this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+            }, 10000)?.unref?.();
+          }
+          return;
+        }
+
+        const cloneScreen = this.screens.get('clone');
+
+        // If invoked inside the cloned bot itself by its owner:
+        if (this.botContext?.isClone && Number(tgId) === Number(this.botContext.ownerId)) {
+          const cloneId = this.botContext.botId;
+          await this.sm.reset(tgId, { reason: 'command' });
+          const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+          const sent = await cloneScreen?.handle(ctx, 'delete_confirm', [cloneId]);
+          updateScreenMsg(sent);
+          return;
+        }
+
+        const multiBotMgr = this.app?.multiBotManager;
+        const targetArg = rest[0]; // e.g. @bot_username or botId
+        const userBots = multiBotMgr?.getBotsForOwner(tgId) ?? [];
+
+        if (userBots.length === 0) {
+          await this.api.sendMessage(
+            chatId,
+            `<blockquote>♡ You don't have any active cloned bots to remove ♡\n\nTip: You can clone your own aesthetic bot in 60 seconds using <code>/clone</code>! ♡</blockquote>`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+
+        if (targetArg) {
+          const cleanArg = targetArg.replace(/^@/, '').trim().toLowerCase();
+          const matched = userBots.find((b) =>
+            String(b.id) === cleanArg || b.bot_username?.toLowerCase() === cleanArg
+          );
+
+          if (matched) {
+            await this.sm.reset(tgId, { reason: 'command' });
+            const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+            const sent = await cloneScreen?.handle(ctx, 'delete_confirm', [matched.id]);
+            updateScreenMsg(sent);
+            return;
+          } else {
+            await this.api.sendMessage(
+              chatId,
+              `<blockquote>✕ Could not find a cloned bot matching <code>${escapeHtml(targetArg)}</code> owned by you ♡\nTip: Type <code>/rmbot</code> to choose from your active bots! ♡</blockquote>`,
+              { parse_mode: 'HTML' }
+            );
+            return;
+          }
+        }
+
+        await this.sm.reset(tgId, { reason: 'command' });
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        if (userBots.length === 1) {
+          const sent = await cloneScreen?.handle(ctx, 'delete_confirm', [userBots[0].id]);
+          updateScreenMsg(sent);
+        } else {
+          const sent = await cloneScreen?.handle(ctx, 'rm_picker', []);
+          updateScreenMsg(sent);
+        }
         return;
       }
 

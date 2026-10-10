@@ -378,3 +378,182 @@ test('E2E Clone Bot Flow: state machine handles name & token input without ctx.r
   db.close();
 });
 
+test('Remove Bot Flow: /rmbot and "rm bot" handle 0 bots, 1 bot, multiple bots picker, and target args', async () => {
+  const { createCloneScreen } = await import('../src/telegram/screens/clone.js');
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.set('security.publicAccess', true);
+  const sm = new StateMachine();
+
+  const userBots = [
+    { id: 1, owner_tg_id: 11111, bot_name: 'MoonBot', bot_username: 'moon_bot', status: 'active' },
+    { id: 2, owner_tg_id: 11111, bot_name: 'StarBot', bot_username: 'star_bot', status: 'active' }
+  ];
+  let deletedBotId = null;
+
+  const fakeMultiBotManager = {
+    getBotsForOwner: (ownerId) => userBots.filter((b) => b.owner_tg_id === Number(ownerId)),
+    getBotById: (botId) => userBots.find((b) => b.id === Number(botId)),
+    deleteBot: async (botId, ownerId) => {
+      deletedBotId = botId;
+      const idx = userBots.findIndex((b) => b.id === Number(botId) && b.owner_tg_id === Number(ownerId));
+      if (idx !== -1) userBots.splice(idx, 1);
+      return true;
+    }
+  };
+
+  const sentMessages = [];
+  const sentRichMessages = [];
+  const answeredCallbacks = [];
+
+  const fakeApi = {
+    call: async () => ({}),
+    sendMessage: async (chatId, text, opts) => {
+      sentMessages.push({ chatId, text, opts });
+      return { message_id: 901 };
+    },
+    sendRichMessage: async (chatId, rich) => {
+      sentRichMessages.push({ chatId, rich });
+      return { message_id: 902 };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      sentRichMessages.push({ chatId, msgId, rich });
+      return { message_id: msgId };
+    },
+    answerCallbackQuery: async (id, opts) => {
+      answeredCallbacks.push({ id, opts });
+      return true;
+    },
+    deleteMessage: async () => true,
+    getMe: async () => ({ id: 999, username: 'lancybot' })
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: fakeApi },
+    multiBotManager: fakeMultiBotManager
+  };
+
+  const cloneScreen = createCloneScreen({ app });
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext: { botId: 0, botName: 'Lancy', isClone: false },
+    app
+  });
+  bot.screens.set('clone', cloneScreen);
+
+  // 1. User with 0 bots runs /rmbot
+  await bot.handleUpdate({
+    update_id: 201,
+    message: {
+      message_id: 301,
+      chat: { id: 22222, type: 'private' },
+      from: { id: 22222, first_name: 'NoBotsUser' },
+      text: '/rmbot'
+    }
+  });
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0].text, /You don't have any active cloned bots to remove/);
+  assert.match(sentMessages[0].text, /<blockquote>/);
+
+  // 2. User in a group chat sends /rmbot -> notice to open DM
+  await bot.handleUpdate({
+    update_id: 202,
+    message: {
+      message_id: 302,
+      chat: { id: -100999, type: 'supergroup' },
+      from: { id: 11111, first_name: 'BotOwner' },
+      text: '/rmbot'
+    }
+  });
+  assert.equal(sentMessages.length, 2);
+  assert.match(sentMessages[1].text, /please open a private DM with the bot/);
+
+  // 3. User with multiple bots sends natural text "rm bot" -> triggers rm_picker
+  sentRichMessages.length = 0;
+  await bot.handleUpdate({
+    update_id: 203,
+    message: {
+      message_id: 303,
+      chat: { id: 11111, type: 'private' },
+      from: { id: 11111, first_name: 'BotOwner' },
+      text: 'rm bot'
+    }
+  });
+  assert.ok(sentRichMessages.length >= 1, 'rm_picker rich card sent');
+  const pickerCard = sentRichMessages[sentRichMessages.length - 1].rich;
+  const pickerJson = JSON.stringify(pickerCard);
+  assert.match(pickerJson, /REMOVE A CLONED BOT/);
+  assert.match(pickerJson, /moon_bot/);
+  assert.match(pickerJson, /star_bot/);
+
+  // 4. Target argument /rmbot @star_bot -> directly confirms deletion for star_bot (id: 2)
+  sentRichMessages.length = 0;
+  await bot.handleUpdate({
+    update_id: 204,
+    message: {
+      message_id: 304,
+      chat: { id: 11111, type: 'private' },
+      from: { id: 11111, first_name: 'BotOwner' },
+      text: '/rmbot @star_bot'
+    }
+  });
+  assert.ok(sentRichMessages.length >= 1, 'delete_confirm card sent for star_bot');
+  const confirmCard = sentRichMessages[sentRichMessages.length - 1].rich;
+  const confirmJson = JSON.stringify(confirmCard);
+  assert.match(confirmJson, /CONFIRM DELETE BOT/);
+  assert.match(confirmJson, /star_bot/);
+  assert.match(confirmJson, /Yes, Delete/);
+
+  // 5. User clicks 'Yes, Delete' callback (action: delete)
+  await bot.handleUpdate({
+    update_id: 205,
+    callback_query: {
+      id: 'cb_del_2',
+      from: { id: 11111, first_name: 'BotOwner' },
+      message: { message_id: 902, chat: { id: 11111, type: 'private' } },
+      data: 'l1:clone:delete:2'
+    }
+  });
+  assert.equal(deletedBotId, 2);
+  assert.equal(userBots.length, 1);
+  assert.equal(userBots[0].id, 1);
+  assert.ok(answeredCallbacks.some((cb) => cb.opts?.text?.includes('star_bot')));
+
+  // 6. User now has 1 bot left. Calling /rmbot directly opens delete_confirm for that remaining bot
+  sentRichMessages.length = 0;
+  await bot.handleUpdate({
+    update_id: 206,
+    message: {
+      message_id: 306,
+      chat: { id: 11111, type: 'private' },
+      from: { id: 11111, first_name: 'BotOwner' },
+      text: '/rmbot'
+    }
+  });
+  assert.ok(sentRichMessages.length >= 1, 'delete_confirm card sent directly for sole bot');
+  const soleConfirm = JSON.stringify(sentRichMessages[sentRichMessages.length - 1].rich);
+  assert.match(soleConfirm, /CONFIRM DELETE BOT/);
+  assert.match(soleConfirm, /moon_bot/);
+
+  // 7. Non-existent bot target: /rmbot @unknown_bot
+  await bot.handleUpdate({
+    update_id: 207,
+    message: {
+      message_id: 307,
+      chat: { id: 11111, type: 'private' },
+      from: { id: 11111, first_name: 'BotOwner' },
+      text: '/rmbot @unknown_bot'
+    }
+  });
+  const lastMsg = sentMessages[sentMessages.length - 1];
+  assert.match(lastMsg.text, /Could not find a cloned bot matching/);
+  assert.match(lastMsg.text, /unknown_bot/);
+
+  db.close();
+});
+

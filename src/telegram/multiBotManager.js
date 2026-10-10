@@ -198,6 +198,11 @@ export class MultiBotManager {
     return this.db.get('SELECT * FROM cloned_bots WHERE id = ?', botId);
   }
 
+  getBotByUsername(username) {
+    const clean = String(username || '').replace(/^@/, '').trim().toLowerCase();
+    return this.db.get('SELECT * FROM cloned_bots WHERE LOWER(bot_username) = ?', clean);
+  }
+
   getRunningBot(botId) {
     return this.runningBots.get(botId) ?? null;
   }
