@@ -137,6 +137,10 @@ export class TelegramAPI {
     return this.call('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: replyMarkup });
   }
 
+  editMessageMedia(params, extra = {}) {
+    return this.call('editMessageMedia', { ...params, ...extra });
+  }
+
   sendMediaGroup(chatId, media, extra = {}, files = null) {
     return this.call('sendMediaGroup', { chat_id: chatId, media, ...extra }, { files });
   }

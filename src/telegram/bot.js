@@ -7,7 +7,7 @@ import { LancyError, friendlyTelegramError } from '../core/errors.js';
 import { decodeCallback, NOOP_CALLBACK, RichMessageBuilder, rt, richButton, encodeCallback } from './rich.js';
 import { banner, kvTable } from './ui.js';
 import { States } from '../core/stateMachine.js';
-import { sleep } from '../utils/time.js';
+import { sleep, parseDurationToSeconds } from '../utils/time.js';
 import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
 import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
@@ -18,6 +18,7 @@ const execFileAsync = promisify(execFile);
 const inlineSearchCache = new Map();
 const inlinePinterestCache = new Map();
 const inlineUrlCache = new Map();
+const recentInlineSearchResults = new Map();
 
 /**
  * TelegramController — the control center.
@@ -46,6 +47,7 @@ export class TelegramController extends EventEmitter {
     this.globalCallbacks = new Map(); // action -> handler (state-agnostic)
     this.userScreenMessage = new Map(); // tgId -> { chatId, messageId }
     this.mediaDeliveryMessageIds = new Set(); // messageId -> boolean
+    this.pendingAudioCaches = new Set(); // query -> boolean
   }
 
   /** Mark a message as containing delivered media (video, album, audio, stickers). */
@@ -264,7 +266,7 @@ export class TelegramController extends EventEmitter {
     if (update.inline_query) return this.#handleInlineQuery(update.inline_query);
     if (update.chosen_inline_result) {
       this.log.info({ chosen: update.chosen_inline_result }, 'received chosen_inline_result');
-      return;
+      return this.#handleChosenInlineResult(update.chosen_inline_result);
     }
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
@@ -403,6 +405,153 @@ export class TelegramController extends EventEmitter {
       return items;
     } catch {
       return [];
+    }
+  }
+
+  async #cacheAudioTrackInBackground(query) {
+    const clean = String(query || '').trim();
+    if (!clean || clean.length < 3 || this.pendingAudioCaches.has(clean.toLowerCase())) return;
+
+    try {
+      const existing = this.db.prepare(
+        'SELECT id FROM cached_audio_tracks WHERE LOWER(query) = ? LIMIT 1'
+      ).get(clean.toLowerCase());
+      if (existing) return;
+    } catch {}
+
+    this.pendingAudioCaches.add(clean.toLowerCase());
+    try {
+      if (!this.app?.mediaDownloader) return;
+      const res = await this.app.mediaDownloader.download(clean);
+      if (!res?.audioTrack?.buffer) return;
+
+      const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+      const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
+      const sent = await this.api.sendAudio(ownerId, res.audioTrack.buffer, {
+        title: res.title || clean,
+        performer: res.artist || res.author || 'Music',
+        ...(durSec > 0 ? { duration: durSec } : {}),
+        disable_notification: true
+      });
+
+      const fileId = sent?.audio?.file_id;
+      if (fileId) {
+        if (sent.message_id) {
+          await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+        }
+        const songTitle = res.title || clean;
+        const songArtist = res.artist || res.author || null;
+        try {
+          const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+          this.db.prepare(sql).run(clean.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
+          if (songTitle && songTitle.toLowerCase().trim() !== clean.toLowerCase().trim()) {
+            this.db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
+          }
+        } catch {}
+      }
+    } catch (err) {
+      this.log.debug({ err, query: clean }, 'background audio caching failed');
+    } finally {
+      this.pendingAudioCaches.delete(clean.toLowerCase());
+    }
+  }
+
+  async #handleChosenInlineResult(chosen) {
+    if (!chosen) return;
+    this.log.info({ chosen }, 'processing chosen_inline_result');
+    const resultId = chosen.result_id || '';
+    const inlineMessageId = chosen.inline_message_id;
+    if (!inlineMessageId) return;
+
+    if (!resultId.startsWith('fresh_aud_')) return;
+
+    const cachedInfo = recentInlineSearchResults.get(resultId);
+    const searchQuery = cachedInfo ? `${cachedInfo.title} ${cachedInfo.artist}`.trim() : (chosen.query || '');
+    if (!searchQuery) return;
+
+    let fileId = null;
+    let trackTitle = cachedInfo?.title || chosen.query;
+    let trackArtist = cachedInfo?.artist || 'Music';
+    let trackDuration = cachedInfo?.duration || 0;
+
+    try {
+      const queryTerms = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+      const rows = this.db.prepare(
+        'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 50'
+      ).all();
+      const match = (rows || []).find((row) => {
+        const rowText = `${row.query || ''} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
+        return queryTerms.every((term) => rowText.includes(term));
+      });
+      if (match?.file_id) {
+        fileId = match.file_id;
+        trackTitle = match.title;
+        trackArtist = match.artist || trackArtist;
+        trackDuration = match.duration || trackDuration;
+      }
+    } catch {}
+
+    if (!fileId && this.app?.mediaDownloader) {
+      try {
+        const res = await this.app.mediaDownloader.download(searchQuery);
+        if (res?.audioTrack?.buffer) {
+          const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+          const durSec = res.duration ? parseDurationToSeconds(res.duration) : trackDuration;
+          const sent = await this.api.sendAudio(ownerId, res.audioTrack.buffer, {
+            title: res.title || trackTitle,
+            performer: res.artist || res.author || trackArtist,
+            ...(durSec > 0 ? { duration: durSec } : {}),
+            disable_notification: true
+          });
+          const uploadedFileId = sent?.audio?.file_id;
+          if (uploadedFileId) {
+            fileId = uploadedFileId;
+            trackTitle = res.title || trackTitle;
+            trackArtist = res.artist || res.author || trackArtist;
+            trackDuration = durSec;
+            if (sent.message_id) {
+              await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+            }
+            try {
+              const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+              this.db.prepare(sql).run(searchQuery.toLowerCase().trim(), fileId, trackTitle, trackArtist, trackDuration);
+              if (trackTitle && trackTitle.toLowerCase().trim() !== searchQuery.toLowerCase().trim()) {
+                this.db.prepare(sql).run(trackTitle.toLowerCase().trim(), fileId, trackTitle, trackArtist, trackDuration);
+              }
+            } catch {}
+          }
+        }
+      } catch (err) {
+        this.log.debug({ err, searchQuery }, 'chosen inline result download failed');
+      }
+    }
+
+    if (fileId) {
+      try {
+        await this.api.editMessageMedia({
+          inline_message_id: inlineMessageId,
+          media: {
+            type: 'audio',
+            media: fileId,
+            caption: `🎵 <b>${escapeHtml(trackTitle)}</b> — <i>${escapeHtml(trackArtist)}</i>\n✨ <i>Full Audio via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
+            parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '✨ 📥 Full MP3 & Lyrics ♡',
+                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(trackTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                  style: 'primary'
+                }
+              ]
+            ]
+          }
+        });
+        this.log.info({ inlineMessageId, fileId, title: trackTitle }, 'upgraded inline message to full audio track');
+      } catch (editErr) {
+        this.log.warn({ editErr, inlineMessageId }, 'failed to edit inline message media');
+      }
     }
   }
 
@@ -948,7 +1097,7 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '🌸 📜 Lyrics & Info ♡',
+                text: '✨ 📥 Full MP3 & Lyrics ♡',
                 url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`,
                 style: 'primary'
               }
@@ -956,6 +1105,11 @@ export class TelegramController extends EventEmitter {
           ]
         }
       }));
+
+      // If no tracks cached yet for this query, kick off background caching
+      if (cachedAudioRows.length === 0 && cleanSongQuery.length >= 3) {
+        this.#cacheAudioTrackInBackground(cleanSongQuery).catch(() => {});
+      }
 
       let searchItems = inlineSearchCache.get(cleanSongQuery.toLowerCase());
       if (!searchItems) {
@@ -969,20 +1123,38 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      const freshResults = (searchItems || []).slice(0, 8).map((item, index) => {
+      // Filter out tracks that are already in cachedResults to prevent duplicate 30s clips
+      const cachedTrackKeys = new Set(cachedAudioRows.map((r) => `${(r.title || '').toLowerCase()} ${(r.artist || '').toLowerCase()}`.trim()));
+      const filteredSearchItems = (searchItems || []).filter((item) => {
+        const itemKey = `${(item.title || '').toLowerCase()} ${(item.artist || '').toLowerCase()}`.trim();
+        return !cachedTrackKeys.has(itemKey);
+      });
+
+      const freshResults = filteredSearchItems.slice(0, 8).map((item, index) => {
         const title = item.title || cleanSongQuery;
         const artist = item.artist || 'Music';
         const duration = item.duration ? `⏱ ${item.duration}` : '🎵 Audio Track';
 
         if (item.audioUrl) {
+          const resultId = `fresh_aud_${item.id || index}_${Date.now()}`;
+          recentInlineSearchResults.set(resultId, {
+            title,
+            artist,
+            duration: item.durationSeconds || 0,
+            query: cleanSongQuery
+          });
+          if (recentInlineSearchResults.size > 200) {
+            const firstKey = recentInlineSearchResults.keys().next().value;
+            recentInlineSearchResults.delete(firstKey);
+          }
           return {
             type: 'audio',
-            id: `fresh_aud_${item.id || index}_${Date.now()}`,
+            id: resultId,
             audio_url: item.audioUrl,
             title,
             performer: artist,
             ...(item.durationSeconds ? { audio_duration: item.durationSeconds } : {}),
-            caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n✨ <i>Via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
+            caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n✨ <i>Full Audio via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [

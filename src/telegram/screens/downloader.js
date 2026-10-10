@@ -519,10 +519,43 @@ export function createDownloaderScreen({ app }) {
       b.validate();
 
       // 5. Deliver Rich Message
-      await tracker.finish(b.toJSON(), files);
+      const sent = await tracker.finish(b.toJSON(), files);
       if (tracker.messageId) {
         (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(tracker.messageId);
         app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
+      }
+
+      // Auto-cache audio track in SQLite cached_audio_tracks for instant live inline playback
+      let richAudioFileId = sent?.audio?.file_id || sent?.document?.file_id;
+      if (!richAudioFileId && Array.isArray(sent?.rich_message?.blocks)) {
+        for (const blk of sent.rich_message.blocks) {
+          if (blk.type === 'audio' && blk.audio?.file_id) {
+            richAudioFileId = blk.audio.file_id;
+            break;
+          }
+        }
+      }
+
+      if (richAudioFileId && (isMusic || audioTrack)) {
+        const db = app.db || ctx.db;
+        try {
+          const songTitle = result.title || title || 'Audio Track';
+          const songPerformer = result.artist || result.author || null;
+          const parsedDur = parseDurationToSeconds(audioTrack?.duration || result.duration) || 0;
+          const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+          const cleanQuery = (url || '').toLowerCase().trim();
+          if (typeof db?.run === 'function') {
+            db.run(sql, cleanQuery, richAudioFileId, songTitle, songPerformer, parsedDur);
+            if (songTitle && songTitle.toLowerCase() !== cleanQuery) {
+              db.run(sql, songTitle.toLowerCase().trim(), richAudioFileId, songTitle, songPerformer, parsedDur);
+            }
+          } else if (typeof db?.prepare === 'function') {
+            db.prepare(sql).run(cleanQuery, richAudioFileId, songTitle, songPerformer, parsedDur);
+            if (songTitle && songTitle.toLowerCase() !== cleanQuery) {
+              db.prepare(sql).run(songTitle.toLowerCase().trim(), richAudioFileId, songTitle, songPerformer, parsedDur);
+            }
+          }
+        } catch {}
       }
 
       await ctx.sm?.reset(ctx.tgId, { reason: 'download_complete' });
@@ -753,15 +786,26 @@ export function createDownloaderScreen({ app }) {
               (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sent.message_id);
               app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
             }
-            const fileId = sent.audio?.file_id || sent.document?.file_id;
+            let fileId = sent.audio?.file_id || sent.document?.file_id;
+            if (!fileId && Array.isArray(sent.rich_message?.blocks)) {
+              for (const blk of sent.rich_message.blocks) {
+                if (blk.type === 'audio' && blk.audio?.file_id) {
+                  fileId = blk.audio.file_id;
+                  break;
+                }
+              }
+            }
             if (fileId) {
               const db = app.db || ctx.db;
               try {
-                const sql = 'INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                const cleanQuery = songTitle.toLowerCase().trim();
+                const cleanArtist = songPerformer !== 'Artist' ? songPerformer : null;
+                const dur = meta.duration || 0;
                 if (typeof db?.run === 'function') {
-                  db.run(sql, songTitle.toLowerCase().trim(), fileId, songTitle, songPerformer !== 'Artist' ? songPerformer : null, meta.duration || 0);
+                  db.run(sql, cleanQuery, fileId, songTitle, cleanArtist, dur);
                 } else if (typeof db?.prepare === 'function') {
-                  db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songPerformer !== 'Artist' ? songPerformer : null, meta.duration || 0);
+                  db.prepare(sql).run(cleanQuery, fileId, songTitle, cleanArtist, dur);
                 }
               } catch {}
             }

@@ -151,6 +151,148 @@ test('TelegramController: /start with play_ deep link executes immediate downloa
   db.close();
 });
 
+test('TelegramController: live inline search returns cached audio with audio_file_id and dedups preview', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [1001];
+  const sm = new StateMachine();
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  db.prepare('INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)').run(
+    'one life lorda',
+    'CQACAgQAAxkDAAIDUmrKn92mh3oNparAAXmX00Jt_RK2AAIWIQACZahRUsuQ4WTCVUcWPQQ',
+    'One Life',
+    'Lorda',
+    215
+  );
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, params) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = params;
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  await controller.handleInlineQuery({
+    id: 'query_cached_1',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'one life lorda',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  const first = inlineAnswer.results[0];
+  assert.equal(first.type, 'audio');
+  assert.equal(first.audio_file_id, 'CQACAgQAAxkDAAIDUmrKn92mh3oNparAAXmX00Jt_RK2AAIWIQACZahRUsuQ4WTCVUcWPQQ');
+  assert.match(first.caption, /Full Audio/);
+  assert.equal(first.reply_markup.inline_keyboard[0][0].style, 'primary');
+
+  // Verify dedup: freshResults should not contain a second duplicate of "One Life Lorda"
+  const duplicates = inlineAnswer.results.filter((r) => /one life/i.test(r.title || r.caption) && /lorda/i.test(r.performer || r.caption));
+  assert.equal(duplicates.length, 1, 'should not return duplicate preview for cached track');
+
+  db.close();
+});
+
+test('TelegramController: chosen_inline_result upgrades inline audio message to full audio file', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [1001];
+  const sm = new StateMachine();
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  db.prepare('INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)').run(
+    'gratitude',
+    'CQACAgQAAxkDAAIDH2rKkj-Y19OSEHC_Rz3ZODwdsS73AAKDHwACqN5YUoyVLlFR6jCePQQ',
+    'Gratitude',
+    'Brandon Lake',
+    337
+  );
+
+  let editedMedia = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, params) => {
+      if (method === 'editMessageMedia') {
+        editedMedia = params;
+      }
+      return { ok: true };
+    },
+    editMessageMedia: async (params) => {
+      editedMedia = params;
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Trigger chosen_inline_result update
+  await controller.handleUpdate({
+    update_id: 11,
+    chosen_inline_result: {
+      result_id: 'fresh_aud_12345_67890',
+      from: { id: 1001, first_name: 'Alex' },
+      inline_message_id: 'inline_msg_999',
+      query: 'gratitude'
+    }
+  });
+
+  assert.ok(editedMedia, 'editMessageMedia should be called to upgrade message');
+  assert.equal(editedMedia.inline_message_id, 'inline_msg_999');
+  assert.equal(editedMedia.media.type, 'audio');
+  assert.equal(editedMedia.media.media, 'CQACAgQAAxkDAAIDH2rKkj-Y19OSEHC_Rz3ZODwdsS73AAKDHwACqN5YUoyVLlFR6jCePQQ');
+  assert.match(editedMedia.media.caption, /Gratitude/);
+  assert.equal(editedMedia.reply_markup.inline_keyboard[0][0].style, 'primary');
+
+  db.close();
+});
+
 test('TelegramController: group chat filters commands tagged for other bots', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
