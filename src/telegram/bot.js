@@ -313,7 +313,36 @@ export class TelegramController extends EventEmitter {
     const clean = String(query || '').trim();
     if (!clean) return [];
 
-    // 1. Try iTunes Search API (fastest, high quality metadata & artwork, ~150ms)
+    // 1. Try Deezer Search API (provides direct MP3 audio stream for Telegram, ~150ms)
+    try {
+      const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=8`, {
+        signal: AbortSignal.timeout(2500)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.data) && data.data.length > 0) {
+          const items = data.data
+            .filter((r) => r.preview && r.preview.startsWith('http'))
+            .map((r, idx) => {
+              const min = Math.floor((r.duration || 0) / 60);
+              const sec = String((r.duration || 0) % 60).padStart(2, '0');
+              const duration = r.duration ? `${min}:${sec}` : '';
+              return {
+                id: String(r.id || idx),
+                title: r.title || clean,
+                artist: r.artist?.name || 'Music',
+                duration,
+                durationSeconds: r.duration || 30,
+                thumbnail: r.album?.cover_big || r.album?.cover_medium,
+                audioUrl: r.preview || null
+              };
+            });
+          if (items.length > 0) return items;
+        }
+      }
+    } catch {}
+
+    // 2. Try iTunes Search API fallback (~150ms)
     try {
       const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(clean)}&entity=song&limit=8`, {
         signal: AbortSignal.timeout(2500)
@@ -335,32 +364,6 @@ export class TelegramController extends EventEmitter {
               durationSeconds,
               thumbnail: thumb,
               audioUrl: r.previewUrl || null
-            };
-          });
-        }
-      }
-    } catch {}
-
-    // 2. Try Deezer Search API fallback (~150ms)
-    try {
-      const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=8`, {
-        signal: AbortSignal.timeout(2500)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.data) && data.data.length > 0) {
-          return data.data.map((r, idx) => {
-            const min = Math.floor((r.duration || 0) / 60);
-            const sec = String((r.duration || 0) % 60).padStart(2, '0');
-            const duration = r.duration ? `${min}:${sec}` : '';
-            return {
-              id: String(r.id || idx),
-              title: r.title || clean,
-              artist: r.artist?.name || 'Music',
-              duration,
-              durationSeconds: r.duration || 30,
-              thumbnail: r.album?.cover_big || r.album?.cover_medium,
-              audioUrl: r.preview || null
             };
           });
         }
@@ -933,7 +936,17 @@ export class TelegramController extends EventEmitter {
         id: `cached_aud_${row.file_id.slice(-8)}_${idx}`,
         audio_file_id: row.file_id,
         caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n✨ <i>Full Audio via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
-        parse_mode: 'HTML'
+        parse_mode: 'HTML',
+        reply_markup: {
+          inline_keyboard: [
+            [
+              {
+                text: '📜 Lyrics & Info ♡',
+                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`
+              }
+            ]
+          ]
+        }
       }));
 
       let searchItems = inlineSearchCache.get(cleanSongQuery.toLowerCase());
@@ -951,17 +964,51 @@ export class TelegramController extends EventEmitter {
       const freshResults = (searchItems || []).slice(0, 8).map((item, index) => {
         const title = item.title || cleanSongQuery;
         const artist = item.artist || 'Music';
-        const duration = item.duration ? `⏱ ${item.duration}` : '🎵 Full Audio MP3';
+        const duration = item.duration ? `⏱ ${item.duration}` : '🎵 Audio Track';
+
+        if (item.audioUrl) {
+          return {
+            type: 'audio',
+            id: `fresh_aud_${item.id || index}_${Date.now()}`,
+            audio_url: item.audioUrl,
+            title,
+            performer: artist,
+            ...(item.durationSeconds ? { audio_duration: item.durationSeconds } : {}),
+            caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n✨ <i>Via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '📥 Full MP3 & Lyrics ♡',
+                    url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`
+                  }
+                ]
+              ]
+            }
+          };
+        }
 
         return {
           type: 'article',
           id: `song_${item.id || index}_${Date.now()}`,
           title: `🎵 ${title}`,
-          description: `🎧 ${artist} • ${duration} ♡ (Tap to download full audio)`,
+          description: `🎧 ${artist} • ${duration} ♡`,
           thumb_url: item.thumbnail || undefined,
           thumbnail_url: item.thumbnail || undefined,
           input_message_content: {
-            message_text: `/play@${this.botUsername || 'Lancy_easy_bot'} ${title}`
+            message_text: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>💡 <i>To stream or download the full MP3, send <code>/play ${escapeHtml(title)}</code> in this chat! ♡</i></blockquote>`,
+            parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '📥 Download Full MP3 ♡',
+                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`
+                }
+              ]
+            ]
           }
         };
       });
@@ -993,6 +1040,16 @@ export class TelegramController extends EventEmitter {
           input_message_content: {
             message_text: `<blockquote>🎵 <b>Music Search</b>\nQuery: <code>${escapeHtml(cleanSongQuery)}</code>\n\nTip: Send <code>/play ${escapeHtml(cleanSongQuery)}</code> in this chat to stream! ♡</blockquote>`,
             parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '📥 Download Full MP3 ♡',
+                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(cleanSongQuery.replace(/\s+/g, '_')).slice(0, 32)}`
+                }
+              ]
+            ]
           }
         });
       }
@@ -1255,6 +1312,29 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/start') {
+        const startPayload = rest[0]?.trim();
+        if (startPayload && /^play_/i.test(startPayload)) {
+          const rawQuery = startPayload.replace(/^play_/i, '').replace(/_/g, ' ').trim();
+          let cleanQuery = rawQuery;
+          try { cleanQuery = decodeURIComponent(rawQuery); } catch {}
+          if (cleanQuery) {
+            await this.sm.reset(tgId, { reason: 'start_play' });
+            const downloaderScreen = this.screens.get('downloader');
+            await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), cleanQuery);
+            return;
+          }
+        }
+        if (startPayload && /^dl_/i.test(startPayload)) {
+          const rawQuery = startPayload.replace(/^dl_/i, '').replace(/_/g, ' ').trim();
+          let cleanQuery = rawQuery;
+          try { cleanQuery = decodeURIComponent(rawQuery); } catch {}
+          if (cleanQuery) {
+            await this.sm.reset(tgId, { reason: 'start_dl' });
+            const downloaderScreen = this.screens.get('downloader');
+            await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), cleanQuery);
+            return;
+          }
+        }
         await this.sm.reset(tgId, { reason: 'start' });
         const dashboard = this.screens.get('dashboard');
         const sent = await dashboard?.open(this.#ctx(tgId, { message }, { forceNew: true }), { forceNew: true });

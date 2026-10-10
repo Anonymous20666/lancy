@@ -96,8 +96,57 @@ test('TelegramController: live inline search returns instant tracks with bot tag
 
   const firstResult = inlineAnswer.results[0];
   assert.ok(firstResult.title, 'first result must have title');
-  assert.ok(firstResult.type === 'audio' ? Boolean(firstResult.audio_url) : Boolean(firstResult.input_message_content?.message_text), 'first result must deliver real audio stream or input command');
-  assert.ok(firstResult.thumbnail_url || firstResult.thumb_url || firstResult.audio_url, 'should have artwork thumbnail or audio stream');
+  assert.equal(firstResult.type, 'audio', 'first result must deliver native audio type');
+  assert.ok(firstResult.audio_url || firstResult.audio_file_id, 'must deliver real audio stream or audio_file_id');
+  assert.ok(firstResult.reply_markup?.inline_keyboard?.[0]?.[0]?.url, 'must include deep-link download button');
+
+  db.close();
+});
+
+test('TelegramController: /start with play_ deep link executes immediate download in DM', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [1001];
+  const sm = new StateMachine();
+
+  let executedQuery = null;
+  const screens = new Map();
+  screens.set('downloader', {
+    executeDownload: async (ctx, query) => {
+      executedQuery = query;
+      return { message_id: 888 };
+    }
+  });
+
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async () => ({ ok: true }),
+    sendMessage: async () => ({ message_id: 101 })
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens,
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Deep-link from inline audio button:
+  await controller.handleUpdate({
+    update_id: 10,
+    message: {
+      message_id: 50,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: 1001, type: 'private' },
+      text: '/start play_No_More_Parties'
+    }
+  });
+
+  assert.equal(executedQuery, 'No More Parties', 'executeDownload should be triggered with parsed song name');
 
   db.close();
 });
