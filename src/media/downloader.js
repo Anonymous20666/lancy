@@ -1074,34 +1074,82 @@ export class MediaDownloader {
         } catch {}
       }
 
-      let searchTarget = /\b(song|music|audio|track|remix)\b/i.test(clean)
-        ? `ytsearch1:${clean}`
-        : `ytsearch1:${clean} song audio`;
-
-      if (trackTitle !== clean && trackAuthor !== 'Spotify / YouTube') {
-        searchTarget = `ytsearch1:${trackAuthor} ${trackTitle} song audio`;
-      }
-
       let trackThumbnailUrl = null;
       let trackDuration = null;
       let trackYear = null;
       let videoId = null;
 
+      // 1. YouTube Primary Search (ytsearch5 ranked by query relevance)
+      const queryTerms = clean.toLowerCase().split(/\s+/).filter(Boolean);
       try {
         const { stdout } = await execFileAsync('yt-dlp', [
           '--no-warnings',
           '--js-runtimes', 'node:/usr/bin/node',
           '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(upload_date)s ||| %(thumbnail)s',
-          searchTarget
+          `ytsearch5:${clean}`
         ], { timeout: 15000 });
-        const parts = stdout.trim().split(' ||| ');
-        if (parts[0]) videoId = parts[0].trim();
-        if (parts[1]) trackTitle = parts[1].trim();
-        if (parts[2]) trackAuthor = parts[2].trim();
-        if (parts[3]) trackDuration = parts[3].trim();
-        if (parts[4]) trackYear = parts[4].slice(0, 4);
-        if (parts[5]) trackThumbnailUrl = parts[5].trim();
-      } catch {}
+
+        const lines = stdout.trim().split('\n').filter(Boolean);
+        const candidates = [];
+
+        for (const line of lines) {
+          const parts = line.split(' ||| ');
+          if (!parts[0]) continue;
+          const id = parts[0].trim();
+          const title = (parts[1] || '').trim();
+          const channel = (parts[2] || '').trim();
+          const duration = (parts[3] || '').trim();
+          const year = (parts[4] || '').slice(0, 4);
+          const thumb = (parts[5] || '').trim();
+
+          const combined = `${title} ${channel}`.toLowerCase();
+          const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
+          candidates.push({ id, title, channel, duration, year, thumb, score });
+        }
+
+        if (candidates.length > 0) {
+          candidates.sort((a, b) => b.score - a.score);
+          const best = candidates[0];
+          videoId = best.id;
+          trackTitle = best.title;
+          trackAuthor = best.channel;
+          trackDuration = best.duration;
+          trackYear = best.year;
+          trackThumbnailUrl = best.thumb;
+        }
+      } catch (ytErr) {
+        this.log.warn({ err: ytErr?.message, clean }, 'YouTube primary search failed, trying Spotify fallback');
+      }
+
+      // 2. Spotify / Deezer Fallback (if YouTube search yielded no match)
+      if (!videoId) {
+        onProgress?.(`Trying Spotify metadata for "${clean}"… ♡`);
+        try {
+          const spRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=3`, {
+            signal: AbortSignal.timeout(5000)
+          });
+          if (spRes.ok) {
+            const spData = await spRes.json();
+            if (Array.isArray(spData.data) && spData.data.length > 0) {
+              const spCandidates = spData.data.map((item) => {
+                const combined = `${item.title} ${item.artist?.name || ''}`.toLowerCase();
+                const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
+                return { item, score };
+              });
+              spCandidates.sort((a, b) => b.score - a.score);
+              const bestSp = spCandidates[0].item;
+              trackTitle = bestSp.title || trackTitle;
+              trackAuthor = bestSp.artist?.name || trackAuthor;
+              if (bestSp.duration) {
+                const min = Math.floor(bestSp.duration / 60);
+                const sec = String(bestSp.duration % 60).padStart(2, '0');
+                trackDuration = `${min}:${sec}`;
+              }
+              trackThumbnailUrl = bestSp.album?.cover_big || bestSp.album?.cover_medium || trackThumbnailUrl;
+            }
+          }
+        } catch {}
+      }
 
       // Clean track title & author from search if needed
       const initialClean = cleanSongMetadata(trackTitle, trackAuthor);
@@ -1137,7 +1185,7 @@ export class MediaDownloader {
         }
       }
 
-      // Layer 2: Direct searchTarget with Android client
+      // Layer 2: Direct clean query search with Android client
       if (!downloaded) {
         try {
           await execFileAsync('yt-dlp', [
@@ -1152,7 +1200,7 @@ export class MediaDownloader {
             '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
-            searchTarget
+            `ytsearch1:${clean}`
           ], { timeout: 60000 });
           downloaded = true;
         } catch (ytSearchErr) {

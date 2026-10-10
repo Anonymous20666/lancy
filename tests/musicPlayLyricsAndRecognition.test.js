@@ -730,5 +730,16 @@ test('Audio Recognizer: extractMediaForMusicRecognition and catalog verification
   }
 });
 
+test('MediaDownloader: music search ranks exact YouTube artist match for "one life lorda"', async () => {
+  const { MediaDownloader } = await import('../src/media/downloader.js');
+  const downloader = new MediaDownloader();
+
+  const result = await downloader.download('one life lorda');
+  assert.ok(result, 'Result should be returned');
+  assert.ok(result.audioTrack?.buffer, 'Audio track buffer should be present');
+  assert.match(result.title.toLowerCase(), /one life/i, 'Title should match One Life');
+  assert.match(result.artist.toLowerCase(), /lorda/i, 'Artist should match Lorda');
+});
+
 
 

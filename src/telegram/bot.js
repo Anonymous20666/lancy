@@ -926,9 +926,16 @@ export class TelegramController extends EventEmitter {
       // Check SQLite cached audio tracks for instant full audio playback
       let cachedAudioRows = [];
       try {
-        cachedAudioRows = this.db.prepare(
-          'SELECT file_id, title, artist, duration FROM cached_audio_tracks WHERE query LIKE ? OR title LIKE ? LIMIT 4'
-        ).all(`%${cleanSongQuery}%`, `%${cleanSongQuery}%`);
+        const queryTerms = cleanSongQuery.toLowerCase().split(/\s+/).filter(Boolean);
+        const rows = this.db.prepare(
+          'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 50'
+        ).all();
+        cachedAudioRows = (rows || []).filter((row) => {
+          const rowQuery = (row.query || '').toLowerCase().trim();
+          if (rowQuery === cleanSongQuery.toLowerCase().trim()) return true;
+          const rowText = `${rowQuery} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
+          return queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
+        }).slice(0, 4);
       } catch {}
 
       const cachedResults = (cachedAudioRows || []).map((row, idx) => ({
