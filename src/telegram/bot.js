@@ -1,5 +1,7 @@
 import { extname } from 'node:path';
 import { EventEmitter } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { logger } from '../core/logger.js';
 import { LancyError, friendlyTelegramError } from '../core/errors.js';
 import { decodeCallback, NOOP_CALLBACK, RichMessageBuilder, rt, richButton, encodeCallback } from './rich.js';
@@ -8,8 +10,11 @@ import { States } from '../core/stateMachine.js';
 import { sleep } from '../utils/time.js';
 import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
-import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics } from '../media/lyrics.js';
+import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
 import { t } from '../core/i18n.js';
+
+const execFileAsync = promisify(execFile);
+const inlineSearchCache = new Map();
 
 /**
  * TelegramController — the control center.
@@ -150,7 +155,7 @@ export class TelegramController extends EventEmitter {
     this.log.info({ bot: `@${me.username}` }, 'telegram connected');
 
     // Register slash commands so typing / displays suggestions
-    void this.#registerCommands();
+    await this.#registerCommands();
 
     this.abort = new AbortController();
     this.running = true;
@@ -160,23 +165,47 @@ export class TelegramController extends EventEmitter {
   }
 
   async #registerCommands() {
+    const isClone = Boolean(this.botContext?.isClone);
+    const botName = this.botContext?.botName || 'Lancy';
+
+    const groupCommands = [
+      { command: 'play', description: '🎵 Search, stream & download music / MP3' },
+      { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
+      { command: 'search', description: '🔍 Search Pinterest (HD photos & aesthetic art)' },
+      { command: 'music', description: '🎧 Fast music & Spotify track search' },
+      { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
+      { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
+      { command: 'start', description: `✦ Open ${botName} group companion menu` },
+      { command: 'help', description: '୨୧ Bot commands & feature guide' },
+      { command: 'cancel', description: '✕ Cancel current active operation' }
+    ];
+
+    const privateCommands = [
+      { command: 'start', description: `✦ Open ${botName} aesthetic dashboard` },
+      { command: 'play', description: '🎵 Search, stream & download music / MP3' },
+      { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
+      { command: 'search', description: '🔍 Search Pinterest (HD photos & videos)' },
+      { command: 'music', description: '🎧 Fast music & Spotify track search' },
+      { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
+      { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
+      { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
+      ...(isClone ? [] : [
+        { command: 'whatsapp', description: '📱 WhatsApp publishing & channels' },
+        { command: 'ai', description: '🪄 Aesthetic AI assistant' },
+        { command: 'clone', description: '🤖 Bring your own bot / clone in 60s' }
+      ]),
+      { command: 'rmbot', description: '🗑 Remove or delete a cloned bot' },
+      { command: 'settings', description: '⚙ Studio configuration' },
+      { command: 'help', description: '୨୧ Complete studio guide' },
+      { command: 'admins', description: '👥 Team admins & workspaces' },
+      { command: 'cancel', description: '✕ Cancel current active operation' }
+    ];
+
     try {
-      await this.api.call('setMyCommands', {
-        commands: [
-          { command: 'start', description: '✦ Open aesthetic dashboard' },
-          { command: 'search', description: '🔍 Search Pinterest (HD photos & videos)' },
-          { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
-          { command: 'whatsapp', description: '📱 WhatsApp publishing & channels' },
-          { command: 'download', description: '📥 Universal social media URL downloader' },
-          { command: 'music', description: '🎧 Search & download music / Spotify MP3' },
-          { command: 'settings', description: '⚙ Studio configuration' },
-          { command: 'ai', description: '🪄 Aesthetic AI assistant' },
-          { command: 'help', description: '୨୧ Complete studio guide' },
-          { command: 'admins', description: '👥 Team admins & workspaces' },
-          { command: 'cancel', description: '✕ Cancel current active operation' }
-        ],
-        scope: { type: 'default' }
-      });
+      await this.api.call('setMyCommands', { commands: privateCommands, scope: { type: 'default' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: privateCommands, scope: { type: 'all_private_chats' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: groupCommands, scope: { type: 'all_group_chats' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: groupCommands, scope: { type: 'all_chat_administrators' } }).catch(() => {});
     } catch (err) {
       this.log.debug({ err: err?.message }, 'could not setMyCommands');
     }
@@ -216,6 +245,7 @@ export class TelegramController extends EventEmitter {
       text: update.message?.text,
       data: update.callback_query?.data
     }, 'received update');
+    if (update.inline_query) return this.#handleInlineQuery(update.inline_query);
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
@@ -257,6 +287,186 @@ export class TelegramController extends EventEmitter {
     } catch {}
 
     return this.db.get('SELECT * FROM users WHERE tg_id = ?', user.id);
+  }
+
+  async #fetchInlineMusicTracks(query) {
+    const clean = String(query || '').trim();
+    if (!clean) return [];
+    try {
+      const searchTarget = `ytsearch5:${clean} song audio`;
+      const { stdout } = await execFileAsync('yt-dlp', [
+        '--no-warnings',
+        '--js-runtimes', 'node:/usr/bin/node',
+        '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(thumbnail)s',
+        searchTarget
+      ], { timeout: 6000 });
+
+      const lines = stdout.trim().split('\n').filter(Boolean);
+      const items = [];
+      for (const line of lines) {
+        const parts = line.split(' ||| ');
+        if (!parts[0]) continue;
+        const id = parts[0].trim();
+        const rawTitle = (parts[1] || clean).trim();
+        const rawChannel = (parts[2] || 'Music').trim();
+        const duration = (parts[3] || '').trim();
+        const thumbnail = (parts[4] || '').trim();
+
+        const cleaned = cleanSongMetadata(rawTitle, rawChannel);
+        items.push({
+          id,
+          title: cleaned.title || rawTitle,
+          artist: cleaned.artist || rawChannel,
+          duration,
+          thumbnail
+        });
+      }
+      return items;
+    } catch {
+      return [];
+    }
+  }
+
+  async #handleInlineQuery(inlineQuery) {
+    if (!inlineQuery?.id) return;
+    const qId = inlineQuery.id;
+    const rawText = String(inlineQuery.query || '').trim();
+    const botName = this.botContext?.botName || 'Lancy';
+
+    try {
+      // 1. If query is empty: provide intuitive entrypoint cards
+      if (!rawText) {
+        const defaultResults = [
+          {
+            type: 'article',
+            id: 'hint_play',
+            title: `🎵 ${botName} Live Music Search`,
+            description: 'Type any song name, artist, or lyrics to search and stream ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🎵 <b>${botName} Music</b>\nType <code>/play &lt;song&gt;</code> or type <code>@${this.botUsername || 'bot'} &lt;song&gt;</code> to stream any song instantly! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            }
+          },
+          {
+            type: 'article',
+            id: 'hint_download',
+            title: `📥 ${botName} Universal Downloader`,
+            description: 'Paste any TikTok, Instagram Reel, YouTube, or Pinterest link ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            input_message_content: {
+              message_text: `<blockquote>📥 <b>Universal Downloader</b>\nPaste any video, audio, or photo link to download in HD! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            }
+          },
+          {
+            type: 'article',
+            id: 'hint_pinterest',
+            title: `🔍 ${botName} Pinterest Search`,
+            description: 'Type "pint <topic>" or "search <topic>" to search HD aesthetic photos ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🔍 <b>Pinterest Search</b>\nType <code>@${this.botUsername || 'bot'} pint aesthetic wallpaper</code> to find aesthetic pins! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            }
+          }
+        ];
+
+        await this.api.call('answerInlineQuery', {
+          inline_query_id: qId,
+          results: defaultResults,
+          cache_time: 60,
+          is_personal: true
+        });
+        return;
+      }
+
+      // 2. Check if Pinterest search:
+      if (/^(pint|pinterest|photo|pic|wallpaper)\s+/i.test(rawText)) {
+        const queryTopic = rawText.replace(/^(pint|pinterest|photo|pic|wallpaper)\s+/i, '').trim();
+        const pintResults = [
+          {
+            type: 'article',
+            id: 'pint_' + Math.random().toString(36).slice(2, 8),
+            title: `🔍 Search Pinterest for "${queryTopic}"`,
+            description: `Fetch HD aesthetic pictures and videos for "${queryTopic}" ♡`,
+            input_message_content: {
+              message_text: `/search ${queryTopic}`,
+              parse_mode: 'HTML'
+            }
+          }
+        ];
+        await this.api.call('answerInlineQuery', {
+          inline_query_id: qId,
+          results: pintResults,
+          cache_time: 30,
+          is_personal: false
+        });
+        return;
+      }
+
+      // 3. Music Search (Live):
+      const cleanSongQuery = rawText.replace(/^(play|music|song|listen|stream)\s+/i, '').trim() || rawText;
+
+      let searchItems = inlineSearchCache.get(cleanSongQuery.toLowerCase());
+      if (!searchItems) {
+        searchItems = await this.#fetchInlineMusicTracks(cleanSongQuery);
+        if (searchItems?.length) {
+          inlineSearchCache.set(cleanSongQuery.toLowerCase(), searchItems);
+          if (inlineSearchCache.size > 200) {
+            const firstKey = inlineSearchCache.keys().next().value;
+            inlineSearchCache.delete(firstKey);
+          }
+        }
+      }
+
+      const results = (searchItems || []).slice(0, 8).map((item, index) => {
+        const title = item.title || cleanSongQuery;
+        const artist = item.artist || 'Music';
+        const duration = item.duration ? `⏱ ${item.duration}` : '🎵 High-Speed MP3';
+
+        return {
+          type: 'article',
+          id: `song_${item.id || index}_${Date.now()}`,
+          title: `🎵 ${title}`,
+          description: `🎧 ${artist} • ${duration} ♡`,
+          thumb_url: item.thumbnail || undefined,
+          input_message_content: {
+            message_text: `/play ${title} ${artist}`.trim(),
+            parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: `🎵 Download / Stream with ${botName}`, callback_data: `l1:downloader:play` }
+              ]
+            ]
+          }
+        };
+      });
+
+      if (results.length === 0) {
+        results.push({
+          type: 'article',
+          id: 'no_results_' + Date.now(),
+          title: `🎵 Play "${cleanSongQuery}"`,
+          description: `Download high-speed MP3 audio with cover art & lyrics ♡`,
+          input_message_content: {
+            message_text: `/play ${cleanSongQuery}`,
+            parse_mode: 'HTML'
+          }
+        });
+      }
+
+      await this.api.call('answerInlineQuery', {
+        inline_query_id: qId,
+        results,
+        cache_time: 120,
+        is_personal: false
+      });
+    } catch (err) {
+      this.log.debug({ err: err?.message, qId }, 'answerInlineQuery failed');
+    }
   }
 
   async #handleCallback(query) {
@@ -717,7 +927,37 @@ export class TelegramController extends EventEmitter {
       const handled = await this.sm.handleMessage(tgId, { ...message, chatId }, ctx);
       if (!handled) {
         if (text) {
-          // Direct media / social link detection in DM:
+          // Check if message is a reply to the bot's prompt cards in group or private chat:
+          const replyMsgFrom = message.reply_to_message?.from;
+          const isReplyToBot = Boolean(
+            message.reply_to_message && (
+              !replyMsgFrom ||
+              replyMsgFrom.is_bot ||
+              (this.api.me?.id && replyMsgFrom.id === this.api.me.id) ||
+              (this.botUsername && replyMsgFrom.username?.toLowerCase() === this.botUsername.toLowerCase())
+            )
+          );
+          if (isReplyToBot) {
+            const promptText = String(message.reply_to_message.text || message.reply_to_message.caption || '');
+            if (/PLAY & DOWNLOAD MUSIC|how to play & download|Search Music Live|song title & artist/i.test(promptText)) {
+              const downloaderScreen = this.screens.get('downloader');
+              if (downloaderScreen?.executeDownload) {
+                const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+                await downloaderScreen.executeDownload(ctx, text);
+                return;
+              }
+            }
+            if (/URL DOWNLOADER|valid media link/i.test(promptText)) {
+              const downloaderScreen = this.screens.get('downloader');
+              if (downloaderScreen?.executeDownload) {
+                const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+                await downloaderScreen.executeDownload(ctx, text);
+                return;
+              }
+            }
+          }
+
+          // Direct media / social link detection in DM or group:
           const urlMatch = text.match(/https?:\/\/[^\s]+/i);
           if (urlMatch) {
             const url = urlMatch[0];

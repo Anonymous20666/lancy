@@ -1,3 +1,4 @@
+import sharp from 'sharp';
 import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
 import { banner, kvTable, statusDot, ACCENT, SPARK } from '../ui.js';
 import { formatDateTime, timeAgo } from '../../utils/text.js';
@@ -6,6 +7,30 @@ import { getLanguageName } from '../../core/i18n.js';
 // In-memory cache for user profile photos: tgId -> { buffer, expiresAt }
 const pfpCache = new Map();
 const PFP_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getFallbackBanner(botName = 'Lancy Bot', userName = '') {
+  try {
+    const cleanName = String(botName || 'Lancy Bot').replace(/[<>&"']/g, '').trim();
+    const cleanUser = String(userName || '').replace(/[<>&"']/g, '').trim();
+    const svg = `
+      <svg width="800" height="400" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#ffb6c1"/>
+            <stop offset="50%" stop-color="#dda0dd"/>
+            <stop offset="100%" stop-color="#b0e0e6"/>
+          </linearGradient>
+        </defs>
+        <rect width="800" height="400" rx="30" fill="url(#g)"/>
+        <text x="50%" y="42%" text-anchor="middle" font-family="sans-serif" font-size="52" font-weight="bold" fill="#ffffff" letter-spacing="3">𓆩♡𓆪 ${cleanName.toUpperCase()} 𓆩♡𓆪</text>
+        <text x="50%" y="62%" text-anchor="middle" font-family="sans-serif" font-size="28" fill="#ffffff" opacity="0.95">${cleanUser ? `welcome ${cleanUser} ♡` : 'group companion & music stream ♡'}</text>
+      </svg>
+    `;
+    return await sharp(Buffer.from(svg)).jpeg({ quality: 90 }).toBuffer();
+  } catch {
+    return null;
+  }
+}
 
 async function getUserPfp(ctx) {
   const userId = Number(ctx.tgId);
@@ -62,7 +87,7 @@ export function createDashboardScreen({ app }) {
     const isGroup = Boolean(ctx.isGroup);
 
     const b = new RichMessageBuilder();
-    if (hasPfp && !isGroup) {
+    if (hasPfp) {
       b.photo('attach://pfp');
     }
     b.paragraph(rt.concat(
@@ -189,7 +214,12 @@ export function createDashboardScreen({ app }) {
     },
     async open(ctx, { forceNew = false } = {}) {
       const stats = await gatherStats(ctx);
-      const pfpBuffer = await getUserPfp(ctx);
+      let pfpBuffer = await getUserPfp(ctx);
+      if (!pfpBuffer) {
+        const botName = ctx.botName || 'Lancy Bot';
+        const firstName = ctx.user?.first_name ?? '';
+        pfpBuffer = await getFallbackBanner(botName, firstName);
+      }
       const hasPfp = !!pfpBuffer;
       const rich = render(ctx, stats, hasPfp);
       const files = pfpBuffer ? { pfp: { buffer: pfpBuffer, filename: 'pfp.jpg', contentType: 'image/jpeg' } } : null;

@@ -135,6 +135,8 @@ export const richButton = {
   }),
   url: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), url, style }),
   copy: (text, copyText, { style = 'primary' } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, style }),
+  switchInline: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query: query, style }),
+  switchInlineCurrent: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query_current_chat: query, style }),
   disabled: (text) => ({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' }, style: 'primary' })
 };
 
@@ -294,6 +296,7 @@ export function inlineKeyboard(rows) {
         out.style = btn.style ?? 'primary'; // danger | success | primary
         if (btn.disabled) out.disabled = btn.disabled;
         if (btn.switch_inline_query !== undefined) out.switch_inline_query = btn.switch_inline_query;
+        if (btn.switch_inline_query_current_chat !== undefined) out.switch_inline_query_current_chat = btn.switch_inline_query_current_chat;
         if (btn.web_app) out.web_app = btn.web_app;
         return out;
       })

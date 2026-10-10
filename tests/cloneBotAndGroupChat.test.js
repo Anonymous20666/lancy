@@ -655,3 +655,238 @@ test('Cloned Bot Downloader: executes download and progress updates via cloned b
   db.close();
 });
 
+test('TelegramController: registers group chat commands including /play for all_group_chats', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  const registeredCommandCalls = [];
+  const fakeApi = {
+    call: async (method, payload) => {
+      if (method === 'setMyCommands') {
+        registeredCommandCalls.push(payload);
+      }
+      return { ok: true };
+    },
+    getMe: async () => ({ id: 500, username: 'group_test_bot', first_name: 'GroupBot' }),
+    poll: async () => []
+  };
+
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext: { botId: 0, botName: 'Lancy', isClone: false }
+  });
+
+  await bot.start();
+  await bot.stop();
+
+  assert.ok(registeredCommandCalls.length >= 3, 'Registered commands across multiple scopes');
+  const groupScope = registeredCommandCalls.find((c) => c.scope?.type === 'all_group_chats');
+  assert.ok(groupScope, 'all_group_chats scope registered');
+  assert.ok(groupScope.commands.some((cmd) => cmd.command === 'play'), '/play included in group commands');
+  assert.ok(groupScope.commands.some((cmd) => cmd.command === 'download'), '/download included in group commands');
+
+  db.close();
+});
+
+test('Group Chat Dashboard: renders user pfp or aesthetic fallback banner so hero image is never empty', async () => {
+  const { createDashboardScreen } = await import('../src/telegram/screens/dashboard.js');
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+
+  let deliveredRich = null;
+  let deliveredFiles = null;
+  const fakeApi = {
+    getUserProfilePhotos: async () => ({ total_count: 0, photos: [] }),
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      deliveredRich = rich;
+      deliveredFiles = files;
+      return { message_id: 1001 };
+    },
+    editMessageRich: async () => ({ message_id: 1002 })
+  };
+
+  const dashboard = createDashboardScreen({ app: { db, settings } });
+  const groupCtx = {
+    tgId: '123456',
+    chatId: -100555666,
+    isGroup: true,
+    chatType: 'supergroup',
+    botName: 'Lancy',
+    user: { id: 123456, first_name: 'Alex' },
+    settings,
+    db,
+    api: fakeApi,
+    sendRichMessage: async (rich, extra, files) => {
+      return fakeApi.sendRichMessage(groupCtx.chatId, rich, extra, files);
+    },
+    editScreen: async (rich, extra, files) => {
+      deliveredRich = rich;
+      deliveredFiles = files;
+      return { message_id: 1003 };
+    }
+  };
+
+  await dashboard.open(groupCtx, { forceNew: true });
+  assert.ok(deliveredRich, 'Group menu rich card delivered');
+  const jsonStr = JSON.stringify(deliveredRich);
+  assert.match(jsonStr, /attach:\/\/pfp/, 'Hero image is attached in GC');
+  assert.ok(deliveredFiles?.pfp?.buffer, 'pfp buffer is present (fallback banner or user pfp)');
+
+  db.close();
+});
+
+test('Inline Query: handles @bot query with live music search and returns articles', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswers = null;
+  const fakeApi = {
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswers = payload;
+      }
+      return { ok: true };
+    },
+    getMe: async () => ({ id: 600, username: 'pappy_inline_bot', first_name: 'PappyBot' })
+  };
+
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext: { botId: 5, botName: 'PappyBot', isClone: true, ownerId: 12345 }
+  });
+
+  // 1. Empty inline query: returns interactive suggestion articles
+  await bot.handleUpdate({
+    update_id: 401,
+    inline_query: {
+      id: 'iq_1',
+      from: { id: 12345, first_name: 'User1' },
+      query: '',
+      offset: ''
+    }
+  });
+  assert.ok(inlineAnswers, 'answerInlineQuery called for empty query');
+  assert.equal(inlineAnswers.inline_query_id, 'iq_1');
+  assert.ok(inlineAnswers.results.length >= 3, '3 suggestion articles returned');
+  assert.match(inlineAnswers.results[0].title, /Live Music Search/);
+
+  // 2. Music query: "ransom"
+  inlineAnswers = null;
+  await bot.handleUpdate({
+    update_id: 402,
+    inline_query: {
+      id: 'iq_2',
+      from: { id: 12345, first_name: 'User1' },
+      query: 'ransom',
+      offset: ''
+    }
+  });
+  assert.ok(inlineAnswers, 'answerInlineQuery called for music query');
+  assert.equal(inlineAnswers.inline_query_id, 'iq_2');
+  assert.ok(inlineAnswers.results.length >= 1, 'Search results returned');
+  const firstSong = inlineAnswers.results[0];
+  assert.match(firstSong.input_message_content.message_text, /\/play/i, 'Clicking result inputs /play command');
+
+  db.close();
+});
+
+test('Group Chat Multitask: concurrent /play requests by multiple users deliver separate cards', async () => {
+  const { createDownloaderScreen } = await import('../src/telegram/screens/downloader.js');
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.set('security.publicAccess', true);
+  const sm = new StateMachine();
+
+  const sentRichMessages = [];
+  const fakeApi = {
+    call: async () => ({ ok: true }),
+    sendRichMessage: async (chatId, rich) => {
+      const msgId = 2000 + sentRichMessages.length;
+      sentRichMessages.push({ msgId, chatId, rich });
+      return { message_id: msgId };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      sentRichMessages.push({ msgId, chatId, rich });
+      return { message_id: msgId };
+    },
+    sendMessage: async () => ({ message_id: 2999 }),
+    sendChatAction: async () => ({ ok: true }),
+    getMe: async () => ({ id: 700, username: 'multitask_bot' })
+  };
+
+  const fakeMediaDownloader = {
+    detectPlatform: () => 'spotify',
+    download: async (query) => ({
+      platform: 'spotify',
+      mediaItems: [],
+      audioTrack: {
+        buffer: Buffer.from(`audio_for_${query}`),
+        title: query,
+        performer: 'Artist'
+      },
+      title: query,
+      artist: 'Artist'
+    })
+  };
+
+  const app = {
+    db,
+    settings,
+    mediaDownloader: fakeMediaDownloader,
+    telegram: { api: fakeApi, controller: null }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  downloader.registerStateHandlers(sm);
+
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext: { botId: 0, botName: 'Lancy', isClone: false },
+    app
+  });
+  bot.screens.set('downloader', downloader);
+
+  // User 1 requests Song A and User 2 requests Song B concurrently in the same group chat
+  const groupChatId = -100888999;
+  await Promise.all([
+    bot.handleUpdate({
+      update_id: 501,
+      message: {
+        message_id: 101,
+        chat: { id: groupChatId, type: 'supergroup' },
+        from: { id: 111, first_name: 'Alice' },
+        text: '/play Song A'
+      }
+    }),
+    bot.handleUpdate({
+      update_id: 502,
+      message: {
+        message_id: 102,
+        chat: { id: groupChatId, type: 'supergroup' },
+        from: { id: 222, first_name: 'Bob' },
+        text: '/play Song B'
+      }
+    })
+  ]);
+
+  // Both users receive their respective delivered rich cards
+  assert.ok(sentRichMessages.length >= 2, 'Delivered cards for both concurrent users');
+  const deliveredA = sentRichMessages.some((m) => JSON.stringify(m.rich).includes('Alice') && JSON.stringify(m.rich).includes('Song A'));
+  const deliveredB = sentRichMessages.some((m) => JSON.stringify(m.rich).includes('Bob') && JSON.stringify(m.rich).includes('Song B'));
+  assert.ok(deliveredA, 'Song A card attributed to Alice');
+  assert.ok(deliveredB, 'Song B card attributed to Bob');
+
+  db.close();
+});
+

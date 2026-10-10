@@ -4,6 +4,28 @@ import { StateMachine } from '../core/stateMachine.js';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 
+import { createDashboardScreen } from './screens/dashboard.js';
+import { createPinterestScreen } from './screens/pinterest.js';
+import { createStickersScreen } from './screens/stickers.js';
+import { createWhatsAppScreen } from './screens/whatsapp.js';
+import { createAIScreen } from './screens/ai.js';
+import { createSettingsScreen } from './screens/settings.js';
+import { createHelpScreen } from './screens/help.js';
+import { createDownloaderScreen } from './screens/downloader.js';
+import { createCloneScreen } from './screens/clone.js';
+
+const SCREEN_FACTORIES = [
+  createDashboardScreen,
+  createPinterestScreen,
+  createStickersScreen,
+  createWhatsAppScreen,
+  createAIScreen,
+  createSettingsScreen,
+  createHelpScreen,
+  createDownloaderScreen,
+  createCloneScreen
+];
+
 /**
  * MultiBotManager — Manages concurrent cloned bots ("Bring Your Own Bot Token").
  * Runs each cloned bot with its own TelegramAPI and TelegramController instance,
@@ -123,23 +145,35 @@ export class MultiBotManager {
       isClone: true
     };
 
-    const controller = new TelegramController({
+    // Create a clone-scoped application proxy so all screens reference this clone's API and controller
+    let controller = null;
+    const cloneApp = Object.create(this.app);
+    cloneApp.telegram = {
+      api,
+      controller: null,
+      markMediaDeliveryMessage: (id) => controller?.markMediaDeliveryMessage?.(id),
+      isMediaDeliveryMessage: (msg) => controller?.isMediaDeliveryMessage?.(msg),
+      isMediaDeliveryMessageId: (id) => controller?.isMediaDeliveryMessageId?.(id)
+    };
+
+    const cloneScreens = new Map();
+    for (const factory of SCREEN_FACTORIES) {
+      const screen = factory({ app: cloneApp });
+      cloneScreens.set(screen.id, screen);
+      screen.registerStateHandlers?.(sm);
+    }
+
+    controller = new TelegramController({
       api,
       db: this.db,
       settings: this.settings,
       stateMachine: sm,
-      app: this.app,
-      screens: this.app.screens,
+      app: cloneApp,
+      screens: cloneScreens,
       botContext,
       log: this.log.child({ clone: `@${me.username}` })
     });
-
-    // Register all screen state handlers with this bot's state machine
-    if (this.app.screens) {
-      for (const screen of this.app.screens.values()) {
-        screen.registerStateHandlers?.(sm);
-      }
-    }
+    cloneApp.telegram.controller = controller;
 
     await controller.start();
     this.runningBots.set(botRecord.id, { controller, api, botRecord });

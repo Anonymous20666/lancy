@@ -163,30 +163,43 @@ export function createDownloaderScreen({ app }) {
     return b.toJSON();
   }
 
-  function renderMusicSearchPrompt() {
+  function renderMusicSearchPrompt(ctx = null) {
     const b = new RichMessageBuilder();
+    const botName = ctx?.bot?.botName || ctx?.botName || 'Lancy';
+    const isGroup = Boolean(ctx?.isGroup);
+
     b.paragraph(rt.bold(banner([
       '𓆩♡𓆪 PLAY & DOWNLOAD MUSIC 𓆩♡𓆪',
       'search, stream & recognize music ♡'
     ])));
     b.divider();
     b.heading('୨୧ how to play & download', 3);
-    b.paragraph(rt.text(
-      '• 🎵 Type song title & artist (e.g. Blinding Lights The Weeknd)\n' +
-      '• 🎧 Paste a Spotify / YouTube / SoundCloud link\n' +
-      '• 🎙️ Forward or send any audio, voice note, or video snippet!'
-    ));
+    if (isGroup) {
+      b.paragraph(rt.text(
+        '• 🎵 Type /play <song title> directly in this chat\n' +
+        '• 🔍 Tap "Search Music Live" below to search right from your chat box!\n' +
+        '• 🎧 Or reply to this card with any song title or Spotify link\n' +
+        '• 🎙️ Forward or send any audio, voice note, or video snippet!'
+      ));
+    } else {
+      b.paragraph(rt.text(
+        '• 🎵 Type song title & artist (e.g. Blinding Lights The Weeknd)\n' +
+        '• 🎧 Paste a Spotify / YouTube / SoundCloud link\n' +
+        '• 🎙️ Forward or send any audio, voice note, or video snippet!'
+      ));
+    }
     b.divider();
     b.quote(rt.text(
-      '✨ Lancy will download the high-speed MP3 track with cover art & lyrics ♡\n' +
+      `✨ ${botName} will download the high-speed MP3 track with cover art & lyrics ♡\n` +
       '🎙️ Forwarded audio will be automatically recognized and downloaded!'
     ));
     b.divider();
     b.buttons([
-      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
-      richButton.callback('« Downloader', encodeCallback(id, 'open'))
+      richButton.switchInlineCurrent('🔍 Search Music Live', ''),
+      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' })
     ]);
     b.buttons([
+      richButton.callback('« Downloader', encodeCallback(id, 'open')),
       richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
     ]);
     b.validate();
@@ -246,7 +259,9 @@ export function createDownloaderScreen({ app }) {
   }
 
   async function executeDownload(ctx, url) {
-    const screenMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
+    const isGroup = Boolean(ctx.isGroup);
+    const forceNew = Boolean(ctx.forceNew);
+    const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
     const tracker = new ProgressTracker({
       api: ctx.api || app.telegram.api,
       chatId: ctx.chatId,
@@ -532,8 +547,8 @@ export function createDownloaderScreen({ app }) {
           return ctx.editScreen(renderInputPrompt());
         case 'play':
           await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
-          if (fromMedia) return ctx.replyRich(renderMusicSearchPrompt());
-          return ctx.editScreen(renderMusicSearchPrompt());
+          if (fromMedia) return ctx.replyRich(renderMusicSearchPrompt(ctx));
+          return ctx.editScreen(renderMusicSearchPrompt(ctx));
         case 'recognize':
           await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
           if (fromMedia) return ctx.replyRich(renderAudioRecognitionPrompt());
@@ -957,6 +972,7 @@ export function createDownloaderScreen({ app }) {
             tgId: sctx.tgId || String(message.from?.id),
             message
           };
+          await sctx.reset?.({ reason: 'download_started' });
           await executeDownload(dlCtx, target);
           return true;
         },
