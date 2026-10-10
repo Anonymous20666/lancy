@@ -19,8 +19,102 @@ export const RICH_LIMITS = {
   maxCallbackDataBytes: 64
 };
 
-// ── RichText helpers ──────────────────────────────────────────────────────
-// RichText = string | RichText[] | typed entity. Plain strings stay strings.
+function decodeEntities(str) {
+  return str
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'");
+}
+
+/**
+ * Parse standard Telegram HTML formatting tags into structured RichText.
+ * Supports: <b>, <strong>, <i>, <em>, <u>, <ins>, <s>, <strike>, <del>,
+ * <code>, <tg-spoiler>, <spoiler>, <a href="...">, <tg-emoji emoji-id="...">
+ */
+export function parseHtmlToRichText(html) {
+  if (html == null) return '';
+  if (typeof html !== 'string') return html;
+  if (!html.includes('<')) return html;
+
+  function parseSegment(str) {
+    const results = [];
+    let remaining = str;
+
+    while (remaining.length > 0) {
+      const openMatch = remaining.match(/<([a-z0-9_-]+)([^>]*)>/i);
+      if (!openMatch) {
+        if (remaining.length > 0) results.push(decodeEntities(remaining));
+        break;
+      }
+
+      const matchIndex = openMatch.index;
+      if (matchIndex > 0) {
+        results.push(decodeEntities(remaining.slice(0, matchIndex)));
+      }
+
+      const tagName = openMatch[1].toLowerCase();
+      const rawAttrs = openMatch[2];
+      const rest = remaining.slice(matchIndex + openMatch[0].length);
+
+      if (openMatch[0].endsWith('/>')) {
+        remaining = rest;
+        continue;
+      }
+
+      const closeTag = `</${tagName}>`;
+      const closeIdx = rest.toLowerCase().indexOf(closeTag);
+
+      if (closeIdx === -1) {
+        results.push(decodeEntities(openMatch[0]));
+        remaining = rest;
+        continue;
+      }
+
+      const innerContent = rest.slice(0, closeIdx);
+      const parsedInner = parseSegment(innerContent);
+      const innerText = parsedInner.length === 1 ? parsedInner[0] : parsedInner;
+
+      if (tagName === 'b' || tagName === 'strong') {
+        results.push({ type: 'bold', text: innerText });
+      } else if (tagName === 'i' || tagName === 'em') {
+        results.push({ type: 'italic', text: innerText });
+      } else if (tagName === 'u' || tagName === 'ins') {
+        results.push({ type: 'underline', text: innerText });
+      } else if (tagName === 's' || tagName === 'strike' || tagName === 'del') {
+        results.push({ type: 'strikethrough', text: innerText });
+      } else if (tagName === 'code') {
+        results.push({ type: 'code', text: typeof innerText === 'string' ? innerText : richTextToString(innerText) });
+      } else if (tagName === 'tg-spoiler' || tagName === 'spoiler') {
+        results.push({ type: 'spoiler', text: innerText });
+      } else if (tagName === 'a') {
+        const hrefMatch = rawAttrs.match(/href=["']([^"']+)["']/i);
+        const url = hrefMatch ? hrefMatch[1] : '';
+        results.push({ type: 'url', text: innerText, url });
+      } else if (tagName === 'tg-emoji') {
+        const idMatch = rawAttrs.match(/emoji-id=["']([^"']+)["']/i);
+        const emojiId = idMatch ? idMatch[1] : '';
+        results.push({
+          type: 'custom_emoji',
+          alternative_text: typeof innerText === 'string' ? innerText : '♡',
+          custom_emoji_id: emojiId
+        });
+      } else {
+        results.push(innerText);
+      }
+
+      remaining = rest.slice(closeIdx + closeTag.length);
+    }
+
+    return results.flat(Infinity).filter((r) => r !== '' && r != null);
+  }
+
+  const parsed = parseSegment(html);
+  if (parsed.length === 0) return '';
+  if (parsed.length === 1) return parsed[0];
+  return parsed;
+}
 
 export const rt = {
   text: (s) => String(s ?? ''),
@@ -35,7 +129,8 @@ export const rt = {
   pre: (text, language) => ({ type: 'pre', text: rt.text(text), ...(language ? { language } : {}) }),
   url: (text, url) => ({ type: 'url', text: rt.text(text), url }),
   mention: (text, username) => ({ type: 'mention', text: rt.text(text), username }),
-  customEmoji: (alternativeText, customEmojiId) => ({ type: 'custom_emoji', alternative_text: alternativeText, custom_emoji_id: String(customEmojiId) })
+  customEmoji: (alternativeText, customEmojiId) => ({ type: 'custom_emoji', alternative_text: alternativeText, custom_emoji_id: String(customEmojiId) }),
+  html: (s) => parseHtmlToRichText(s)
 };
 
 import { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText } from './customEmoji.js';
@@ -62,6 +157,7 @@ export function richTextToString(text) {
 export const block = {
   paragraph: (text) => ({ type: 'paragraph', text }),
   heading: (text, size = 1) => ({ type: 'heading', text, size: clampSize(size) }),
+  header: (text, size = 1) => ({ type: 'heading', text, size: clampSize(size) }),
   pre: (text, language) => ({ type: 'pre', text, ...(language ? { language } : {}) }),
   footer: (text) => ({ type: 'footer', text }),
   divider: () => ({ type: 'divider' }),
@@ -143,7 +239,7 @@ export const richButton = {
 function isRichMessageBlock(item) {
   if (!item || typeof item !== 'object') return false;
   const blockTypes = [
-    'paragraph', 'heading', 'pre', 'footer', 'divider',
+    'paragraph', 'heading', 'header', 'pre', 'footer', 'divider',
     'buttons', 'table', 'list', 'blockquote', 'expandable_blockquote',
     'pullquote', 'details', 'photo', 'video', 'audio',
     'animation', 'document', 'collage', 'slideshow'
@@ -166,6 +262,7 @@ export class RichMessageBuilder {
   }
 
   heading(text, size = 1) { this.blocks.push(block.heading(text, size)); return this; }
+  header(text, size = 1) { this.blocks.push(block.heading(text, size)); return this; }
   paragraph(text) { this.blocks.push(block.paragraph(text)); return this; }
   text(text) { return this.paragraph(text); }
   pre(text, language) { this.blocks.push(block.pre(text, language)); return this; }
@@ -219,6 +316,74 @@ export class RichMessageBuilder {
     return this;
   }
 
+  /**
+   * Header banner using native Bot API 10.3 heading + italic subtitle.
+   */
+  bannerHeader(lines, { size = 1 } = {}) {
+    const list = Array.isArray(lines) ? lines : [lines];
+    const title = list[0] || 'LANCY BOT';
+    const sub = list.slice(1).join(' • ');
+    this.heading(title, size);
+    if (sub) {
+      this.paragraph(rt.italic(`₊˚⊹♡  ${sub}  ˙ᵕ˙`));
+    }
+    this.divider();
+    return this;
+  }
+
+  /**
+   * Append blocks from structured HTML markup.
+   * Supports: <header>, <h1>, <h2>, <h3>, <p>, <blockquote>, <pre>, <hr>, <divider>
+   */
+  html(htmlContent) {
+    if (typeof htmlContent !== 'string') return this;
+    const blockRegex = /<(header|h1|h2|h3|p|blockquote|pre|hr|divider)([^>]*)>([\s\S]*?)<\/\1>|<(hr|divider)\s*\/?>/gi;
+    let lastIndex = 0;
+    let match;
+
+    while ((match = blockRegex.exec(htmlContent)) !== null) {
+      const matchIndex = match.index;
+      if (matchIndex > lastIndex) {
+        const leading = htmlContent.slice(lastIndex, matchIndex).trim();
+        if (leading) this.paragraph(parseHtmlToRichText(leading));
+      }
+
+      const tagName = (match[1] || match[4] || '').toLowerCase();
+      const rawAttrs = match[2] || '';
+      const inner = (match[3] || '').trim();
+
+      if (tagName === 'header' || tagName === 'h1') {
+        this.heading(parseHtmlToRichText(inner), 1);
+      } else if (tagName === 'h2') {
+        this.heading(parseHtmlToRichText(inner), 2);
+      } else if (tagName === 'h3') {
+        this.heading(parseHtmlToRichText(inner), 3);
+      } else if (tagName === 'p') {
+        this.paragraph(parseHtmlToRichText(inner));
+      } else if (tagName === 'blockquote') {
+        if (/expandable/i.test(rawAttrs)) {
+          this.expandableBlockquote(inner);
+        } else {
+          this.blockquote(parseHtmlToRichText(inner));
+        }
+      } else if (tagName === 'pre') {
+        const langMatch = rawAttrs.match(/language=["']([^"']+)["']/i);
+        this.pre(inner, langMatch ? langMatch[1] : undefined);
+      } else if (tagName === 'hr' || tagName === 'divider') {
+        this.divider();
+      }
+
+      lastIndex = blockRegex.lastIndex;
+    }
+
+    if (lastIndex < htmlContent.length) {
+      const trailing = htmlContent.slice(lastIndex).trim();
+      if (trailing) this.paragraph(parseHtmlToRichText(trailing));
+    }
+
+    return this;
+  }
+
   /** Validate against Bot API limits. Throws with a clear message. */
   validate() {
     const count = countBlocks(this.blocks);
@@ -237,8 +402,12 @@ export class RichMessageBuilder {
   }
 
   toJSON({ useCustomEmojis = true } = {}) {
+    const normalizedBlocks = this.blocks.map((b) => {
+      if (b && b.type === 'header') return { ...b, type: 'heading' };
+      return b;
+    });
     return {
-      blocks: useCustomEmojis ? applyCustomEmojisToBlocks(this.blocks) : this.blocks,
+      blocks: useCustomEmojis ? applyCustomEmojisToBlocks(normalizedBlocks) : normalizedBlocks,
       ...(this.rtl ? { is_rtl: true } : {}),
       skip_entity_detection: this.skipEntityDetection
     };

@@ -114,3 +114,59 @@ test('table normalizes cells with required align/valign', () => {
   assert.equal(blk.cells[0][1].is_header, true);
   assert.equal(blk.cells[0][1].colspan, 2);
 });
+
+test('Bot API 10.3: b.header and block.header produce valid heading blocks', () => {
+  const b = new RichMessageBuilder();
+  b.header('𓆩♡𓆪 SPOTIFY / MUSIC 𓆩♡𓆪', 1);
+  const json = b.toJSON();
+  assert.equal(json.blocks[0].type, 'heading');
+  assert.equal(json.blocks[0].size, 1);
+  assert.equal(json.blocks[0].text, '𓆩♡𓆪 SPOTIFY / MUSIC 𓆩♡𓆪');
+});
+
+test('Bot API 10.3: b.bannerHeader constructs clean heading, subtitle, and divider', () => {
+  const b = new RichMessageBuilder();
+  b.bannerHeader(['𓆩♡𓆪 PINTEREST SEARCH 𓆩♡𓆪', 'mode: images • depth: deep']);
+  const json = b.toJSON();
+  assert.equal(json.blocks[0].type, 'heading');
+  assert.equal(json.blocks[0].text, '𓆩♡𓆪 PINTEREST SEARCH 𓆩♡𓆪');
+  assert.equal(json.blocks[1].type, 'paragraph');
+  assert.deepEqual(json.blocks[1].text, { type: 'italic', text: '₊˚⊹♡  mode: images • depth: deep  ˙ᵕ˙' });
+  assert.equal(json.blocks[2].type, 'divider');
+});
+
+test('Bot API 10.3: rt.html converts HTML markup into clean structured RichText', () => {
+  const parsed = rt.html('<b>Bold text</b> &amp; <i>Italic text</i> with <code>/play</code> &lt;3');
+  assert.ok(Array.isArray(parsed));
+  assert.deepEqual(parsed[0], { type: 'bold', text: 'Bold text' });
+  assert.equal(parsed[1], ' & ');
+  assert.deepEqual(parsed[2], { type: 'italic', text: 'Italic text' });
+  assert.equal(parsed[3], ' with ');
+  assert.deepEqual(parsed[4], { type: 'code', text: '/play' });
+  assert.equal(parsed[5], ' <3');
+
+  const customEmojiParsed = rt.html('<tg-emoji emoji-id="5375129864179319277">🎀</tg-emoji>');
+  assert.deepEqual(customEmojiParsed, {
+    type: 'custom_emoji',
+    alternative_text: '🎀',
+    custom_emoji_id: '5375129864179319277'
+  });
+});
+
+test('Bot API 10.3: b.html parses block-level HTML tags into RichBlocks', () => {
+  const b = new RichMessageBuilder();
+  b.html(
+    '<header>𓆩♡𓆪 SPOTIFY DOWNLOAD 𓆩♡𓆪</header>' +
+    '<p>🎵 <b>Starboy</b> — <i>The Weeknd</i></p>' +
+    '<hr>' +
+    '<blockquote expandable>📱 Platform: Spotify ♡</blockquote>'
+  );
+  const json = b.toJSON();
+  assert.equal(json.blocks[0].type, 'heading');
+  assert.equal(json.blocks[0].size, 1);
+  assert.equal(json.blocks[0].text, '𓆩♡𓆪 SPOTIFY DOWNLOAD 𓆩♡𓆪');
+
+  assert.equal(json.blocks[1].type, 'paragraph');
+  assert.equal(json.blocks[2].type, 'divider');
+  assert.equal(json.blocks[3].type, 'expandable_blockquote');
+});

@@ -330,10 +330,8 @@ export function createDownloaderScreen({ app }) {
       const files = {};
       const b = new RichMessageBuilder();
 
-      b.paragraph(rt.bold(banner([
-        `𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`,
-        'aesthetic media delivery ♡'
-      ])));
+      b.header(`𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`, 1);
+      b.paragraph(rt.italic('₊˚⊹♡ aesthetic media delivery ♡ ˙ᵕ˙'));
       b.divider();
 
       // 1. Embed Downloaded Media (Video / Photo / Collage) inside Rich Message

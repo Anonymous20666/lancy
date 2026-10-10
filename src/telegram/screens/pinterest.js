@@ -21,10 +21,8 @@ export function createPinterestScreen({ app }) {
   // ── Menu ────────────────────────────────────────────────────────────────
   function renderMenu(ctx) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
-      '𓆩♡𓆪 PINTEREST STUDIO 𓆩♡𓆪',
-      'deep, duplicate-free searches ♡'
-    ])));
+    b.header('𓆩♡𓆪 PINTEREST STUDIO 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡ deep, duplicate-free searches ♡ ˙ᵕ˙'));
     b.divider();
     b.buttons([
       richButton.callback('🔍 Search Pinterest', encodeCallback(id, 'search'), { style: 'primary' })
@@ -70,13 +68,11 @@ export function createPinterestScreen({ app }) {
       screenMessageId: screenMsgId
     });
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
-      '𓆩♡𓆪 PINTEREST SEARCH 𓆩♡𓆪',
-      `mode: ${mode} • depth: ${ctx.settings.get('pinterest.searchDepth')}`
-    ])));
+    b.header('𓆩♡𓆪 PINTEREST SEARCH 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic(`₊˚⊹♡ mode: ${mode} • depth: ${ctx.settings.get('pinterest.searchDepth')} ˙ᵕ˙`));
     b.divider();
     b.paragraph(rt.italic('tell me what to search for ♡'));
-    b.paragraph(rt.text('example: '), rt.code('gojo satoru'));
+    b.paragraph(rt.concat(rt.text('example: '), rt.code('gojo satoru')));
     b.divider();
     b.buttons(navButtons(id, { cancel: true, home: true }));
     b.validate();
