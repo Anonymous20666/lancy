@@ -1,3 +1,6 @@
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { RichMessageBuilder, rt, block, richButton, encodeCallback } from '../rich.js';
 import { banner, kvTable, statusDot } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
@@ -5,11 +8,39 @@ import { ProgressTracker } from '../progress.js';
 import { logger } from '../../core/logger.js';
 import { truncate } from '../../utils/text.js';
 import { getLyrics, formatBlockquoteLyrics, chunkLyrics, escapeHtml } from '../../media/lyrics.js';
-import { extractMediaForMusicRecognition } from '../../media/recognizer.js';
+import { extractMediaForMusicRecognition, recognizeAudio } from '../../media/recognizer.js';
 import { sleep, parseDurationToSeconds } from '../../utils/time.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
+
+// Global cache for video soundtracks: trackKey -> Buffer
+const trackAudioCache = new Map();
+
+function saveTrackAudio(key, buffer) {
+  if (trackAudioCache.size > 50) {
+    const oldestKey = trackAudioCache.keys().next().value;
+    trackAudioCache.delete(oldestKey);
+  }
+  trackAudioCache.set(key, buffer);
+  try {
+    writeFileSync(join(tmpdir(), `lancy_track_${key}.mp3`), buffer);
+  } catch {}
+}
+
+function getTrackAudio(key) {
+  let buf = trackAudioCache.get(key);
+  if (!buf && key) {
+    try {
+      const filePath = join(tmpdir(), `lancy_track_${key}.mp3`);
+      if (existsSync(filePath)) {
+        buf = readFileSync(filePath);
+        trackAudioCache.set(key, buf);
+      }
+    } catch {}
+  }
+  return buf;
+}
 
 export function createDownloaderScreen({ app }) {
   const id = 'downloader';
@@ -314,7 +345,7 @@ export function createDownloaderScreen({ app }) {
       const buttons = [
         richButton.callback('📥 Download Link', encodeCallback(id, 'input', ['from_media']), { style: 'primary' })
       ];
-      if (isMusic || audioTrack) {
+      if (isMusic) {
         const lyricKey = Math.random().toString(36).slice(2, 8);
         const songMeta = {
           title: result.title || title,
@@ -330,6 +361,10 @@ export function createDownloaderScreen({ app }) {
           );
         } catch {}
         buttons.push(richButton.callback('📜 Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' }));
+      } else if (audioTrack && audioTrack.buffer) {
+        const trackKey = Math.random().toString(36).slice(2, 8);
+        saveTrackAudio(trackKey, audioTrack.buffer);
+        buttons.push(richButton.callback('🎧 Identify Song', encodeCallback(id, 'identify', trackKey), { style: 'primary' }));
       }
       if (photoCount > 0) {
         buttons.push(richButton.callback('✦ Make Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' }));
@@ -490,6 +525,88 @@ export function createDownloaderScreen({ app }) {
             if (total > 1) {
               await sleep(300);
             }
+          }
+          return;
+        }
+        case 'identify': {
+          const trackKey = args[0];
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎧 Listening to video soundtrack… ♡' }).catch(() => {});
+          }
+
+          let progressMsg = null;
+          try {
+            progressMsg = await ctx.api.sendMessage(
+              ctx.chatId,
+              '🎧 <b>Listening to video soundtrack…</b>\nAnalyzing audio to identify the song ♡',
+              { parse_mode: 'HTML' }
+            );
+          } catch {
+            progressMsg = await ctx.api.sendMessage(
+              ctx.chatId,
+              '🎧 Listening to video soundtrack and identifying song… ♡'
+            ).catch(() => null);
+          }
+
+          let audioBuf = getTrackAudio(trackKey);
+          if (!audioBuf) {
+            const msg = ctx.query?.message;
+            const audioFileId = msg?.audio?.file_id || msg?.voice?.file_id;
+            if (audioFileId) {
+              try {
+                const fileInfo = await ctx.api.getFile(audioFileId);
+                if (fileInfo?.file_path) {
+                  audioBuf = await ctx.api.downloadFile(fileInfo.file_path);
+                }
+              } catch {}
+            }
+          }
+
+          if (!audioBuf || audioBuf.length === 0) {
+            const errorText = `୨୧ Could not retrieve the soundtrack for this video ♡\n` +
+              `Tip: You can search directly by typing <code>/play &lt;song name or lyrics&gt;</code> ♡`;
+            if (progressMsg?.message_id) {
+              await ctx.api.editMessageText(ctx.chatId, progressMsg.message_id, errorText, {
+                parse_mode: 'HTML',
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '🔍 Search by Song / Lyrics', callback_data: 'l1:downloader:play' }],
+                    [{ text: '« Menu', callback_data: 'l1:dashboard:open' }]
+                  ]
+                }
+              }).catch(() => {});
+            }
+            return;
+          }
+
+          const recResult = await recognizeAudio(audioBuf, { extension: '.mp3' });
+          if (recResult?.success && recResult.title) {
+            const { title, artist } = recResult;
+            const query = `${title} ${artist || ''}`.trim();
+            const dlCtx = {
+              ...ctx,
+              messageId: progressMsg?.message_id,
+              initialStage: `Identified: "${title}" by ${artist || 'Unknown'} ♡`
+            };
+            await executeDownload(dlCtx, query);
+            return;
+          }
+
+          const notFoundText = `୨୧ Could not recognize the music in this video soundtrack ♡\n\n` +
+            `💡 <b>Why this happens:</b>\n` +
+            `• Background audio may be distorted, pitched, shortened, or spoken over.\n\n` +
+            `✨ <b>Know any words or lyrics?</b> Tap <b>🔍 Search by Lyrics</b> below or type <code>/play &lt;lyrics&gt;</code> to download it directly! ♡`;
+
+          if (progressMsg?.message_id) {
+            await ctx.api.editMessageText(ctx.chatId, progressMsg.message_id, notFoundText, {
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [
+                  [{ text: '🔍 Search by Lyrics or Title', callback_data: 'l1:downloader:play' }],
+                  [{ text: '« Menu', callback_data: 'l1:dashboard:open' }]
+                ]
+              }
+            }).catch(() => {});
           }
           return;
         }
