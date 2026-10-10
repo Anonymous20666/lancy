@@ -17,6 +17,7 @@ import { PinterestWebProvider } from '../pinterest/web.js';
 const execFileAsync = promisify(execFile);
 const inlineSearchCache = new Map();
 const inlinePinterestCache = new Map();
+const inlineTikTokCache = new Map();
 const inlineUrlCache = new Map();
 const recentInlineSearchResults = new Map();
 
@@ -842,6 +843,62 @@ export class TelegramController extends EventEmitter {
     }
   }
 
+  async #fetchInlineTikTokSearch(queryTopic) {
+    if (!queryTopic) return [];
+    try {
+      const { yts } = await import('btch-downloader');
+      const res = await yts(queryTopic + ' tiktok');
+      const vids = res?.result?.videos || res?.result?.all || [];
+      if (!vids.length) return [];
+      const results = [];
+      const botUser = this.botUsername || 'Lancy_easy_bot';
+
+      for (let idx = 0; idx < Math.min(vids.length, 12); idx++) {
+        const item = vids[idx];
+        const title = item.title || queryTopic;
+        const duration = item.timestamp || item.duration?.timestamp || 'HD Clip';
+        const views = item.views ? `${Number(item.views).toLocaleString()} views` : 'Trending';
+        const thumb = item.thumbnail || item.image || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150';
+        const videoUrl = item.url || `https://youtube.com/watch?v=${item.videoId}`;
+
+        results.push({
+          type: 'article',
+          id: `tt_${item.videoId || idx}_${Date.now()}`,
+          title: `🎬 ${title.slice(0, 50)}`,
+          description: `⏱ ${duration} • 👁 ${views} ♡ (Tap to download)`,
+          thumb_url: thumb,
+          thumbnail_url: thumb,
+          input_message_content: {
+            message_text: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <i>${duration} • 👁 ${views} • TikTok &amp; Shorts HD Clip ♡</i></blockquote>`,
+            parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '✨ 📥 Download No-Watermark Video ♡',
+                  url: `https://t.me/${botUser}?start=dl_${encodeURIComponent(videoUrl).slice(0, 48)}`,
+                  style: 'primary'
+                }
+              ],
+              [
+                {
+                  text: `🔍 Search More "${queryTopic.slice(0, 15)}"`,
+                  switch_inline_query_current_chat: `tt ${queryTopic}`,
+                  style: 'primary'
+                }
+              ]
+            ]
+          }
+        });
+      }
+      return results;
+    } catch (err) {
+      this.log?.debug?.({ err: err?.message, queryTopic }, 'inline tiktok search failed');
+      return [];
+    }
+  }
+
   async #fetchInlineUrlMedia(url, botTag, botName) {
     const cleanUrl = url.trim();
 
@@ -1132,6 +1189,29 @@ export class TelegramController extends EventEmitter {
                 ]
               ]
             }
+          },
+          {
+            type: 'article',
+            id: 'hint_tiktok',
+            title: '🎬 TikTok Search 🎬',
+            description: 'Type "tt <topic>" or "tiktok <topic>" to search viral clips ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🎬 <b>${botName} TikTok Search</b>\nType <code>@${this.botUsername || 'bot'} tt &lt;topic&gt;</code> in any chat to find and share trending clips! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎬 Search Trending TikToks',
+                    switch_inline_query_current_chat: 'tt ',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
           }
         ];
 
@@ -1245,6 +1325,95 @@ export class TelegramController extends EventEmitter {
                   {
                     text: '🔍 Try Another Search',
                     switch_inline_query_current_chat: 'pint ',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          }],
+          cache_time: 15,
+          is_personal: false
+        });
+        return;
+      }
+
+      // 3b. Check if TikTok search:
+      if (/^(tt|tiktok)\b/i.test(rawText)) {
+        const queryTopic = rawText.replace(/^(tt|tiktok)\s*/i, '').trim();
+        if (!queryTopic) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: [{
+              type: 'article',
+              id: 'hint_type_tt',
+              title: '🎬 Type a topic to search TikTok videos',
+              description: `e.g. "${rawText} dance tutorial", "${rawText} funny cats" ♡`,
+              thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🎬 <b>${botName} TikTok Search</b>\nType <code>@${this.botUsername || 'bot'} ${rawText} &lt;topic&gt;</code> to browse and send trending clips live! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🎬 Search Trending TikToks',
+                      switch_inline_query_current_chat: `${rawText} dance `,
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            }],
+            cache_time: 10,
+            is_personal: false
+          });
+          return;
+        }
+
+        let ttResults = inlineTikTokCache.get(queryTopic.toLowerCase());
+        if (!ttResults) {
+          ttResults = await this.#fetchInlineTikTokSearch(queryTopic);
+          if (ttResults?.length) {
+            inlineTikTokCache.set(queryTopic.toLowerCase(), ttResults);
+            if (inlineTikTokCache.size > 200) {
+              const firstKey = inlineTikTokCache.keys().next().value;
+              inlineTikTokCache.delete(firstKey);
+            }
+          }
+        }
+
+        if (ttResults && ttResults.length > 0) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: ttResults,
+            cache_time: 30,
+            is_personal: false
+          });
+          return;
+        }
+
+        // Friendly fallback when 0 videos found
+        await this.api.call('answerInlineQuery', {
+          inline_query_id: qId,
+          results: [{
+            type: 'article',
+            id: 'tt_none_' + Date.now(),
+            title: `🎬 No TikTok videos found for "${queryTopic}"`,
+            description: `Try another search term or paste a direct TikTok link ♡`,
+            thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🎬 <b>TikTok Search</b>\nCould not find clips for <code>${escapeHtml(queryTopic)}</code>.\nTip: Paste any TikTok video link directly in chat to download without watermark! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎬 Try Another TikTok Search',
+                    switch_inline_query_current_chat: 'tt ',
                     style: 'primary'
                   }
                 ]
@@ -1687,6 +1856,17 @@ export class TelegramController extends EventEmitter {
             await this.sm.reset(tgId, { reason: 'start_dl' });
             const downloaderScreen = this.screens.get('downloader');
             await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), cleanQuery);
+            return;
+          }
+        }
+        if (startPayload && /^tt_/i.test(startPayload)) {
+          const rawQuery = startPayload.replace(/^tt_/i, '').replace(/_/g, ' ').trim();
+          let cleanQuery = rawQuery;
+          try { cleanQuery = decodeURIComponent(rawQuery); } catch {}
+          if (cleanQuery) {
+            await this.sm.reset(tgId, { reason: 'start_tt' });
+            const downloaderScreen = this.screens.get('downloader');
+            await downloaderScreen?.executeTikTokSearch(this.#ctx(tgId, { message }, { forceNew: true }), cleanQuery);
             return;
           }
         }

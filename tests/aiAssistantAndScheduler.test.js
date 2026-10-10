@@ -405,3 +405,65 @@ test('LancyAssistant direct music play intent ("Play me juice wrld") safely reso
 
   db.close();
 });
+
+test('LancyAssistant: systemPrompt includes complete end-to-end bot knowledge', async () => {
+  const db = new Database(':memory:');
+  let capturedSystemPrompt = null;
+  const app = {
+    db,
+    settings: { get: () => 'girly', getForUser: () => 'girly' },
+    ai: {
+      generate: async ({ prompt, system, context }) => {
+        capturedSystemPrompt = context?.system || system;
+        return { text: 'Everything is in my knowledge bestie! ♡' };
+      }
+    },
+    telegram: {
+      screens: new Map(),
+      api: { sendMessage: async () => ({ message_id: 1 }) }
+    }
+  };
+
+  const assistant = new LancyAssistant({ app });
+  const sctx = {
+    tgId: '1001',
+    chatId: 1001,
+    reply: async () => {}
+  };
+
+  await assistant.handleMessage({
+    ctx: sctx,
+    message: { message_id: 1, text: 'What can you do on WhatsApp and how does the bot work?' },
+    text: 'What can you do on WhatsApp and how does the bot work?'
+  });
+
+  assert.ok(capturedSystemPrompt, 'systemPrompt should be captured');
+  assert.match(capturedSystemPrompt, /<bot_knowledge>/i);
+  // Commands check
+  assert.match(capturedSystemPrompt, /\/start/);
+  assert.match(capturedSystemPrompt, /\/play/);
+  assert.match(capturedSystemPrompt, /\/grab/);
+  assert.match(capturedSystemPrompt, /\/search/);
+  assert.match(capturedSystemPrompt, /\/stickers/);
+  assert.match(capturedSystemPrompt, /\/whatsapp/);
+  assert.match(capturedSystemPrompt, /\/clone/);
+  assert.match(capturedSystemPrompt, /\/help/);
+  // Screen buttons check
+  assert.match(capturedSystemPrompt, /Pinterest Studio/);
+  assert.match(capturedSystemPrompt, /TikTok Search/);
+  assert.match(capturedSystemPrompt, /Send Audio File/);
+  assert.match(capturedSystemPrompt, /Sticker Posting/);
+  // WhatsApp DM vs Channel check
+  assert.match(capturedSystemPrompt, /\.ping/);
+  assert.match(capturedSystemPrompt, /\.menu/);
+  assert.match(capturedSystemPrompt, /\.prefix/);
+  assert.match(capturedSystemPrompt, /\.s|\.sticker/);
+  assert.match(capturedSystemPrompt, /\.convert|\.cv/);
+  assert.match(capturedSystemPrompt, /\.tg/);
+  assert.match(capturedSystemPrompt, /@newsletter/);
+  // TikTok inline search check
+  assert.match(capturedSystemPrompt, /tt <query>/);
+
+  db.close();
+});
+

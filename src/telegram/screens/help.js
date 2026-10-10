@@ -25,8 +25,9 @@ export function createHelpScreen({ app }) {
 • Tap "📜 Lyrics" to sing along with synchronized, expandable lyrics cards!
 • Heard a fire song in a video or voice note? Just reply or forward it to the bot — our Shazam recognizer identifies it instantly!
 
-📥 UNIVERSAL HD MEDIA DOWNLOADER (/grab or /download)
+📥 UNIVERSAL HD MEDIA DOWNLOADER & TIKTOK SEARCH (/grab, /download)
 • Paste ANY link or type /grab <link> from TikTok (no watermark!), Instagram Reels, YouTube Shorts, Twitter/X, Pinterest, or Facebook.
+• 🎬 TikTok Search: Type ${botTag} tt <topic> in any chat or tap "🎬 TikTok Search" in the Downloader menu to find viral clips!
 • The bot grabs crystal-clear HD video or photo albums in seconds.
 • If the video has a soundtrack or background song, the MP3 audio track is automatically extracted and delivered right alongside it!
 
@@ -35,13 +36,24 @@ export function createHelpScreen({ app }) {
 • Choose your style: photos or video loops, depth, and pick your batch size (10 to 150+ picks!).
 • Browse through albums with smooth ← Prev / Next → pagination and download your favorites in original quality.
 
-🎀 STICKER STUDIO & WHATSAPP SYNC
-• Turn any picture, Pinterest pin, or meme into Telegram sticker packs in one click.
-• Seamlessly publish sticker packs to your paired WhatsApp sessions and announcement channels.
+🎀 STICKER STUDIO & WHATSAPP HUB (DM vs CHANNELS)
+• Telegram Sticker Studio: Create packs from images, Pinterest pins, or imports in 1 click.
+• In WhatsApp DM (Private chat):
+  - .ping: Response latency & health check.
+  - .menu: Complete WhatsApp command list.
+  - .prefix <char>: Custom trigger symbol (e.g. .prefix !).
+  - .s / .sticker: Turn any photo into a WhatsApp sticker.
+  - .convert / .cv: Convert WhatsApp stickers or packs into Telegram format!
+  - .tg <link>: Convert Telegram sticker pack link into WhatsApp format.
+• In WhatsApp Channels (@newsletter):
+  - Dedicated broadcasting outlet! Commands stay off in channels to eliminate spam.
+  - Telegram control center: Select sticker packs, generate AI Aura captions, pick target channels, and publish with live real-time progress!
+  - Auto pack splitting: Packs with >60 stickers are split into Part 1, Part 2 automatically.
 
 📱 LIVE INLINE SEARCH EVERYWHERE
-• Type ${botTag} <song name> in ANY chat or group!
-• Preview tracks with album art in real-time and drop music directly into any conversation without leaving the chat!
+• Type ${botTag} <song name> in ANY chat to stream full songs live!
+• Type ${botTag} pint <topic> in ANY chat to share HD aesthetic photos!
+• Type ${botTag} tt <topic> in ANY chat to find trending TikTok clips!
 • (Tip: Cloned bots must have /setinline enabled in @BotFather to activate live search in chats)
 
 🤖 BRING YOUR OWN BOT (/clone in 60s)
@@ -66,6 +78,9 @@ export function createHelpScreen({ app }) {
       [{ text: rt.bold('/help'), align: 'left', valign: 'middle' }, { text: 'Open this guide', align: 'left', valign: 'middle' }]
     ], { compact: true });
     b.divider();
+    b.buttons([
+      richButton.callback('📖 WhatsApp Detailed Guide', encodeCallback('whatsapp', 'help'), { style: 'primary' })
+    ]);
     b.buttons(navButtons(id, { back: false, home: true }));
     b.footer(rt.italic(`version ${app.version ?? '1.0.0'} • made with love ♡`));
     b.validate();

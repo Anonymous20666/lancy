@@ -33,7 +33,10 @@ export function createWhatsAppScreen({ app }) {
     if (!sessions.length) {
       b.paragraph(rt.italic('no WhatsApp numbers are connected yet ♡'));
       b.divider();
-      b.buttons([richButton.callback('📱 Pair Number', encodeCallback(id, 'pair'), { style: 'primary' })]);
+      b.buttons([
+        richButton.callback('📱 Pair Number', encodeCallback(id, 'pair'), { style: 'primary' }),
+        richButton.callback('📖 WhatsApp Guide & Help', encodeCallback(id, 'help'), { style: 'primary' })
+      ]);
     } else {
       b.paragraph(rt.italic('your sessions ♡'));
       b.divider();
@@ -50,10 +53,59 @@ export function createWhatsAppScreen({ app }) {
         ]);
         b.divider();
       }
-      b.buttons([richButton.callback('📱 Pair Number', encodeCallback(id, 'pair'))]);
+      b.buttons([
+        richButton.callback('📱 Pair Number', encodeCallback(id, 'pair')),
+        richButton.callback('📖 WhatsApp Guide & Help', encodeCallback(id, 'help'), { style: 'primary' })
+      ]);
     }
     b.buttons(navButtons(id, { back: false, home: true }));
     b.footer(rt.italic('telegram is the control center — whatsapp only receives the output ♡'));
+    b.validate();
+    await editOrSend(ctx, b.toJSON());
+  }
+
+  async function showWhatsAppHelp(ctx) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 WHATSAPP GUIDE & POWERS 𓆩♡𓆪',
+      'DM commands vs channel publishing breakdown ♡'
+    ])));
+    b.divider();
+
+    b.heading('💬 WHAT WORKS IN WHATSAPP DM (1-ON-1 CHAT)', 2);
+    b.paragraph(rt.text(
+      'When you chat directly with your connected WhatsApp number, you can use these commands:\n\n' +
+      '• <b>.ping</b> — Latency & health check. Shows connection status and active session name.\n' +
+      '• <b>.menu</b> — Shows the complete WhatsApp command list in chat.\n' +
+      '• <b>.prefix &lt;char&gt;</b> — Changes your command trigger (e.g. <code>.prefix !</code> or <code>.prefix #</code>). Strict isolation ensures former prefix never triggers by mistake.\n' +
+      '• <b>.s</b> (or <b>.sticker</b>) — Turn any photo into a WhatsApp sticker! Send a photo with caption <code>.s</code> or reply to any photo with <code>.s</code>.\n' +
+      '• <b>.convert</b> (or <b>.cv</b>) — Convert WhatsApp stickers to Telegram! Reply to any sticker, animated GIF, or sticker pack document/ZIP. It sends a preview card to your Telegram bot DM with 1-tap buttons to add to an existing Telegram pack or create a new pack!\n' +
+      '• <b>.tg &lt;pack-link&gt;</b> — Convert a Telegram sticker pack to WhatsApp! Send <code>.tg https://t.me/addstickers/...</code> and Lancy will split & convert it into WhatsApp sticker format (auto-splits packs &gt;60 stickers).'
+    ));
+    b.divider();
+
+    b.heading('📢 WHAT IS FOR CHANNELS & NEWSLETTERS', 2);
+    b.paragraph(rt.text(
+      'Channels (@newsletter) are dedicated broadcasting feeds. Commands do not run in channels to prevent spam. Instead, you control channel publishing from Telegram:\n\n' +
+      '• <b>Channel Discovery</b> — Lancy automatically detects newsletters you follow and own.\n' +
+      '• <b>Add by Invite Link</b> — Add channels directly using <code>https://whatsapp.com/channel/...</code> or direct JID.\n' +
+      '• <b>Sticker Posting Flow</b> — Pick any Telegram pack from your bot → choose or auto-generate AI Aura captions → pick target channels → publish!\n' +
+      '• <b>Auto Pack Splitting</b> — Packs larger than 60 stickers are automatically split into manageable physical sub-packs (Part 1, Part 2).\n' +
+      '• <b>Live Real-Time Tracker</b> — Watch publishing progress with a live progress bar without channel spam.'
+    ));
+    b.divider();
+
+    b.heading('🎀 TELEGRAM IS YOUR CONTROL CENTER', 3);
+    b.quote(rt.text(
+      'WhatsApp stays quiet and clean! All configurations, pack management, and channel selection happen right here in Telegram ♡'
+    ));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('📱 Pair Number', encodeCallback(id, 'pair'), { style: 'primary' }),
+      richButton.callback('« WhatsApp Menu', encodeCallback(id, 'open'))
+    ]);
+    b.buttons(navButtons(id, { back: false, home: true }));
     b.validate();
     await editOrSend(ctx, b.toJSON());
   }
@@ -1067,6 +1119,8 @@ export function createWhatsAppScreen({ app }) {
           sel.channels = [];
           return showCaptionMenu(ctx);
         }
+        case 'help':
+          return showWhatsAppHelp(ctx);
         case 'back':
           return ctx.sm.back(ctx.tgId).then(() => openMenu(ctx));
         case 'cancel':

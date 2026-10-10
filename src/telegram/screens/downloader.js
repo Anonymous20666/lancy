@@ -157,14 +157,45 @@ export function createDownloaderScreen({ app }) {
 
     b.buttons([
       richButton.callback('✦ Paste / Send Link', encodeCallback(id, 'input'), { style: 'primary' }),
-      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' })
+      richButton.callback('🎬 TikTok Search', encodeCallback(id, 'tiktokSearch'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
+      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
+      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' })
+    ]);
+    b.buttons([
       richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
     ]);
 
     b.footer(rt.italic('Tip: You can also simply paste any social link directly in chat ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderTikTokSearchPrompt(ctx = null) {
+    const b = new RichMessageBuilder();
+    const botUser = ctx?.bot?.botUsername || 'Lancy_easy_bot';
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 TIKTOK STUDIO & SEARCH 𓆩♡𓆪',
+      'search viral clips & download HD without watermark ♡'
+    ])));
+    b.divider();
+    b.heading('୨୧ how to search & download', 3);
+    b.paragraph(rt.text(
+      '• 🔍 Send any keyword or topic (e.g. "dance tutorial", "funny cats") to search clips\n' +
+      '• 📥 Or paste any TikTok video URL to download immediately with no watermark\n' +
+      '• 📸 TikTok photo carousels & slideshows are fully supported with music extraction\n' +
+      '• 📱 Live in chat: Type @' + botUser + ' tt <topic> in any chat or group!'
+    ));
+    b.divider();
+    b.quote(rt.text(
+      '✨ Tip: Every video downloaded is 100% clean without watermark, and background music is automatically extracted as MP3! ♡'
+    ));
+    b.divider();
+    b.buttons([
+      richButton.callback('🎬 Search TikTok Live', '', { switch_inline_query_current_chat: 'tt ', style: 'primary' }),
+      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+    ]);
     b.validate();
     return b.toJSON();
   }
@@ -599,8 +630,100 @@ export function createDownloaderScreen({ app }) {
     }
   }
 
+  async function executeTikTokSearch(ctx, query) {
+    const q = String(query || '').trim();
+    if (!q) return;
+    const isGroup = Boolean(ctx.isGroup);
+    const forceNew = Boolean(ctx.forceNew);
+    const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
+    const tracker = new ProgressTracker({
+      api: ctx.api || app.telegram.api,
+      chatId: ctx.chatId,
+      messageId: screenMsgId,
+      heartbeatMs: 2000,
+      action: 'typing'
+    });
+
+    try {
+      tracker.set({ stage: 'search', text: `Searching TikTok clips for "${truncate(q, 30)}"… ♡` });
+      const { yts } = await import('btch-downloader');
+      const res = await yts(q + ' tiktok');
+      const vids = res?.result?.videos || res?.result?.all || [];
+
+      if (!vids.length) {
+        const b = new RichMessageBuilder();
+        b.paragraph(rt.bold(banner([
+          '𓆩♡𓆪 TIKTOK SEARCH 𓆩♡𓆪',
+          'no matching clips found ♡'
+        ])));
+        b.divider();
+        b.quote(rt.text(`Could not find clips for "${truncate(q, 30)}".\nTip: You can paste any TikTok video URL directly in chat to download without watermark! ♡`));
+        b.divider();
+        b.buttons([
+          richButton.callback('🎬 Search Another Topic', encodeCallback(id, 'tiktokSearch'), { style: 'primary' }),
+          richButton.callback('« Downloader Studio', encodeCallback(id, 'open'))
+        ]);
+        b.validate();
+        await tracker.finish(b.toJSON());
+        return;
+      }
+
+      const b = new RichMessageBuilder();
+      b.paragraph(rt.bold(banner([
+        '𓆩♡𓆪 TIKTOK SEARCH RESULTS 𓆩♡𓆪',
+        `trending clips for "${truncate(q, 24)}" ♡`
+      ])));
+      b.divider();
+
+      const topClips = vids.slice(0, 5);
+      for (let i = 0; i < topClips.length; i++) {
+        const v = topClips[i];
+        const duration = v.timestamp || v.duration?.timestamp || 'HD Clip';
+        const views = v.views ? `${Number(v.views).toLocaleString()} views` : 'Trending';
+        b.paragraph(rt.concat(
+          rt.bold(`${i + 1}. ${truncate(v.title || 'TikTok Video', 45)}\n`),
+          rt.italic(`⏱ ${duration} • 👁 ${views}`)
+        ));
+      }
+      b.divider();
+
+      const botUsername = ctx.bot?.botUsername || app?.telegram?.botUsername || 'Lancy_easy_bot';
+      for (let i = 0; i < Math.min(topClips.length, 3); i++) {
+        const v = topClips[i];
+        const vUrl = v.url || `https://youtube.com/watch?v=${v.videoId}`;
+        b.buttons([
+          richButton.url(
+            `✨ 📥 Download Clip ${i + 1} (${truncate(v.title || '', 20)}) ♡`,
+            `https://t.me/${botUsername}?start=dl_${encodeURIComponent(vUrl).slice(0, 48)}`,
+            { style: 'primary' }
+          )
+        ]);
+      }
+
+      b.buttons([
+        richButton.callback('🎬 Search Another Topic', encodeCallback(id, 'tiktokSearch'), { style: 'primary' }),
+        richButton.callback('« Downloader Studio', encodeCallback(id, 'open'))
+      ]);
+      b.footer(rt.italic('Tip: You can also paste any TikTok video URL directly in chat ♡'));
+      b.validate();
+
+      await tracker.finish(b.toJSON());
+    } catch (err) {
+      log.error({ err: err?.message, query }, 'tiktok search error');
+      const b = new RichMessageBuilder();
+      b.heading('🎬 TIKTOK SEARCH', 2);
+      b.paragraph(rt.italic(`Search could not be completed. You can paste any TikTok URL directly to download! ♡`));
+      b.divider();
+      b.buttons([richButton.callback('« Downloader Studio', encodeCallback(id, 'open'))]);
+      b.validate();
+      await tracker.finish(b.toJSON());
+    }
+  }
+
   return {
     id,
+    executeDownload,
+    executeTikTokSearch,
     async open(ctx) {
       return ctx.editScreen(renderMainMenu(ctx));
     },
@@ -614,6 +737,10 @@ export function createDownloaderScreen({ app }) {
           await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT, { context: { mode: 'url' } });
           if (fromMedia) return ctx.replyRich(renderInputPrompt());
           return ctx.editScreen(renderInputPrompt());
+        case 'tiktokSearch':
+          await ctx.sm?.transition(ctx.tgId, States.TIKTOK_SEARCH_INPUT, { context: { mode: 'tiktok' } });
+          if (fromMedia) return ctx.replyRich(renderTikTokSearchPrompt(ctx));
+          return ctx.editScreen(renderTikTokSearchPrompt(ctx));
         case 'play':
           await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
           if (fromMedia) return ctx.replyRich(renderMusicSearchPrompt(ctx));
@@ -1034,6 +1161,10 @@ export function createDownloaderScreen({ app }) {
       }
     },
     executeDownload,
+    executeTikTokSearch,
+    registerStates(sm) {
+      return this.registerStateHandlers(sm);
+    },
     registerStateHandlers(sm) {
       sm.register(States.URL_DOWNLOADER_INPUT, {
         onEnter: async (sctx) => {
@@ -1140,6 +1271,35 @@ export function createDownloaderScreen({ app }) {
           };
           await sctx.reset?.({ reason: 'download_started' });
           await executeDownload(dlCtx, target);
+          return true;
+        },
+        onCancel: async (sctx) => {
+          await sctx.reset?.({ reason: 'cancelled' });
+        }
+      });
+
+      sm.register(States.TIKTOK_SEARCH_INPUT, {
+        onEnter: async (sctx) => {
+          // Handled in handle('tiktokSearch')
+        },
+        onMessage: async (sctx, message) => {
+          const text = String(message.text || message.caption || '').trim();
+          if (!text) return true;
+          const match = text.match(/https?:\/\/[^\s]+/i);
+          const dlCtx = {
+            ...sctx,
+            controller: sctx.controller || app.telegram?.controller,
+            api: sctx.api || app.telegram?.api,
+            chatId: message.chat?.id || sctx.chatId,
+            tgId: sctx.tgId || String(message.from?.id),
+            message
+          };
+          await sctx.reset?.({ reason: 'tiktok_search_started' });
+          if (match) {
+            await executeDownload(dlCtx, match[0]);
+          } else {
+            await executeTikTokSearch(dlCtx, text);
+          }
           return true;
         },
         onCancel: async (sctx) => {

@@ -44,10 +44,11 @@ test('TelegramController: live inline search returns entrypoint cards on empty q
 
   assert.ok(inlineAnswer, 'answerInlineQuery should be called');
   assert.equal(inlineAnswer.inline_query_id, 'query_123');
-  assert.equal(inlineAnswer.results.length, 3);
+  assert.equal(inlineAnswer.results.length, 4);
   assert.match(inlineAnswer.results[0].title, /Music Search/);
   assert.match(inlineAnswer.results[1].title, /Universal Downloader/);
   assert.match(inlineAnswer.results[2].title, /Pinterest Search/);
+  assert.match(inlineAnswer.results[3].title, /TikTok Search/);
   assert.ok(inlineAnswer.results[0].thumbnail_url, 'should include thumbnail_url');
   assert.ok(inlineAnswer.results[0].thumb_url, 'should include thumb_url');
   for (const res of inlineAnswer.results) {
@@ -718,4 +719,128 @@ test('TelegramController: live inline search for Pinterest album and video URLs 
 
   db.close();
 });
+
+test('TelegramController: live inline search handles tt / tiktok query and returns video cards with primary button style', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // 1. Test empty tt query shows prompt
+  await controller.handleInlineQuery({
+    id: 'query_tt_empty',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'tt',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.equal(inlineAnswer.results.length, 1);
+  assert.match(inlineAnswer.results[0].title, /search TikTok videos/i);
+  assert.equal(inlineAnswer.results[0].reply_markup.inline_keyboard[0][0].style, 'primary');
+
+  // 2. Test tt query with topic
+  inlineAnswer = null;
+  await controller.handleInlineQuery({
+    id: 'query_tt_dance',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'tt dance tutorial',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.ok(inlineAnswer.results.length >= 1, 'should return video cards');
+  const firstVideo = inlineAnswer.results[0];
+  assert.equal(firstVideo.type, 'article');
+  assert.ok(firstVideo.reply_markup?.inline_keyboard, 'must have inline keyboard');
+  for (const row of firstVideo.reply_markup.inline_keyboard) {
+    for (const btn of row) {
+      assert.equal(btn.style, 'primary', `button "${btn.text}" must have style primary`);
+    }
+  }
+
+  db.close();
+});
+
+test('DownloaderScreen: main menu includes TikTok search button and executes TikTok search', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let replyPayload = null;
+  const fakeApi = {
+    sendRichMessage: async (chatId, rich) => {
+      replyPayload = rich;
+      return { message_id: 201 };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      replyPayload = rich;
+      return { message_id: msgId };
+    }
+  };
+
+  const fakeApp = {
+    db,
+    settings,
+    telegram: { api: fakeApi, botUsername: 'Lancy_easy_bot' },
+    screens: new Map()
+  };
+
+  const downloader = createDownloaderScreen({ app: fakeApp });
+  downloader.registerStates(sm);
+
+  let renderedMenu = null;
+  const ctx = {
+    tgId: '1001',
+    chatId: 1001,
+    db,
+    settings,
+    sm,
+    api: fakeApi,
+    editScreen: async (rich) => { renderedMenu = rich; return { message_id: 200 }; },
+    replyRich: async (rich) => { replyPayload = rich; return { message_id: 200 }; }
+  };
+
+  await downloader.open(ctx);
+  assert.ok(renderedMenu, 'menu should render');
+  const buttonBlocks = (renderedMenu.blocks || []).filter(b => b.type === 'buttons');
+  const allButtons = buttonBlocks.flatMap(b => b.buttons);
+  const ttButton = allButtons.find(b => b.callback_data?.includes('tiktokSearch'));
+  assert.ok(ttButton, 'TikTok Search button should exist');
+
+  // Trigger tiktokSearch action
+  let promptRendered = null;
+  const promptCtx = {
+    ...ctx,
+    editScreen: async (rich) => { promptRendered = rich; return { message_id: 200 }; }
+  };
+  await downloader.handle(promptCtx, 'tiktokSearch', []);
+  assert.ok(promptRendered, 'TikTok prompt should be rendered');
+  assert.equal(sm.get('1001').state, 'TIKTOK_SEARCH_INPUT');
+
+  db.close();
+});
+
 

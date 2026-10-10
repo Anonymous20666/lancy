@@ -507,3 +507,59 @@ test('WhatsApp screen post_confirm executes publish without throwing and uses pe
   db.close();
 });
 
+test('WhatsApp screen: renders WhatsApp Guide & Help card with DM vs Channel breakdown', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  const userId = 1001;
+
+  let renderedCard = null;
+  const mockApi = {
+    editMessageRich: async (chatId, msgId, rich) => {
+      renderedCard = rich;
+      return { message_id: msgId };
+    }
+  };
+
+  const app = {
+    whatsapp: { listForUser: () => [] },
+    telegram: { api: mockApi }
+  };
+
+  const waScreen = createWhatsAppScreen({ app });
+  const ctx = {
+    tgId: userId,
+    chatId: userId,
+    messageId: 100,
+    api: mockApi,
+    db,
+    settings,
+    sm,
+    editScreen: async (rich) => { renderedCard = rich; return { message_id: 100 }; }
+  };
+
+  // 1. Menu should have guide button
+  await waScreen.open(ctx);
+  assert.ok(renderedCard, 'Menu should render');
+  const btnBlocks = renderedCard.blocks.filter(b => b.type === 'buttons');
+  const allBtns = btnBlocks.flatMap(b => b.buttons);
+  const helpBtn = allBtns.find(b => b.callback_data?.includes('whatsapp:help'));
+  assert.ok(helpBtn, 'Guide & Help button should exist on menu');
+
+  // 2. Tapping help should display DM vs Channel breakdown card
+  renderedCard = null;
+  await waScreen.handle(ctx, 'help', []);
+  assert.ok(renderedCard, 'Help card should render');
+  const cardJson = JSON.stringify(renderedCard);
+  assert.match(cardJson, /WHATSAPP GUIDE/i);
+  assert.match(cardJson, /\.ping/i);
+  assert.match(cardJson, /\.menu/i);
+  assert.match(cardJson, /\.prefix/i);
+  assert.match(cardJson, /\.convert|\.cv/i);
+  assert.match(cardJson, /\.s|\.sticker/i);
+  assert.match(cardJson, /CHANNELS & NEWSLETTERS/i);
+  assert.match(cardJson, /CONTROL CENTER/i);
+
+  db.close();
+});
+
