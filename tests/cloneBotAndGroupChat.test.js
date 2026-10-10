@@ -267,3 +267,114 @@ test('TelegramController: group commands restrict WhatsApp and AI to private DM 
 
   db.close();
 });
+
+test('E2E Clone Bot Flow: state machine handles name & token input without ctx.replyRich or sm.get errors', async () => {
+  const { createCloneScreen } = await import('../src/telegram/screens/clone.js');
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.set('security.publicAccess', true);
+  const sm = new StateMachine();
+
+  const registeredBots = [];
+  const fakeMultiBotManager = {
+    getBotsForOwner: () => [],
+    registerAndStartBot: async ({ ownerTgId, token, botName }) => {
+      const record = {
+        id: 1,
+        owner_tg_id: ownerTgId,
+        token,
+        bot_name: botName,
+        bot_username: 'pappy_cloned_bot',
+        status: 'active'
+      };
+      registeredBots.push(record);
+      return record;
+    }
+  };
+
+  const sentRichMessages = [];
+  const fakeApi = {
+    call: async () => ({}),
+    sendMessage: async () => ({ message_id: 888 }),
+    sendRichMessage: async (chatId, rich) => {
+      sentRichMessages.push({ chatId, rich });
+      return { message_id: 889 };
+    },
+    deleteMessage: async () => true,
+    getMe: async () => ({ id: 999, username: 'lancybot' })
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: fakeApi },
+    multiBotManager: fakeMultiBotManager
+  };
+
+  const cloneScreen = createCloneScreen({ app });
+  cloneScreen.registerStateHandlers(sm);
+
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext: { botId: 0, botName: 'Lancy', isClone: false }
+  });
+  bot.screens.set('clone', cloneScreen);
+
+  const testUser = { id: 8380969639, first_name: 'Pappy' };
+
+  // 1. User starts clone flow
+  await sm.transition(testUser.id, States.CLONE_BOT_NAME_INPUT);
+  assert.equal(sm.state(testUser.id), States.CLONE_BOT_NAME_INPUT);
+
+  // 2. User sends bot name "pappy"
+  await bot.handleUpdate({
+    update_id: 101,
+    message: {
+      message_id: 201,
+      chat: { id: testUser.id, type: 'private' },
+      from: testUser,
+      text: 'pappy'
+    }
+  });
+
+  // Verify transition to token input and token prompt sent
+  assert.equal(sm.state(testUser.id), States.CLONE_BOT_TOKEN_INPUT);
+  assert.equal(sm.context(testUser.id).botName, 'pappy');
+  assert.ok(sentRichMessages.length >= 1, 'Token prompt sent as rich message');
+
+  // Verify blockquote in token prompt
+  const lastPrompt = sentRichMessages[sentRichMessages.length - 1].rich;
+  const quoteBlocks = lastPrompt.blocks.filter((b) => b.type === 'blockquote');
+  assert.ok(quoteBlocks.length > 0, 'Token prompt card contains aesthetic blockquote');
+
+  // 3. User sends bot token
+  await bot.handleUpdate({
+    update_id: 102,
+    message: {
+      message_id: 202,
+      chat: { id: testUser.id, type: 'private' },
+      from: testUser,
+      text: '8539878707:AAFuUbhEiCrfqrivMdQCplf2iOcWiu2Z-Uk'
+    }
+  });
+
+  // Verify bot registered and state reset to IDLE without any runtime errors
+  assert.equal(registeredBots.length, 1);
+  assert.equal(registeredBots[0].bot_name, 'pappy');
+  assert.equal(sm.state(testUser.id), States.IDLE, 'State reset to IDLE after success');
+
+  // Verify success card was delivered with blockquote and no raw <b> tags
+  assert.ok(sentRichMessages.length >= 2, 'Success card sent as rich message');
+  const successCard = sentRichMessages[sentRichMessages.length - 1].rich;
+  const successJson = JSON.stringify(successCard);
+  assert.match(successJson, /pappy_cloned_bot/);
+  assert.match(successJson, /blockquote/);
+  assert.doesNotMatch(successJson, /<b>/);
+  assert.doesNotMatch(successJson, /<\/b>/);
+
+  db.close();
+});
+

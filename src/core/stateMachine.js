@@ -124,6 +124,10 @@ export class StateMachine extends EventEmitter {
     return this.users.get(key);
   }
 
+  get(tgId) {
+    return this.for(tgId);
+  }
+
   state(tgId) {
     return this.for(tgId).state;
   }
@@ -193,24 +197,28 @@ export class StateMachine extends EventEmitter {
   }
 
   /** Route an incoming text message to the current state. Returns true if handled. */
-  async handleMessage(tgId, message) {
+  async handleMessage(tgId, message, extraCtx = null) {
     const key = String(tgId);
     const record = this.for(key);
     const handler = this.handlers.get(record.state);
     if (!handler?.onMessage) return false;
     this.#touch(key, record);
-    const handled = await handler.onMessage(this.#ctx(key, record), message);
+    const baseCtx = this.#ctx(key, record);
+    const ctx = extraCtx && typeof extraCtx === 'object' ? Object.assign(baseCtx, extraCtx) : baseCtx;
+    const handled = await handler.onMessage(ctx, message);
     return handled === true;
   }
 
   /** Route an incoming callback query to the current state. Returns true if handled. */
-  async handleCallback(tgId, query) {
+  async handleCallback(tgId, query, extraCtx = null) {
     const key = String(tgId);
     const record = this.for(key);
     const handler = this.handlers.get(record.state);
     if (!handler?.onCallback) return false;
     this.#touch(key, record);
-    const handled = await handler.onCallback(this.#ctx(key, record), query);
+    const baseCtx = this.#ctx(key, record);
+    const ctx = extraCtx && typeof extraCtx === 'object' ? Object.assign(baseCtx, extraCtx) : baseCtx;
+    const handled = await handler.onCallback(ctx, query);
     return handled === true;
   }
 

@@ -564,18 +564,19 @@ export class TelegramController extends EventEmitter {
         );
         await this.api.sendMessage(
           chatId,
-          `𓆩♡𓆪 *ADMIN ALLOCATED* 𓆩♡𓆪\n> 👤 *Name:* ${fullName} ${username ? `(${username})` : ''}\n> 🆔 *ID:* \`${targetId}\`\n> ✓ Admin access enabled with private isolated workspace ♡`
+          `𓆩♡𓆪 <b>ADMIN ALLOCATED</b> 𓆩♡𓆪\n<blockquote>👤 <b>Name:</b> ${escapeHtml(fullName)} ${username ? `(${escapeHtml(username)})` : ''}\n🆔 <b>ID:</b> <code>${targetId}</code>\n✓ Admin access enabled with private isolated workspace ♡</blockquote>`,
+          { parse_mode: 'HTML' }
         );
         return;
       }
       if (command === '/deladmin' || command === '/removeadmin') {
         if (!this.isOwner(tgId)) {
-          await this.api.sendMessage(chatId, '♡ Only the General Owner can remove admins ♡');
+          await this.api.sendMessage(chatId, '<blockquote>♡ Only the General Owner can remove admins ♡</blockquote>', { parse_mode: 'HTML' });
           return;
         }
         const targetId = Number(rest[0]);
         if (!targetId || isNaN(targetId) || targetId <= 0) {
-          await this.api.sendMessage(chatId, '♡ Usage: `/deladmin <Telegram_ID>`\nExample: `/deladmin 8831887192`');
+          await this.api.sendMessage(chatId, '<blockquote>♡ Usage: <code>/deladmin &lt;Telegram_ID&gt;</code>\nExample: <code>/deladmin 8831887192</code> ♡</blockquote>', { parse_mode: 'HTML' });
           return;
         }
         const adminIds = (this.settings.get('telegram.adminIds') ?? []).map(Number).filter((id) => id !== targetId);
@@ -583,12 +584,12 @@ export class TelegramController extends EventEmitter {
         this.db.run('UPDATE users SET is_admin = 0 WHERE tg_id = ?', targetId);
         const userRow = this.db.get('SELECT username, first_name, last_name FROM users WHERE tg_id = ?', targetId);
         const name = [userRow?.first_name, userRow?.last_name].filter(Boolean).join(' ') || `User ${targetId}`;
-        await this.api.sendMessage(chatId, `✓ Admin *${name}* (\`${targetId}\`) removed successfully ♡`);
+        await this.api.sendMessage(chatId, `<blockquote>✓ Admin <b>${escapeHtml(name)}</b> (<code>${targetId}</code>) removed successfully ♡</blockquote>`, { parse_mode: 'HTML' });
         return;
       }
       if (command === '/admins') {
         if (!this.isOwner(tgId) && !(this.settings.get('telegram.adminIds') ?? []).map(Number).includes(Number(tgId))) {
-          await this.api.sendMessage(chatId, '♡ Only administrators can view the team roster ♡');
+          await this.api.sendMessage(chatId, '<blockquote>♡ Only administrators can view the team roster ♡</blockquote>', { parse_mode: 'HTML' });
           return;
         }
         const owners = (this.settings.get('general.ownerIds') ?? []).map(Number);
@@ -599,21 +600,20 @@ export class TelegramController extends EventEmitter {
           const name = [row?.first_name, row?.last_name].filter(Boolean).join(' ');
           const handle = row?.username ? `@${row.username}` : '';
           const info = [name, handle].filter(Boolean).join(' ');
-          return info ? `• *${info}* (\`${id}\`)` : `• \`${id}\``;
+          return info ? `• <b>${escapeHtml(info)}</b> (<code>${id}</code>)` : `• <code>${id}</code>`;
         };
 
         const lines = [
-          '𓆩♡𓆪 *LANCY TEAM ROSTER* 𓆩♡𓆪',
-          '',
-          '👑 *General Owner(s):*',
+          '𓆩♡𓆪 <b>LANCY TEAM ROSTER</b> 𓆩♡𓆪\n',
+          '👑 <b>General Owner(s):</b>',
           ...owners.map((id) => `${formatUserLabel(id)} — Studio Owner`),
           '',
-          '🎀 *Admins (Isolated Workspaces):*',
-          ...(admins.length ? admins.map((id) => `${formatUserLabel(id)} — Admin Workspace`) : ['• _None currently allocated_']),
+          '🎀 <b>Admins (Isolated Workspaces):</b>',
+          ...(admins.length ? admins.map((id) => `${formatUserLabel(id)} — Admin Workspace`) : ['• <i>None currently allocated</i>']),
           '',
-          '> ✨ Workspaces are 100% isolated per user ♡'
+          '<blockquote>✨ Workspaces are 100% isolated per user ♡</blockquote>'
         ];
-        await this.api.sendMessage(chatId, lines.join('\n'));
+        await this.api.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
         return;
       }
       // Unknown command: silently ignore to keep chat clean
@@ -634,7 +634,8 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      const handled = await this.sm.handleMessage(tgId, { ...message, chatId });
+      const ctx = this.#ctx(tgId, { message });
+      const handled = await this.sm.handleMessage(tgId, { ...message, chatId }, ctx);
       if (!handled) {
         if (text) {
           // Direct media / social link detection in DM:

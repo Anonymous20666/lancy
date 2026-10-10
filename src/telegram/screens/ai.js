@@ -94,10 +94,12 @@ export function createAIScreen({ app }) {
       for (const s of schedules.slice(0, 5)) {
         const statusEmoji = s.status === 'active' ? '🟢' : (s.status === 'paused' ? '⏸' : '✓');
         b.paragraph(rt.bold(`${statusEmoji} ${s.topic}`));
-        b.paragraph(rt.text(`> ⏱ ${s.frequency_label}`));
-        b.paragraph(rt.text(`> 📊 Progress: ${s.runs_completed} of ${s.total_runs} drops completed`));
+        b.quote(rt.concat(
+          rt.text(`⏱ ${s.frequency_label}\n`),
+          rt.text(`📊 Progress: ${s.runs_completed} of ${s.total_runs} drops completed`),
+          s.status === 'active' ? rt.text(`\n⏳ Next drop: ${s.next_run_at ? new Date(s.next_run_at).toLocaleString() : 'soon'}`) : rt.text('')
+        ));
         if (s.status === 'active') {
-          b.paragraph(rt.italic(`> Next drop: ${s.next_run_at ? new Date(s.next_run_at).toLocaleString() : 'soon'}`));
           b.buttons([
             richButton.callback('⏸ Pause', encodeCallback(id, 'sched_pause', String(s.id))),
             richButton.callback('🗑 Delete', encodeCallback(id, 'sched_del', String(s.id)), { style: 'danger' })
