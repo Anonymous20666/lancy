@@ -27,6 +27,20 @@ export class Database {
     try {
       this.db.exec("ALTER TABLE wa_sessions ADD COLUMN prefix TEXT DEFAULT '.';");
     } catch {}
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          query TEXT NOT NULL,
+          file_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          artist TEXT,
+          duration INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cached_audio_query ON cached_audio_tracks(query);
+      `);
+    } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     const current = row ? Number(row.value) : 0;
     if (current < SCHEMA_VERSION) {

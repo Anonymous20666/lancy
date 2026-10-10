@@ -123,7 +123,7 @@ export class TelegramController extends EventEmitter {
     return this;
   }
 
-  isAllowed(tgId) {
+  isAllowed(tgId, { isGroup = false } = {}) {
     const id = Number(tgId);
     if (this.isOwner(id)) return { ok: true, role: 'owner' };
     const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
@@ -131,6 +131,9 @@ export class TelegramController extends EventEmitter {
 
     // Cloned bots are public for their audience:
     if (this.botContext?.isClone) return { ok: true, role: 'allowed' };
+
+    // In group chats, any member can use public commands & buttons:
+    if (isGroup) return { ok: true, role: 'member' };
 
     // Public platform access if enabled:
     if (this.settings.get('security.publicAccess') === true) {
@@ -917,6 +920,22 @@ export class TelegramController extends EventEmitter {
       // 4. Music Search (Live):
       const cleanSongQuery = rawText.replace(/^(play|music|song|listen|stream)\s+/i, '').trim() || rawText;
 
+      // Check SQLite cached audio tracks for instant full audio playback
+      let cachedAudioRows = [];
+      try {
+        cachedAudioRows = this.db.prepare(
+          'SELECT file_id, title, artist, duration FROM cached_audio_tracks WHERE query LIKE ? OR title LIKE ? LIMIT 4'
+        ).all(`%${cleanSongQuery}%`, `%${cleanSongQuery}%`);
+      } catch {}
+
+      const cachedResults = (cachedAudioRows || []).map((row, idx) => ({
+        type: 'audio',
+        id: `cached_aud_${row.file_id.slice(-8)}_${idx}`,
+        audio_file_id: row.file_id,
+        caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n✨ <i>Full Audio via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
+        parse_mode: 'HTML'
+      }));
+
       let searchItems = inlineSearchCache.get(cleanSongQuery.toLowerCase());
       if (!searchItems) {
         searchItems = await this.#fetchInlineMusicTracks(cleanSongQuery);
@@ -929,47 +948,25 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      const results = (searchItems || []).slice(0, 8).map((item, index) => {
+      const freshResults = (searchItems || []).slice(0, 8).map((item, index) => {
         const title = item.title || cleanSongQuery;
         const artist = item.artist || 'Music';
-        const duration = item.duration ? `⏱ ${item.duration}` : '🎵 High-Speed MP3';
-
-        if (item.audioUrl) {
-          return {
-            type: 'audio',
-            id: `song_${item.id || index}_${Date.now()}`,
-            audio_url: item.audioUrl,
-            title,
-            performer: artist,
-            audio_duration: item.durationSeconds || undefined,
-            caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n✨ <i>Streamed via @${this.botUsername || 'bot'} ♡</i>`,
-            parse_mode: 'HTML',
-            reply_markup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: `🎵 Play in ${botName}`,
-                    url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=music`
-                  }
-                ]
-              ]
-            }
-          };
-        }
+        const duration = item.duration ? `⏱ ${item.duration}` : '🎵 Full Audio MP3';
 
         return {
           type: 'article',
           id: `song_${item.id || index}_${Date.now()}`,
           title: `🎵 ${title}`,
-          description: `🎧 ${artist} • ${duration} ♡`,
+          description: `🎧 ${artist} • ${duration} ♡ (Tap to download full audio)`,
           thumb_url: item.thumbnail || undefined,
           thumbnail_url: item.thumbnail || undefined,
           input_message_content: {
-            message_text: `<blockquote>🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n⏱ ${duration}\n\nTip: Send <code>/play ${escapeHtml(title)}</code> in this chat to stream full 320k MP3! ♡</blockquote>`,
-            parse_mode: 'HTML'
+            message_text: `/play@${this.botUsername || 'Lancy_easy_bot'} ${title}`
           }
         };
       });
+
+      const results = [...cachedResults, ...freshResults];
 
       // 5. If no music results and query is generic, fall back to Pinterest pictures
       if (results.length === 0 && cleanSongQuery.length >= 2) {
@@ -1025,7 +1022,9 @@ export class TelegramController extends EventEmitter {
 
   async #handleCallback(query) {
     const user = this.#upsertUser(query.from);
-    const guard = this.isAllowed(query.from.id);
+    const chatType = query.message?.chat?.type;
+    const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
+    const guard = this.isAllowed(query.from.id, { isGroup });
     if (!guard.ok) {
       await this.api.answerCallbackQuery(query.id, { text: 'This Lancy belongs to someone else ♡', showAlert: true });
       return;
@@ -1075,8 +1074,9 @@ export class TelegramController extends EventEmitter {
 
   async #handleMessage(message, { edited = false } = {}) {
     const user = this.#upsertUser(message.from);
-    const guard = this.isAllowed(message.from.id);
-    if (!guard.ok) return; // silent for strangers in groups
+    const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+    const guard = this.isAllowed(message.from.id, { isGroup });
+    if (!guard.ok) return; // silent for strangers in DMs
     const tgId = String(message.from.id);
     const chatId = message.chat.id;
 

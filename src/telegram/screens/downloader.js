@@ -516,12 +516,78 @@ export function createDownloaderScreen({ app }) {
       b.footer(rt.italic(`Delivered with aesthetic love by ${ctx.botName || 'Lancy Bot'} ♡`));
       b.validate();
 
-      // 5. Deliver ONE unified Rich Message directly
+      // 5. Deliver Rich Message
       await tracker.finish(b.toJSON(), files);
       if (tracker.messageId) {
         (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(tracker.messageId);
         app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
       }
+
+      // If music track is available, also deliver native playable Telegram audio directly
+      if (isMusic && audioTrack && audioTrack.buffer && typeof (ctx.api || app.telegram?.api)?.sendAudio === 'function') {
+        const parsedDuration = parseDurationToSeconds(audioTrack.duration || result.duration);
+        const songTitle = audioTrack.title || result.title || title || 'Audio Track';
+        const songArtist = audioTrack.performer || result.artist || result.author || 'Spotify';
+        const cleanFilename = audioTrack.filename || `${(songTitle || 'track').replace(/[^\w\s-]/g, '') || 'track'}.mp3`;
+
+        const caption = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n` +
+          `<blockquote expandable>` +
+          `📱 <b>Platform:</b> SPOTIFY / MUSIC ♡\n` +
+          (result.album ? `💿 <b>Album:</b> ${escapeHtml(result.album)}\n` : '') +
+          (result.year ? `📅 <b>Release:</b> ${result.year}\n` : '') +
+          (parsedDuration > 0 ? `⏱ <b>Duration:</b> ${Math.floor(parsedDuration / 60)}:${String(parsedDuration % 60).padStart(2, '0')}\n` : '') +
+          `📦 <b>Audio Quality:</b> High-Speed MP3 (192k) + Artwork ♡` +
+          (ctx.isGroup && ctx.user?.first_name ? `\n👤 <b>Requested By:</b> ${escapeHtml(ctx.user.first_name)}` : '') +
+          `</blockquote>`;
+
+        const api = ctx.api || app.telegram.api;
+        let sentAudio = null;
+        try {
+          sentAudio = await api.sendAudio(
+            ctx.chatId,
+            audioTrack.buffer,
+            {
+              title: songTitle,
+              performer: songArtist,
+              ...(parsedDuration > 0 ? { duration: parsedDuration } : {}),
+              ...(thumbBuf ? { thumbnail: thumbBuf } : {}),
+              filename: cleanFilename,
+              caption,
+              parse_mode: 'HTML'
+            }
+          );
+        } catch (audioErr) {
+          log.warn({ err: audioErr?.message }, 'sendAudio with thumb failed, retrying without thumb');
+          sentAudio = await api.sendAudio(ctx.chatId, audioTrack.buffer, {
+            title: songTitle,
+            performer: songArtist,
+            ...(parsedDuration > 0 ? { duration: parsedDuration } : {}),
+            filename: cleanFilename,
+            caption,
+            parse_mode: 'HTML'
+          }).catch((err) => {
+            log.error({ err: err?.message }, 'sendAudio failed completely');
+            return null;
+          });
+        }
+
+        if (sentAudio?.message_id) {
+          (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sentAudio.message_id);
+          app.telegram?.markMediaDeliveryMessage?.(sentAudio.message_id);
+
+          const db = app.db || ctx.db;
+          if (sentAudio?.audio?.file_id && db?.run) {
+            try {
+              const queryStr = (url || songTitle).toLowerCase().trim();
+              db.run(
+                'INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)',
+                queryStr, sentAudio.audio.file_id, songTitle, songArtist, parsedDuration || 0
+              );
+            } catch {}
+          }
+        }
+      }
+
       await ctx.sm?.reset(ctx.tgId, { reason: 'download_complete' });
     } catch (err) {
       log.error({ err, url }, 'download failed');
@@ -756,16 +822,18 @@ export function createDownloaderScreen({ app }) {
               app.telegram?.markMediaDeliveryMessage?.(sentAudio.message_id);
             }
           } catch (err) {
-            log.warn({ err, audioKey }, 'sendAudio failed, falling back to document');
+            log.warn({ err, audioKey }, 'sendAudio with thumb failed, retrying without thumb');
             try {
-              const sentDoc = await ctx.api.sendDocument(
+              const sentDoc = await ctx.api.sendAudio(
                 ctx.chatId,
                 audioBuf,
                 {
+                  title: songTitle,
+                  performer: songPerformer,
+                  ...(meta.duration ? { duration: meta.duration } : {}),
                   filename: cleanFilename,
                   caption,
-                  parse_mode: 'HTML',
-                  contentType: 'audio/mpeg'
+                  parse_mode: 'HTML'
                 }
               );
               if (sentDoc?.message_id) {
@@ -773,7 +841,7 @@ export function createDownloaderScreen({ app }) {
                 app.telegram?.markMediaDeliveryMessage?.(sentDoc.message_id);
               }
             } catch (docErr) {
-              log.error({ docErr, audioKey }, 'sendAudio and sendDocument both failed');
+              log.error({ docErr, audioKey }, 'sendAudio failed completely');
               const errSent = await ctx.api.sendMessage(
                 ctx.chatId,
                 '<blockquote>♡ Could not send audio file right now. Please try again in a moment ♡</blockquote>',
