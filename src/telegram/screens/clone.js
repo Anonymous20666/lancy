@@ -278,7 +278,12 @@ export function createCloneScreen({ app }) {
           await sm.transition(ctx.tgId, States.CLONE_BOT_TOKEN_INPUT, {
             context: { botName: cleanName }
           });
-          return ctx.replyRich(renderTokenPrompt(cleanName));
+          const chatId = ctx.chatId || message.chat?.id;
+          const api = app.telegram?.api;
+          if (api?.sendRichMessage) {
+            await api.sendRichMessage(chatId, renderTokenPrompt(cleanName)).catch(() => {});
+          }
+          return true;
         }
       });
 
@@ -289,16 +294,18 @@ export function createCloneScreen({ app }) {
           const text = String(message.text || '').trim();
           if (!text || text.startsWith('/cancel')) return false;
 
+          const api = app.telegram?.api;
+          const chatId = ctx.chatId || message.chat?.id;
+
           // Scrub the token message from chat for privacy
-          if (message.message_id && typeof ctx.api?.deleteMessage === 'function') {
-            ctx.api.deleteMessage(ctx.chatId, message.message_id).catch(() => {});
+          if (message.message_id && typeof api?.deleteMessage === 'function') {
+            api.deleteMessage(chatId, message.message_id).catch(() => {});
           }
 
-          const userState = sm.get(ctx.tgId);
-          const botName = userState?.context?.botName || 'Custom Bot';
+          const botName = ctx.context?.botName || sm.context(ctx.tgId)?.botName || 'Custom Bot';
 
-          const progressMsg = await ctx.api.sendMessage(
-            ctx.chatId,
+          const progressMsg = await api?.sendMessage?.(
+            chatId,
             '⏳ <i>Connecting to Telegram and validating token… ♡</i>',
             { parse_mode: 'HTML' }
           ).catch(() => null);
@@ -312,8 +319,8 @@ export function createCloneScreen({ app }) {
 
             await sm.reset(ctx.tgId, { reason: 'bot_cloned' });
 
-            if (progressMsg?.message_id) {
-              await ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
+            if (progressMsg?.message_id && typeof api?.deleteMessage === 'function') {
+              await api.deleteMessage(chatId, progressMsg.message_id).catch(() => {});
             }
 
             const b = new RichMessageBuilder();
@@ -339,21 +346,24 @@ export function createCloneScreen({ app }) {
             ]);
             b.footer(rt.italic('Powered with love by Lancy Multi-Bot Engine ♡'));
             b.validate();
-            return ctx.replyRich(b.toJSON());
+            if (api?.sendRichMessage) {
+              await api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+            }
+            return true;
           } catch (err) {
             log.warn({ err: err.message }, 'token validation failed');
-            if (progressMsg?.message_id) {
-              await ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
+            if (progressMsg?.message_id && typeof api?.deleteMessage === 'function') {
+              await api.deleteMessage(chatId, progressMsg.message_id).catch(() => {});
             }
 
-            const errSent = await ctx.api.sendMessage(
-              ctx.chatId,
+            const errSent = await api?.sendMessage?.(
+              chatId,
               `<blockquote>✕ <b>Could not launch bot:</b> ${escapeHtml(err.message)}\n\nPlease verify your token from @BotFather and try pasting it again ♡</blockquote>`,
               { parse_mode: 'HTML' }
             );
-            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
+            if (errSent?.message_id && typeof api?.deleteMessage === 'function') {
               setTimeout(() => {
-                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
+                api.deleteMessage(chatId, errSent.message_id).catch(() => {});
               }, 12000)?.unref?.();
             }
             return true;
@@ -368,12 +378,14 @@ export function createCloneScreen({ app }) {
           const text = String(message.text || '').trim();
           if (!text || text.startsWith('/cancel')) return false;
 
-          const userState = sm.get(ctx.tgId);
-          const botId = userState?.context?.botId;
+          const api = app.telegram?.api;
+          const chatId = ctx.chatId || message.chat?.id;
+
+          const botId = ctx.context?.botId || sm.context(ctx.tgId)?.botId;
           if (!botId) return false;
 
-          const statusMsg = await ctx.api.sendMessage(
-            ctx.chatId,
+          const statusMsg = await api?.sendMessage?.(
+            chatId,
             '⏳ <i>Delivering broadcast to your bot users… ♡</i>',
             { parse_mode: 'HTML' }
           ).catch(() => null);
@@ -382,8 +394,8 @@ export function createCloneScreen({ app }) {
             const res = await app.multiBotManager.broadcast(botId, ctx.tgId, text);
             await sm.reset(ctx.tgId, { reason: 'broadcast_done' });
 
-            if (statusMsg?.message_id) {
-              await ctx.api.deleteMessage(ctx.chatId, statusMsg.message_id).catch(() => {});
+            if (statusMsg?.message_id && typeof api?.deleteMessage === 'function') {
+              await api.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
             }
 
             const b = new RichMessageBuilder();
@@ -403,13 +415,16 @@ export function createCloneScreen({ app }) {
               richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
             ]);
             b.validate();
-            return ctx.replyRich(b.toJSON());
+            if (api?.sendRichMessage) {
+              await api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+            }
+            return true;
           } catch (err) {
             log.error({ err }, 'broadcast execution error');
-            if (statusMsg?.message_id) {
-              await ctx.api.deleteMessage(ctx.chatId, statusMsg.message_id).catch(() => {});
+            if (statusMsg?.message_id && typeof api?.deleteMessage === 'function') {
+              await api.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
             }
-            await ctx.api.sendMessage(ctx.chatId, `<blockquote>✕ Failed to broadcast: ${escapeHtml(err.message)}</blockquote>`, { parse_mode: 'HTML' });
+            await api?.sendMessage?.(chatId, `<blockquote>✕ Failed to broadcast: ${escapeHtml(err.message)}</blockquote>`, { parse_mode: 'HTML' });
             return true;
           }
         }
