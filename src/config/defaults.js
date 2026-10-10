@@ -148,6 +148,7 @@ export const DEFAULT_SETTINGS = {
   security: {
     ownerIds: [],                // mirrored from general.ownerIds
     allowedUsers: [],            // empty = owner + admins only
+    publicAccess: false,         // when true, anyone can use the bot
     sessionCredentialPermissions: '0600',
     encryptSecrets: false,       // optional at-rest encryption for creds
     tokenProtection: true,

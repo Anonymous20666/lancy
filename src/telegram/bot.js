@@ -9,6 +9,7 @@ import { sleep } from '../utils/time.js';
 import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
 import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics } from '../media/lyrics.js';
+import { t } from '../core/i18n.js';
 
 /**
  * TelegramController — the control center.
@@ -20,7 +21,7 @@ import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics } from '../m
  * - Every failure becomes a friendly message — never a stack trace.
  */
 export class TelegramController extends EventEmitter {
-  constructor({ api, db, settings, stateMachine, sm = null, screens = new Map(), app = null, log } = {}) {
+  constructor({ api, db, settings, stateMachine, sm = null, screens = new Map(), app = null, botContext = null, log } = {}) {
     super();
     this.api = api;
     this.db = db;
@@ -28,6 +29,8 @@ export class TelegramController extends EventEmitter {
     this.sm = stateMachine ?? sm ?? null;
     this.screens = screens; // Map<screenId, screenModule>
     this.app = app; // the composed application (services)
+    this.botContext = botContext || { botId: 0, botName: 'Lancy', isClone: false };
+    this.botName = this.botContext.botName;
     this.log = log ?? logger().child({ module: 'telegram' });
     this.offset = 0;
     this.running = false;
@@ -114,17 +117,30 @@ export class TelegramController extends EventEmitter {
 
   isAllowed(tgId) {
     const id = Number(tgId);
-    const ownerIds = new Set((this.settings.get('general.ownerIds') ?? []).map(Number));
+    if (this.isOwner(id)) return { ok: true, role: 'owner' };
     const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
+    if (adminIds.has(id)) return { ok: true, role: 'admin' };
+
+    // Cloned bots are public for their audience:
+    if (this.botContext?.isClone) return { ok: true, role: 'allowed' };
+
+    // Public platform access if enabled:
+    if (this.settings.get('security.publicAccess') === true) {
+      return { ok: true, role: 'allowed' };
+    }
+
     const allowed = (this.settings.get('security.allowedUsers') ?? []).map(Number);
-    if (ownerIds.has(id) || adminIds.has(id)) return { ok: true, role: ownerIds.has(id) ? 'owner' : 'admin' };
     if (allowed.length === 0) return { ok: false, role: 'stranger' };
     if (allowed.includes(id)) return { ok: true, role: 'allowed' };
     return { ok: false, role: 'stranger' };
   }
 
   isOwner(tgId) {
-    return (this.settings.get('general.ownerIds') ?? []).map(Number).includes(Number(tgId));
+    const id = Number(tgId);
+    if (this.botContext?.isClone && this.botContext.ownerId) {
+      return id === Number(this.botContext.ownerId);
+    }
+    return (this.settings.get('general.ownerIds') ?? []).map(Number).includes(id);
   }
 
   async start() {
@@ -189,6 +205,10 @@ export class TelegramController extends EventEmitter {
     }
   }
 
+  async handleUpdate(update) {
+    return this.#handleUpdate(update);
+  }
+
   async #handleUpdate(update) {
     this.log.info({
       updateId: update.update_id,
@@ -203,6 +223,7 @@ export class TelegramController extends EventEmitter {
 
   #upsertUser(user) {
     if (!user?.id) return null;
+    const botId = this.botContext?.botId ?? 0;
     const existing = this.db.get('SELECT id FROM users WHERE tg_id = ?', user.id);
     const isOwner = this.isOwner(user.id);
     const isAdmin = (this.settings.get('telegram.adminIds') ?? []).map(Number).includes(Number(user.id));
@@ -213,15 +234,28 @@ export class TelegramController extends EventEmitter {
         user.username ?? null, user.first_name ?? null, user.last_name ?? null,
         isOwner ? 1 : 0, isAdmin ? 1 : 0, user.id
       );
-      return this.db.get('SELECT * FROM users WHERE tg_id = ?', user.id);
+    } else {
+      this.db.run(
+        `INSERT INTO users (tg_id, username, first_name, last_name, is_owner, is_admin, is_allowed)
+         VALUES (?, ?, ?, ?, ?, ?, 1)`,
+        user.id, user.username ?? null, user.first_name ?? null, user.last_name ?? null,
+        isOwner ? 1 : 0, isAdmin ? 1 : 0
+      );
+      this.db.audit?.(user.id, 'user.seen', { username: user.username });
     }
-    this.db.run(
-      `INSERT INTO users (tg_id, username, first_name, last_name, is_owner, is_admin, is_allowed)
-       VALUES (?, ?, ?, ?, ?, ?, 1)`,
-      user.id, user.username ?? null, user.first_name ?? null, user.last_name ?? null,
-      isOwner ? 1 : 0, isAdmin ? 1 : 0
-    );
-    this.db.audit(user.id, 'user.seen', { username: user.username });
+
+    try {
+      this.db.run(
+        `INSERT INTO bot_users (bot_id, tg_id, username, first_name, last_seen)
+         VALUES (?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(bot_id, tg_id) DO UPDATE SET
+           username = excluded.username,
+           first_name = excluded.first_name,
+           last_seen = datetime('now')`,
+        botId, user.id, user.username ?? null, user.first_name ?? null
+      );
+    } catch {}
+
     return this.db.get('SELECT * FROM users WHERE tg_id = ?', user.id);
   }
 
@@ -298,6 +332,50 @@ export class TelegramController extends EventEmitter {
         }
       };
 
+      const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+
+      if (isGroup && (command === '/whatsapp' || command === '/ai' || command === '/admins' || command === '/settings' || command === '/addadmin' || command === '/deladmin')) {
+        const notice = await this.api.sendMessage(
+          chatId,
+          `<blockquote>🌸 The <b>${command.slice(1).toUpperCase()}</b> feature is only available in private DM with the bot ♡</blockquote>`,
+          { parse_mode: 'HTML' }
+        );
+        if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+          setTimeout(() => {
+            this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+          }, 10000)?.unref?.();
+        }
+        return;
+      }
+
+      if (command === '/clone') {
+        if (isGroup) {
+          const notice = await this.api.sendMessage(
+            chatId,
+            `<blockquote>🤖 To clone your own bot, please open a private DM with the bot and type <code>/clone</code>! ♡</blockquote>`,
+            { parse_mode: 'HTML' }
+          );
+          if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+            setTimeout(() => {
+              this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+            }, 10000)?.unref?.();
+          }
+          return;
+        }
+        await this.sm.reset(tgId, { reason: 'command' });
+        const cloneScreen = this.screens.get('clone');
+        const sent = await cloneScreen?.open(this.#ctx(tgId, { message }, { forceNew: true }));
+        updateScreenMsg(sent);
+        return;
+      }
+
+      if (command === '/lang' || command === '/language') {
+        const dashboard = this.screens.get('dashboard');
+        const sent = await dashboard?.handle?.(this.#ctx(tgId, { message }, { forceNew: true }), 'language', []);
+        updateScreenMsg(sent);
+        return;
+      }
+
       if (command === '/start') {
         await this.sm.reset(tgId, { reason: 'start' });
         const dashboard = this.screens.get('dashboard');
@@ -305,11 +383,18 @@ export class TelegramController extends EventEmitter {
         updateScreenMsg(sent);
         return;
       }
-      if (command === '/search') {
+      if (command === '/search' || command === '/pinterest' || command === '/pint') {
+        const query = rest.join(' ').trim();
         await this.sm.reset(tgId, { reason: 'command' });
         const pinterest = this.screens.get('pinterest');
-        const sent = await pinterest?.open(this.#ctx(tgId, { message }, { forceNew: true }));
-        updateScreenMsg(sent);
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        if (query && pinterest?.executeSearch) {
+          const sent = await pinterest.executeSearch(ctx, query);
+          updateScreenMsg(sent);
+        } else {
+          const sent = await pinterest?.open(ctx);
+          updateScreenMsg(sent);
+        }
         return;
       }
       if (command === '/stickers') {
@@ -727,12 +812,29 @@ export class TelegramController extends EventEmitter {
     const forceNew = Boolean(opts.forceNew || source?.forceNew || opts.fromMedia || source?.fromMedia);
     const fromMedia = Boolean(opts.fromMedia || source?.fromMedia || forceNew);
 
+    const chatType = queryMessage?.chat?.type ?? directMessage?.chat?.type ?? message?.chat?.type ?? 'private';
+    const isGroup = chatType === 'group' || chatType === 'supergroup';
+
+    let userLang = 'en';
+    try {
+      const bu = this.db.get('SELECT language FROM bot_users WHERE bot_id = ? AND tg_id = ?', this.botContext?.botId ?? 0, Number(tgId));
+      if (bu?.language) userLang = bu.language;
+    } catch {}
+
     return {
       tgId,
       forceNew,
       fromMedia,
       user: this.db.get('SELECT * FROM users WHERE tg_id = ?', Number(tgId)),
       chatId,
+      chatType,
+      isGroup,
+      bot: this.botContext,
+      botName: this.botContext?.botName || 'Lancy',
+      botId: this.botContext?.botId ?? 0,
+      isClone: Boolean(this.botContext?.isClone),
+      lang: userLang,
+      t: (key, params) => t(userLang, key, params),
       messageId,
       message,
       query,
@@ -804,10 +906,6 @@ export class TelegramController extends EventEmitter {
       ?? source?.callback_query?.message?.chat?.id
       ?? source?.chatId
       ?? Number(tgId);
-  }
-
-  createContext(tgId, source = {}, opts = {}) {
-    return this.#ctx(tgId, source, opts);
   }
 }
 

@@ -702,6 +702,15 @@ export function createPinterestScreen({ app }) {
   return {
     id,
     registerStateHandlers,
+    async executeSearch(ctx, query, count = 5) {
+      await ctx.sm.transition(ctx.tgId, States.PINTEREST_SEARCH, {
+        context: { query, mode: 'normal', goal: count, stage: 'count' }
+      });
+      const sctx = ctx.sm.ctxFor(ctx.tgId);
+      sctx.messageId = ctx.messageId;
+      sctx.screenMessageId = ctx.messageId;
+      return runSearch(sctx, query, count);
+    },
     async open(ctx) {
       await ctx.sm.reset(ctx.tgId, { reason: 'navigate' });
       await openMenu(ctx);

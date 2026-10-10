@@ -35,6 +35,8 @@ import { createAIScreen } from './telegram/screens/ai.js';
 import { createSettingsScreen } from './telegram/screens/settings.js';
 import { createHelpScreen } from './telegram/screens/help.js';
 import { createDownloaderScreen } from './telegram/screens/downloader.js';
+import { createCloneScreen } from './telegram/screens/clone.js';
+import { MultiBotManager } from './telegram/multiBotManager.js';
 
 /**
  * LancyApp — the composition root. Every service is constructed here and
@@ -174,11 +176,17 @@ export class LancyApp {
       media: this.media
     });
 
+    this.multiBotManager = new MultiBotManager({
+      app: this,
+      db: this.db,
+      settings: this.settings
+    });
+
     // Register screens.
     const factories = [
       createDashboardScreen, createPinterestScreen, createStickersScreen,
       createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
-      createDownloaderScreen
+      createDownloaderScreen, createCloneScreen
     ];
     for (const factory of factories) {
       const screen = factory({ app: this });
@@ -247,6 +255,7 @@ export class LancyApp {
 
     // Telegram polling.
     await this.telegram.controller.start();
+    await this.multiBotManager.startAll();
     this.#setupTestTriggerWatcher();
     this.log.info('✦ Lancy Bot is ready ♡');
   }
@@ -317,6 +326,7 @@ export class LancyApp {
     clearInterval(this.cleanupTimer);
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
+    await this.multiBotManager?.stopAll();
     await this.telegram.controller?.stop();
     await this.whatsapp.stopAll();
     await this.ai.stop();

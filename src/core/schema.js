@@ -3,7 +3,7 @@
  * Everything important is persisted — no critical state lives only in memory.
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 export const SCHEMA_SQL = `
 PRAGMA journal_mode = WAL;
@@ -299,4 +299,48 @@ CREATE TABLE IF NOT EXISTS scheduled_drops (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_drops_status ON scheduled_drops(status, next_run_at);
+
+-- Cloned Bot Registry (Multi-tenant Bring Your Own Token)
+CREATE TABLE IF NOT EXISTS cloned_bots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_tg_id INTEGER NOT NULL,
+  token TEXT NOT NULL UNIQUE,
+  bot_name TEXT NOT NULL,
+  bot_username TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active', -- active | paused | error | revoked
+  error_message TEXT,
+  config_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_cloned_bots_owner ON cloned_bots(owner_tg_id);
+CREATE INDEX IF NOT EXISTS idx_cloned_bots_status ON cloned_bots(status);
+
+-- Scoped User Audience (Per Bot & Language)
+CREATE TABLE IF NOT EXISTS bot_users (
+  bot_id INTEGER NOT NULL,            -- 0 = Master Lancy, >0 = cloned_bots.id
+  tg_id INTEGER NOT NULL,
+  language TEXT NOT NULL DEFAULT 'en',-- en, es, fr, ar, pt, ru, id
+  username TEXT,
+  first_name TEXT,
+  joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+  last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+  is_banned INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (bot_id, tg_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_users_lang ON bot_users(bot_id, language);
+
+-- Broadcast History (For bot owners to broadcast to their bot's users)
+CREATE TABLE IF NOT EXISTS bot_broadcasts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  bot_id INTEGER NOT NULL,
+  sender_tg_id INTEGER NOT NULL,
+  message_text TEXT NOT NULL,
+  target_language TEXT,               -- NULL for all languages, or specific lang code
+  sent_count INTEGER NOT NULL DEFAULT 0,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'completed',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bot_broadcasts_bot ON bot_broadcasts(bot_id);
 `;

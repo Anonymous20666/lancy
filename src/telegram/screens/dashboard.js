@@ -1,6 +1,7 @@
 import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
 import { banner, kvTable, statusDot, ACCENT, SPARK } from '../ui.js';
 import { formatDateTime, timeAgo } from '../../utils/text.js';
+import { getLanguageName } from '../../core/i18n.js';
 
 // In-memory cache for user profile photos: tgId -> { buffer, expiresAt }
 const pfpCache = new Map();
@@ -56,60 +57,133 @@ export function createDashboardScreen({ app }) {
   function render(ctx, stats, hasPfp = false) {
     const { settings } = ctx;
     const tz = settings.get('general.timezone') ?? 'UTC';
-    const botName = settings.get('general.botName') ?? 'Lancy Bot';
+    const botName = ctx.botName || settings.get('general.botName') || 'Lancy Bot';
     const firstName = ctx.user?.first_name ?? 'bestie';
+    const isGroup = Boolean(ctx.isGroup);
 
     const b = new RichMessageBuilder();
-    if (hasPfp) {
+    if (hasPfp && !isGroup) {
       b.photo('attach://pfp');
     }
     b.paragraph(rt.concat(
       rt.bold(banner([
         `𓆩♡𓆪 ${botName.toUpperCase()} 𓆩♡𓆪`,
-        'your cute little control center ♡'
+        isGroup ? 'group media & music companion ♡' : 'your cute little control center ♡'
       ]))
     ));
     b.spacer();
-    b.paragraph(rt.concat(rt.italic(`welcome back, ${firstName} ♡`), rt.text(`\n${formatDateTime(new Date(), tz)}`)));
+    if (isGroup) {
+      b.paragraph(rt.concat(rt.italic(`hello everyone! I'm ${botName} ♡`), rt.text(`\n${formatDateTime(new Date(), tz)}`)));
+    } else {
+      b.paragraph(rt.concat(rt.italic(`welcome back, ${firstName} ♡`), rt.text(`\n${formatDateTime(new Date(), tz)}`)));
+    }
     b.divider();
 
     // Live status card
     b.heading('𓆩♡𓆪 status overview', 3);
-    b.table(kvTable([
-      ['ʕ•ᴥ•ʔ WhatsApp', `${statusDot(stats.online > 0 ? 'online' : 'offline')} ${stats.online}/${stats.sessions.length} sessions online`],
-      ['˙ᵕ˙ Sticker packs', `${stats.packs} created`],
-      ['୨୧ Pinterest', `${stats.searches} searches • ${stats.delivered} saved`],
-      ['૮꒰ ˶• ༝ •˶꒱ა AI assistant', stats.ai?.enabled ? `${statusDot(stats.ai.available ? 'online' : 'offline')} ${stats.ai.provider}` : 'off'],
-      ['₊˚⊹♡ Media cache', `${stats.cacheStats.entries} files`]
-    ]), { compact: true });
+    if (isGroup) {
+      b.table(kvTable([
+        ['🎵 Music Engine', 'High-Speed MP3 & Lyrics Active'],
+        ['📥 Downloader', 'YouTube, TikTok, Spotify & 1000+ sites'],
+        ['୨୧ Pinterest', `${stats.searches ?? 0} searches completed`],
+        ['₊˚⊹♡ Media cache', `${stats.cacheStats?.entries ?? 0} files cached`]
+      ]), { compact: true });
+    } else {
+      b.table(kvTable([
+        ['ʕ•ᴥ•ʔ WhatsApp', `${statusDot(stats.online > 0 ? 'online' : 'offline')} ${stats.online ?? 0}/${stats.sessions?.length ?? 0} sessions online`],
+        ['˙ᵕ˙ Sticker packs', `${stats.packs ?? 0} created`],
+        ['୨୧ Pinterest', `${stats.searches ?? 0} searches • ${stats.delivered ?? 0} saved`],
+        ['૮꒰ ˶• ༝ •˶꒱ა AI assistant', stats.ai?.enabled ? `${statusDot(stats.ai.available ? 'online' : 'offline')} ${stats.ai.provider}` : 'off'],
+        ['₊˚⊹♡ Media cache', `${stats.cacheStats?.entries ?? 0} files`]
+      ]), { compact: true });
+    }
     b.divider();
 
-    // Primary navigation — six sections in a 2-column feel via button rows.
+    // Primary navigation — grouped rows.
     b.heading('୨୧ quick actions', 3);
-    b.buttons([
-      richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
-      richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
-    ]);
-    b.buttons([
-      richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open')),
-      richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
-    ]);
-    b.buttons([
-      richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
-      richButton.callback('🪄 AI Assistant', encodeCallback('ai', 'open'))
-    ]);
-    b.buttons([
-      richButton.callback('⚙ Settings', encodeCallback('settings', 'open')),
-      richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
-    ]);
+    if (isGroup) {
+      // In groups: WhatsApp and AI are omitted
+      b.buttons([
+        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
+        richButton.callback('🌐 Language', encodeCallback(id, 'language'))
+      ]);
+      b.buttons([
+        richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
+      ]);
+    } else {
+      // In private chat: Full dashboard with Clone Bot
+      b.buttons([
+        richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
+        richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open')),
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
+        richButton.callback('🪄 AI Assistant', encodeCallback('ai', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open')),
+        richButton.callback('⚙ Settings', encodeCallback('settings', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('🌐 Language', encodeCallback(id, 'language')),
+        richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
+      ]);
+    }
 
-    b.footer(rt.concat(rt.italic('made with love by '), rt.bold(settings.get('general.defaultCreatorName') ?? 'Lancy'), rt.italic(' ♡')));
+    b.footer(rt.concat(rt.italic('made with love by '), rt.bold(ctx.botName || settings.get('general.defaultCreatorName') || 'Lancy'), rt.italic(' ♡')));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderLanguagePicker(ctx) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 CHOOSE LANGUAGE 𓆩♡𓆪',
+      'customize your bot language ♡'
+    ])));
+    b.divider();
+    b.paragraph(rt.text('🌍 <b>Please select your preferred language:</b>\nAll bot responses and notifications will be personalized for you ♡'));
+    b.divider();
+
+    const langRows = [
+      [
+        richButton.callback('🇬🇧 English', encodeCallback(id, 'set_lang', 'en'), { style: 'primary' }),
+        richButton.callback('🇪🇸 Español', encodeCallback(id, 'set_lang', 'es'), { style: 'primary' })
+      ],
+      [
+        richButton.callback('🇫🇷 Français', encodeCallback(id, 'set_lang', 'fr'), { style: 'primary' }),
+        richButton.callback('🇸🇦 العربية', encodeCallback(id, 'set_lang', 'ar'), { style: 'primary' })
+      ],
+      [
+        richButton.callback('🇧🇷 Português', encodeCallback(id, 'set_lang', 'pt'), { style: 'primary' }),
+        richButton.callback('🇷🇺 Русский', encodeCallback(id, 'set_lang', 'ru'), { style: 'primary' })
+      ],
+      [
+        richButton.callback('🇮🇩 Bahasa Indonesia', encodeCallback(id, 'set_lang', 'id'), { style: 'primary' }),
+        richButton.callback('« Back', encodeCallback(id, 'open'))
+      ]
+    ];
+    for (const row of langRows) {
+      b.buttons(row);
+    }
+    b.footer(rt.italic('Language is saved to your personal profile ♡'));
     b.validate();
     return b.toJSON();
   }
 
   return {
     id,
+    render(ctx, stats = {}, hasPfp = false) {
+      return render(ctx, stats, hasPfp);
+    },
     async open(ctx, { forceNew = false } = {}) {
       const stats = await gatherStats(ctx);
       const pfpBuffer = await getUserPfp(ctx);
@@ -136,7 +210,29 @@ export function createDashboardScreen({ app }) {
           ctx.forceNew ||
           (queryMsg && ctx.controller?.isMediaDeliveryMessage?.(queryMsg))
         );
-        await this.open(ctx, { forceNew: fromMedia });
+        return this.open(ctx, { forceNew: fromMedia });
+      }
+      if (action === 'language') {
+        return ctx.editScreen(renderLanguagePicker(ctx));
+      }
+      if (action === 'set_lang') {
+        const langCode = args[0] || 'en';
+        const botId = ctx.botId ?? 0;
+        try {
+          ctx.db.run(
+            `INSERT INTO bot_users (bot_id, tg_id, language, last_seen)
+             VALUES (?, ?, ?, datetime('now'))
+             ON CONFLICT(bot_id, tg_id) DO UPDATE SET
+               language = excluded.language,
+               last_seen = datetime('now')`,
+            botId, Number(ctx.tgId), langCode
+          );
+        } catch {}
+        if (ctx.query?.id) {
+          const langName = getLanguageName(langCode);
+          await ctx.api.answerCallbackQuery(ctx.query.id, { text: `Language set to ${langName} ♡` }).catch(() => {});
+        }
+        return this.open(ctx);
       }
     }
   };

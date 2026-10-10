@@ -374,14 +374,21 @@ export function createDownloaderScreen({ app }) {
         if (result.year) musicRows.push(['📅 Release', String(result.year)]);
         if (result.duration) musicRows.push(['⏱ Duration', String(result.duration)]);
         musicRows.push(['📦 Audio Quality', 'High-Speed MP3 (192k) + Artwork ♡']);
+        if (ctx.isGroup) {
+          musicRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
+        }
         b.table(kvTable(musicRows), { compact: true });
       } else {
-        b.table(kvTable([
+        const metaRows = [
           ['📱 Platform', platform.toUpperCase()],
           ['🏷 Title', truncate(title, 36)],
           ['📦 Media Items', `${mediaItems.length} item(s) (${photoCount} photos, ${videoCount} videos)`],
           ['🎵 Sound / Audio', audioTrack ? 'Extracted & Included (MP3) ♡' : 'None in source']
-        ]), { compact: true });
+        ];
+        if (ctx.isGroup) {
+          metaRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
+        }
+        b.table(kvTable(metaRows), { compact: true });
       }
       b.divider();
 
@@ -458,7 +465,7 @@ export function createDownloaderScreen({ app }) {
         richButton.callback('🎵 Play Another', encodeCallback(id, 'play', ['from_media']), { style: 'primary' }),
         richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']))
       ]);
-      b.footer(rt.italic('Delivered with aesthetic love by Lancy Bot ♡'));
+      b.footer(rt.italic(`Delivered with aesthetic love by ${ctx.botName || 'Lancy Bot'} ♡`));
       b.validate();
 
       // 5. Deliver ONE unified Rich Message directly

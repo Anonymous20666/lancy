@@ -1,0 +1,416 @@
+import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
+import { banner, kvTable, statusDot } from '../ui.js';
+import { States } from '../../core/stateMachine.js';
+import { logger } from '../../core/logger.js';
+import { escapeHtml } from '../../media/lyrics.js';
+
+export function createCloneScreen({ app }) {
+  const id = 'clone';
+  const log = logger().child({ module: 'screen:clone' });
+
+  function renderWelcomeCard(ctx) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 BRING YOUR OWN BOT 𓆩♡𓆪',
+      'clone your own aesthetic bot in 60 seconds ♡'
+    ])));
+    b.divider();
+
+    b.heading('୨୧ what is bot cloning?', 3);
+    b.paragraph(rt.text(
+      '• 🌸 <b>Custom Branding:</b> Your bot replaces "Lancy" everywhere with your chosen name!\n' +
+      '• 🎵 <b>All Features Included:</b> High-speed music, universal downloader & Pinterest search.\n' +
+      '• 👥 <b>Group Chats:</b> Add your bot to groups for music & media with member tagging.\n' +
+      '• 🌍 <b>Multi-Language:</b> Supports 7 languages with custom audience tracking.\n' +
+      '• 📢 <b>Broadcasts:</b> Send announcements directly to all users of your bot.'
+    ));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('✨ Start Cloning', encodeCallback(id, 'start'), { style: 'primary' }),
+      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+    ]);
+    b.footer(rt.italic('Powered by Lancy Multi-Bot Engine ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderBotsList(ctx, bots) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 YOUR CLONED BOTS 𓆩♡𓆪',
+      'manage your personal bot empire ♡'
+    ])));
+    b.divider();
+
+    b.heading('୨୧ active bot instances', 3);
+    const rows = bots.map((bot) => {
+      const isOnline = bot.status === 'active';
+      const userCount = app.db.get('SELECT COUNT(*) AS c FROM bot_users WHERE bot_id = ?', bot.id)?.c ?? 0;
+      return [
+        `@${bot.bot_username}`,
+        `${statusDot(isOnline ? 'online' : 'offline')} ${bot.bot_name} • ${userCount} users`
+      ];
+    });
+    b.table(kvTable(rows), { compact: true });
+    b.divider();
+
+    // Buttons for each bot
+    for (const bot of bots.slice(0, 4)) {
+      b.buttons([
+        richButton.callback(`⚙ Manage @${bot.bot_username}`, encodeCallback(id, 'manage', bot.id), { style: 'primary' })
+      ]);
+    }
+
+    b.buttons([
+      richButton.callback('✨ Clone Another Bot', encodeCallback(id, 'start'), { style: 'primary' }),
+      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+    ]);
+    b.footer(rt.italic('Delivered with aesthetic love ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderNamePrompt() {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 STEP 1: NAME YOUR BOT 𓆩♡𓆪',
+      'choose your custom bot identity ♡'
+    ])));
+    b.divider();
+    b.paragraph(rt.text(
+      '🌸 <b>What name would you like your bot to have?</b>\n\n' +
+      'Instead of "Lancy", this name will appear in greetings, banners, and delivery cards!\n' +
+      '<i>Examples: Aria, Nova, Sam Music, Bella Studio</i>\n\n' +
+      '👇 Type and send your desired bot name in chat now:'
+    ));
+    b.divider();
+    b.buttons([
+      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'))
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderTokenPrompt(botName) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 STEP 2: GET BOT TOKEN 𓆩♡𓆪',
+      `connect @BotFather for ${botName} ♡`
+    ])));
+    b.divider();
+
+    b.heading('୨୧ follow these 4 quick steps:', 3);
+    b.paragraph(rt.text(
+      '1. Open Telegram\'s official <b><a href="https://t.me/BotFather">@BotFather</a></b>\n' +
+      '2. Send the command <code>/newbot</code>\n' +
+      '3. Choose a display name and username ending in <code>bot</code>\n' +
+      '4. Copy the HTTP API token (e.g. <code>123456789:ABCdefGHI...</code>)\n\n' +
+      '👇 <b>Paste and send your bot token here:</b>'
+    ));
+    b.divider();
+
+    b.buttons([
+      richButton.url('🤖 Open @BotFather', 'https://t.me/BotFather'),
+      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'))
+    ]);
+    b.footer(rt.italic('Your token is secured and never shared ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderManageScreen(ctx, botRecord) {
+    const isOnline = botRecord.status === 'active';
+    const userCount = app.db.get('SELECT COUNT(*) AS c FROM bot_users WHERE bot_id = ?', botRecord.id)?.c ?? 0;
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      `𓆩♡𓆪 MANAGE @${botRecord.bot_username.toUpperCase()} 𓆩♡𓆪`,
+      `${botRecord.bot_name} control panel ♡`
+    ])));
+    b.divider();
+
+    b.table(kvTable([
+      ['🏷 Bot Name', botRecord.bot_name],
+      ['🤖 Username', `@${botRecord.bot_username}`],
+      ['⚡ Status', `${statusDot(isOnline ? 'online' : 'offline')} ${botRecord.status.toUpperCase()}`],
+      ['👥 Total Users', `${userCount} active users`],
+      ['📅 Created', botRecord.created_at?.slice(0, 10) || 'Recently']
+    ]), { compact: true });
+    b.divider();
+
+    b.buttons([
+      richButton.url(`🚀 Open @${botRecord.bot_username}`, `https://t.me/${botRecord.bot_username}`),
+      richButton.callback('📢 Broadcast Message', encodeCallback(id, 'broadcast', botRecord.id), { style: 'primary' })
+    ]);
+
+    const toggleText = isOnline ? '⏸ Pause Bot' : '▶ Resume Bot';
+    const toggleAction = isOnline ? 'pause' : 'resume';
+    b.buttons([
+      richButton.callback(toggleText, encodeCallback(id, toggleAction, botRecord.id)),
+      richButton.callback('🗑 Delete Bot', encodeCallback(id, 'delete_confirm', botRecord.id))
+    ]);
+
+    b.buttons([
+      richButton.callback('« Cloned Bots', encodeCallback(id, 'open')),
+      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  return {
+    id,
+    async open(ctx) {
+      const bots = app.multiBotManager?.getBotsForOwner(ctx.tgId) ?? [];
+      if (bots.length === 0) {
+        return ctx.editScreen(renderWelcomeCard(ctx));
+      }
+      return ctx.editScreen(renderBotsList(ctx, bots));
+    },
+
+    async handle(ctx, action, args) {
+      switch (action) {
+        case 'open':
+          return this.open(ctx);
+
+        case 'start':
+          await ctx.sm?.transition(ctx.tgId, States.CLONE_BOT_NAME_INPUT);
+          if (ctx.fromMedia || ctx.forceNew) return ctx.replyRich(renderNamePrompt());
+          return ctx.editScreen(renderNamePrompt());
+
+        case 'manage': {
+          const botId = Number(args[0]);
+          const botRecord = app.multiBotManager?.getBotById(botId);
+          if (!botRecord) return this.open(ctx);
+          return ctx.editScreen(renderManageScreen(ctx, botRecord));
+        }
+
+        case 'pause': {
+          const botId = Number(args[0]);
+          await app.multiBotManager?.pauseBot(botId);
+          const botRecord = app.multiBotManager?.getBotById(botId);
+          return ctx.editScreen(renderManageScreen(ctx, botRecord));
+        }
+
+        case 'resume': {
+          const botId = Number(args[0]);
+          await app.multiBotManager?.resumeBot(botId);
+          const botRecord = app.multiBotManager?.getBotById(botId);
+          return ctx.editScreen(renderManageScreen(ctx, botRecord));
+        }
+
+        case 'delete_confirm': {
+          const botId = Number(args[0]);
+          const botRecord = app.multiBotManager?.getBotById(botId);
+          if (!botRecord) return this.open(ctx);
+
+          const b = new RichMessageBuilder();
+          b.paragraph(rt.bold(banner([
+            '⚠️ CONFIRM DELETE BOT ⚠️',
+            `delete @${botRecord.bot_username} permanently?`
+          ])));
+          b.divider();
+          b.paragraph(rt.text(`Are you sure you want to stop and delete <b>@${botRecord.bot_username}</b>? This cannot be undone.`));
+          b.divider();
+          b.buttons([
+            richButton.callback('🗑 Yes, Delete', encodeCallback(id, 'delete', botId), { style: 'primary' }),
+            richButton.callback('« Cancel', encodeCallback(id, 'manage', botId))
+          ]);
+          b.validate();
+          return ctx.editScreen(b.toJSON());
+        }
+
+        case 'delete': {
+          const botId = Number(args[0]);
+          await app.multiBotManager?.deleteBot(botId, ctx.tgId);
+          return this.open(ctx);
+        }
+
+        case 'broadcast': {
+          const botId = Number(args[0]);
+          const botRecord = app.multiBotManager?.getBotById(botId);
+          if (!botRecord) return this.open(ctx);
+
+          await ctx.sm?.transition(ctx.tgId, States.CLONE_BOT_BROADCAST_INPUT, {
+            context: { botId, botUsername: botRecord.bot_username }
+          });
+
+          const b = new RichMessageBuilder();
+          b.paragraph(rt.bold(banner([
+            '📢 BROADCAST TO BOT USERS',
+            `sending message via @${botRecord.bot_username} ♡`
+          ])));
+          b.divider();
+          b.paragraph(rt.text(
+            '👇 <b>Type and send the announcement message you want to broadcast:</b>\n\n' +
+            'HTML formatting is supported (<b>bold</b>, <i>italic</i>, etc.).\n' +
+            'It will be delivered to all active users who started your bot.'
+          ));
+          b.divider();
+          b.buttons([
+            richButton.callback('« Cancel', encodeCallback(id, 'manage', botId))
+          ]);
+          b.validate();
+          return ctx.editScreen(b.toJSON());
+        }
+
+        case 'cancel':
+          await ctx.sm?.reset(ctx.tgId, { reason: 'cancelled' });
+          return this.open(ctx);
+
+        default:
+          return this.open(ctx);
+      }
+    },
+
+    registerStateHandlers(sm) {
+      // 1. Name input handler
+      sm.register(States.CLONE_BOT_NAME_INPUT, {
+        timeoutMs: 10 * 60 * 1000,
+        async onMessage(ctx, message) {
+          const rawName = String(message.text || '').trim();
+          if (!rawName || rawName.startsWith('/')) return false;
+
+          const cleanName = rawName.slice(0, 32);
+          await sm.transition(ctx.tgId, States.CLONE_BOT_TOKEN_INPUT, {
+            context: { botName: cleanName }
+          });
+          return ctx.replyRich(renderTokenPrompt(cleanName));
+        }
+      });
+
+      // 2. Token input handler
+      sm.register(States.CLONE_BOT_TOKEN_INPUT, {
+        timeoutMs: 15 * 60 * 1000,
+        async onMessage(ctx, message) {
+          const text = String(message.text || '').trim();
+          if (!text || text.startsWith('/cancel')) return false;
+
+          // Scrub the token message from chat for privacy
+          if (message.message_id && typeof ctx.api?.deleteMessage === 'function') {
+            ctx.api.deleteMessage(ctx.chatId, message.message_id).catch(() => {});
+          }
+
+          const userState = sm.get(ctx.tgId);
+          const botName = userState?.context?.botName || 'Custom Bot';
+
+          const progressMsg = await ctx.api.sendMessage(
+            ctx.chatId,
+            '⏳ <i>Connecting to Telegram and validating token… ♡</i>',
+            { parse_mode: 'HTML' }
+          ).catch(() => null);
+
+          try {
+            const botRecord = await app.multiBotManager.registerAndStartBot({
+              ownerTgId: ctx.tgId,
+              token: text,
+              botName
+            });
+
+            await sm.reset(ctx.tgId, { reason: 'bot_cloned' });
+
+            if (progressMsg?.message_id) {
+              await ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
+            }
+
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(banner([
+              '🎉 YOUR BOT IS NOW LIVE! 🎉',
+              `@${botRecord.bot_username} is running ♡`
+            ])));
+            b.divider();
+            b.paragraph(rt.text(
+              `✨ <b>Congratulations!</b> Your bot <b>@${botRecord.bot_username}</b> has been successfully cloned and launched!\n\n` +
+              `• 🏷 <b>Brand Name:</b> ${escapeHtml(botRecord.bot_name)}\n` +
+              `• 🚀 <b>Status:</b> Online & Polling\n` +
+              `• 🎵 <b>Features:</b> Music, Downloader, Pinterest, Group Chat & Multi-Language\n\n` +
+              `Tap the button below to start your new bot!`
+            ));
+            b.divider();
+            b.buttons([
+              richButton.url(`🚀 Open @${botRecord.bot_username}`, `https://t.me/${botRecord.bot_username}`),
+              richButton.callback('⚙ Manage Bot', encodeCallback(id, 'manage', botRecord.id), { style: 'primary' })
+            ]);
+            b.buttons([
+              richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+            ]);
+            b.footer(rt.italic('Powered with love by Lancy Multi-Bot Engine ♡'));
+            b.validate();
+            return ctx.replyRich(b.toJSON());
+          } catch (err) {
+            log.warn({ err: err.message }, 'token validation failed');
+            if (progressMsg?.message_id) {
+              await ctx.api.deleteMessage(ctx.chatId, progressMsg.message_id).catch(() => {});
+            }
+
+            const errSent = await ctx.api.sendMessage(
+              ctx.chatId,
+              `<blockquote>✕ <b>Could not launch bot:</b> ${escapeHtml(err.message)}\n\nPlease verify your token from @BotFather and try pasting it again ♡</blockquote>`,
+              { parse_mode: 'HTML' }
+            );
+            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
+              setTimeout(() => {
+                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
+              }, 12000)?.unref?.();
+            }
+            return true;
+          }
+        }
+      });
+
+      // 3. Broadcast input handler
+      sm.register(States.CLONE_BOT_BROADCAST_INPUT, {
+        timeoutMs: 10 * 60 * 1000,
+        async onMessage(ctx, message) {
+          const text = String(message.text || '').trim();
+          if (!text || text.startsWith('/cancel')) return false;
+
+          const userState = sm.get(ctx.tgId);
+          const botId = userState?.context?.botId;
+          if (!botId) return false;
+
+          const statusMsg = await ctx.api.sendMessage(
+            ctx.chatId,
+            '⏳ <i>Delivering broadcast to your bot users… ♡</i>',
+            { parse_mode: 'HTML' }
+          ).catch(() => null);
+
+          try {
+            const res = await app.multiBotManager.broadcast(botId, ctx.tgId, text);
+            await sm.reset(ctx.tgId, { reason: 'broadcast_done' });
+
+            if (statusMsg?.message_id) {
+              await ctx.api.deleteMessage(ctx.chatId, statusMsg.message_id).catch(() => {});
+            }
+
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(banner([
+              '📢 BROADCAST COMPLETED',
+              'messages delivered successfully ♡'
+            ])));
+            b.divider();
+            b.table(kvTable([
+              ['✅ Sent Successfully', `${res.sentCount} users`],
+              ['✕ Failed / Blocked', `${res.failedCount} users`],
+              ['👥 Total Audience', `${res.total} users`]
+            ]), { compact: true });
+            b.divider();
+            b.buttons([
+              richButton.callback('⚙ Manage Bot', encodeCallback(id, 'manage', botId), { style: 'primary' }),
+              richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+            ]);
+            b.validate();
+            return ctx.replyRich(b.toJSON());
+          } catch (err) {
+            log.error({ err }, 'broadcast execution error');
+            if (statusMsg?.message_id) {
+              await ctx.api.deleteMessage(ctx.chatId, statusMsg.message_id).catch(() => {});
+            }
+            await ctx.api.sendMessage(ctx.chatId, `<blockquote>✕ Failed to broadcast: ${escapeHtml(err.message)}</blockquote>`, { parse_mode: 'HTML' });
+            return true;
+          }
+        }
+      });
+    }
+  };
+}
