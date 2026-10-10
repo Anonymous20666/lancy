@@ -488,7 +488,7 @@ test('Media Delivery Card: renders 🎵 Send Audio File button and handle("send_
     sendMessage: async (chatId, text, opts) => ({ message_id: 888 }),
     sendAudio: async (chatId, audio, opts) => {
       sentAudioArgs = { chatId, audio, opts };
-      return { message_id: 999 };
+      return { message_id: 999, audio: { file_id: 'test_file_id_123' } };
     },
     sendDocument: async (chatId, doc, opts) => ({ message_id: 1001 }),
     sendRichMessage: async (_c, rich) => {
@@ -536,6 +536,7 @@ test('Media Delivery Card: renders 🎵 Send Audio File button and handle("send_
   // 1. Download media with audio track
   await downloader.executeDownload(mockCtx, 'As It Was Harry Styles');
   assert.ok(deliveredRich, 'Media card was delivered');
+  assert.equal(sentAudioArgs, null, 'Native audio is not sent automatically (only rich card delivered)');
 
   // Verify "🎵 Send Audio File" button exists
   const allButtons = deliveredRich.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
@@ -566,7 +567,14 @@ test('Media Delivery Card: renders 🎵 Send Audio File button and handle("send_
   assert.equal(sentAudioArgs.opts.duration, 167);
   assert.deepEqual(sentAudioArgs.opts.thumbnail, fakeThumbBuf, 'Thumbnail attached to sendAudio');
   assert.ok(sentAudioArgs.opts.caption.includes('As It Was'), 'Caption includes title');
+  assert.ok(sentAudioArgs.opts.caption.includes('<blockquote expandable>'), 'Caption includes expandable blockquote');
+  assert.ok(sentAudioArgs.opts.caption.includes('Platform:'), 'Caption includes platform in blockquote');
   assert.ok(markedMediaMessages.includes(999), 'Sent audio message marked as permanent delivery');
+
+  // Verify cached in database for inline search
+  const cachedRow = db.prepare('SELECT * FROM cached_audio_tracks WHERE file_id = ?').get('test_file_id_123');
+  assert.ok(cachedRow, 'Audio track is cached in SQLite for inline search');
+  assert.equal(cachedRow.title, 'As It Was');
 
   db.close();
 });
