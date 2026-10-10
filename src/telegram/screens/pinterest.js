@@ -279,7 +279,7 @@ export function createPinterestScreen({ app }) {
       }
 
       result.mode = mode;
-      const rich = resultsRich(result, previewBlocks.length, totalMedia, previewBlocks);
+      const rich = resultsRich(result, previewBlocks.length, totalMedia, previewBlocks, 0);
       const files = previewBlocks.length > 0 ? mediaFiles : null;
       await tracker.finish(rich, files);
       if (tracker.messageId) {
@@ -534,19 +534,20 @@ export function createPinterestScreen({ app }) {
       stats: { duplicatesFound: row.duplicates_found ?? 0 }
     };
 
-    const rich = resultsRich(resultStub, Math.min(10, totalMedia), totalMedia, previewBlocks);
+    const rich = resultsRich(resultStub, Math.min(10, totalMedia), totalMedia, previewBlocks, 0);
     const files = previewBlocks.length > 0 ? mediaFiles : null;
     await editOrSend(ctx, rich, files);
   }
 
-  async function showMoreAlbum(ctx, searchId, offset) {
+  async function showMoreAlbum(ctx, searchId, offset = 0) {
     const api = ctx.api || app.telegram.api;
     const chatId = ctx.chatId;
+    const numOffset = Math.max(0, Number(offset) || 0);
 
     const nextMedia = app.pinterest.db.all(
       `SELECT * FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0
        ORDER BY quality_score DESC LIMIT 10 OFFSET ?`,
-      searchId, offset
+      searchId, numOffset
     );
 
     const totalMediaRow = app.pinterest.db.get(
@@ -569,8 +570,14 @@ export function createPinterestScreen({ app }) {
         : 'all aesthetic picks in this search have already been browsed ♡'
       ));
       b.divider();
+      const endButtons = [];
+      if (numOffset > 0) {
+        const prevOffset = Math.max(0, numOffset - 10);
+        endButtons.push(richButton.callback('← Prev Picks', encodeCallback(id, 'moreAlbum', String(searchId), String(prevOffset)), { style: 'primary' }));
+      }
+      endButtons.push(richButton.callback('« Back to Results', encodeCallback(id, 'reuse', String(searchId)), { style: 'primary' }));
+      b.buttons(endButtons);
       b.buttons([
-        richButton.callback('« Back to Results', encodeCallback(id, 'reuse', String(searchId)), { style: 'primary' }),
         richButton.callback('🔍 New Search', encodeCallback(id, 'search'), { style: 'primary' })
       ]);
       b.buttons(navButtons(id, { home: true }));
@@ -599,7 +606,7 @@ export function createPinterestScreen({ app }) {
       }
     }
 
-    const nextOffset = offset + nextMedia.length;
+    const nextOffset = numOffset + nextMedia.length;
     const resultStub = {
       searchId,
       query: searchRow?.query ?? '',
@@ -609,7 +616,7 @@ export function createPinterestScreen({ app }) {
     };
 
     // In-place update with new slideshow in the SAME message!
-    const rich = resultsRich(resultStub, nextOffset, totalMedia, previewBlocks);
+    const rich = resultsRich(resultStub, nextOffset, totalMedia, previewBlocks, numOffset);
     const files = previewBlocks.length > 0 ? mediaFiles : null;
     const screenMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
     if (screenMsgId) {
@@ -759,12 +766,15 @@ export function createPinterestScreen({ app }) {
         case 'reuse':
           return reuseSearch(ctx, args[0]);
         case 'more_album':
-        case 'moreAlbum': {
+        case 'moreAlbum':
+        case 'prev_album':
+        case 'prevAlbum': {
           const searchId = Number(args[0]);
           const offset = Number(args[1] ?? 0);
           return showMoreAlbum(ctx, searchId, offset);
         }
-        case 'moreVideos': {
+        case 'moreVideos':
+        case 'prevVideos': {
           const searchId = Number(args[0]);
           const offset = Number(args[1] ?? 5);
           return showMoreVideos(ctx, searchId, offset);
@@ -833,9 +843,10 @@ function progressRich({ stage, mode, depth, query, goal = 60, ...p }) {
   return b.toJSON();
 }
 
-function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachments = []) {
+function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachments = [], startOffset = null) {
   const b = new RichMessageBuilder();
   const count = Array.isArray(result.results) ? result.results.length : (result.results?.length ?? totalImages);
+  const total = Math.max(Number(totalImages) || 0, Number(count) || 0);
   b.paragraph(rt.bold(banner([
     '𓆩♡𓆪 SEARCH COMPLETED 𓆩♡𓆪',
     `found: ${count} aesthetic picks`
@@ -867,17 +878,61 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
     ]
   ], { compact: true });
   b.divider();
-  b.paragraph(rt.bold('₊˚⊹♡ scroll slideshow above to browse aesthetic picks!'), rt.text('\nʕ•ᴥ•ʔ tap below to create a sticker pack or search again.'));
 
-  if (totalImages > currentOffset) {
-    const nextBatchSize = Math.min(10, totalImages - currentOffset);
-    const label = result.mode === 'videos'
-      ? `🎬 Next ${nextBatchSize} Videos (${currentOffset + 1}–${currentOffset + nextBatchSize})`
-      : `🖼 Next ${nextBatchSize} Picks (${currentOffset + 1}–${currentOffset + nextBatchSize})`;
+  const previewCount = previewAttachments?.length ?? 0;
+  const start = startOffset !== null && startOffset !== undefined
+    ? Math.max(0, Number(startOffset) || 0)
+    : Math.max(0, currentOffset - (previewCount || 10));
+  const end = Math.min(total, start + (previewCount || Math.min(10, total - start)));
+
+  if (total > 0 && end > 0) {
+    b.paragraph(rt.concat(
+      rt.bold('₊˚⊹♡ scroll slideshow above to browse aesthetic picks!'),
+      rt.text(`\nʕ•ᴥ•ʔ showing ${start + 1}–${end} of ${total} picks ♡`)
+    ));
+  } else {
+    b.paragraph(rt.concat(
+      rt.bold('₊˚⊹♡ scroll slideshow above to browse aesthetic picks!'),
+      rt.text('\nʕ•ᴥ•ʔ tap below to create a sticker pack or search again.')
+    ));
+  }
+
+  const isVideo = result.mode === 'videos';
+  const hasPrev = start > 0;
+  const hasNext = total > currentOffset;
+
+  const prevOffset = Math.max(0, start - 10);
+  const prevBatchSize = start - prevOffset;
+  const nextOffset = currentOffset;
+  const nextBatchSize = Math.min(10, total - nextOffset);
+
+  if (hasPrev && hasNext) {
+    const prevRange = `(${prevOffset + 1}–${prevOffset + prevBatchSize})`;
+    const nextRange = `(${nextOffset + 1}–${nextOffset + nextBatchSize})`;
+    const prevLabel = isVideo ? `← Prev ${prevRange}` : `← Prev ${prevRange}`;
+    const nextLabel = isVideo ? `Next ${nextRange} →` : `Next ${nextRange} →`;
     b.buttons([
-      richButton.callback(label, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(currentOffset)), { style: 'primary' })
+      richButton.callback(prevLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(prevOffset)), { style: 'primary' }),
+      richButton.callback(nextLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(nextOffset)), { style: 'primary' })
+    ]);
+  } else if (hasNext) {
+    const nextRange = `(${nextOffset + 1}–${nextOffset + nextBatchSize})`;
+    const nextLabel = isVideo
+      ? `🎬 Next ${nextBatchSize} Videos ${nextRange} →`
+      : `🖼 Next ${nextBatchSize} Picks ${nextRange} →`;
+    b.buttons([
+      richButton.callback(nextLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(nextOffset)), { style: 'primary' })
+    ]);
+  } else if (hasPrev) {
+    const prevRange = `(${prevOffset + 1}–${prevOffset + prevBatchSize})`;
+    const prevLabel = isVideo
+      ? `← 🎬 Prev ${prevBatchSize} Videos ${prevRange}`
+      : `← 🖼 Prev ${prevBatchSize} Picks ${prevRange}`;
+    b.buttons([
+      richButton.callback(prevLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(prevOffset)), { style: 'primary' })
     ]);
   }
+
   b.buttons([
     richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(result.searchId)), { style: 'primary' }),
     richButton.callback('➕ Add to Existing Pack', encodeCallback('stickers', 'addExistingFromSearch', String(result.searchId)), { style: 'primary' })
