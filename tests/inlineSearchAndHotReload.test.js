@@ -96,10 +96,8 @@ test('TelegramController: live inline search returns instant tracks with bot tag
 
   const firstResult = inlineAnswer.results[0];
   assert.ok(firstResult.title, 'first result must have title');
-  assert.ok(firstResult.input_message_content?.message_text, 'first result must have message_text');
-  // Must include bot tag to ensure group chats privacy mode doesn't block the command
-  assert.match(firstResult.input_message_content.message_text, /^\/play@PappyCodespacebot\s+/);
-  assert.ok(firstResult.thumbnail_url || firstResult.thumb_url, 'should have artwork thumbnail');
+  assert.ok(firstResult.type === 'audio' ? Boolean(firstResult.audio_url) : Boolean(firstResult.input_message_content?.message_text), 'first result must deliver real audio stream or input command');
+  assert.ok(firstResult.thumbnail_url || firstResult.thumb_url || firstResult.audio_url, 'should have artwork thumbnail or audio stream');
 
   db.close();
 });

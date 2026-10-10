@@ -319,13 +319,16 @@ export class TelegramController extends EventEmitter {
             const min = Math.floor((r.trackTimeMillis || 0) / 60000);
             const sec = String(Math.floor(((r.trackTimeMillis || 0) % 60000) / 1000)).padStart(2, '0');
             const duration = r.trackTimeMillis ? `${min}:${sec}` : '';
+            const durationSeconds = r.trackTimeMillis ? Math.round(r.trackTimeMillis / 1000) : 30;
             const thumb = r.artworkUrl100?.replace('100x100bb', '600x600bb') || r.artworkUrl100;
             return {
               id: String(r.trackId || idx),
               title: r.trackName || clean,
               artist: r.artistName || 'Music',
               duration,
-              thumbnail: thumb
+              durationSeconds,
+              thumbnail: thumb,
+              audioUrl: r.previewUrl || null
             };
           });
         }
@@ -349,7 +352,9 @@ export class TelegramController extends EventEmitter {
               title: r.title || clean,
               artist: r.artist?.name || 'Music',
               duration,
-              thumbnail: r.album?.cover_big || r.album?.cover_medium
+              durationSeconds: r.duration || 30,
+              thumbnail: r.album?.cover_big || r.album?.cover_medium,
+              audioUrl: r.preview || null
             };
           });
         }
@@ -392,6 +397,116 @@ export class TelegramController extends EventEmitter {
     }
   }
 
+  async #fetchInlineUrlMedia(url, botTag, botName) {
+    const cleanUrl = url.trim();
+
+    // 1. Direct media extensions
+    if (/\.(jpg|jpeg|png|webp)($|\?)/i.test(cleanUrl)) {
+      return [{
+        type: 'photo',
+        id: 'photo_' + Date.now(),
+        photo_url: cleanUrl,
+        thumb_url: cleanUrl,
+        title: '📷 HD Image Preview',
+        caption: `📷 <b>HD Image</b>\n✨ <i>Delivered via @${this.botUsername || 'bot'} ♡</i>`,
+        parse_mode: 'HTML'
+      }];
+    }
+    if (/\.(mp4|mov|webm)($|\?)/i.test(cleanUrl)) {
+      return [{
+        type: 'video',
+        id: 'vid_' + Date.now(),
+        video_url: cleanUrl,
+        mime_type: 'video/mp4',
+        thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        title: '🎬 HD Video',
+        caption: `🎬 <b>HD Video</b>\n✨ <i>Delivered via @${this.botUsername || 'bot'} ♡</i>`,
+        parse_mode: 'HTML'
+      }];
+    }
+    if (/\.(mp3|m4a|aac|ogg|wav)($|\?)/i.test(cleanUrl)) {
+      return [{
+        type: 'audio',
+        id: 'aud_' + Date.now(),
+        audio_url: cleanUrl,
+        title: '🎵 Audio File',
+        caption: `🎵 <b>Audio File</b>\n✨ <i>Delivered via @${this.botUsername || 'bot'} ♡</i>`,
+        parse_mode: 'HTML'
+      }];
+    }
+
+    // 2. TikTok: Fast watermark-free extraction via TikWM API (~300ms)
+    if (/tiktok\.com/i.test(cleanUrl)) {
+      try {
+        const res = await fetch('https://www.tikwm.com/api/', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/131 Mobile Safari/537.36'
+          },
+          body: new URLSearchParams({ url: cleanUrl, hd: '1' }),
+          signal: AbortSignal.timeout(4500)
+        });
+        const json = await res.json().catch(() => null);
+        if (json?.code === 0 && json.data) {
+          const d = json.data;
+          const videoUrl = d.play?.startsWith('http') ? d.play : (d.play ? 'https://www.tikwm.com' + d.play : null);
+          const audioUrl = d.music?.startsWith('http') ? d.music : (d.music ? 'https://www.tikwm.com' + d.music : null);
+          const title = d.title || 'TikTok Media';
+          const author = d.author?.nickname || d.author?.unique_id || 'TikTok';
+          const cover = d.cover?.startsWith('http') ? d.cover : (d.cover ? 'https://www.tikwm.com' + d.cover : undefined);
+          const results = [];
+
+          if (videoUrl) {
+            results.push({
+              type: 'video',
+              id: 'tt_vid_' + Date.now(),
+              video_url: videoUrl,
+              mime_type: 'video/mp4',
+              thumb_url: cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+              title: `🎬 HD Video: ${title.slice(0, 45)}`,
+              description: `👤 ${author} • Direct No-Watermark MP4 ♡`,
+              caption: `🎬 <b>${escapeHtml(title)}</b>\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${this.botUsername || 'bot'} ♡</i>`,
+              parse_mode: 'HTML'
+            });
+          }
+
+          if (audioUrl) {
+            results.push({
+              type: 'audio',
+              id: 'tt_aud_' + Date.now(),
+              audio_url: audioUrl,
+              title: d.music_info?.title || title.slice(0, 30) || 'Soundtrack',
+              performer: d.music_info?.author || author,
+              caption: `🎵 <b>${escapeHtml(d.music_info?.title || title)}</b>\n👤 <i>${escapeHtml(d.music_info?.author || author)}</i>\n✨ <i>Extracted audio via @${this.botUsername || 'bot'} ♡</i>`,
+              parse_mode: 'HTML'
+            });
+          }
+
+          if (results.length > 0) return results;
+        }
+      } catch (err) {
+        this.log.debug({ err: err?.message }, 'inline tiktok fetch failed');
+      }
+    }
+
+    // 3. Fallback action card for other platforms
+    return [
+      {
+        type: 'article',
+        id: 'dl_action_' + Date.now(),
+        title: `📥 Download Media with ${botName}`,
+        description: `Tap to download link in full HD with extracted audio ♡`,
+        thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        input_message_content: {
+          message_text: `<blockquote>📥 <b>Universal Downloader</b>\nLink: <code>${escapeHtml(cleanUrl)}</code>\n\nTip: Send <code>/grab ${escapeHtml(cleanUrl)}</code> in this chat for full HD media delivery! ♡</blockquote>`,
+          parse_mode: 'HTML'
+        }
+      }
+    ];
+  }
+
   async #handleInlineQuery(inlineQuery) {
     if (!inlineQuery?.id) return;
     const qId = inlineQuery.id;
@@ -406,7 +521,7 @@ export class TelegramController extends EventEmitter {
           {
             type: 'article',
             id: 'hint_play',
-            title: '🎵 Music 🎵',
+            title: '🎵 Music Search 🎵',
             description: 'Enter your search term (e.g. song name, artist, album) ♡',
             thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
             thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
@@ -450,7 +565,21 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      // 2. Check if Pinterest search:
+      // 2. Check if user pasted a media URL (TikTok, Instagram, YouTube, etc.)
+      if (/^https?:\/\//i.test(rawText)) {
+        const urlResults = await this.#fetchInlineUrlMedia(rawText, botTag, botName);
+        if (urlResults?.length > 0) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: urlResults,
+            cache_time: 15,
+            is_personal: false
+          });
+          return;
+        }
+      }
+
+      // 3. Check if Pinterest search:
       if (/^(pint|pinterest|photo|pic|wallpaper)\s+/i.test(rawText)) {
         const queryTopic = rawText.replace(/^(pint|pinterest|photo|pic|wallpaper)\s+/i, '').trim();
         const pintResults = [
@@ -460,7 +589,8 @@ export class TelegramController extends EventEmitter {
             title: `🔍 Search Pinterest for "${queryTopic}"`,
             description: `Fetch HD aesthetic pictures and videos for "${queryTopic}" ♡`,
             input_message_content: {
-              message_text: `/search${botTag} ${queryTopic}`
+              message_text: `<blockquote>🔍 <b>Pinterest Search</b>\nTopic: <code>${escapeHtml(queryTopic)}</code>\n\nTip: Send <code>/search ${escapeHtml(queryTopic)}</code> in chat for full album delivery! ♡</blockquote>`,
+              parse_mode: 'HTML'
             }
           }
         ];
@@ -473,7 +603,7 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      // 3. Music Search (Live):
+      // 4. Music Search (Live):
       const cleanSongQuery = rawText.replace(/^(play|music|song|listen|stream)\s+/i, '').trim() || rawText;
 
       let searchItems = inlineSearchCache.get(cleanSongQuery.toLowerCase());
@@ -493,6 +623,29 @@ export class TelegramController extends EventEmitter {
         const artist = item.artist || 'Music';
         const duration = item.duration ? `⏱ ${item.duration}` : '🎵 High-Speed MP3';
 
+        if (item.audioUrl) {
+          return {
+            type: 'audio',
+            id: `song_${item.id || index}_${Date.now()}`,
+            audio_url: item.audioUrl,
+            title,
+            performer: artist,
+            audio_duration: item.durationSeconds || undefined,
+            caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n✨ <i>Streamed via @${this.botUsername || 'bot'} ♡</i>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `🎵 Play in ${botName}`,
+                    url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=music`
+                  }
+                ]
+              ]
+            }
+          };
+        }
+
         return {
           type: 'article',
           id: `song_${item.id || index}_${Date.now()}`,
@@ -501,7 +654,8 @@ export class TelegramController extends EventEmitter {
           thumb_url: item.thumbnail || undefined,
           thumbnail_url: item.thumbnail || undefined,
           input_message_content: {
-            message_text: `/play${botTag} ${title} ${artist}`.trim()
+            message_text: `<blockquote>🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n⏱ ${duration}\n\nTip: Send <code>/play ${escapeHtml(title)}</code> in this chat to stream full 320k MP3! ♡</blockquote>`,
+            parse_mode: 'HTML'
           }
         };
       });
@@ -515,7 +669,8 @@ export class TelegramController extends EventEmitter {
           thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
           thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
           input_message_content: {
-            message_text: `/play${botTag} ${cleanSongQuery}`.trim()
+            message_text: `<blockquote>🎵 <b>Music Search</b>\nQuery: <code>${escapeHtml(cleanSongQuery)}</code>\n\nTip: Send <code>/play ${escapeHtml(cleanSongQuery)}</code> in this chat to stream! ♡</blockquote>`,
+            parse_mode: 'HTML'
           }
         });
       }

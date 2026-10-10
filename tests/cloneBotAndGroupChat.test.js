@@ -793,7 +793,22 @@ test('Inline Query: handles @bot query with live music search and returns articl
   assert.equal(inlineAnswers.inline_query_id, 'iq_2');
   assert.ok(inlineAnswers.results.length >= 1, 'Search results returned');
   const firstSong = inlineAnswers.results[0];
-  assert.match(firstSong.input_message_content.message_text, /\/play/i, 'Clicking result inputs /play command');
+  // 3. Media URL query: e.g. direct mp4 or media link
+  inlineAnswers = null;
+  await bot.handleUpdate({
+    update_id: 403,
+    inline_query: {
+      id: 'iq_3',
+      from: { id: 12345, first_name: 'User1' },
+      query: 'https://example.com/aesthetic_loop.mp4',
+      offset: ''
+    }
+  });
+  assert.ok(inlineAnswers, 'answerInlineQuery called for media URL query');
+  assert.equal(inlineAnswers.inline_query_id, 'iq_3');
+  assert.ok(inlineAnswers.results.length >= 1, 'Media results returned');
+  assert.equal(inlineAnswers.results[0].type, 'video');
+  assert.equal(inlineAnswers.results[0].video_url, 'https://example.com/aesthetic_loop.mp4');
 
   db.close();
 });
