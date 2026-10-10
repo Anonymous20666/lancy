@@ -138,6 +138,17 @@ export const richButton = {
   disabled: (text) => ({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' }, style: 'primary' })
 };
 
+function isRichMessageBlock(item) {
+  if (!item || typeof item !== 'object') return false;
+  const blockTypes = [
+    'paragraph', 'heading', 'pre', 'footer', 'divider',
+    'buttons', 'table', 'list', 'blockquote', 'expandable_blockquote',
+    'pullquote', 'details', 'photo', 'video', 'audio',
+    'animation', 'document', 'collage', 'slideshow'
+  ];
+  return blockTypes.includes(item.type);
+}
+
 // ── InputRichMessage builder ──────────────────────────────────────────────
 
 export class RichMessageBuilder {
@@ -162,7 +173,19 @@ export class RichMessageBuilder {
   table(rows, opts) { this.blocks.push(block.table(rows, opts)); return this; }
   list(items) { this.blocks.push(block.list(items)); return this; }
   blockquote(blocksOrText, credit) {
-    this.blocks.push(block.blockquote(Array.isArray(blocksOrText) ? blocksOrText : [block.paragraph(blocksOrText)], credit));
+    let blocks;
+    if (Array.isArray(blocksOrText)) {
+      if (blocksOrText.length > 0 && blocksOrText.every(isRichMessageBlock)) {
+        blocks = blocksOrText;
+      } else {
+        blocks = [block.paragraph(blocksOrText)];
+      }
+    } else if (isRichMessageBlock(blocksOrText)) {
+      blocks = [blocksOrText];
+    } else {
+      blocks = [block.paragraph(blocksOrText)];
+    }
+    this.blocks.push(block.blockquote(blocks, credit));
     return this;
   }
   quote(blocksOrText, credit) {

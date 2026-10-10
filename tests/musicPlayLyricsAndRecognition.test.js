@@ -678,4 +678,23 @@ test('Clone Screen: renders welcome card and prompts with b.quote and zero raw H
   db.close();
 });
 
+test('RichMessageBuilder: b.quote correctly wraps rich text arrays in paragraph block without bare bold blocks', async () => {
+  const { RichMessageBuilder, rt } = await import('../src/telegram/rich.js');
+
+  const b = new RichMessageBuilder();
+  b.quote(rt.concat(
+    rt.bold('Title: '),
+    rt.text('Description')
+  ));
+
+  const json = b.toJSON();
+  const bq = json.blocks.find((blk) => blk.type === 'blockquote');
+  assert.ok(bq, 'Blockquote exists');
+  assert.ok(Array.isArray(bq.blocks), 'bq.blocks is an array');
+  assert.equal(bq.blocks[0].type, 'paragraph', 'bq.blocks child must be an InputRichMessageBlock paragraph');
+  assert.ok(Array.isArray(bq.blocks[0].text), 'paragraph text contains the rich text array');
+  assert.equal(bq.blocks[0].text[0].type, 'bold', 'first rich text item is bold');
+  assert.equal(bq.blocks[0].text[1], 'Description', 'second rich text item is string');
+});
+
 
