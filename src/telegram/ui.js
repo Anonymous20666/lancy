@@ -72,11 +72,12 @@ export function kvTable(pairs) {
 }
 
 /** Standard navigation buttons for rich messages. */
-export function navButtons(screen, { back = true, cancel = false, home = false } = {}) {
+export function navButtons(screen, { back = true, cancel = false, home = false, fromMedia = false } = {}) {
   const buttons = [];
-  if (back) buttons.push(richButton.callback('« Back', encodeCallback(screen, 'back'), { style: 'primary' }));
-  if (home) buttons.push(richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' }));
-  if (cancel) buttons.push(richButton.callback('✕ Cancel', encodeCallback(screen, 'cancel'), { style: 'danger' }));
+  const extraArgs = fromMedia ? ['from_media'] : [];
+  if (back) buttons.push(richButton.callback('« Back', encodeCallback(screen, 'back', ...extraArgs), { style: 'primary' }));
+  if (home) buttons.push(richButton.callback('✦ Home', encodeCallback('dashboard', 'open', ...extraArgs), { style: 'primary' }));
+  if (cancel) buttons.push(richButton.callback('✕ Cancel', encodeCallback(screen, 'cancel', ...extraArgs), { style: 'danger' }));
   return buttons;
 }
 

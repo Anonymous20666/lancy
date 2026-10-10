@@ -256,9 +256,9 @@ export function createStickersScreen({ app }) {
       const targetMedia = activeMedia.length > 0 ? activeMedia : usableRows;
       const count = targetMedia.length;
 
-      // Use existing screen message for ticking in-place progress tracker
-      const screenMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
-      const tracker = new ProgressTracker({ api, chatId, messageId: screenMsgId, heartbeatMs: 2000 });
+      // DO NOT reuse existing screen message (which is the Pinterest search results media)
+      // Send a fresh progress tracker message so the user's search photos stay intact!
+      const tracker = new ProgressTracker({ api, chatId, messageId: null, heartbeatMs: 2000 });
       await tracker.live((state, { elapsedMs }) => packProgressRich({ ...state, elapsedMs }), {
         stage: 'downloading', count, query, mode: isVideoSearch ? 'videos' : 'normal', total: count, done: 0
       });
@@ -1249,7 +1249,7 @@ export function createStickersScreen({ app }) {
         richButton.callback('✨ Create New Pack', encodeCallback(id, 'fromSearch', String(searchId)), { style: 'primary' })
       ]);
       b.buttons([
-        richButton.callback('« Back to Results', encodeCallback('pinterest', 'reuse', String(searchId)), { style: 'primary' })
+        richButton.callback('« Back to Results', encodeCallback('pinterest', 'reuse', String(searchId), 'from_media'), { style: 'primary' })
       ]);
     } else {
       b.paragraph(rt.italic(`packs with space available (${total} total • page ${page + 1}/${totalPages}):`));
@@ -1265,7 +1265,7 @@ export function createStickersScreen({ app }) {
       if (page < totalPages - 1) navRow.push(richButton.callback('Next →', encodeCallback(id, 'addExistingFromSearch', String(searchId), String(page + 1)), { style: 'primary' }));
       if (navRow.length) b.buttons(navRow);
       b.buttons([
-        richButton.callback('« Back to Results', encodeCallback('pinterest', 'reuse', String(searchId)), { style: 'primary' })
+        richButton.callback('« Back to Results', encodeCallback('pinterest', 'reuse', String(searchId), 'from_media'), { style: 'primary' })
       ]);
     }
     b.validate();
@@ -1306,8 +1306,13 @@ export function createStickersScreen({ app }) {
       return editOrSend(ctx, b.toJSON());
     }
 
-    const screenMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
-    const tracker = new ProgressTracker({ api, chatId, messageId: screenMsgId, heartbeatMs: 2000 });
+    const isFromMedia = Boolean(
+      ctx.fromMedia || ctx.forceNew ||
+      (ctx.query?.message && app.telegram?.controller?.isMediaDeliveryMessage?.(ctx.query.message)) ||
+      (ctx.messageId && app.telegram?.controller?.isMediaDeliveryMessageId?.(ctx.messageId))
+    );
+    const targetMsgId = isFromMedia ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
+    const tracker = new ProgressTracker({ api, chatId, messageId: targetMsgId, heartbeatMs: 2000 });
     const isVideo = pack.stickerType === 'video';
     await tracker.live((state, { elapsedMs }) => packProgressRich({ ...state, elapsedMs }), {
       stage: 'downloading', count: allMediaRows.length, query, mode: isVideo ? 'videos' : 'normal', total: allMediaRows.length, done: 0

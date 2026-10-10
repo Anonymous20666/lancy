@@ -84,7 +84,7 @@ export class TelegramController extends EventEmitter {
     // Any message with inline keyboard containing lyrics, downloader, media actions
     if (msg.reply_markup?.inline_keyboard) {
       const allCb = msg.reply_markup.inline_keyboard.flat().map((b) => b.callback_data || '').join(' ');
-      if (/lyrics|from_media|downloader|stickers:open/i.test(allCb)) {
+      if (/lyrics|from_media|downloader|stickers:open|moreAlbum|prevAlbum|moreVideos|prevVideos|fromSearch|addExistingFromSearch|addToExistingPack|getMedia|pinterest:getMedia/i.test(allCb)) {
         return true;
       }
     }
@@ -1044,7 +1044,15 @@ export class TelegramController extends EventEmitter {
       }
       const { screen, action, args } = decoded;
 
-      const isFromMedia = Boolean(
+      // Pagination actions on media messages should update in-place (browsing album slides)
+      const isPagination = Boolean(
+        action === 'moreAlbum' ||
+        action === 'prevAlbum' ||
+        action === 'moreVideos' ||
+        action === 'prevVideos'
+      );
+
+      const isFromMedia = !isPagination && Boolean(
         args?.includes('from_media') ||
         (query.message && this.isMediaDeliveryMessage(query.message)) ||
         (query.message?.message_id && this.isMediaDeliveryMessageId(query.message.message_id))
@@ -1771,14 +1779,16 @@ export class TelegramController extends EventEmitter {
       replyRich: (rich, extra = {}, files = null) => this.api.sendRichMessage(chatId, rich, extra, files),
       sendRichMessage: (rich, extra = {}, files = null) => this.api.sendRichMessage(chatId, rich, extra, files),
       editScreen: async (rich, extra = {}, files = null) => {
-        const isMediaDelivery = fromMedia || forceNew ||
-          (queryMessage && this.isMediaDeliveryMessage(queryMessage)) ||
-          (queryMessage?.message_id && this.isMediaDeliveryMessageId(queryMessage.message_id));
-
         const activeScreenMsgId = queryMessage?.message_id ||
           this.userScreenMessage.get(tgId)?.messageId ||
           this.sm?.for(tgId)?.screenMessageId ||
           this.sm?.context?.(tgId)?.screenMessageId;
+
+        const isTargetMedia = Boolean(activeScreenMsgId && this.isMediaDeliveryMessageId(activeScreenMsgId));
+
+        const isMediaDelivery = fromMedia || forceNew || isTargetMedia ||
+          (queryMessage && this.isMediaDeliveryMessage(queryMessage)) ||
+          (queryMessage?.message_id && this.isMediaDeliveryMessageId(queryMessage.message_id));
 
         // If fromMedia, forceNew, the current message contains delivered media, or no existing screen message:
         // send a fresh rich message so the user never loses their video, photo, or audio!

@@ -571,12 +571,12 @@ export function createPinterestScreen({ app }) {
         const prevOffset = Math.max(0, numOffset - 10);
         endButtons.push(richButton.callback('← Prev Picks', encodeCallback(id, 'moreAlbum', String(searchId), String(prevOffset)), { style: 'primary' }));
       }
-      endButtons.push(richButton.callback('« Back to Results', encodeCallback(id, 'reuse', String(searchId)), { style: 'primary' }));
+      endButtons.push(richButton.callback('« Back to Results', encodeCallback(id, 'reuse', String(searchId), 'from_media'), { style: 'primary' }));
       b.buttons(endButtons);
       b.buttons([
-        richButton.callback('🔍 New Search', encodeCallback(id, 'search'), { style: 'primary' })
+        richButton.callback('🔍 New Search', encodeCallback(id, 'search', 'from_media'), { style: 'primary' })
       ]);
-      b.buttons(navButtons(id, { home: true }));
+      b.buttons(navButtons(id, { home: true, fromMedia: true }));
       b.validate();
       await editOrSend(ctx, b.toJSON());
       return;
@@ -940,12 +940,12 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
   }
 
   b.buttons([
-    richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(result.searchId)), { style: 'primary' }),
-    richButton.callback('➕ Add to Existing Pack', encodeCallback('stickers', 'addExistingFromSearch', String(result.searchId)), { style: 'primary' })
+    richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(result.searchId), 'from_media'), { style: 'primary' }),
+    richButton.callback('➕ Add to Existing Pack', encodeCallback('stickers', 'addExistingFromSearch', String(result.searchId), '0', 'from_media'), { style: 'primary' })
   ]);
   b.buttons([
-    richButton.callback('🔍 New Search', encodeCallback('pinterest', 'search'), { style: 'primary' }),
-    richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    richButton.callback('🔍 New Search', encodeCallback('pinterest', 'search', 'from_media'), { style: 'primary' }),
+    richButton.callback('✦ Home', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
   ]);
   b.validate();
   return b.toJSON();
@@ -957,8 +957,8 @@ function errorRich(error) {
   b.paragraph(rt.bold(`ʕ•ᴥ•ʔ ${String(error?.userMessage ?? error?.message ?? 'something went wrong')}`));
   b.divider();
   b.buttons([
-    richButton.callback('↺ Try Again', encodeCallback('pinterest', 'search'), { style: 'primary' }),
-    richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    richButton.callback('↺ Try Again', encodeCallback('pinterest', 'search', 'from_media'), { style: 'primary' }),
+    richButton.callback('✦ Home', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
   ]);
   b.validate();
   return b.toJSON();
