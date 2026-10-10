@@ -248,7 +248,7 @@ export function createDownloaderScreen({ app }) {
   async function executeDownload(ctx, url) {
     const screenMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
     const tracker = new ProgressTracker({
-      api: app.telegram.api,
+      api: ctx.api || app.telegram.api,
       chatId: ctx.chatId,
       messageId: screenMsgId,
       heartbeatMs: 2000,
@@ -867,7 +867,7 @@ export function createDownloaderScreen({ app }) {
                 ...sctx,
                 chatId: message.chat?.id || sctx.chatId,
                 tgId: sctx.tgId || String(message.from?.id),
-                api: app.telegram.api,
+                api: sctx.api || app.telegram.api,
                 message
               };
               await controller.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
@@ -896,8 +896,9 @@ export function createDownloaderScreen({ app }) {
               richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
             ]);
             b.validate();
-            await app.telegram.api.sendRichMessage(sctx.chatId, b.toJSON()).catch(async () => {
-              await app.telegram.api.sendMessage(
+            const api = sctx.api || app.telegram.api;
+            await api.sendRichMessage(sctx.chatId, b.toJSON()).catch(async () => {
+              await api.sendMessage(
                 sctx.chatId,
                 `୨୧ Please provide a valid media link starting with http:// or https:// ♡\n` +
                 `Tip: To search & play music, use 🎵 Play Music from the menu or type /play <song name> ♡`
@@ -909,8 +910,8 @@ export function createDownloaderScreen({ app }) {
           const target = match ? match[0] : text;
           const dlCtx = {
             ...sctx,
-            controller: app.telegram?.controller,
-            api: app.telegram?.api,
+            controller: sctx.controller || app.telegram?.controller,
+            api: sctx.api || app.telegram?.api,
             chatId: message.chat?.id || sctx.chatId,
             tgId: sctx.tgId || String(message.from?.id),
             message
@@ -930,13 +931,13 @@ export function createDownloaderScreen({ app }) {
         onMessage: async (sctx, message) => {
           const recMedia = extractMediaForMusicRecognition(message);
           if (recMedia && recMedia.obj?.file_id) {
-            const controller = app.telegram?.controller;
+            const controller = sctx.controller || app.telegram?.controller;
             if (controller?.handleAudioRecognition) {
               const ctx = {
                 ...sctx,
                 chatId: message.chat?.id || sctx.chatId,
                 tgId: sctx.tgId || String(message.from?.id),
-                api: app.telegram.api,
+                api: sctx.api || app.telegram.api,
                 message
               };
               await controller.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
@@ -950,8 +951,8 @@ export function createDownloaderScreen({ app }) {
           const target = match ? match[0] : text;
           const dlCtx = {
             ...sctx,
-            controller: app.telegram?.controller,
-            api: app.telegram?.api,
+            controller: sctx.controller || app.telegram?.controller,
+            api: sctx.api || app.telegram?.api,
             chatId: message.chat?.id || sctx.chatId,
             tgId: sctx.tgId || String(message.from?.id),
             message

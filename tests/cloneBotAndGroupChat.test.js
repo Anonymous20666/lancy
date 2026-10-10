@@ -557,3 +557,101 @@ test('Remove Bot Flow: /rmbot and "rm bot" handle 0 bots, 1 bot, multiple bots p
   db.close();
 });
 
+test('Cloned Bot Downloader: executes download and progress updates via cloned bot API without chat not found', async () => {
+  const { createDownloaderScreen } = await import('../src/telegram/screens/downloader.js');
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.set('security.publicAccess', true);
+  const sm = new StateMachine();
+
+  const mainApiCalls = [];
+  const fakeMainApi = {
+    call: async () => ({}),
+    sendRichMessage: async (...args) => { mainApiCalls.push(['sendRichMessage', ...args]); return { message_id: 101 }; },
+    editMessageRich: async (...args) => { mainApiCalls.push(['editMessageRich', ...args]); return { message_id: 101 }; },
+    sendMessage: async (...args) => { mainApiCalls.push(['sendMessage', ...args]); return { message_id: 102 }; },
+    getMe: async () => ({ id: 1000, username: 'main_bot' })
+  };
+
+  const cloneApiCalls = [];
+  const fakeCloneApi = {
+    call: async () => ({}),
+    sendRichMessage: async (chatId, rich) => {
+      cloneApiCalls.push(['sendRichMessage', chatId, rich]);
+      return { message_id: 201 };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      cloneApiCalls.push(['editMessageRich', chatId, msgId, rich]);
+      return { message_id: msgId };
+    },
+    sendMessage: async (chatId, text) => {
+      cloneApiCalls.push(['sendMessage', chatId, text]);
+      return { message_id: 202 };
+    },
+    sendChatAction: async () => ({ ok: true }),
+    getMe: async () => ({ id: 2000, username: 'pappy_clone_bot' })
+  };
+
+  const fakeMediaDownloader = {
+    detectPlatform: () => 'spotify',
+    download: async (query) => ({
+      platform: 'spotify',
+      mediaItems: [],
+      audioTrack: {
+        buffer: Buffer.from('mock_audio'),
+        title: 'Ransom',
+        performer: 'Lil Tecca'
+      },
+      title: 'Ransom',
+      artist: 'Lil Tecca'
+    })
+  };
+
+  const app = {
+    db,
+    settings,
+    mediaDownloader: fakeMediaDownloader,
+    telegram: {
+      api: fakeMainApi,
+      controller: null
+    }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  downloader.registerStateHandlers(sm);
+
+  const cloneBot = new TelegramController({
+    api: fakeCloneApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext: { botId: 2, botName: 'PappyBot', isClone: true, ownerId: 8380969639 },
+    app
+  });
+  cloneBot.screens.set('downloader', downloader);
+
+  // Set user state to MUSIC_SEARCH_INPUT in clone bot
+  await sm.transition(8380969639, States.MUSIC_SEARCH_INPUT, {
+    chatId: 8380969639,
+    screenMessageId: 555
+  });
+
+  // User sends "ransom" to cloned bot
+  await cloneBot.handleUpdate({
+    update_id: 301,
+    message: {
+      message_id: 777,
+      chat: { id: 8380969639, type: 'private' },
+      from: { id: 8380969639, first_name: 'Pappy' },
+      text: 'ransom'
+    }
+  });
+
+  // Verify clone API was called for rich message delivery
+  assert.ok(cloneApiCalls.length > 0, 'Clone API received calls for progress and delivery');
+  // Verify main bot API was NOT called
+  assert.equal(mainApiCalls.length, 0, 'Main bot API must never be called for cloned bot interactions');
+
+  db.close();
+});
+

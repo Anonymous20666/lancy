@@ -49,11 +49,12 @@ export function createPinterestScreen({ app }) {
     const chatId = ctx.chatId ?? Number(tgId);
     const sm = ctx.sm ?? ctx.machine;
     const targetMsgId = ctx.messageId ?? ctx.screenMessageId ?? sm?.for(tgId)?.screenMessageId ?? sm?.context?.(tgId)?.screenMessageId;
+    const api = ctx.api || app.telegram.api;
     if (targetMsgId) {
-      const res = await app.telegram.api.editMessageRich(chatId, targetMsgId, rich, {}, files).catch(() => null);
+      const res = await api.editMessageRich(chatId, targetMsgId, rich, {}, files).catch(() => null);
       if (res) return res;
     }
-    return app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+    return api.sendRichMessage(chatId, rich, {}, files);
   }
 
   async function openMenu(ctx) {
@@ -193,7 +194,7 @@ export function createPinterestScreen({ app }) {
     const rawGoal = targetGoal ?? sctx.context.goal ?? null;
     const goal = mode === 'videos' ? Math.min(20, Math.max(1, Number(rawGoal) || 20)) : (Number(rawGoal) > 0 ? Number(rawGoal) : 60);
     const userId = Number(sctx.tgId);
-    const api = app.telegram.api;
+    const api = sctx.api || app.telegram.api;
     const chatId = sctx.chatId;
 
     // Delete user input message to keep chat totally clean & un-spammy
@@ -539,7 +540,7 @@ export function createPinterestScreen({ app }) {
   }
 
   async function showMoreAlbum(ctx, searchId, offset) {
-    const api = app.telegram.api;
+    const api = ctx.api || app.telegram.api;
     const chatId = ctx.chatId;
 
     const nextMedia = app.pinterest.db.all(
@@ -641,7 +642,7 @@ export function createPinterestScreen({ app }) {
         const text = (message.text ?? '').trim();
         if (!text) return false;
         if (message.message_id) {
-          await app.telegram.api.deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+          await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
         }
         if (sctx.context.stage === 'historySearch') {
           return showHistory(sctx, 0, text);
@@ -655,7 +656,7 @@ export function createPinterestScreen({ app }) {
         return askCount(sctx, text, sctx.context.mode || 'normal');
       },
       onTimeout: async (sctx) => {
-        await app.telegram.api.sendMessage(sctx.chatId, '♡ search timed out — send a new query whenever you are ready.').catch(() => {});
+        await (sctx.api || app.telegram.api).sendMessage(sctx.chatId, '♡ search timed out — send a new query whenever you are ready.').catch(() => {});
       },
       onCleanup: (sctx) => {
         activeSearches.get(sctx.tgId)?.abort();
