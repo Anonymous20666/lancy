@@ -370,3 +370,121 @@ test('Rich Music Drop: /play command produces full Rich Message with audio, meta
   db.close();
 });
 
+test('TelegramController: live inline search for pint/photo returns real HD photos', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const fakePinterestProvider = {
+    search: async ({ query }) => ({
+      items: [
+        {
+          pinId: 'pin_1',
+          mediaUrl: 'https://i.pinimg.com/originals/cute_cat.jpg',
+          thumbnailUrl: 'https://i.pinimg.com/736x/cute_cat.jpg',
+          type: 'image'
+        },
+        {
+          pinId: 'pin_2',
+          mediaUrl: 'https://v.pinimg.com/videos/cute_video.mp4',
+          thumbnailUrl: 'https://i.pinimg.com/736x/thumb.jpg',
+          type: 'video'
+        }
+      ]
+    })
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: { pinterest: { provider: fakePinterestProvider } },
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  await controller.handleInlineQuery({
+    id: 'query_pint_1',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pint cute cats',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.equal(inlineAnswer.inline_query_id, 'query_pint_1');
+  assert.equal(inlineAnswer.results.length, 2);
+
+  // First result is photo
+  const photoResult = inlineAnswer.results[0];
+  assert.equal(photoResult.type, 'photo');
+  assert.equal(photoResult.photo_url, 'https://i.pinimg.com/originals/cute_cat.jpg');
+  assert.match(photoResult.caption, /cute cats/);
+
+  // Second result is video
+  const videoResult = inlineAnswer.results[1];
+  assert.equal(videoResult.type, 'video');
+  assert.equal(videoResult.video_url, 'https://v.pinimg.com/videos/cute_video.mp4');
+
+  db.close();
+});
+
+test('TelegramController: live inline search for Pinterest album and video URLs delivers real media items', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Test real Pinterest album extraction
+  await controller.handleInlineQuery({
+    id: 'query_pin_album',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'https://pin.it/2WiRqWBjo',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.equal(inlineAnswer.inline_query_id, 'query_pin_album');
+  assert.ok(inlineAnswer.results.length >= 1, 'should return album slides');
+  const firstSlide = inlineAnswer.results[0];
+  assert.equal(firstSlide.type, 'photo', 'album items must be delivered as photo type');
+  assert.ok(firstSlide.photo_url.includes('pinimg.com'), 'photo_url must point to Pinterest CDN');
+
+  db.close();
+});
+

@@ -12,9 +12,12 @@ import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
 import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
 import { t } from '../core/i18n.js';
+import { PinterestWebProvider } from '../pinterest/web.js';
 
 const execFileAsync = promisify(execFile);
 const inlineSearchCache = new Map();
+const inlinePinterestCache = new Map();
+const inlineUrlCache = new Map();
 
 /**
  * TelegramController — the control center.
@@ -397,6 +400,227 @@ export class TelegramController extends EventEmitter {
     }
   }
 
+  async #fetchInlinePinterestMedia(url, botTag, botName) {
+    try {
+      const headRes = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(6500)
+      });
+      let resolvedUrl = headRes.url;
+      const pinIdMatch = resolvedUrl.match(/pin\/(\d+)/);
+      const pinId = pinIdMatch ? pinIdMatch[1] : null;
+      let html = await headRes.text();
+
+      if (pinId && (resolvedUrl.includes('/sent/') || !html.includes('window.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__('))) {
+        const cleanUrl = `https://www.pinterest.com/pin/${pinId}/`;
+        try {
+          const cleanRes = await fetch(cleanUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            signal: AbortSignal.timeout(6500)
+          });
+          if (cleanRes.ok) {
+            resolvedUrl = cleanUrl;
+            html = await cleanRes.text();
+          }
+        } catch {}
+      }
+
+      let title = 'Pinterest Pin';
+      const ogTitle = html.match(/<meta property="og:title" content="([^"]+)"/i)?.[1];
+      if (ogTitle) title = ogTitle.replace(/\s*\|\s*Pinterest.*$/i, '').trim();
+
+      let videoUrl = null;
+      const imageUrls = [];
+
+      const relayMarker = 'window.__PWS_RELAY_REGISTER_COMPLETED_REQUEST__(';
+      let searchIdx = 0;
+      while ((searchIdx = html.indexOf(relayMarker, searchIdx)) !== -1) {
+        const after = html.slice(searchIdx + relayMarker.length);
+        const firstComma = after.indexOf(',');
+        if (firstComma !== -1) {
+          const secondArg = after.slice(firstComma + 1).trim();
+          let depth = 0, endIdx = -1;
+          for (let i = 0; i < secondArg.length; i++) {
+            if (secondArg[i] === '{') depth++;
+            else if (secondArg[i] === '}') {
+              depth--;
+              if (depth === 0) { endIdx = i + 1; break; }
+            }
+          }
+          if (endIdx !== -1) {
+            try {
+              const parsed = JSON.parse(secondArg.slice(0, endIdx));
+              const pin = parsed?.data?.v3GetPinQueryv2?.data || parsed?.data?.pin;
+              if (pin) {
+                if (pin.title || pin.gridTitle) title = (pin.title || pin.gridTitle).trim();
+                if (pin.videos?.videoList) {
+                  const vList = pin.videos.videoList;
+                  const vBest = vList.v720P?.url || vList.vEXP3?.url || vList.vEXP2?.url || Object.values(vList).find((v) => v?.url && /\.mp4(?:[?&]|$)/i.test(v.url))?.url;
+                  if (vBest) videoUrl = vBest;
+                }
+                if (!videoUrl && Array.isArray(pin.videos?.videoUrls)) {
+                  videoUrl = pin.videos.videoUrls.find((u) => /\.mp4(?:[?&]|$)/i.test(u)) || null;
+                }
+                if (pin.carouselData?.carouselSlots?.length) {
+                  for (const slot of pin.carouselData.carouselSlots) {
+                    const img = slot.images_orig?.url
+                      || (slot.imageSignature ? `https://i.pinimg.com/originals/${slot.imageSignature.slice(0, 2)}/${slot.imageSignature.slice(2, 4)}/${slot.imageSignature.slice(4, 6)}/${slot.imageSignature}.jpg` : null)
+                      || slot.images_1200x?.url
+                      || slot.images_736x?.url;
+                    if (img && !imageUrls.includes(img)) imageUrls.push(img);
+                  }
+                }
+                if (pin.storyPinData?.pages?.length) {
+                  for (const page of pin.storyPinData.pages) {
+                    const img = page.image?.images?.originals?.url || page.image?.images?.['736x']?.url;
+                    if (img && !imageUrls.includes(img)) imageUrls.push(img);
+                    const vid = page.video?.video_list?.V_720P?.url || page.video?.video_list?.V_EXP3?.url;
+                    if (vid && !videoUrl) videoUrl = vid;
+                  }
+                }
+                if (!videoUrl && imageUrls.length === 0) {
+                  const orig = pin.images_orig?.url || pin.imageLargeUrl || pin.images_736x?.url;
+                  if (orig && !imageUrls.includes(orig)) imageUrls.push(orig);
+                }
+              }
+            } catch {}
+          }
+        }
+        searchIdx += relayMarker.length;
+      }
+
+      // Fallback regex
+      if (!videoUrl) {
+        const vMatches = html.match(/https:\/\/(?:v\d+|v)\.pinimg\.com\/videos\/[^\s"'\\]+\.mp4/g);
+        if (vMatches?.length) videoUrl = vMatches[0];
+      }
+      if (!videoUrl && imageUrls.length === 0) {
+        const origMatches = html.match(/https:\/\/i\.pinimg\.com\/originals\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{32}\.(jpg|png|webp)/g) || [];
+        for (const u of new Set(origMatches)) imageUrls.push(u);
+        if (imageUrls.length === 0) {
+          const medMatches = html.match(/https:\/\/i\.pinimg\.com\/736x\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{32}\.(jpg|png|webp)/g) || [];
+          if (medMatches.length) imageUrls.push(medMatches[0]);
+        }
+      }
+
+      const results = [];
+      const botUser = this.botUsername || 'bot';
+
+      if (videoUrl) {
+        results.push({
+          type: 'video',
+          id: 'pin_vid_' + Date.now(),
+          video_url: videoUrl,
+          mime_type: 'video/mp4',
+          thumb_url: imageUrls[0] || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+          title: `🎬 HD Video: ${title.slice(0, 45)}`,
+          description: `Pinterest HD Video ♡`,
+          caption: `🎬 <b>${escapeHtml(title)}</b>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+          parse_mode: 'HTML'
+        });
+      }
+
+      if (imageUrls.length === 1) {
+        results.push({
+          type: 'photo',
+          id: 'pin_pic_' + Date.now(),
+          photo_url: imageUrls[0],
+          thumb_url: imageUrls[0],
+          title: `📷 ${title.slice(0, 45)}`,
+          description: `Pinterest HD Photo ♡`,
+          caption: `📷 <b>${escapeHtml(title)}</b>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+          parse_mode: 'HTML'
+        });
+      } else if (imageUrls.length > 1) {
+        // Multi-photo album / carousel
+        imageUrls.slice(0, 10).forEach((imgUrl, idx) => {
+          results.push({
+            type: 'photo',
+            id: `pin_album_${idx}_${Date.now()}`,
+            photo_url: imgUrl,
+            thumb_url: imgUrl,
+            title: `🖼 ${title.slice(0, 35)} (${idx + 1}/${imageUrls.length})`,
+            description: `Pinterest Album • Slide ${idx + 1} of ${imageUrls.length} ♡`,
+            caption: `🖼 <b>${escapeHtml(title)}</b> [${idx + 1}/${imageUrls.length}]\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+            parse_mode: 'HTML'
+          });
+        });
+      }
+
+      return results;
+    } catch (err) {
+      this.log.debug({ err: err?.message }, 'inline pinterest fetch failed');
+      return [];
+    }
+  }
+
+  async #fetchInlinePinterestSearch(queryTopic) {
+    if (!queryTopic) return [];
+    try {
+      const provider = this.app?.pinterest?.provider || new PinterestWebProvider();
+      const res = await provider.search({ query: queryTopic });
+      if (!res?.items?.length) return [];
+      const results = [];
+      const botUser = this.botUsername || 'bot';
+
+      for (let idx = 0; idx < Math.min(res.items.length, 15); idx++) {
+        const item = res.items[idx];
+        if (item.type === 'video' && item.mediaUrl) {
+          results.push({
+            type: 'video',
+            id: `pin_vid_${item.pinId || idx}_${Date.now()}`,
+            video_url: item.mediaUrl,
+            mime_type: 'video/mp4',
+            thumb_url: item.thumbnailUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            title: `🎬 HD Video: ${queryTopic.slice(0, 35)}`,
+            description: `Pinterest HD Video ♡`,
+            caption: `🎬 <b>${escapeHtml(queryTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `🔍 Search More "${queryTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `pint ${queryTopic}`
+                  }
+                ]
+              ]
+            }
+          });
+        } else if (item.mediaUrl) {
+          results.push({
+            type: 'photo',
+            id: `pin_pic_${item.pinId || idx}_${Date.now()}`,
+            photo_url: item.mediaUrl,
+            thumb_url: item.thumbnailUrl || item.mediaUrl,
+            title: `📷 ${queryTopic.slice(0, 35)}`,
+            description: `HD Aesthetic Photo ♡`,
+            caption: `📷 <b>${escapeHtml(queryTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `🔍 Search More "${queryTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `pint ${queryTopic}`
+                  }
+                ]
+              ]
+            }
+          });
+        }
+      }
+      return results;
+    } catch (err) {
+      this.log.debug({ err: err?.message }, 'inline pinterest search failed');
+      return [];
+    }
+  }
+
   async #fetchInlineUrlMedia(url, botTag, botName) {
     const cleanUrl = url.trim();
 
@@ -435,7 +659,13 @@ export class TelegramController extends EventEmitter {
       }];
     }
 
-    // 2. TikTok: Fast watermark-free extraction via TikWM API (~300ms)
+    // 2. Pinterest (videos, single photos, and photo albums / carousels!)
+    if (/pinterest\.com|pin\.it/i.test(cleanUrl)) {
+      const pinResults = await this.#fetchInlinePinterestMedia(cleanUrl, botTag, botName);
+      if (pinResults?.length > 0) return pinResults;
+    }
+
+    // 3. TikTok: Fast watermark-free extraction via TikWM API (~300ms)
     if (/tiktok\.com/i.test(cleanUrl)) {
       try {
         const res = await fetch('https://www.tikwm.com/api/', {
@@ -455,7 +685,25 @@ export class TelegramController extends EventEmitter {
           const title = d.title || 'TikTok Media';
           const author = d.author?.nickname || d.author?.unique_id || 'TikTok';
           const cover = d.cover?.startsWith('http') ? d.cover : (d.cover ? 'https://www.tikwm.com' + d.cover : undefined);
+          const images = Array.isArray(d.images) ? d.images : [];
           const results = [];
+
+          // If TikTok photo album / carousel (slideshow)
+          if (images.length > 0) {
+            images.slice(0, 10).forEach((imgUrl, idx) => {
+              const fullUrl = imgUrl?.startsWith('http') ? imgUrl : ('https://www.tikwm.com' + imgUrl);
+              results.push({
+                type: 'photo',
+                id: `tt_img_${idx}_${Date.now()}`,
+                photo_url: fullUrl,
+                thumb_url: fullUrl,
+                title: `🖼 ${title.slice(0, 35)} (${idx + 1}/${images.length})`,
+                description: `👤 ${author} • Slide ${idx + 1} of ${images.length} ♡`,
+                caption: `🖼 <b>${escapeHtml(title)}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${this.botUsername || 'bot'} ♡</i>`,
+                parse_mode: 'HTML'
+              });
+            });
+          }
 
           if (videoUrl) {
             results.push({
@@ -490,7 +738,7 @@ export class TelegramController extends EventEmitter {
       }
     }
 
-    // 3. Fallback action card for other platforms
+    // 4. Fallback action card for other platforms
     return [
       {
         type: 'article',
@@ -552,6 +800,16 @@ export class TelegramController extends EventEmitter {
             input_message_content: {
               message_text: `<blockquote>🔍 <b>Pinterest Search</b>\nType <code>@${this.botUsername || 'bot'} pint aesthetic wallpaper</code> to find aesthetic pins! ♡</blockquote>`,
               parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🔍 Search HD Pictures',
+                    switch_inline_query_current_chat: 'pint '
+                  }
+                ]
+              ]
             }
           }
         ];
@@ -565,39 +823,92 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      // 2. Check if user pasted a media URL (TikTok, Instagram, YouTube, etc.)
+      // 2. Check if user pasted a media URL (TikTok, Pinterest, direct media, etc.)
       if (/^https?:\/\//i.test(rawText)) {
-        const urlResults = await this.#fetchInlineUrlMedia(rawText, botTag, botName);
+        let urlResults = inlineUrlCache.get(rawText);
+        if (!urlResults) {
+          urlResults = await this.#fetchInlineUrlMedia(rawText, botTag, botName);
+          if (urlResults?.length > 0) {
+            inlineUrlCache.set(rawText, urlResults);
+            if (inlineUrlCache.size > 200) {
+              const firstKey = inlineUrlCache.keys().next().value;
+              inlineUrlCache.delete(firstKey);
+            }
+          }
+        }
         if (urlResults?.length > 0) {
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
             results: urlResults,
-            cache_time: 15,
+            cache_time: 20,
             is_personal: false
           });
           return;
         }
       }
 
-      // 3. Check if Pinterest search:
-      if (/^(pint|pinterest|photo|pic|wallpaper)\s+/i.test(rawText)) {
-        const queryTopic = rawText.replace(/^(pint|pinterest|photo|pic|wallpaper)\s+/i, '').trim();
-        const pintResults = [
-          {
-            type: 'article',
-            id: 'pint_' + Math.random().toString(36).slice(2, 8),
-            title: `🔍 Search Pinterest for "${queryTopic}"`,
-            description: `Fetch HD aesthetic pictures and videos for "${queryTopic}" ♡`,
-            input_message_content: {
-              message_text: `<blockquote>🔍 <b>Pinterest Search</b>\nTopic: <code>${escapeHtml(queryTopic)}</code>\n\nTip: Send <code>/search ${escapeHtml(queryTopic)}</code> in chat for full album delivery! ♡</blockquote>`,
-              parse_mode: 'HTML'
+      // 3. Check if Pinterest / photo search:
+      if (/^(pint|pinterest|photo|photos|pic|pics|wallpaper|wallpapers|image|images|art)\b/i.test(rawText)) {
+        const queryTopic = rawText.replace(/^(pint|pinterest|photo|photos|pic|pics|wallpaper|wallpapers|image|images|art)\s*/i, '').trim();
+        if (!queryTopic) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: [{
+              type: 'article',
+              id: 'hint_type_topic',
+              title: '🔍 Type a topic to search HD pictures',
+              description: `e.g. "${rawText} anime aesthetic", "${rawText} cute kittens" ♡`,
+              thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🔍 <b>${botName} Image Search</b>\nType <code>@${this.botUsername || 'bot'} ${rawText} &lt;topic&gt;</code> to browse and send HD aesthetic photos live! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              }
+            }],
+            cache_time: 10,
+            is_personal: false
+          });
+          return;
+        }
+
+        let pintResults = inlinePinterestCache.get(queryTopic.toLowerCase());
+        if (!pintResults) {
+          pintResults = await this.#fetchInlinePinterestSearch(queryTopic);
+          if (pintResults?.length) {
+            inlinePinterestCache.set(queryTopic.toLowerCase(), pintResults);
+            if (inlinePinterestCache.size > 200) {
+              const firstKey = inlinePinterestCache.keys().next().value;
+              inlinePinterestCache.delete(firstKey);
             }
           }
-        ];
+        }
+
+        if (pintResults && pintResults.length > 0) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: pintResults,
+            cache_time: 30,
+            is_personal: false
+          });
+          return;
+        }
+
+        // Friendly fallback when 0 pins found
         await this.api.call('answerInlineQuery', {
           inline_query_id: qId,
-          results: pintResults,
-          cache_time: 30,
+          results: [{
+            type: 'article',
+            id: 'pin_none_' + Date.now(),
+            title: `🔍 No pins found for "${queryTopic}"`,
+            description: `Try another search term like "aesthetic wallpaper", "cute cat" ♡`,
+            thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🔍 <b>Pinterest Search</b>\nCould not find pins for <code>${escapeHtml(queryTopic)}</code>.\nTry sending <code>/search ${escapeHtml(queryTopic)}</code> in chat for deep web extraction! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            }
+          }],
+          cache_time: 15,
           is_personal: false
         });
         return;
@@ -659,6 +970,20 @@ export class TelegramController extends EventEmitter {
           }
         };
       });
+
+      // 5. If no music results and query is generic, fall back to Pinterest pictures
+      if (results.length === 0 && cleanSongQuery.length >= 2) {
+        const pintFallback = await this.#fetchInlinePinterestSearch(cleanSongQuery);
+        if (pintFallback && pintFallback.length > 0) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: pintFallback,
+            cache_time: 30,
+            is_personal: false
+          });
+          return;
+        }
+      }
 
       if (results.length === 0) {
         results.push({
