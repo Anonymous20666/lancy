@@ -291,6 +291,38 @@ export class MultiBotManager {
   }
 
   /**
+   * Hot-reloads command suggestions across the primary bot and all active cloned bots.
+   * @returns {Promise<Array<{ botId?: number, bot?: string, username?: string, success: boolean, error?: string }>>}
+   */
+  async hotReloadAllCommands() {
+    const results = [];
+    // 1. Primary bot controller if available
+    if (this.app?.telegram?.controller?.registerCommands) {
+      try {
+        await this.app.telegram.controller.registerCommands();
+        results.push({ bot: 'primary', success: true });
+      } catch (err) {
+        results.push({ bot: 'primary', success: false, error: err.message });
+      }
+    }
+
+    // 2. All running cloned bots
+    for (const [botId, { controller, botRecord }] of this.runningBots.entries()) {
+      try {
+        if (controller?.registerCommands) {
+          await controller.registerCommands();
+          results.push({ botId, username: botRecord?.bot_username, success: true });
+        }
+      } catch (err) {
+        results.push({ botId, username: botRecord?.bot_username, success: false, error: err.message });
+      }
+    }
+
+    this.log.info({ results }, 'hot-reloaded command suggestions across bots');
+    return results;
+  }
+
+  /**
    * Shutdown all cloned bots cleanly.
    */
   async stopAll() {

@@ -155,7 +155,7 @@ export class TelegramController extends EventEmitter {
     this.log.info({ bot: `@${me.username}` }, 'telegram connected');
 
     // Register slash commands so typing / displays suggestions
-    await this.#registerCommands();
+    await this.registerCommands();
 
     this.abort = new AbortController();
     this.running = true;
@@ -164,7 +164,7 @@ export class TelegramController extends EventEmitter {
     return me;
   }
 
-  async #registerCommands() {
+  async registerCommands() {
     const isClone = Boolean(this.botContext?.isClone);
     const botName = this.botContext?.botName || 'Lancy';
 
@@ -238,6 +238,10 @@ export class TelegramController extends EventEmitter {
     return this.#handleUpdate(update);
   }
 
+  async handleInlineQuery(inlineQuery) {
+    return this.#handleInlineQuery(inlineQuery);
+  }
+
   async #handleUpdate(update) {
     this.log.info({
       updateId: update.update_id,
@@ -246,6 +250,10 @@ export class TelegramController extends EventEmitter {
       data: update.callback_query?.data
     }, 'received update');
     if (update.inline_query) return this.#handleInlineQuery(update.inline_query);
+    if (update.chosen_inline_result) {
+      this.log.info({ chosen: update.chosen_inline_result }, 'received chosen_inline_result');
+      return;
+    }
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
@@ -292,6 +300,57 @@ export class TelegramController extends EventEmitter {
   async #fetchInlineMusicTracks(query) {
     const clean = String(query || '').trim();
     if (!clean) return [];
+
+    // 1. Try iTunes Search API (fastest, high quality metadata & artwork, ~150ms)
+    try {
+      const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(clean)}&entity=song&limit=8`, {
+        signal: AbortSignal.timeout(2500)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.results) && data.results.length > 0) {
+          return data.results.map((r, idx) => {
+            const min = Math.floor((r.trackTimeMillis || 0) / 60000);
+            const sec = String(Math.floor(((r.trackTimeMillis || 0) % 60000) / 1000)).padStart(2, '0');
+            const duration = r.trackTimeMillis ? `${min}:${sec}` : '';
+            const thumb = r.artworkUrl100?.replace('100x100bb', '600x600bb') || r.artworkUrl100;
+            return {
+              id: String(r.trackId || idx),
+              title: r.trackName || clean,
+              artist: r.artistName || 'Music',
+              duration,
+              thumbnail: thumb
+            };
+          });
+        }
+      }
+    } catch {}
+
+    // 2. Try Deezer Search API fallback (~150ms)
+    try {
+      const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=8`, {
+        signal: AbortSignal.timeout(2500)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (Array.isArray(data.data) && data.data.length > 0) {
+          return data.data.map((r, idx) => {
+            const min = Math.floor((r.duration || 0) / 60);
+            const sec = String((r.duration || 0) % 60).padStart(2, '0');
+            const duration = r.duration ? `${min}:${sec}` : '';
+            return {
+              id: String(r.id || idx),
+              title: r.title || clean,
+              artist: r.artist?.name || 'Music',
+              duration,
+              thumbnail: r.album?.cover_big || r.album?.cover_medium
+            };
+          });
+        }
+      }
+    } catch {}
+
+    // 3. Fallback to yt-dlp search if external catalogs return nothing
     try {
       const searchTarget = `ytsearch5:${clean} song audio`;
       const { stdout } = await execFileAsync('yt-dlp', [
@@ -299,7 +358,7 @@ export class TelegramController extends EventEmitter {
         '--js-runtimes', 'node:/usr/bin/node',
         '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(thumbnail)s',
         searchTarget
-      ], { timeout: 6000 });
+      ], { timeout: 4000 });
 
       const lines = stdout.trim().split('\n').filter(Boolean);
       const items = [];
@@ -332,6 +391,7 @@ export class TelegramController extends EventEmitter {
     const qId = inlineQuery.id;
     const rawText = String(inlineQuery.query || '').trim();
     const botName = this.botContext?.botName || 'Lancy';
+    const botTag = this.botUsername ? `@${this.botUsername}` : '';
 
     try {
       // 1. If query is empty: provide intuitive entrypoint cards
@@ -343,6 +403,7 @@ export class TelegramController extends EventEmitter {
             title: `🎵 ${botName} Live Music Search`,
             description: 'Type any song name, artist, or lyrics to search and stream ♡',
             thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
             input_message_content: {
               message_text: `<blockquote>🎵 <b>${botName} Music</b>\nType <code>/play &lt;song&gt;</code> or type <code>@${this.botUsername || 'bot'} &lt;song&gt;</code> to stream any song instantly! ♡</blockquote>`,
               parse_mode: 'HTML'
@@ -354,6 +415,7 @@ export class TelegramController extends EventEmitter {
             title: `📥 ${botName} Universal Downloader`,
             description: 'Paste any TikTok, Instagram Reel, YouTube, or Pinterest link ♡',
             thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
             input_message_content: {
               message_text: `<blockquote>📥 <b>Universal Downloader</b>\nPaste any video, audio, or photo link to download in HD! ♡</blockquote>`,
               parse_mode: 'HTML'
@@ -365,6 +427,7 @@ export class TelegramController extends EventEmitter {
             title: `🔍 ${botName} Pinterest Search`,
             description: 'Type "pint <topic>" or "search <topic>" to search HD aesthetic photos ♡',
             thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
             input_message_content: {
               message_text: `<blockquote>🔍 <b>Pinterest Search</b>\nType <code>@${this.botUsername || 'bot'} pint aesthetic wallpaper</code> to find aesthetic pins! ♡</blockquote>`,
               parse_mode: 'HTML'
@@ -375,7 +438,7 @@ export class TelegramController extends EventEmitter {
         await this.api.call('answerInlineQuery', {
           inline_query_id: qId,
           results: defaultResults,
-          cache_time: 60,
+          cache_time: 30,
           is_personal: true
         });
         return;
@@ -391,8 +454,7 @@ export class TelegramController extends EventEmitter {
             title: `🔍 Search Pinterest for "${queryTopic}"`,
             description: `Fetch HD aesthetic pictures and videos for "${queryTopic}" ♡`,
             input_message_content: {
-              message_text: `/search ${queryTopic}`,
-              parse_mode: 'HTML'
+              message_text: `/search${botTag} ${queryTopic}`
             }
           }
         ];
@@ -431,16 +493,9 @@ export class TelegramController extends EventEmitter {
           title: `🎵 ${title}`,
           description: `🎧 ${artist} • ${duration} ♡`,
           thumb_url: item.thumbnail || undefined,
+          thumbnail_url: item.thumbnail || undefined,
           input_message_content: {
-            message_text: `/play ${title} ${artist}`.trim(),
-            parse_mode: 'HTML'
-          },
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: `🎵 Download / Stream with ${botName}`, callback_data: `l1:downloader:play` }
-              ]
-            ]
+            message_text: `/play${botTag} ${title} ${artist}`.trim()
           }
         };
       });
@@ -448,21 +503,34 @@ export class TelegramController extends EventEmitter {
       if (results.length === 0) {
         results.push({
           type: 'article',
-          id: 'no_results_' + Date.now(),
+          id: 'manual_' + Date.now(),
           title: `🎵 Play "${cleanSongQuery}"`,
           description: `Download high-speed MP3 audio with cover art & lyrics ♡`,
+          thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+          thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
           input_message_content: {
-            message_text: `/play ${cleanSongQuery}`,
-            parse_mode: 'HTML'
+            message_text: `/play${botTag} ${cleanSongQuery}`.trim()
           }
         });
       }
 
-      await this.api.call('answerInlineQuery', {
+      const answerPayload = {
         inline_query_id: qId,
         results,
-        cache_time: 120,
+        cache_time: 15,
         is_personal: false
+      };
+
+      await this.api.call('answerInlineQuery', {
+        ...answerPayload,
+        button: {
+          text: `🎵 Search in ${botName}`,
+          start_parameter: 'music'
+        }
+      }).catch(async () => {
+        await this.api.call('answerInlineQuery', answerPayload).catch((err) => {
+          this.log.debug({ err: err?.message, qId }, 'answerInlineQuery failed');
+        });
       });
     } catch (err) {
       this.log.debug({ err: err?.message, qId }, 'answerInlineQuery failed');
@@ -535,7 +603,34 @@ export class TelegramController extends EventEmitter {
 
     if (text.startsWith('/')) {
       const [cmd, ...rest] = text.split(/\s+/);
-      const command = cmd.toLowerCase().split('@')[0];
+      const parts = cmd.split('@');
+      const command = parts[0].toLowerCase();
+      const targetBot = parts[1]?.toLowerCase();
+      if (targetBot && this.botUsername && targetBot !== this.botUsername.toLowerCase()) {
+        return;
+      }
+
+      if (command === '/reloadcommands' || command === '/reload_commands') {
+        const isOwner = this.isOwner(tgId);
+        if (!isOwner) {
+          await this.api.sendMessage(chatId, `<blockquote>✕ Only bot owners or admins can hot-reload commands ♡</blockquote>`, { parse_mode: 'HTML' });
+          return;
+        }
+
+        let report = '';
+        if (this.app?.multiBotManager) {
+          const results = await this.app.multiBotManager.hotReloadAllCommands();
+          const succeeded = results.filter((r) => r.success).length;
+          report = `🌸 Hot-reloaded command suggestions across <b>${succeeded}</b> / <b>${results.length}</b> bots! ♡`;
+        } else {
+          await this.registerCommands();
+          report = `🌸 Hot-reloaded command suggestions for <b>${this.botContext?.botName || 'Lancy'}</b>! ♡`;
+        }
+
+        await this.api.sendMessage(chatId, `<blockquote>${report}</blockquote>`, { parse_mode: 'HTML' });
+        return;
+      }
+
       const updateScreenMsg = (sent) => {
         if (sent?.message_id) {
           this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });

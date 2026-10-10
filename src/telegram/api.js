@@ -316,7 +316,11 @@ export class TelegramAPI {
 
   // ── Polling ───────────────────────────────────────────────────────────
   async poll({ offset, timeout = 30, signal } = {}) {
-    const params = { offset, timeout, allowed_updates: ['message', 'callback_query', 'edited_message'] };
+    const params = {
+      offset,
+      timeout,
+      allowed_updates: ['message', 'callback_query', 'edited_message', 'inline_query', 'chosen_inline_result']
+    };
     const controller = new AbortController();
     const onAbort = () => controller.abort();
     signal?.addEventListener('abort', onAbort, { once: true });
