@@ -707,8 +707,6 @@ export class TelegramController extends EventEmitter {
           try {
             const sql = 'INSERT OR REPLACE INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)';
             this.db.prepare(sql).run(cleanKey, fileId, vidTitle, durSec);
-            if (vidTitle) this.db.prepare(sql).run(vidTitle.toLowerCase().trim(), fileId, vidTitle, durSec);
-            if (query) this.db.prepare(sql).run(query.toLowerCase().trim(), fileId, vidTitle, durSec);
           } catch {}
           return fileId;
         }
@@ -752,8 +750,8 @@ export class TelegramController extends EventEmitter {
       // 1. Check SQLite cached_video_tracks
       try {
         const row = this.db.prepare(
-          'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? OR query = ? OR title = ? LIMIT 1'
-        ).get(videoId, videoTitle.toLowerCase().trim(), videoTitle);
+          'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? LIMIT 1'
+        ).get(videoId);
         if (row?.file_id) {
           fileId = row.file_id;
           if (row.title) videoTitle = row.title;
@@ -792,8 +790,6 @@ export class TelegramController extends EventEmitter {
               try {
                 const sql = 'INSERT OR REPLACE INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)';
                 if (videoId) this.db.prepare(sql).run(videoId, fileId, videoTitle, durSec);
-                this.db.prepare(sql).run(videoTitle.toLowerCase().trim(), fileId, videoTitle, durSec);
-                if (queryTopic) this.db.prepare(sql).run(queryTopic.toLowerCase().trim(), fileId, videoTitle, durSec);
               } catch {}
             }
           }
@@ -1425,30 +1421,23 @@ export class TelegramController extends EventEmitter {
         const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
         const resId = `tt_${item.videoId}_${offset}_${idx}`;
 
-        // Check if video is already cached on Telegram servers
+        // Check if video is already cached on Telegram servers by its unique ID
         let cachedVid = null;
         try {
           cachedVid = this.db.prepare(
-            'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? OR query = ? OR title = ? LIMIT 1'
-          ).get(item.videoId, title.toLowerCase().trim(), title);
+            'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? LIMIT 1'
+          ).get(item.videoId);
         } catch {}
 
-        if (!cachedVid) {
-          try {
-            cachedVid = this.db.prepare(
-              'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? OR query = ? LIMIT 1'
-            ).get(cleanTopic.toLowerCase().trim(), cleanTopic);
-          } catch {}
-        }
-
         const safeTitle = [...String(title)].slice(0, 50).join('').trim();
+        const cleanSwitchSong = safeTitle.replace(/[^\p{L}\p{N}\s]/gu, '').trim().slice(0, 30);
         const caption = `🎬 <b>${escapeHtml(safeTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`;
 
         const keyboard = [
           [
             {
               text: '🎙️ Recognize Music / Search Song ♡',
-              switch_inline_query_current_chat: `${safeTitle.slice(0, 30)} song`,
+              switch_inline_query_current_chat: `${cleanSwitchSong || 'song'} song`,
               style: 'primary'
             }
           ],

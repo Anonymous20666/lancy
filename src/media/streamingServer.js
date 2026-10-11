@@ -88,18 +88,6 @@ export class VideoStreamingServer {
     }
 
     if (!filePath || !existsSync(filePath)) {
-      // Fallback to verified existing video in cache if download failed
-      const fallbacks = ['7106594312292453675.mp4', '-WamEUt2Tu0.mp4', 'qjmUeXMs53Y.mp4'];
-      for (const fb of fallbacks) {
-        const candidate = join(this.cacheDir, fb);
-        if (existsSync(candidate)) {
-          filePath = candidate;
-          break;
-        }
-      }
-    }
-
-    if (!filePath || !existsSync(filePath)) {
       res.writeHead(404, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
       res.end('Video not found');
       return;

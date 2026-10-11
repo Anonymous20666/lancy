@@ -1449,6 +1449,14 @@ export class MediaDownloader {
         url
       ];
 
+      if (existsSync('/data/youtube_cookies.txt')) {
+        args.splice(1, 0, '--cookies', '/data/youtube_cookies.txt');
+      }
+
+      if (platform === 'tiktok' || /tiktok\.com/i.test(url)) {
+        args.splice(1, 0, '--impersonate', 'chrome');
+      }
+
       if (isYouTube) {
         // Enforce mp4 and max 1080p for Telegram file limit safety
         args.splice(1, 0, '-f', 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/ba/b/best');
