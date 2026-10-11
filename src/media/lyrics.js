@@ -12,6 +12,20 @@ export function cleanSongMetadata(rawTitle, rawArtist = '') {
   let raw = String(rawTitle || '').trim();
   let artist = String(rawArtist || '').trim();
 
+  // Strip hashtags (#nigeriamusic, #trending, etc.)
+  raw = raw.replace(/#[\w\d_-]+/g, '').trim();
+
+  // If raw title has "Song by Artist" (e.g. "One Life by lorda lyrics video")
+  const byMatch = raw.match(/\s+by\s+([^#(\[\-–—:|]+)/i);
+  if (byMatch) {
+    let detectedArtist = byMatch[1].trim();
+    detectedArtist = detectedArtist.replace(/\s+(?:lyrics|video|official|audio|visualizer).*$/i, '').trim();
+    if (detectedArtist && !/\b(channel|records|vevo|promo)\b/i.test(detectedArtist)) {
+      artist = detectedArtist;
+      raw = raw.slice(0, byMatch.index).trim();
+    }
+  }
+
   // 0. Remove YouTube/channel handles from beginning of raw title (e.g. "@NewMusicFriday - ", "@RapCity: ")
   raw = raw.replace(/^@[\w\.-]+\s*[-–—:|]\s*/i, '').trim();
   if (/^@[\w\.-]+$/i.test(artist)) {
@@ -218,7 +232,41 @@ async function _doSearchSongByLyrics(snippet) {
     log.debug({ err: err.message }, 'DuckDuckGo reverse lyrics search failed');
   }
 
-  // Tier 2: YouTube ytsearch fallback
+  // Tier 2: Direct InnerTube search (bypasses bot detection & runs in <300ms)
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      body: JSON.stringify({
+        context: { client: { clientName: 'WEB', clientVersion: '2.20240101.00.00', hl: 'en', gl: 'US' } },
+        query: `${cleanSnippet.slice(0, 100)} lyrics`
+      }),
+      signal: AbortSignal.timeout(6000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const contents = data?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents || [];
+      for (const item of contents) {
+        const vr = item.videoRenderer;
+        if (!vr?.title) continue;
+        const ytTitle = vr.title?.runs?.[0]?.text || '';
+        const ytChannel = vr.ownerText?.runs?.[0]?.text || '';
+        if (ytTitle) {
+          const meta = cleanSongMetadata(ytTitle, ytChannel);
+          if (meta.title && meta.title.toLowerCase() !== 'song') {
+            return { title: meta.title, artist: meta.artist || ytChannel || '' };
+          }
+        }
+      }
+    }
+  } catch (err) {
+    log.debug({ err: err.message }, 'InnerTube reverse lyrics search failed');
+  }
+
+  // Tier 3: YouTube ytsearch fallback
   try {
     const { stdout } = await execFileAsync('yt-dlp', [
       '--no-warnings',

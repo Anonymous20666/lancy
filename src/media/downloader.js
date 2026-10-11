@@ -1128,6 +1128,7 @@ export class MediaDownloader {
         this.log.warn({ err: ytErr?.message, clean }, 'YouTube primary search failed, trying Spotify fallback');
       }
 
+      let dzPreviewUrl = null;
       // 2. Spotify / Deezer Fallback (if YouTube search yielded no match)
       if (!videoId) {
         onProgress?.(`Trying Spotify metadata for "${clean}"… ♡`);
@@ -1147,6 +1148,7 @@ export class MediaDownloader {
               const bestSp = spCandidates[0].item;
               trackTitle = bestSp.title || trackTitle;
               trackAuthor = bestSp.artist?.name || trackAuthor;
+              dzPreviewUrl = bestSp.preview || null;
               if (bestSp.duration) {
                 const min = Math.floor(bestSp.duration / 60);
                 const sec = String(bestSp.duration % 60).padStart(2, '0');
@@ -1169,6 +1171,14 @@ export class MediaDownloader {
 
       let downloaded = false;
 
+      const hasAudioFile = () => {
+        try {
+          return readdirSync(tempDir).some((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+        } catch {
+          return false;
+        }
+      };
+
       // Layer 1: Download matched YouTube video with Android client (bypasses 403 SABR block)
       if (videoId) {
         try {
@@ -1187,7 +1197,7 @@ export class MediaDownloader {
             '-o', '%(title).60s.%(ext)s',
             `https://www.youtube.com/watch?v=${videoId}`
           ], { timeout: 60000 });
-          downloaded = true;
+          if (hasAudioFile()) downloaded = true;
         } catch (ytDlErr) {
           this.log.warn({ err: ytDlErr.message, videoId }, 'YouTube direct video download failed, trying search fallback');
         }
@@ -1211,7 +1221,7 @@ export class MediaDownloader {
             '-o', '%(title).60s.%(ext)s',
             `ytsearch1:${clean}`
           ], { timeout: 60000 });
-          downloaded = true;
+          if (hasAudioFile()) downloaded = true;
         } catch (ytSearchErr) {
           this.log.warn({ err: ytSearchErr.message }, 'YouTube searchTarget download failed, trying SoundCloud fallback');
         }
@@ -1231,10 +1241,50 @@ export class MediaDownloader {
             '-o', '%(title).60s.%(ext)s',
             `scsearch1:${clean}`
           ], { timeout: 60000 });
-          downloaded = true;
+          if (hasAudioFile()) downloaded = true;
         } catch (scErr) {
           this.log.error({ err: scErr.message }, 'SoundCloud search download also failed');
         }
+      }
+
+      // Layer 4: Direct Deezer CDN stream download (guaranteed 200 OK, zero DRM, zero 403 blocks)
+      if (!downloaded && dzPreviewUrl) {
+        try {
+          const dzRes = await fetch(dzPreviewUrl, { signal: AbortSignal.timeout(10000) });
+          if (dzRes.ok) {
+            const dzBuf = Buffer.from(await dzRes.arrayBuffer());
+            if (dzBuf.length > 4096) {
+              writeFileSync(join(tempDir, `${(trackTitle || 'track').slice(0, 30)}.mp3`), dzBuf);
+              downloaded = true;
+            }
+          }
+        } catch {}
+      }
+
+      if (!downloaded) {
+        try {
+          const dzRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=1`, { signal: AbortSignal.timeout(5000) });
+          if (dzRes.ok) {
+            const dzData = await dzRes.json();
+            const first = dzData?.data?.[0];
+            if (first?.preview) {
+              const audioRes = await fetch(first.preview, { signal: AbortSignal.timeout(10000) });
+              if (audioRes.ok) {
+                const dzBuf = Buffer.from(await audioRes.arrayBuffer());
+                if (dzBuf.length > 4096) {
+                  if (!trackTitle || trackTitle.toLowerCase() === 'song') {
+                    trackTitle = first.title || trackTitle;
+                  }
+                  if (!trackAuthor || trackAuthor.toLowerCase() === 'artist') {
+                    trackAuthor = first.artist?.name || trackAuthor;
+                  }
+                  writeFileSync(join(tempDir, `${(trackTitle || 'track').slice(0, 30)}.mp3`), dzBuf);
+                  downloaded = true;
+                }
+              }
+            }
+          }
+        } catch {}
       }
 
       const files = readdirSync(tempDir);

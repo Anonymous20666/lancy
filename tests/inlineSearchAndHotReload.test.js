@@ -1702,5 +1702,81 @@ test('TelegramController: live music search provides 100+ items across infinite 
   db.close();
 });
 
+test('TelegramController: TikTok live search delivers real video media cards with video/mp4 or video_file_id and never empty text placeholders', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  inlineTikTokCache.set('tt_trending', [
+    {
+      videoId: 'vid_trend_1',
+      title: 'Viral Trend Dance Clip',
+      duration: '0:22',
+      views: '10M',
+      thumb: 'https://i.ytimg.com/vi/vid_trend_1/hqdefault.jpg'
+    },
+    {
+      videoId: 'vid_trend_2',
+      title: 'Epic Anime Action Scene',
+      duration: '0:35',
+      views: '4.2M',
+      videoUrl: 'https://pappysonghttps.duckdns.org/video/vid_trend_2.mp4',
+      thumb: 'https://i.ytimg.com/vi/vid_trend_2/hqdefault.jpg'
+    }
+  ]);
+
+  await controller.handleInlineQuery({
+    id: 'q_tt_real_vid',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'tt trending',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery must be called');
+  assert.ok(inlineAnswer.results.length >= 2, 'must return video results');
+
+  for (const item of inlineAnswer.results) {
+    assert.equal(item.type, 'video', 'card must be of type video');
+    assert.ok(!item.input_message_content, 'must NEVER override video with input_message_content text');
+    if (item.video_url) {
+      assert.ok(!item.video_url.includes('youtube.com'), 'video_url must NEVER be youtube.com HTML page');
+      assert.equal(item.mime_type, 'video/mp4', 'mime_type must be video/mp4 for direct playable playback');
+    }
+    assert.ok(item.caption.includes('<blockquote expandable>'), 'must format caption with expandable blockquote');
+    assert.ok(item.reply_markup?.inline_keyboard, 'must include inline action buttons');
+    for (const row of item.reply_markup.inline_keyboard) {
+      for (const btn of row) {
+        assert.equal(btn.style, 'primary', 'buttons must have primary style');
+      }
+    }
+  }
+
+  db.close();
+});
+
+
 
 

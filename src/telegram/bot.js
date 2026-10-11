@@ -760,6 +760,9 @@ export class TelegramController extends EventEmitter {
           const res = await this.app.mediaDownloader.download(videoTarget);
           const videoItem = res?.mediaItems?.find((m) => m.type === 'video');
           if (videoItem?.buffer) {
+            try {
+              if (videoId) writeFileSync(`/data/video_cache/${videoId}.mp4`, videoItem.buffer);
+            } catch {}
             const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
             const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
             const sent = await this.api.sendVideo(ownerId, videoItem.buffer, {
@@ -793,7 +796,7 @@ export class TelegramController extends EventEmitter {
             media: {
               type: 'video',
               media: fileId,
-              caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote>⏱ <b>Duration:</b> ${escapeHtml(videoDuration)}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
+              caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${escapeHtml(videoDuration)}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
               parse_mode: 'HTML'
             },
             reply_markup: {
@@ -807,8 +810,8 @@ export class TelegramController extends EventEmitter {
                 ],
                 [
                   {
-                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    text: '🎬 Search TikTok Live',
+                    switch_inline_query_current_chat: 'tt ',
                     style: 'primary'
                   }
                 ]
@@ -1415,39 +1418,45 @@ export class TelegramController extends EventEmitter {
           ).get(item.videoId, title.toLowerCase().trim(), title);
         } catch {}
 
-        if (cachedVid?.file_id) {
+        const safeTitle = [...String(title)].slice(0, 50).join('').trim();
+        const caption = `🎬 <b>${escapeHtml(safeTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`;
+
+        const keyboard = [
+          [
+            {
+              text: '🎙️ Recognize Music / Search Song ♡',
+              switch_inline_query_current_chat: `${safeTitle.slice(0, 30)} song`,
+              style: 'primary'
+            }
+          ],
+          [
+            {
+              text: '🎬 Search TikTok Live',
+              switch_inline_query_current_chat: 'tt ',
+              style: 'primary'
+            }
+          ]
+        ];
+
+        const videoFileId = item.fileId || item.video_file_id || cachedVid?.file_id;
+        if (videoFileId) {
           results.push({
             type: 'video',
-            id: `cached_vid_${cachedVid.file_id.slice(-8)}_${offset}_${idx}`,
-            video_file_id: cachedVid.file_id,
-            title: `🎬 ${title.slice(0, 50)}`,
+            id: `cached_vid_${videoFileId.slice(-8)}_${offset}_${idx}`,
+            video_file_id: videoFileId,
+            title: `🎬 ${safeTitle}`,
             description: `⏱ ${duration} • 👁 ${views} ♡`,
-            caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
+            caption,
             parse_mode: 'HTML',
             reply_markup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: '🎙️ Recognize Music / Search Song ♡',
-                    switch_inline_query_current_chat: `${title.slice(0, 30)} song`,
-                    style: 'primary'
-                  }
-                ],
-                [
-                  {
-                    text: `🔍 More "${cleanTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `tt ${cleanTopic}`,
-                    style: 'primary'
-                  }
-                ]
-              ]
+              inline_keyboard: keyboard
             }
           });
         } else {
           recentInlineSearchResults.set(resId, {
             type: 'video',
             videoId: item.videoId,
-            title,
+            title: safeTitle,
             duration,
             query: cleanTopic
           });
@@ -1456,37 +1465,22 @@ export class TelegramController extends EventEmitter {
             recentInlineSearchResults.delete(firstKey);
           }
 
+          const streamUrl = existsSync(`/data/video_cache/${item.videoId}.mp4`)
+            ? `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`
+            : (item.videoUrl || `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`);
+
           results.push({
             type: 'video',
             id: resId,
-            video_url: `https://www.youtube.com/watch?v=${item.videoId}`,
-            mime_type: 'text/html',
+            video_url: streamUrl,
+            mime_type: 'video/mp4',
             thumbnail_url: thumb,
-            title: `🎬 ${title.slice(0, 50)}`,
+            title: `🎬 ${safeTitle}`,
             description: `⏱ ${duration} • 👁 ${views} ♡`,
-            caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>Delivering video via @${botUser}… ♡</i></blockquote>`,
+            caption,
             parse_mode: 'HTML',
-            input_message_content: {
-              message_text: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>Downloading &amp; delivering HD clip via @${botUser}… ♡</i></blockquote>`,
-              parse_mode: 'HTML'
-            },
             reply_markup: {
-              inline_keyboard: [
-                [
-                  {
-                    text: '🎙️ Recognize Music / Search Song ♡',
-                    switch_inline_query_current_chat: `${title.slice(0, 30)} song`,
-                    style: 'primary'
-                  }
-                ],
-                [
-                  {
-                    text: `🔍 More "${cleanTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `tt ${cleanTopic}`,
-                    style: 'primary'
-                  }
-                ]
-              ]
+              inline_keyboard: keyboard
             }
           });
         }
@@ -1766,11 +1760,14 @@ export class TelegramController extends EventEmitter {
         ];
 
         if (item.source === 'youtube_video' && item.videoId) {
+          const streamUrl = existsSync(`/data/video_cache/${item.videoId}.mp4`)
+            ? `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`
+            : (item.videoUrl || `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`);
           results.push({
             type: 'video',
             id: `yt_vid_${item.videoId}_${offset}_${idx}`,
-            video_url: `https://www.youtube.com/watch?v=${item.videoId}`,
-            mime_type: 'text/html',
+            video_url: streamUrl,
+            mime_type: 'video/mp4',
             thumbnail_url: item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`,
             title: `🎬 ${safeTitle.slice(0, 50)}`,
             description: `⏱ ${item.duration} ♡`,
