@@ -3477,7 +3477,7 @@ export class TelegramController extends EventEmitter {
     if (!isGroup) {
       await this.api.sendMessage(
         chatId,
-        `<blockquote>📢 The <code>/hidetag</code> command is only available in group chats! ♡</blockquote>`,
+        `<blockquote>📢 This command is only available in group chats! ♡</blockquote>`,
         { parse_mode: 'HTML' }
       );
       return;
@@ -3505,7 +3505,7 @@ export class TelegramController extends EventEmitter {
     if (!isAuthorized) {
       const notice = await this.api.sendMessage(
         chatId,
-        `<blockquote>✕ Only group administrators can use <b>/hidetag</b> ♡</blockquote>`,
+        `<blockquote>✕ Only group administrators can use this command ♡</blockquote>`,
         { parse_mode: 'HTML', reply_to_message_id: message.message_id }
       );
       if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
@@ -3521,33 +3521,11 @@ export class TelegramController extends EventEmitter {
       this.api.deleteMessage(chatId, message.message_id).catch(() => {});
     }
 
-    // 2. Discover members
+    // 2. Discover members (regular active chat members prioritized first!)
     const userMap = new Map();
     const botId = this.api.me?.id ? Number(this.api.me.id) : null;
 
-    // Fetch live group administrators (include caller so they see they got tagged too!)
-    try {
-      const admins = await this.api.getChatAdministrators(chatId);
-      if (Array.isArray(admins)) {
-        for (const admin of admins) {
-          if (admin?.user && !admin.user.is_bot) {
-            const uid = Number(admin.user.id);
-            if (uid !== botId) {
-              userMap.set(uid, {
-                id: uid,
-                name: admin.user.first_name || 'Member',
-                username: admin.user.username || null
-              });
-            }
-            this.db.recordGroupMember(chatId, admin.user);
-          }
-        }
-      }
-    } catch (err) {
-      this.log.warn({ err, chatId }, 'failed to get chat administrators for /hidetag');
-    }
-
-    // Fetch all recorded group members from database
+    // 2a. Fetch all recorded group members from database first
     try {
       const dbMembers = this.db.getGroupMembers(chatId);
       if (Array.isArray(dbMembers)) {
@@ -3564,6 +3542,28 @@ export class TelegramController extends EventEmitter {
       }
     } catch (err) {
       this.log.warn({ err, chatId }, 'failed to get db members for /hidetag');
+    }
+
+    // 2b. Fetch live group administrators
+    try {
+      const admins = await this.api.getChatAdministrators(chatId);
+      if (Array.isArray(admins)) {
+        for (const admin of admins) {
+          if (admin?.user && !admin.user.is_bot) {
+            const uid = Number(admin.user.id);
+            if (uid !== botId && !userMap.has(uid)) {
+              userMap.set(uid, {
+                id: uid,
+                name: admin.user.first_name || 'Member',
+                username: admin.user.username || null
+              });
+            }
+            this.db.recordGroupMember(chatId, admin.user);
+          }
+        }
+      }
+    } catch (err) {
+      this.log.warn({ err, chatId }, 'failed to get chat administrators for /hidetag');
     }
 
     // Also record message.from and replied message's author
@@ -3591,9 +3591,8 @@ export class TelegramController extends EventEmitter {
       this.db.recordGroupMember(chatId, repUser);
     }
 
-    // 3. Determine announcement text and options
-    const isTagAll = command === '/tagall' || command === '/everyone' || command === '/mentionall';
-    const isVisible = isTagAll || rest.includes('-v') || rest.includes('--visible');
+    // 3. Determine announcement text and options (ALWAYS invisible by default - NO listing mentions!)
+    const isVisible = rest.includes('-v') || rest.includes('--visible');
     const shouldPin = rest.some((arg) => /^(?:pin|--pin|-p)$/i.test(arg));
     const cleanArgs = rest.filter((a) => !/^(?:pin|--pin|-p|-v|--visible)$/i.test(a));
     const customText = cleanArgs.join(' ').trim();

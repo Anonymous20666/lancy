@@ -272,6 +272,60 @@ test('TelegramController /tagall -v: visible flag attaches readable mentions', a
   db.close();
 });
 
+test('TelegramController /tagall: default mode tags members invisibly without listing usernames and prioritizes regular members', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sentMessages = [];
+  const chatId = -100778;
+
+  // Regular members in database
+  db.recordGroupMember(chatId, { id: 6001, username: 'regular_user', first_name: 'Regular' });
+  db.recordGroupMember(chatId, { id: 6002, username: null, first_name: 'MemberTwo' });
+
+  const mockApi = {
+    me: { id: 8859351350, username: 'Lancy_easy_bot' },
+    getChatMember: async () => ({ status: 'creator' }),
+    getChatAdministrators: async () => [
+      { user: { id: 9999, is_bot: false, first_name: 'AdminOnly' } }
+    ],
+    deleteMessage: async () => true,
+    sendMessage: async (cid, text, opts) => {
+      sentMessages.push({ cid, text, opts });
+      return { message_id: 350 };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: new StateMachine(db)
+  });
+
+  const msg = {
+    message_id: 105,
+    chat: { id: chatId, type: 'supergroup' },
+    from: { id: 1001, first_name: 'Creator' },
+    text: '/tagall Hello guys'
+  };
+
+  await controller.handleHideTag(msg, ['Hello', 'guys'], '/tagall');
+
+  assert.equal(sentMessages.length, 1);
+  // Custom message is visible
+  assert.match(sentMessages[0].text, /^Hello guys/);
+  // NO visible @ or names listed!
+  assert.doesNotMatch(sentMessages[0].text, /@regular_user/);
+  assert.doesNotMatch(sentMessages[0].text, /Regular/);
+  assert.doesNotMatch(sentMessages[0].text, /AdminOnly/);
+  // But invisible mentions exist for regular members and admin!
+  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=6001">\u3164<\/a>/);
+  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=6002">\u3164<\/a>/);
+  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=9999">\u3164<\/a>/);
+
+  db.close();
+});
+
 test('TelegramController handleUpdate: passively tracks group members and supports !hidetag prefix', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
