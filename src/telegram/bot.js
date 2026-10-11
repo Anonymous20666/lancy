@@ -227,6 +227,8 @@ export class TelegramController extends EventEmitter {
     const botName = this.botContext?.botName || 'Lancy';
 
     const groupCommands = [
+      { command: 'hidetag', description: '📢 Invisibly mention all group members in one message (admins only)' },
+      { command: 'tagall', description: '📢 Tag all group members in one clean message' },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
@@ -2553,6 +2555,9 @@ export class TelegramController extends EventEmitter {
     const user = this.#upsertUser(query.from);
     const chatType = query.message?.chat?.type;
     const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
+    if (isGroup && query.message?.chat?.id && query.from && !query.from.is_bot) {
+      this.db.recordGroupMember(query.message.chat.id, query.from);
+    }
     const guard = this.isAllowed(query.from.id, { isGroup });
     if (!guard.ok) {
       await this.api.answerCallbackQuery(query.id, { text: 'This Lancy belongs to someone else ♡', showAlert: true });
@@ -2616,16 +2621,40 @@ export class TelegramController extends EventEmitter {
   async #handleMessage(message, { edited = false } = {}) {
     const user = this.#upsertUser(message.from);
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
-    const guard = this.isAllowed(message.from.id, { isGroup });
-    if (!guard.ok) return; // silent for strangers in DMs
-    const tgId = String(message.from.id);
+    const tgId = String(message.from?.id);
     const chatId = message.chat.id;
+
+    // In group chats, passively keep group roster up-to-date for /hidetag
+    if (isGroup && chatId) {
+      if (message.from && !message.from.is_bot) {
+        this.db.recordGroupMember(chatId, message.from);
+      }
+      if (Array.isArray(message.new_chat_members)) {
+        for (const newMember of message.new_chat_members) {
+          if (!newMember.is_bot) {
+            this.db.recordGroupMember(chatId, newMember);
+          }
+        }
+      }
+      if (message.left_chat_member?.id) {
+        this.db.removeGroupMember(chatId, message.left_chat_member.id);
+      }
+      if (message.reply_to_message?.from && !message.reply_to_message.from.is_bot) {
+        this.db.recordGroupMember(chatId, message.reply_to_message.from);
+      }
+    }
+
+    const guard = this.isAllowed(message.from?.id, { isGroup });
+    if (!guard.ok) return; // silent for strangers in DMs
 
     // Commands
     const rawText = message.text ?? message.caption ?? '';
     let text = rawText.trim();
     if (/^(rm\s*bot|remove\s*bot|delete\s*bot)(\s+.*)?$/i.test(text)) {
       text = text.replace(/^(rm\s*bot|remove\s*bot|delete\s*bot)/i, '/rmbot');
+    }
+    if (text.startsWith('!') || text.startsWith('.')) {
+      text = '/' + text.slice(1);
     }
 
     if (text.startsWith('/')) {
@@ -2634,6 +2663,11 @@ export class TelegramController extends EventEmitter {
       const command = parts[0].toLowerCase();
       const targetBot = parts[1]?.toLowerCase();
       if (targetBot && this.botUsername && targetBot !== this.botUsername.toLowerCase()) {
+        return;
+      }
+
+      if (command === '/hidetag' || command === '/tagall' || command === '/everyone' || command === '/mentionall') {
+        await this.handleHideTag(message, rest);
         return;
       }
 
@@ -3433,6 +3467,182 @@ export class TelegramController extends EventEmitter {
         }
       },
     };
+  }
+
+  async handleHideTag(message, rest = []) {
+    const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+    const chatId = message.chat.id;
+    const tgId = String(message.from?.id);
+
+    if (!isGroup) {
+      await this.api.sendMessage(
+        chatId,
+        `<blockquote>📢 The <code>/hidetag</code> command is only available in group chats! ♡</blockquote>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    // 1. Check permissions: caller must be group creator/administrator or bot owner
+    let isAuthorized = this.isOwner(tgId);
+    if (!isAuthorized) {
+      try {
+        const member = await this.api.getChatMember(chatId, Number(tgId));
+        if (member && (member.status === 'creator' || member.status === 'administrator')) {
+          isAuthorized = true;
+        }
+      } catch (err) {
+        this.log.warn({ err, chatId, tgId }, 'getChatMember failed, trying getChatAdministrators fallback');
+        try {
+          const admins = await this.api.getChatAdministrators(chatId);
+          if (Array.isArray(admins) && admins.some((a) => Number(a?.user?.id) === Number(tgId))) {
+            isAuthorized = true;
+          }
+        } catch {}
+      }
+    }
+
+    if (!isAuthorized) {
+      const notice = await this.api.sendMessage(
+        chatId,
+        `<blockquote>✕ Only group administrators can use <b>/hidetag</b> ♡</blockquote>`,
+        { parse_mode: 'HTML', reply_to_message_id: message.message_id }
+      );
+      if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+        setTimeout(() => {
+          this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+        }, 8000)?.unref?.();
+      }
+      return;
+    }
+
+    // Try deleting the trigger command message to keep the chat clean
+    if (typeof this.api.deleteMessage === 'function') {
+      this.api.deleteMessage(chatId, message.message_id).catch(() => {});
+    }
+
+    // 2. Discover members
+    const userMap = new Map();
+    const callerId = Number(tgId);
+    const botId = this.api.me?.id ? Number(this.api.me.id) : null;
+
+    // Fetch live group administrators
+    try {
+      const admins = await this.api.getChatAdministrators(chatId);
+      if (Array.isArray(admins)) {
+        for (const admin of admins) {
+          if (admin?.user && !admin.user.is_bot) {
+            const uid = Number(admin.user.id);
+            if (uid !== botId && uid !== callerId) {
+              userMap.set(uid, {
+                id: uid,
+                name: admin.user.first_name || 'Member',
+                username: admin.user.username || null
+              });
+            }
+            this.db.recordGroupMember(chatId, admin.user);
+          }
+        }
+      }
+    } catch (err) {
+      this.log.warn({ err, chatId }, 'failed to get chat administrators for /hidetag');
+    }
+
+    // Fetch all recorded group members from database
+    try {
+      const dbMembers = this.db.getGroupMembers(chatId);
+      if (Array.isArray(dbMembers)) {
+        for (const m of dbMembers) {
+          const uid = Number(m.user_id);
+          if (uid && uid !== botId && uid !== callerId && !userMap.has(uid)) {
+            userMap.set(uid, {
+              id: uid,
+              name: m.first_name || 'Member',
+              username: m.username || null
+            });
+          }
+        }
+      }
+    } catch (err) {
+      this.log.warn({ err, chatId }, 'failed to get db members for /hidetag');
+    }
+
+    // Also record message.from and replied message's author
+    if (message.from && !message.from.is_bot) {
+      this.db.recordGroupMember(chatId, message.from);
+    }
+    if (message.reply_to_message?.from && !message.reply_to_message.from.is_bot) {
+      const repUser = message.reply_to_message.from;
+      const repId = Number(repUser.id);
+      if (repId !== botId && repId !== callerId && !userMap.has(repId)) {
+        userMap.set(repId, {
+          id: repId,
+          name: repUser.first_name || 'Member',
+          username: repUser.username || null
+        });
+      }
+      this.db.recordGroupMember(chatId, repUser);
+    }
+
+    // 3. Determine announcement text and options
+    const isVisible = rest.includes('-v') || rest.includes('--visible');
+    const cleanArgs = rest.filter((a) => a !== '-v' && a !== '--visible');
+    const customText = cleanArgs.join(' ').trim();
+
+    let bodyText = '';
+    if (customText) {
+      bodyText = escapeHtml(customText);
+    } else if (message.reply_to_message) {
+      bodyText = '📢 <b>Attention everyone!</b> ♡';
+    } else {
+      bodyText = '📢 <b>Attention everyone!</b> ♡';
+    }
+
+    // 4. Build single message payload
+    // Telegram Bot API allows up to 100 entities and 4096 characters per message.
+    // We cap members at 90 and calculate remaining character budget so it NEVER errors.
+    const membersToTag = Array.from(userMap.values()).slice(0, 90);
+    let finalHtml = '';
+
+    if (isVisible) {
+      const visibleTags = membersToTag
+        .map((m) => m.username ? `@${m.username}` : `<a href="tg://user?id=${m.id}">${escapeHtml(m.name)}</a>`)
+        .join(' ');
+      finalHtml = visibleTags ? `${bodyText}\n\n${visibleTags}` : bodyText;
+    } else {
+      const maxChars = 4000;
+      let remainingBudget = maxChars - bodyText.length;
+      let zeroWidthMentions = '';
+
+      for (const member of membersToTag) {
+        const tag = `<a href="tg://user?id=${member.id}">\u200B</a>`;
+        if (tag.length > remainingBudget) break;
+        zeroWidthMentions += tag;
+        remainingBudget -= tag.length;
+      }
+
+      finalHtml = `${bodyText}${zeroWidthMentions}`;
+    }
+
+    const sendOptions = {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true }
+    };
+
+    if (message.reply_to_message?.message_id) {
+      sendOptions.reply_to_message_id = message.reply_to_message.message_id;
+    }
+
+    try {
+      await this.api.sendMessage(chatId, finalHtml, sendOptions);
+    } catch (err) {
+      this.log.error({ err, chatId }, 'failed to send hidetag message');
+      try {
+        await this.api.sendMessage(chatId, bodyText, sendOptions);
+      } catch (fbErr) {
+        this.log.error({ fbErr, chatId }, 'fallback hidetag sendMessage failed');
+      }
+    }
   }
 
   #chatIdFor(tgId, source) {

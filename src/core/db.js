@@ -49,6 +49,17 @@ export class Database {
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_cached_video_query ON cached_video_tracks(query);
+
+        CREATE TABLE IF NOT EXISTS group_members (
+          chat_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          username TEXT,
+          first_name TEXT,
+          last_name TEXT,
+          last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (chat_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_group_members_chat ON group_members(chat_id);
       `);
     } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
@@ -168,6 +179,60 @@ export class Database {
       this.run('INSERT INTO audit_events (user_id, action, details_json) VALUES (?, ?, ?)', userId ?? null, action, JSON.stringify(details));
     } catch (error) {
       logger().warn({ error }, 'audit log failed');
+    }
+  }
+
+  recordGroupMember(chatId, user) {
+    if (!chatId || !user?.id || user.is_bot) return;
+    try {
+      this.run(
+        `INSERT INTO group_members (chat_id, user_id, username, first_name, last_name, last_seen)
+         VALUES (?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(chat_id, user_id) DO UPDATE SET
+           username = COALESCE(excluded.username, group_members.username),
+           first_name = COALESCE(excluded.first_name, group_members.first_name),
+           last_name = COALESCE(excluded.last_name, group_members.last_name),
+           last_seen = datetime('now')`,
+        Number(chatId),
+        Number(user.id),
+        user.username ?? null,
+        user.first_name ?? null,
+        user.last_name ?? null
+      );
+    } catch (err) {
+      logger().warn({ err, chatId, userId: user.id }, 'failed to record group member');
+    }
+  }
+
+  removeGroupMember(chatId, userId) {
+    if (!chatId || !userId) return;
+    try {
+      this.run('DELETE FROM group_members WHERE chat_id = ? AND user_id = ?', Number(chatId), Number(userId));
+    } catch (err) {
+      logger().warn({ err, chatId, userId }, 'failed to remove group member');
+    }
+  }
+
+  getGroupMembers(chatId) {
+    if (!chatId) return [];
+    try {
+      return this.all(
+        'SELECT user_id, username, first_name, last_name, last_seen FROM group_members WHERE chat_id = ? ORDER BY last_seen DESC',
+        Number(chatId)
+      );
+    } catch (err) {
+      logger().warn({ err, chatId }, 'failed to get group members');
+      return [];
+    }
+  }
+
+  getGroupMemberCount(chatId) {
+    if (!chatId) return 0;
+    try {
+      const row = this.get('SELECT COUNT(*) as count FROM group_members WHERE chat_id = ?', Number(chatId));
+      return row?.count ? Number(row.count) : 0;
+    } catch {
+      return 0;
     }
   }
 

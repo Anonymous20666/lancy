@@ -343,4 +343,16 @@ CREATE TABLE IF NOT EXISTS bot_broadcasts (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_bot_broadcasts_bot ON bot_broadcasts(bot_id);
+ 
+-- Group Members Tracking (for /hidetag, /tagall and group mentions)
+CREATE TABLE IF NOT EXISTS group_members (
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  username TEXT,
+  first_name TEXT,
+  last_name TEXT,
+  last_seen TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_group_members_chat ON group_members(chat_id);
 `;
