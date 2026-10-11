@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Database } from '../src/core/db.js';
 import { SettingsManager } from '../src/config/settings.js';
 import { StateMachine } from '../src/core/stateMachine.js';
-import { TelegramController, searchYouTubeFast, fetchSearchSuggestions, inlineTikTokCache, recentInlineSearchResults } from '../src/telegram/bot.js';
+import { TelegramController, searchYouTubeFast, fetchSearchSuggestions, inlineTikTokCache, inlineMusicCache, recentInlineSearchResults } from '../src/telegram/bot.js';
 import { MultiBotManager } from '../src/telegram/multiBotManager.js';
 import { createDownloaderScreen } from '../src/telegram/screens/downloader.js';
 
@@ -1629,5 +1629,78 @@ test('TelegramController: inline search results NEVER expose YouTube or Pinteres
 
   db.close();
 });
+
+test('TelegramController: live music search provides 100+ items across infinite scrolling with native audio files', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswers = [];
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswers.push(payload);
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Seed online music cache with 110 tracks
+  const mockPool = [];
+  for (let i = 1; i <= 110; i++) {
+    mockPool.push({
+      id: 1000 + i,
+      title: `Juice WRLD Song ${i}`,
+      artist: 'Juice WRLD',
+      duration: 195,
+      preview: `https://cdnt-preview.dzcdn.net/api/sample_${i}.mp3`
+    });
+  }
+  inlineMusicCache.set('mus_pool_juice wrld', {
+    items: mockPool,
+    combosTried: 99,
+    dzIndex: 0,
+    seenKeys: new Set(mockPool.map((t) => t.id)),
+    timestamp: Date.now()
+  });
+
+  let offset = '';
+  let totalCollected = 0;
+  for (let p = 0; p < 11; p++) {
+    await controller.handleInlineQuery({
+      id: `query_jw_p${p}`,
+      from: { id: 1001, first_name: 'Alex' },
+      query: 'juice wrld',
+      offset
+    });
+
+    const ans = inlineAnswers[inlineAnswers.length - 1];
+    assert.ok(ans, `page ${p} answer must exist`);
+    assert.ok(ans.results.length >= 1, `page ${p} must have audio results`);
+    assert.equal(ans.results[0].type, 'audio');
+    assert.ok(!ans.results[0].audio_url?.includes('youtube.com'), 'audio_url must never be youtube.com');
+
+    totalCollected += ans.results.length;
+    offset = ans.next_offset;
+    if (!offset) break;
+  }
+
+  assert.ok(totalCollected >= 100, `must deliver 100+ tracks, got ${totalCollected}`);
+  db.close();
+});
+
 
 

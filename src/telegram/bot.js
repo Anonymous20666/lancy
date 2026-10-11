@@ -1,4 +1,5 @@
 import { extname } from 'node:path';
+import { existsSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -18,6 +19,7 @@ const execFileAsync = promisify(execFile);
 export const inlineSearchCache = new Map();
 export const inlinePinterestCache = new Map();
 export const inlineTikTokCache = new Map();
+export const inlineMusicCache = new Map();
 export const inlineUrlCache = new Map();
 export const recentInlineSearchResults = new Map();
 
@@ -840,8 +842,8 @@ export class TelegramController extends EventEmitter {
       return;
     }
 
-    // Handle audio chosen results (yt_aud_ or fresh_aud_)
-    if (resultId.startsWith('yt_aud_') || resultId.startsWith('fresh_aud_')) {
+    // Handle audio chosen results (yt_aud_, fresh_aud_, live_aud_, dz_aud_)
+    if (resultId.startsWith('yt_aud_') || resultId.startsWith('fresh_aud_') || resultId.startsWith('live_aud_') || resultId.startsWith('dz_aud_')) {
       const cachedInfo = recentInlineSearchResults.get(resultId);
       const videoId = cachedInfo?.videoId || (resultId.split('_')[2] || '');
       let trackTitle = cachedInfo?.title || chosen.query || 'Music Track';
@@ -913,6 +915,7 @@ export class TelegramController extends EventEmitter {
           const min = Math.floor(durSec / 60);
           const sec = String(durSec % 60).padStart(2, '0');
           const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
+          const lyricsSlug = trackTitle.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
           await this.api.editMessageMedia({
             inline_message_id: inlineMessageId,
             media: {
@@ -926,7 +929,7 @@ export class TelegramController extends EventEmitter {
                 [
                   {
                     text: '📜 Lyrics & Info ♡',
-                    url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(trackTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                    url: `https://t.me/${botUser}?start=lyrics_${lyricsSlug}`,
                     style: 'primary'
                   }
                 ],
@@ -1496,6 +1499,334 @@ export class TelegramController extends EventEmitter {
       return { results, nextOffset };
     } catch (err) {
       this.log?.debug?.({ err: err?.message, queryTopic }, 'inline tiktok search failed');
+      return { results: [], nextOffset: '' };
+    }
+  }
+
+  async #fetchInlineMusicSearch(queryTopic, offset = 0) {
+    if (!queryTopic) return { results: [], nextOffset: '' };
+    try {
+      const botUser = this.botUsername || 'Lancy_easy_bot';
+      const cleanTopic = String(queryTopic || '')
+        .replace(/^(play|music|song|listen|stream)\s+/i, '')
+        .trim() || String(queryTopic || '').trim();
+      if (!cleanTopic || cleanTopic.length < 2) return { results: [], nextOffset: '' };
+
+      const cacheKey = `mus_pool_${cleanTopic.toLowerCase()}`;
+      let cached = inlineMusicCache.get(cacheKey);
+
+      const legacyKey = `mus_${cleanTopic.toLowerCase()}`;
+      const legacyCached = inlineMusicCache.get(legacyKey) || inlineSearchCache.get(legacyKey);
+
+      if (!cached || !Array.isArray(cached.items) || (Date.now() - cached.timestamp > 180000)) {
+        if (Array.isArray(legacyCached)) {
+          cached = {
+            items: legacyCached,
+            combosTried: 99,
+            dzIndex: 0,
+            seenKeys: new Set(legacyCached.map((i) => i.fileId || i.id || i.videoId || i.title)),
+            timestamp: Date.now()
+          };
+        } else {
+          cached = {
+            items: [],
+            combosTried: 0,
+            dzIndex: 0,
+            seenKeys: new Set(),
+            timestamp: Date.now()
+          };
+        }
+        inlineMusicCache.set(cacheKey, cached);
+        if (inlineMusicCache.size > 200) {
+          const firstKey = inlineMusicCache.keys().next().value;
+          inlineMusicCache.delete(firstKey);
+        }
+      }
+
+      // 1. Initial SQLite cached_audio_tracks lookup
+      if (cached.items.length === 0) {
+        try {
+          const queryTerms = cleanTopic.toLowerCase().split(/\s+/).filter(Boolean);
+          const allCached = this.db?.prepare?.(
+            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 300'
+          )?.all?.() || [];
+
+          for (const row of allCached) {
+            if (!row?.file_id) continue;
+            const rowQuery = (row.query || '').toLowerCase().trim();
+            const rowTitle = (row.title || '').toLowerCase().trim();
+            const rowArtist = (row.artist || '').toLowerCase().trim();
+            const cleanLower = cleanTopic.toLowerCase().trim();
+
+            const isExact = rowQuery === cleanLower || rowTitle === cleanLower || `${rowTitle} ${rowArtist}` === cleanLower || `${rowArtist} ${rowTitle}` === cleanLower;
+            const rowText = `${rowQuery} ${rowTitle} ${rowArtist}`;
+            const termsMatch = queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
+            const matchingTermsCount = queryTerms.filter((term) => term.length >= 3 && rowText.includes(term)).length;
+
+            let score = 0;
+            if (isExact) score = 100;
+            else if (termsMatch) score = 50 + queryTerms.length;
+            else if (matchingTermsCount > 0) score = 10 * matchingTermsCount;
+
+            if (score > 0) {
+              const normKey = `${rowTitle} ${rowArtist}`.trim();
+              if (!cached.seenKeys.has(row.file_id) && (!normKey || !cached.seenKeys.has(normKey))) {
+                cached.seenKeys.add(row.file_id);
+                if (normKey) cached.seenKeys.add(normKey);
+                if (rowTitle) cached.seenKeys.add(rowTitle);
+                cached.items.push({
+                  source: 'cached',
+                  fileId: row.file_id,
+                  title: row.title,
+                  artist: row.artist || 'Music',
+                  duration: row.duration || 0,
+                  score
+                });
+              }
+            }
+          }
+          cached.items.sort((a, b) => (b.score || 0) - (a.score || 0));
+          const exactCachedCount = allCached.filter((r) => (r.query || '').toLowerCase().trim() === cleanTopic.toLowerCase().trim()).length;
+          if (exactCachedCount >= 25) {
+            cached.combosTried = 99;
+          }
+        } catch {}
+      }
+
+      const combos = [
+        cleanTopic,
+        `${cleanTopic} songs`,
+        `${cleanTopic} remix`,
+        `${cleanTopic} unreleased`,
+        `${cleanTopic} official audio`,
+        `${cleanTopic} album`,
+        `${cleanTopic} hits`,
+        `${cleanTopic} greatest hits`,
+        `${cleanTopic} full album`
+      ];
+
+      // 2. Expand pool until offset + 15 items are collected or combos exhausted
+      while (cached.items.length < (offset + 15) && cached.combosTried < combos.length) {
+        const comboTerm = combos[cached.combosTried % combos.length];
+        const dzIdx = cached.dzIndex || 0;
+
+        let addedCount = 0;
+        try {
+          const dzUrl = `https://api.deezer.com/search?q=${encodeURIComponent(comboTerm)}&index=${dzIdx}&limit=50`;
+          const dzRes = await fetch(dzUrl, { signal: AbortSignal.timeout(3500) }).then((r) => r.json()).catch(() => null);
+
+          if (Array.isArray(dzRes?.data) && dzRes.data.length > 0) {
+            for (const item of dzRes.data) {
+              if (!item?.title || !item?.preview) continue;
+              const normTitle = (item.title || '').toLowerCase().trim();
+              const normArtist = (item.artist?.name || '').toLowerCase().trim();
+              const normKey = `${normTitle} ${normArtist}`.trim();
+
+              if (!cached.seenKeys.has(item.id) && !cached.seenKeys.has(normKey) && !cached.seenKeys.has(normTitle)) {
+                let matchingFileId = null;
+                try {
+                  const matchRow = this.db?.prepare?.(
+                    'SELECT file_id, duration FROM cached_audio_tracks WHERE query = ? OR title = ? LIMIT 1'
+                  )?.get?.(normTitle, item.title);
+                  if (matchRow?.file_id) matchingFileId = matchRow.file_id;
+                } catch {}
+
+                if (matchingFileId && cached.seenKeys.has(matchingFileId)) {
+                  continue;
+                }
+
+                const isDupe = cached.items.some((i) => {
+                  const iTitle = (i.title || '').toLowerCase().trim();
+                  const iArtist = (i.artist || '').toLowerCase().trim();
+                  return (iTitle === normTitle || (normTitle.includes(iTitle) && iTitle.length >= 4) || (iTitle.includes(normTitle) && normTitle.length >= 4)) &&
+                         (!normArtist || !iArtist || iArtist === normArtist || normArtist.includes(iArtist) || iArtist.includes(normArtist));
+                });
+                if (isDupe) continue;
+
+                cached.seenKeys.add(item.id);
+                if (normKey) cached.seenKeys.add(normKey);
+                if (normTitle) cached.seenKeys.add(normTitle);
+                if (matchingFileId) cached.seenKeys.add(matchingFileId);
+
+                let audioUrl = item.preview;
+                if (existsSync(`/data/audio_cache/${item.id}.mp3`)) {
+                  audioUrl = `https://pappysonghttps.duckdns.org/audio/${item.id}.mp3`;
+                }
+
+                cached.items.push({
+                  source: matchingFileId ? 'cached' : 'deezer',
+                  id: item.id,
+                  fileId: matchingFileId,
+                  audioUrl: matchingFileId ? null : audioUrl,
+                  title: item.title,
+                  artist: item.artist?.name || 'Music',
+                  duration: item.duration || 30
+                });
+                addedCount++;
+              }
+            }
+          }
+        } catch {}
+
+        if (cached.items.length < (offset + 15)) {
+          try {
+            const ytItems = await searchYouTubeFast(comboTerm).catch(() => []);
+            for (const yt of ytItems || []) {
+              if (!yt?.videoId || !yt?.title) continue;
+              const normTitle = (yt.title || '').toLowerCase().trim();
+              if (!cached.seenKeys.has(yt.videoId) && !cached.seenKeys.has(normTitle)) {
+                let ytFileId = null;
+                try {
+                  const row = this.db?.prepare?.(
+                    'SELECT file_id, duration FROM cached_audio_tracks WHERE query = ? OR title = ? LIMIT 1'
+                  )?.get?.(yt.videoId, yt.title);
+                  if (row?.file_id) ytFileId = row.file_id;
+                } catch {}
+
+                if (ytFileId && cached.seenKeys.has(ytFileId)) {
+                  continue;
+                }
+
+                cached.seenKeys.add(yt.videoId);
+                cached.seenKeys.add(normTitle);
+
+                if (ytFileId) {
+                  cached.seenKeys.add(ytFileId);
+                  cached.items.push({
+                    source: 'cached',
+                    videoId: yt.videoId,
+                    fileId: ytFileId,
+                    title: yt.title,
+                    artist: yt.author || 'Music',
+                    duration: yt.duration || 0
+                  });
+                  addedCount++;
+                } else if (cached.items.length === 0) {
+                  // Fallback to real video card if Deezer returned zero items
+                  cached.items.push({
+                    source: 'youtube_video',
+                    videoId: yt.videoId,
+                    title: yt.title,
+                    artist: yt.author || 'Music',
+                    duration: yt.duration || 'HD Clip',
+                    thumb: yt.thumb
+                  });
+                  addedCount++;
+                }
+              }
+            }
+          } catch {}
+        }
+
+        cached.dzIndex = (cached.dzIndex || 0) + 50;
+        if (cached.dzIndex >= 150 || addedCount === 0) {
+          cached.dzIndex = 0;
+          cached.combosTried++;
+        }
+      }
+
+      inlineMusicCache.set(legacyKey, cached.items);
+
+      if (cached.items.length === 0) return { results: [], nextOffset: '' };
+
+      const PAGE_SIZE = 10;
+      const paged = cached.items.slice(offset, offset + PAGE_SIZE);
+      const hasMore = (offset + paged.length < cached.items.length) || (cached.combosTried < combos.length);
+      const nextOffset = hasMore && paged.length > 0 ? String(offset + paged.length) : '';
+
+      const results = [];
+      for (let idx = 0; idx < paged.length; idx++) {
+        const item = paged[idx];
+        const durSec = typeof item.duration === 'number' ? item.duration : parseDurationToSeconds(item.duration);
+        const min = Math.floor(durSec / 60);
+        const sec = String(durSec % 60).padStart(2, '0');
+        const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
+
+        const safeTitle = [...String(item.title || 'Music Track')].slice(0, 60).join('').trim();
+        const safeArtist = [...String(item.artist || 'Music')].slice(0, 60).join('').trim();
+        const lyricsSlug = safeTitle.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
+
+        const caption = `🎵 <b>${escapeHtml(safeTitle)}</b> — <i>${escapeHtml(safeArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`;
+
+        const keyboard = [
+          [
+            {
+              text: '📜 Lyrics & Info ♡',
+              url: `https://t.me/${botUser}?start=lyrics_${lyricsSlug}`,
+              style: 'primary'
+            }
+          ],
+          [
+            {
+              text: '🎵 Search Music Live',
+              switch_inline_query_current_chat: '',
+              style: 'primary'
+            }
+          ]
+        ];
+
+        if (item.source === 'youtube_video' && item.videoId) {
+          results.push({
+            type: 'video',
+            id: `yt_vid_${item.videoId}_${offset}_${idx}`,
+            video_url: `https://www.youtube.com/watch?v=${item.videoId}`,
+            mime_type: 'text/html',
+            thumbnail_url: item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`,
+            title: `🎬 ${safeTitle.slice(0, 50)}`,
+            description: `⏱ ${item.duration} ♡`,
+            caption: `🎬 <b>${escapeHtml(safeTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${item.duration}\n✨ <i>Delivered via @${botUser} ♡</i></blockquote>`,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: keyboard }
+          });
+        } else if (item.fileId) {
+          results.push({
+            type: 'audio',
+            id: `cached_aud_${item.fileId.slice(-8)}_${offset}_${idx}`,
+            audio_file_id: item.fileId,
+            title: safeTitle,
+            performer: safeArtist,
+            ...(durSec > 0 ? { audio_duration: durSec } : {}),
+            caption,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: keyboard }
+          });
+        } else if (item.audioUrl || item.preview) {
+          const streamUrl = item.audioUrl || item.preview;
+          const resId = `live_aud_${item.id || idx}_${offset}_${idx}`;
+          recentInlineSearchResults.set(resId, {
+            type: 'audio',
+            id: item.id,
+            title: safeTitle,
+            artist: safeArtist,
+            duration: durSec,
+            query: cleanTopic
+          });
+          if (recentInlineSearchResults.size > 500) {
+            const firstKey = recentInlineSearchResults.keys().next().value;
+            recentInlineSearchResults.delete(firstKey);
+          }
+
+          results.push({
+            type: 'audio',
+            id: resId,
+            audio_url: streamUrl,
+            title: safeTitle,
+            performer: safeArtist,
+            ...(durSec > 0 ? { audio_duration: durSec } : {}),
+            caption,
+            parse_mode: 'HTML',
+            reply_markup: { inline_keyboard: keyboard }
+          });
+        }
+      }
+
+      if (paged.length > 0 && !paged[0].fileId) {
+        this.#cacheAudioTrack(`${paged[0].title} ${paged[0].artist}`, 0).catch(() => {});
+      }
+
+      return { results, nextOffset };
+    } catch (err) {
+      this.log?.debug?.({ err: err?.message, queryTopic }, 'inline music search failed');
       return { results: [], nextOffset: '' };
     }
   }
@@ -2159,307 +2490,31 @@ export class TelegramController extends EventEmitter {
 
       // 4. Music Search (Live):
       const cleanSongQuery = rawText.replace(/^(play|music|song|listen|stream)\s+/i, '').trim() || rawText;
+      const { results: musicResults, nextOffset } = await this.#fetchInlineMusicSearch(cleanSongQuery, offset);
 
-      // Check SQLite cached audio tracks for instant full audio playback
-      const queryTerms = cleanSongQuery.toLowerCase().split(/\s+/).filter(Boolean);
-      const lookupCached = () => {
-        try {
-          const rows = this.db.prepare(
-            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 200'
-          ).all();
-          const seen = new Set();
-          const matches = [];
-
-          for (const row of rows || []) {
-            if (!row?.file_id) continue;
-            const normKey = `${(row.title || '').toLowerCase().trim()} ${(row.artist || '').toLowerCase().trim()}`.trim();
-            if (seen.has(row.file_id) || (normKey && seen.has(normKey))) continue;
-
-            const rowQuery = (row.query || '').toLowerCase().trim();
-            const rowTitle = (row.title || '').toLowerCase().trim();
-            const rowArtist = (row.artist || '').toLowerCase().trim();
-            const cleanLower = cleanSongQuery.toLowerCase().trim();
-
-            const isExact = rowQuery === cleanLower || rowTitle === cleanLower || `${rowTitle} ${rowArtist}` === cleanLower || `${rowArtist} ${rowTitle}` === cleanLower;
-            const rowText = `${rowQuery} ${rowTitle} ${rowArtist}`;
-            const termsMatch = queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
-            const matchingTermsCount = queryTerms.filter((term) => term.length >= 3 && rowText.includes(term)).length;
-
-            let score = 0;
-            if (isExact) score = 100;
-            else if (termsMatch) score = 50 + queryTerms.length;
-            else if (matchingTermsCount > 0) score = 10 * matchingTermsCount;
-
-            if (score > 0) {
-              seen.add(row.file_id);
-              if (normKey) seen.add(normKey);
-              matches.push({ ...row, isExact, score });
-            }
-          }
-
-          matches.sort((a, b) => b.score - a.score);
-          return matches.slice(0, 50);
-        } catch {
-          return [];
-        }
-      };
-
-      const cachedAudioRows = lookupCached();
-
-      const cachedResults = (cachedAudioRows || []).map((row, idx) => {
-        const durSec = row.duration || 0;
-        const min = Math.floor(durSec / 60);
-        const sec = String(durSec % 60).padStart(2, '0');
-        const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
-        const botUser = this.botUsername || 'Lancy_easy_bot';
-
-        return {
-          type: 'audio',
-          id: `cached_aud_${row.file_id.slice(-8)}_${idx}`,
-          audio_file_id: row.file_id,
-          title: row.title,
-          performer: row.artist || 'Music',
-          ...(durSec > 0 ? { audio_duration: durSec } : {}),
-          caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
-          parse_mode: 'HTML',
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '📜 Lyrics & Info ♡',
-                  url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`,
-                  style: 'primary'
-                }
-              ],
-              [
-                {
-                  text: '🎵 Search Music Live',
-                  switch_inline_query_current_chat: '',
-                  style: 'primary'
-                }
-              ]
-            ]
-          }
+      if (musicResults && musicResults.length > 0) {
+        const answerPayload = {
+          inline_query_id: qId,
+          results: musicResults,
+          next_offset: nextOffset,
+          cache_time: 15,
+          is_personal: false
         };
-      });
 
-      let results = [];
-      let nextOffset = '';
-
-      if (cachedResults.length >= 10) {
-        const pagedAudioResults = cachedResults.slice(offset, offset + 10);
-        const nextAudioOffset = (offset + pagedAudioResults.length < cachedResults.length)
-          ? String(offset + pagedAudioResults.length)
-          : '';
-        results = pagedAudioResults;
-        nextOffset = nextAudioOffset;
-      } else {
-        const combinedMusicResults = [];
-        const seenTitles = new Set();
-        const seenVids = new Set();
-        const seenFileIds = new Set();
-
-        // 1. Add matching cached native audio tracks first (they drop native full MP3!)
-        for (const row of cachedResults) {
-          if (row.audio_file_id) seenFileIds.add(row.audio_file_id);
-          seenTitles.add((row.title || '').toLowerCase().trim());
-          combinedMusicResults.push(row);
-        }
-
-        let cachedPool = null;
-
-        // 2. Fetch online YouTube tracks when query has at least 2 chars so users ALWAYS get endless music results!
-        if (cleanSongQuery.length >= 2) {
-          this.#cacheAudioTrack(cleanSongQuery, 0).catch(() => {});
-
-          const cacheKey = `mus_pool_${cleanSongQuery.toLowerCase()}`;
-          cachedPool = inlineSearchCache.get(cacheKey);
-
-          if (!cachedPool || !Array.isArray(cachedPool.items) || (Date.now() - cachedPool.timestamp > 180000)) {
-            cachedPool = {
-              items: [],
-              combosTried: 0,
-              timestamp: Date.now()
-            };
-            inlineSearchCache.set(cacheKey, cachedPool);
-            if (inlineSearchCache.size > 200) {
-              const firstKey = inlineSearchCache.keys().next().value;
-              inlineSearchCache.delete(firstKey);
-            }
+        await this.api.call('answerInlineQuery', {
+          ...answerPayload,
+          button: {
+            text: `🎵 Search in ${botName}`,
+            start_parameter: 'music'
           }
-
-          const searchTerms = [
-            cleanSongQuery,
-            `${cleanSongQuery} audio`,
-            `${cleanSongQuery} music`,
-            `${cleanSongQuery} song`,
-            `${cleanSongQuery} official audio`,
-            `${cleanSongQuery} full song`,
-            `${cleanSongQuery} lyrics`,
-            `${cleanSongQuery} soundtrack`,
-            `${cleanSongQuery} remix`
-          ];
-
-          while (cachedPool.items.length < (offset + 10) && cachedPool.combosTried < 25) {
-            const term = cachedPool.combosTried < searchTerms.length
-              ? searchTerms[cachedPool.combosTried]
-              : `${cleanSongQuery} song part ${cachedPool.combosTried - searchTerms.length + 2}`;
-            cachedPool.combosTried++;
-            const vids = await searchYouTubeFast(term).catch(() => []);
-            if (vids?.length) {
-              const seenPoolVids = new Set(cachedPool.items.map((v) => v.videoId));
-              for (const v of vids) {
-                if (v?.videoId && !seenPoolVids.has(v.videoId)) {
-                  seenPoolVids.add(v.videoId);
-                  cachedPool.items.push(v);
-                }
-              }
-            }
-          }
-
-          if (cachedPool.items && cachedPool.items.length > 0) {
-            const botUser = this.botUsername || 'Lancy_easy_bot';
-            const allCachedRows = this.db.prepare('SELECT file_id, title, artist, duration, query FROM cached_audio_tracks').all() || [];
-
-            for (let idx = 0; idx < cachedPool.items.length; idx++) {
-              const item = cachedPool.items[idx];
-              if (seenVids.has(item.videoId)) continue;
-              seenVids.add(item.videoId);
-
-              const titleLower = (item.title || '').toLowerCase().trim();
-              if (seenTitles.has(titleLower)) continue;
-
-              // Check if duplicate of any cached track
-              const isDupe = cachedAudioRows.some((c) => {
-                const cTitle = (c.title || '').toLowerCase().trim();
-                const cArtist = (c.artist || '').toLowerCase().trim();
-                const vidFull = `${titleLower} ${(item.author || '').toLowerCase()}`;
-                if (cTitle && (titleLower.includes(cTitle) || cTitle.includes(titleLower))) {
-                  if (!cArtist || cArtist === 'music' || cArtist === 'artist' || vidFull.includes(cArtist)) return true;
-                }
-                return false;
-              });
-              if (isDupe) continue;
-
-              seenTitles.add(titleLower);
-
-              const title = item.title || cleanSongQuery;
-              const duration = item.duration || 'HD Track';
-              const artist = item.author || 'Music';
-              const resId = `yt_aud_${item.videoId}_${offset}_${idx}`;
-
-              // Check if track is already cached in SQLite with fuzzy matcher
-              const cachedTrack = this.#matchCachedAudio(item, allCachedRows);
-
-              if (cachedTrack?.file_id) {
-                if (seenFileIds.has(cachedTrack.file_id)) continue;
-                seenFileIds.add(cachedTrack.file_id);
-
-                const durSec = cachedTrack.duration || 0;
-                const min = Math.floor(durSec / 60);
-                const sec = String(durSec % 60).padStart(2, '0');
-                const durStr = durSec > 0 ? `${min}:${sec}` : duration;
-                const songTitle = cachedTrack.title || title;
-                const songArtist = cachedTrack.artist || artist;
-                combinedMusicResults.push({
-                  type: 'audio',
-                  id: `cached_aud_${cachedTrack.file_id.slice(-8)}_${offset}_${idx}`,
-                  audio_file_id: cachedTrack.file_id,
-                  title: songTitle,
-                  performer: songArtist,
-                  ...(durSec > 0 ? { audio_duration: durSec } : {}),
-                  caption: `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
-                  parse_mode: 'HTML',
-                  reply_markup: {
-                    inline_keyboard: [
-                      [
-                        {
-                          text: '📜 Lyrics & Info ♡',
-                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(songTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
-                          style: 'primary'
-                        }
-                      ],
-                      [
-                        {
-                          text: '🎵 Search Music Live',
-                          switch_inline_query_current_chat: '',
-                          style: 'primary'
-                        }
-                      ]
-                    ]
-                  }
-                });
-              } else {
-                // Pre-cache top uncached tracks in background
-                if (idx < 2) {
-                  this.#cacheAudioTrack(title, 0, item.videoId).catch(() => {});
-                }
-
-                recentInlineSearchResults.set(resId, {
-                  type: 'audio',
-                  videoId: item.videoId,
-                  title,
-                  artist,
-                  duration,
-                  query: cleanSongQuery
-                });
-                if (recentInlineSearchResults.size > 500) {
-                  const firstKey = recentInlineSearchResults.keys().next().value;
-                  recentInlineSearchResults.delete(firstKey);
-                }
-
-                combinedMusicResults.push({
-                  type: 'audio',
-                  id: resId,
-                  audio_url: `https://www.youtube.com/watch?v=${item.videoId}`,
-                  title: title.slice(0, 64),
-                  performer: artist.slice(0, 64),
-                  caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Tap below to drop full MP3 via @${botUser} ♡</i></blockquote>`,
-                  parse_mode: 'HTML',
-                  input_message_content: {
-                    message_text: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Tap below to drop full MP3 via @${botUser}… ♡</i></blockquote>`,
-                    parse_mode: 'HTML'
-                  },
-                  reply_markup: {
-                    inline_keyboard: [
-                      [
-                        {
-                          text: '📥 Drop Full MP3 File Now ♡',
-                          callback_data: encodeCallback('downloader', 'live_audio', item.videoId),
-                          style: 'primary'
-                        }
-                      ],
-                      [
-                        {
-                          text: '📜 Lyrics & Info ♡',
-                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
-                          style: 'primary'
-                        },
-                        {
-                          text: '🎵 Search Music Live',
-                          switch_inline_query_current_chat: '',
-                          style: 'primary'
-                        }
-                      ]
-                    ]
-                  }
-                });
-              }
-            }
-          }
-        }
-
-        if (combinedMusicResults.length > 0) {
-          const pagedResults = combinedMusicResults.slice(offset, offset + 10);
-          nextOffset = (offset + pagedResults.length < combinedMusicResults.length || (cachedPool?.combosTried < 25)) && pagedResults.length > 0
-            ? String(offset + pagedResults.length)
-            : '';
-          results = pagedResults;
-        }
+        }).catch(async () => {
+          await this.api.call('answerInlineQuery', answerPayload).catch(() => {});
+        });
+        return;
       }
 
       // 5. Friendly fallback when zero music results found (never fall back to Pinterest photos!)
-      if (results.length === 0 && cleanSongQuery.length >= 2) {
+      if (cleanSongQuery.length >= 2) {
         await this.api.call('answerInlineQuery', {
           inline_query_id: qId,
           results: [{
@@ -2490,27 +2545,6 @@ export class TelegramController extends EventEmitter {
         });
         return;
       }
-
-      const answerPayload = {
-        inline_query_id: qId,
-        results,
-        next_offset: nextOffset,
-        cache_time: results[0]?.type === 'audio' ? 30 : 2,
-        is_personal: false
-      };
-
-      await this.api.call('answerInlineQuery', {
-        ...answerPayload,
-        button: {
-          text: `🎵 Search in ${botName}`,
-          start_parameter: 'music'
-        }
-      }).catch(async (err) => {
-        this.log.error({ err: err?.message, qId }, 'answerInlineQuery with button failed, retrying without button');
-        await this.api.call('answerInlineQuery', answerPayload).catch((retryErr) => {
-          this.log.error({ err: retryErr?.message, qId }, 'answerInlineQuery failed completely');
-        });
-      });
     } catch (err) {
       this.log.error({ err: err?.message, qId }, 'answerInlineQuery failed');
     }
