@@ -2667,7 +2667,7 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/hidetag' || command === '/tagall' || command === '/everyone' || command === '/mentionall') {
-        await this.handleHideTag(message, rest);
+        await this.handleHideTag(message, rest, command);
         return;
       }
 
@@ -3469,7 +3469,7 @@ export class TelegramController extends EventEmitter {
     };
   }
 
-  async handleHideTag(message, rest = []) {
+  async handleHideTag(message, rest = [], command = '/hidetag') {
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
     const chatId = message.chat.id;
     const tgId = String(message.from?.id);
@@ -3523,17 +3523,16 @@ export class TelegramController extends EventEmitter {
 
     // 2. Discover members
     const userMap = new Map();
-    const callerId = Number(tgId);
     const botId = this.api.me?.id ? Number(this.api.me.id) : null;
 
-    // Fetch live group administrators
+    // Fetch live group administrators (include caller so they see they got tagged too!)
     try {
       const admins = await this.api.getChatAdministrators(chatId);
       if (Array.isArray(admins)) {
         for (const admin of admins) {
           if (admin?.user && !admin.user.is_bot) {
             const uid = Number(admin.user.id);
-            if (uid !== botId && uid !== callerId) {
+            if (uid !== botId) {
               userMap.set(uid, {
                 id: uid,
                 name: admin.user.first_name || 'Member',
@@ -3554,7 +3553,7 @@ export class TelegramController extends EventEmitter {
       if (Array.isArray(dbMembers)) {
         for (const m of dbMembers) {
           const uid = Number(m.user_id);
-          if (uid && uid !== botId && uid !== callerId && !userMap.has(uid)) {
+          if (uid && uid !== botId && !userMap.has(uid)) {
             userMap.set(uid, {
               id: uid,
               name: m.first_name || 'Member',
@@ -3569,12 +3568,20 @@ export class TelegramController extends EventEmitter {
 
     // Also record message.from and replied message's author
     if (message.from && !message.from.is_bot) {
+      const uid = Number(message.from.id);
+      if (uid !== botId && !userMap.has(uid)) {
+        userMap.set(uid, {
+          id: uid,
+          name: message.from.first_name || 'Member',
+          username: message.from.username || null
+        });
+      }
       this.db.recordGroupMember(chatId, message.from);
     }
     if (message.reply_to_message?.from && !message.reply_to_message.from.is_bot) {
       const repUser = message.reply_to_message.from;
       const repId = Number(repUser.id);
-      if (repId !== botId && repId !== callerId && !userMap.has(repId)) {
+      if (repId !== botId && !userMap.has(repId)) {
         userMap.set(repId, {
           id: repId,
           name: repUser.first_name || 'Member',
@@ -3585,7 +3592,8 @@ export class TelegramController extends EventEmitter {
     }
 
     // 3. Determine announcement text and options
-    const isVisible = rest.includes('-v') || rest.includes('--visible');
+    const isTagAll = command === '/tagall' || command === '/everyone' || command === '/mentionall';
+    const isVisible = isTagAll || rest.includes('-v') || rest.includes('--visible');
     const shouldPin = rest.some((arg) => /^(?:pin|--pin|-p)$/i.test(arg));
     const cleanArgs = rest.filter((a) => !/^(?:pin|--pin|-p|-v|--visible)$/i.test(a));
     const customText = cleanArgs.join(' ').trim();
@@ -3609,16 +3617,17 @@ export class TelegramController extends EventEmitter {
 
     if (isVisible) {
       const visibleTags = mainBatch
-        .map((m) => m.username ? `@${m.username}` : `<a href="tg://user?id=${m.id}">${escapeHtml(m.name)}</a>`)
+        .map((m) => m.username ? `@${m.username}` : `<a href="tg://user?id=${m.id}">${escapeHtml(m.name || 'Member')}</a>`)
         .join(' ');
-      finalHtml = visibleTags ? `${bodyText}\n\n${visibleTags}` : bodyText;
+      finalHtml = bodyText ? `${bodyText}\n\n${visibleTags}` : visibleTags;
     } else {
       const maxChars = 4000;
       let remainingBudget = maxChars - bodyText.length;
       let zeroWidthMentions = '';
 
       for (const member of mainBatch) {
-        const tag = `<a href="tg://user?id=${member.id}">\u200B</a>`;
+        // Use Hangul Filler U+3164 for 100% reliable invisible mention across all Telegram clients
+        const tag = `<a href="tg://user?id=${member.id}">\u3164</a>`;
         if (tag.length > remainingBudget) break;
         zeroWidthMentions += tag;
         remainingBudget -= tag.length;
@@ -3670,7 +3679,7 @@ export class TelegramController extends EventEmitter {
         for (const batch of ghostBatches) {
           try {
             await sleep(2000); // Respect Telegram 20 msg/min group rate limit
-            const ghostTags = batch.map((m) => `<a href="tg://user?id=${m.id}">\u200B</a>`).join('');
+            const ghostTags = batch.map((m) => `<a href="tg://user?id=${m.id}">\u3164</a>`).join('');
             const ghostMsg = await this.api.sendMessage(
               chatId,
               `📢 ${ghostTags}`,

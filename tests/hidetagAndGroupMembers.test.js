@@ -164,14 +164,14 @@ test('TelegramController /hidetag: administrator sends EXACTLY ONE message taggi
   // Announcement text is present
   assert.match(sent.text, /Important announcement for everyone!/);
 
-  // Invisible mentions contain zero-width spaces for member 2001, 2002, 3001
-  assert.match(sent.text, /<a href="tg:\/\/user\?id=2001">\u200B<\/a>/);
-  assert.match(sent.text, /<a href="tg:\/\/user\?id=2002">\u200B<\/a>/);
-  assert.match(sent.text, /<a href="tg:\/\/user\?id=3001">\u200B<\/a>/);
+  // Invisible mentions contain zero-width spaces for member 2001, 2002, 3001, and caller 1001
+  assert.match(sent.text, /<a href="tg:\/\/user\?id=2001">\u3164<\/a>/);
+  assert.match(sent.text, /<a href="tg:\/\/user\?id=2002">\u3164<\/a>/);
+  assert.match(sent.text, /<a href="tg:\/\/user\?id=3001">\u3164<\/a>/);
+  assert.match(sent.text, /<a href="tg:\/\/user\?id=1001">\u3164<\/a>/);
 
-  // Bot itself and caller admin are not tagged
+  // Bot itself is not tagged
   assert.doesNotMatch(sent.text, /<a href="tg:\/\/user\?id=8859351350">/);
-  assert.doesNotMatch(sent.text, /<a href="tg:\/\/user\?id=1001">/);
 
   // Trigger command message was deleted
   assert.equal(deletedMessages.length, 1);
@@ -223,7 +223,7 @@ test('TelegramController /hidetag: replying to another message carries reply_to_
   assert.equal(sentMessages.length, 1);
   assert.equal(sentMessages[0].opts.reply_to_message_id, 77);
   assert.match(sentMessages[0].text, /Attention everyone!/);
-  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=4001">\u200B<\/a>/);
+  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=4001">\u3164<\/a>/);
 
   db.close();
 });
@@ -357,7 +357,7 @@ test('TelegramController handleUpdate: passively tracks group members and suppor
   assert.equal(sentMessages.length, 1);
   assert.match(sentMessages[0].text, /Wake up everyone!/);
   // User 7001 should be invisibly tagged
-  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=7001">\u200B<\/a>/);
+  assert.match(sentMessages[0].text, /<a href="tg:\/\/user\?id=7001">\u3164<\/a>/);
 
   db.close();
 });
