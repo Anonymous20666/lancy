@@ -410,3 +410,56 @@ test('TelegramController /hidetag pin: pins announcement with notification so al
 
   db.close();
 });
+
+test('TelegramController /hidetag: large groups (>80 members) use ghost batches that auto-delete', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sentMessages = [];
+  const deletedMessages = [];
+  const chatId = -100666;
+
+  // Add 120 members to database
+  for (let i = 1; i <= 120; i++) {
+    db.recordGroupMember(chatId, { id: 8000 + i, username: `user_${i}`, first_name: `Member ${i}` });
+  }
+
+  const mockApi = {
+    me: { id: 8859351350, username: 'Lancy_easy_bot' },
+    getChatMember: async () => ({ status: 'administrator' }),
+    getChatAdministrators: async () => [],
+    deleteMessage: async (cid, mid) => {
+      deletedMessages.push({ cid, mid });
+      return true;
+    },
+    sendMessage: async (cid, text, opts) => {
+      const msgId = 600 + sentMessages.length;
+      sentMessages.push({ cid, text, opts, message_id: msgId });
+      return { message_id: msgId };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: new StateMachine(db)
+  });
+
+  const msg = {
+    message_id: 33,
+    chat: { id: chatId, type: 'supergroup' },
+    from: { id: 1001, first_name: 'Admin' },
+    text: '/hidetag Big rally!'
+  };
+
+  await controller.handleHideTag(msg, ['Big', 'rally!']);
+
+  // Main message is sent immediately
+  assert.ok(sentMessages.length >= 1);
+  assert.match(sentMessages[0].text, /Big rally!/);
+
+  // Trigger command message (id 33) is deleted
+  assert.ok(deletedMessages.some((d) => d.mid === 33));
+
+  db.close();
+});

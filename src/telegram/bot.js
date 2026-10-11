@@ -3601,12 +3601,14 @@ export class TelegramController extends EventEmitter {
 
     // 4. Build single message payload
     // Telegram Bot API allows up to 100 entities and 4096 characters per message.
-    // We cap members at 90 and calculate remaining character budget so it NEVER errors.
-    const membersToTag = Array.from(userMap.values()).slice(0, 90);
+    // The first batch (up to 80 members) is attached directly to the main message.
+    const allMembers = Array.from(userMap.values());
+    const mainBatch = allMembers.slice(0, 80);
+    const remainingMembers = allMembers.slice(80);
     let finalHtml = '';
 
     if (isVisible) {
-      const visibleTags = membersToTag
+      const visibleTags = mainBatch
         .map((m) => m.username ? `@${m.username}` : `<a href="tg://user?id=${m.id}">${escapeHtml(m.name)}</a>`)
         .join(' ');
       finalHtml = visibleTags ? `${bodyText}\n\n${visibleTags}` : bodyText;
@@ -3615,7 +3617,7 @@ export class TelegramController extends EventEmitter {
       let remainingBudget = maxChars - bodyText.length;
       let zeroWidthMentions = '';
 
-      for (const member of membersToTag) {
+      for (const member of mainBatch) {
         const tag = `<a href="tg://user?id=${member.id}">\u200B</a>`;
         if (tag.length > remainingBudget) break;
         zeroWidthMentions += tag;
@@ -3653,6 +3655,40 @@ export class TelegramController extends EventEmitter {
       } catch (pinErr) {
         this.log.warn({ pinErr, chatId }, 'failed to pin hidetag message');
       }
+    }
+
+    // 5. Large group ghost-tagging: If there are more than 80 members (up to 2k+),
+    // silently tag them in quick background batches that auto-delete after delivering pings,
+    // leaving ONLY the one single announcement message visible on screen!
+    if (remainingMembers.length > 0 && sent?.message_id && !isVisible) {
+      const ghostBatches = [];
+      for (let i = 0; i < remainingMembers.length; i += 75) {
+        ghostBatches.push(remainingMembers.slice(i, i + 75));
+      }
+
+      (async () => {
+        for (const batch of ghostBatches) {
+          try {
+            await sleep(2000); // Respect Telegram 20 msg/min group rate limit
+            const ghostTags = batch.map((m) => `<a href="tg://user?id=${m.id}">\u200B</a>`).join('');
+            const ghostMsg = await this.api.sendMessage(
+              chatId,
+              `📢 ${ghostTags}`,
+              {
+                parse_mode: 'HTML',
+                reply_to_message_id: sent.message_id,
+                link_preview_options: { is_disabled: true }
+              }
+            );
+            if (ghostMsg?.message_id && typeof this.api.deleteMessage === 'function') {
+              await sleep(1500);
+              await this.api.deleteMessage(chatId, ghostMsg.message_id).catch(() => {});
+            }
+          } catch (batchErr) {
+            this.log.warn({ batchErr, chatId }, 'ghost tag batch failed');
+          }
+        }
+      })().catch(() => {});
     }
   }
 
