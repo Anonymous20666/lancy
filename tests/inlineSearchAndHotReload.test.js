@@ -780,6 +780,9 @@ test('TelegramController: live inline search handles tt / tiktok query and retur
       assert.equal(btn.style, 'primary', `button "${btn.text}" must have style primary`);
     }
   }
+  if (inlineAnswer.results.length >= 8) {
+    assert.equal(inlineAnswer.next_offset, String(inlineAnswer.results.length));
+  }
 
   db.close();
 });
@@ -953,5 +956,94 @@ test('TelegramController: live inline audio drops 100% full audio player with ri
 
   db.close();
 });
+
+test('TelegramController: live inline search supports infinite pagination with next_offset', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot', first_name: 'Lancy' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  // Insert 25 cached tracks for "pop hits"
+  for (let i = 1; i <= 25; i++) {
+    db.prepare('INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)').run(
+      'pop hits',
+      `audio_file_id_${i}`,
+      `Pop Track ${i}`,
+      'Pop Artist',
+      180
+    );
+  }
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // 1. Initial query with offset '' (page 1: items 0-9)
+  await controller.handleInlineQuery({
+    id: 'query_page_1',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pop hits',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.equal(inlineAnswer.results.length, 10, 'first page should contain 10 tracks');
+  assert.equal(inlineAnswer.next_offset, '10', 'next_offset should be 10');
+
+  // 2. Subsequent query with offset '10' (page 2: items 10-19)
+  await controller.handleInlineQuery({
+    id: 'query_page_2',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pop hits',
+    offset: '10'
+  });
+
+  assert.equal(inlineAnswer.results.length, 10, 'second page should contain 10 tracks');
+  assert.equal(inlineAnswer.next_offset, '20', 'next_offset should be 20');
+
+  // 3. Final query with offset '20' (page 3: items 20-24)
+  await controller.handleInlineQuery({
+    id: 'query_page_3',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pop hits',
+    offset: '20'
+  });
+
+  assert.equal(inlineAnswer.results.length, 5, 'third page should contain remaining 5 tracks');
+  assert.equal(inlineAnswer.next_offset, '', 'next_offset should be empty once exhausted');
+
+  db.close();
+});
+
 
 

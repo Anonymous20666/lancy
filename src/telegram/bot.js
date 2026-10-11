@@ -862,17 +862,37 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  async #fetchInlineTikTokSearch(queryTopic) {
+  async #fetchInlineTikTokSearch(queryTopic, offset = 0) {
     if (!queryTopic) return [];
     try {
       const { yts } = await import('btch-downloader');
-      const res = await yts(queryTopic + ' tiktok');
+      const botUser = this.botUsername || 'Lancy_easy_bot';
+
+      const modifiers = [
+        'tiktok',
+        'tiktok viral',
+        'tiktok trending',
+        'tiktok shorts',
+        'tiktok compilation',
+        'tiktok clips',
+        'tiktok dance',
+        'tiktok edit',
+        'tiktok best',
+        'tiktok popular',
+        'tiktok funny',
+        'tiktok 2026'
+      ];
+
+      const pageIndex = Math.floor(offset / 10);
+      const mod = modifiers[pageIndex % modifiers.length];
+      const searchTerm = `${queryTopic} ${mod}`;
+
+      const res = await yts(searchTerm);
       const vids = res?.result?.videos || res?.result?.all || [];
       if (!vids.length) return [];
       const results = [];
-      const botUser = this.botUsername || 'Lancy_easy_bot';
 
-      for (let idx = 0; idx < Math.min(vids.length, 12); idx++) {
+      for (let idx = 0; idx < Math.min(vids.length, 10); idx++) {
         const item = vids[idx];
         const title = item.title || queryTopic;
         const duration = item.timestamp || item.duration?.timestamp || 'HD Clip';
@@ -882,7 +902,7 @@ export class TelegramController extends EventEmitter {
 
         results.push({
           type: 'article',
-          id: `tt_${item.videoId || idx}_${Date.now()}`,
+          id: `tt_${item.videoId || idx}_${offset}_${idx}`,
           title: `🎬 ${title.slice(0, 50)}`,
           description: `⏱ ${duration} • 👁 ${views} ♡ (Tap to download)`,
           thumb_url: thumb,
@@ -1133,6 +1153,7 @@ export class TelegramController extends EventEmitter {
     if (!inlineQuery?.id) return;
     const qId = inlineQuery.id;
     const rawText = String(inlineQuery.query || '').trim();
+    const offset = parseInt(inlineQuery.offset || '0', 10) || 0;
     const botName = this.botContext?.botName || 'Lancy';
     const botTag = this.botUsername ? `@${this.botUsername}` : '';
 
@@ -1315,9 +1336,12 @@ export class TelegramController extends EventEmitter {
         }
 
         if (pintResults && pintResults.length > 0) {
+          const pagedPins = pintResults.slice(offset, offset + 15);
+          const nextOffset = (offset + pagedPins.length < pintResults.length) ? String(offset + pagedPins.length) : '';
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
-            results: pintResults,
+            results: pagedPins,
+            next_offset: nextOffset,
             cache_time: 30,
             is_personal: false
           });
@@ -1391,11 +1415,12 @@ export class TelegramController extends EventEmitter {
           return;
         }
 
-        let ttResults = inlineTikTokCache.get(queryTopic.toLowerCase());
+        const cacheKey = `${queryTopic.toLowerCase()}_off_${offset}`;
+        let ttResults = inlineTikTokCache.get(cacheKey);
         if (!ttResults) {
-          ttResults = await this.#fetchInlineTikTokSearch(queryTopic);
+          ttResults = await this.#fetchInlineTikTokSearch(queryTopic, offset);
           if (ttResults?.length) {
-            inlineTikTokCache.set(queryTopic.toLowerCase(), ttResults);
+            inlineTikTokCache.set(cacheKey, ttResults);
             if (inlineTikTokCache.size > 200) {
               const firstKey = inlineTikTokCache.keys().next().value;
               inlineTikTokCache.delete(firstKey);
@@ -1404,10 +1429,12 @@ export class TelegramController extends EventEmitter {
         }
 
         if (ttResults && ttResults.length > 0) {
+          const nextOffset = ttResults.length >= 8 ? String(offset + ttResults.length) : '';
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
             results: ttResults,
-            cache_time: 30,
+            next_offset: nextOffset,
+            cache_time: 20,
             is_personal: false
           });
           return;
@@ -1480,7 +1507,7 @@ export class TelegramController extends EventEmitter {
           }
 
           matches.sort((a, b) => (b.isExact ? 1 : 0) - (a.isExact ? 1 : 0));
-          return matches.slice(0, 10);
+          return matches.slice(0, 50);
         } catch {
           return [];
         }
@@ -1531,10 +1558,12 @@ export class TelegramController extends EventEmitter {
         };
       });
 
-      let results = cachedResults;
+      const pagedAudioResults = cachedResults.slice(offset, offset + 10);
+      const nextOffset = (offset + pagedAudioResults.length < cachedResults.length) ? String(offset + pagedAudioResults.length) : '';
+      let results = pagedAudioResults;
 
-      // If no cached tracks yet, trigger background caching and show interactive live refresh card
-      if (results.length === 0 && cleanSongQuery.length >= 2) {
+      // If offset === 0 and no cached tracks yet, trigger background caching and show interactive live refresh card
+      if (offset === 0 && results.length === 0 && cleanSongQuery.length >= 2) {
         this.#cacheAudioTrack(cleanSongQuery, 100).catch(() => {});
 
         const botUser = this.botUsername || 'Lancy_easy_bot';
@@ -1567,9 +1596,12 @@ export class TelegramController extends EventEmitter {
       if (results.length === 0 && cleanSongQuery.length >= 2) {
         const pintFallback = await this.#fetchInlinePinterestSearch(cleanSongQuery);
         if (pintFallback && pintFallback.length > 0) {
+          const pagedFallback = pintFallback.slice(offset, offset + 15);
+          const nextFallbackOffset = (offset + pagedFallback.length < pintFallback.length) ? String(offset + pagedFallback.length) : '';
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
-            results: pintFallback,
+            results: pagedFallback,
+            next_offset: nextFallbackOffset,
             cache_time: 30,
             is_personal: false
           });
@@ -1580,6 +1612,7 @@ export class TelegramController extends EventEmitter {
       const answerPayload = {
         inline_query_id: qId,
         results,
+        next_offset: nextOffset,
         cache_time: results[0]?.type === 'audio' ? 30 : 2,
         is_personal: false
       };
