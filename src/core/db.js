@@ -39,6 +39,16 @@ export class Database {
           created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_cached_audio_query ON cached_audio_tracks(query);
+
+        CREATE TABLE IF NOT EXISTS cached_video_tracks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          query TEXT NOT NULL,
+          file_id TEXT NOT NULL,
+          title TEXT NOT NULL,
+          duration INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_cached_video_query ON cached_video_tracks(query);
       `);
     } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');

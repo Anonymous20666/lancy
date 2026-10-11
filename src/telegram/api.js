@@ -141,6 +141,10 @@ export class TelegramAPI {
     return this.call('editMessageMedia', { ...params, ...extra });
   }
 
+  editMessageCaption(params, extra = {}) {
+    return this.call('editMessageCaption', { ...params, ...extra });
+  }
+
   sendMediaGroup(chatId, media, extra = {}, files = null) {
     return this.call('sendMediaGroup', { chat_id: chatId, media, ...extra }, { files });
   }

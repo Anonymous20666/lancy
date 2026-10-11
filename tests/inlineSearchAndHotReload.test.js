@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Database } from '../src/core/db.js';
 import { SettingsManager } from '../src/config/settings.js';
 import { StateMachine } from '../src/core/stateMachine.js';
-import { TelegramController, searchYouTubeFast, fetchSearchSuggestions } from '../src/telegram/bot.js';
+import { TelegramController, searchYouTubeFast, fetchSearchSuggestions, inlineTikTokCache, recentInlineSearchResults } from '../src/telegram/bot.js';
 import { MultiBotManager } from '../src/telegram/multiBotManager.js';
 import { createDownloaderScreen } from '../src/telegram/screens/downloader.js';
 
@@ -773,12 +773,14 @@ test('TelegramController: live inline search handles tt / tiktok query and retur
   assert.ok(inlineAnswer, 'answerInlineQuery should be called');
   assert.ok(inlineAnswer.results.length >= 1, 'should return video cards');
   const firstVideo = inlineAnswer.results[0];
-  assert.equal(firstVideo.type, 'video', 'must return video type to drop playable media into chat');
-  assert.ok(firstVideo.video_url, 'must provide video_url');
+  assert.ok(['video', 'photo'].includes(firstVideo.type), 'must return media card to drop into chat');
   assert.ok(firstVideo.reply_markup?.inline_keyboard, 'must have inline keyboard');
   for (const row of firstVideo.reply_markup.inline_keyboard) {
     for (const btn of row) {
       assert.equal(btn.style, 'primary', `button "${btn.text}" must have style primary`);
+      if (btn.url) {
+        assert.ok(!btn.url.includes('youtube.com'), 'must never redirect to youtube');
+      }
     }
   }
   if (inlineAnswer.results.length >= 8) {
@@ -1159,7 +1161,7 @@ test('TelegramController: TikTok live search supports infinite pagination withou
 
   assert.ok(inlineAnswer, 'answerInlineQuery should be called');
   assert.ok(inlineAnswer.results.length >= 1, 'must return video cards');
-  assert.equal(inlineAnswer.results[0].type, 'video');
+  assert.ok(['video', 'photo'].includes(inlineAnswer.results[0].type));
   for (const res of inlineAnswer.results) {
     if (res.reply_markup?.inline_keyboard) {
       for (const row of res.reply_markup.inline_keyboard) {
@@ -1280,4 +1282,352 @@ test('TelegramController: live inline Pinterest search supports infinite scrolli
 
   db.close();
 });
+
+test('TelegramController: live inline search returns cached_video_tracks as native playable video with video_file_id', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_video_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      duration INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  db.prepare('INSERT INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)').run(
+    'B_wgKoSDPr0',
+    'BAADBAADtgADtestvideo123',
+    'Evil Aura Sigma Edit',
+    30
+  );
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Seed cache with mock video
+  inlineTikTokCache.set('tt_evil aura', [{
+    videoId: 'B_wgKoSDPr0',
+    title: 'Evil Aura Sigma Edit',
+    duration: '0:30',
+    views: '1.2M',
+    thumb: 'https://i.ytimg.com/vi/B_wgKoSDPr0/hqdefault.jpg'
+  }]);
+
+  await controller.handleInlineQuery({
+    id: 'query_tt_cached',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'tt evil aura',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.equal(inlineAnswer.results.length, 1);
+  const res = inlineAnswer.results[0];
+  assert.equal(res.type, 'video');
+  assert.equal(res.video_file_id, 'BAADBAADtgADtestvideo123', 'must drop native video using Telegram file_id');
+  assert.ok(!res.video_url, 'must not have external video_url');
+  assert.ok(!res.input_message_content, 'must not override video with text message');
+  for (const row of res.reply_markup.inline_keyboard) {
+    for (const btn of row) {
+      assert.equal(btn.style, 'primary');
+      if (btn.url) assert.ok(!btn.url.includes('youtube.com'), 'must never have youtube.com in button');
+    }
+  }
+
+  db.close();
+});
+
+test('TelegramController: handleChosenInlineResult upgrades video chosen result into playable video in chat', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let editedMedia = null;
+  let sentVideo = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    sendVideo: async (chatId, buf, extra) => {
+      sentVideo = { chatId, buf, extra };
+      return { message_id: 888, video: { file_id: 'BAADBAADvid_uploaded_999' } };
+    },
+    editMessageMedia: async (params) => {
+      editedMedia = params;
+      return true;
+    },
+    call: async (method, payload) => {
+      if (method === 'deleteMessage') return true;
+      return { ok: true };
+    }
+  };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_video_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      duration INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  const fakeDownloader = {
+    download: async (url) => {
+      return {
+        title: 'Evil Aura HD Clip',
+        duration: '0:25',
+        mediaItems: [{
+          type: 'video',
+          buffer: Buffer.from('mock_video_bytes_123'),
+          filename: 'clip.mp4',
+          mimeType: 'video/mp4'
+        }]
+      };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: { mediaDownloader: fakeDownloader },
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  recentInlineSearchResults.set('tt_testvid123_0_0', {
+    type: 'video',
+    videoId: 'testvid123',
+    title: 'Evil Aura HD Clip',
+    duration: '0:25',
+    query: 'evil aura'
+  });
+
+  await controller.handleChosenInlineResult({
+    result_id: 'tt_testvid123_0_0',
+    inline_message_id: 'INLINE_MSG_12345',
+    query: 'tt evil aura'
+  });
+
+  assert.ok(sentVideo, 'must upload video to obtain Telegram file_id');
+  assert.ok(editedMedia, 'editMessageMedia must be called to upgrade inline card to video');
+  assert.equal(editedMedia.inline_message_id, 'INLINE_MSG_12345');
+  assert.equal(editedMedia.media.type, 'video');
+  assert.equal(editedMedia.media.media, 'BAADBAADvid_uploaded_999');
+  assert.match(editedMedia.media.caption, /Evil Aura HD Clip/);
+
+  // Check saved to SQLite
+  const cached = db.prepare('SELECT file_id, title FROM cached_video_tracks WHERE query = ?').get('testvid123');
+  assert.equal(cached.file_id, 'BAADBAADvid_uploaded_999');
+
+  db.close();
+});
+
+test('TelegramController: handleChosenInlineResult upgrades audio chosen result into playable audio player in chat', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let editedMedia = null;
+  let sentAudio = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    sendAudio: async (chatId, buf, extra) => {
+      sentAudio = { chatId, buf, extra };
+      return { message_id: 889, audio: { file_id: 'CQACAgQAAxkDAAIDUmrKn_aud_123' } };
+    },
+    editMessageMedia: async (params) => {
+      editedMedia = params;
+      return true;
+    },
+    call: async (method, payload) => {
+      if (method === 'deleteMessage') return true;
+      return { ok: true };
+    }
+  };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  const fakeDownloader = {
+    download: async (query) => {
+      return {
+        title: 'Starboy',
+        artist: 'The Weeknd',
+        duration: '3:50',
+        audioTrack: {
+          buffer: Buffer.from('mock_audio_bytes_456'),
+          filename: 'starboy.mp3'
+        }
+      };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: { mediaDownloader: fakeDownloader },
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  recentInlineSearchResults.set('yt_aud_starboyvid_0_0', {
+    type: 'audio',
+    videoId: 'starboyvid',
+    title: 'Starboy',
+    artist: 'The Weeknd',
+    duration: '3:50',
+    query: 'starboy'
+  });
+
+  await controller.handleChosenInlineResult({
+    result_id: 'yt_aud_starboyvid_0_0',
+    inline_message_id: 'INLINE_MSG_67890',
+    query: 'starboy'
+  });
+
+  assert.ok(sentAudio, 'must upload audio to obtain Telegram file_id');
+  assert.ok(editedMedia, 'editMessageMedia must be called to upgrade inline card to audio');
+  assert.equal(editedMedia.inline_message_id, 'INLINE_MSG_67890');
+  assert.equal(editedMedia.media.type, 'audio');
+  assert.equal(editedMedia.media.media, 'CQACAgQAAxkDAAIDUmrKn_aud_123');
+  assert.match(editedMedia.media.caption, /Starboy/);
+
+  // Check saved to SQLite
+  const cached = db.prepare('SELECT file_id, title FROM cached_audio_tracks WHERE query = ?').get('starboy');
+  assert.equal(cached.file_id, 'CQACAgQAAxkDAAIDUmrKn_aud_123');
+
+  db.close();
+});
+
+test('TelegramController: inline search results NEVER expose YouTube or Pinterest URLs in buttons or text', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_video_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      duration INTEGER,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Seed online TikTok search cache
+  inlineTikTokCache.set('tt_dance', [{
+    videoId: 'dancevid123',
+    title: 'Dance Challenge Viral',
+    duration: '0:15',
+    views: '5M',
+    thumb: 'https://i.ytimg.com/vi/dancevid123/hqdefault.jpg'
+  }]);
+
+  await controller.handleInlineQuery({
+    id: 'q_tt_check_btns',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'tt dance',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer);
+  for (const res of inlineAnswer.results) {
+    if (res.caption) {
+      assert.ok(!res.caption.includes('youtube.com'), 'caption must not contain youtube.com');
+      assert.ok(!res.caption.includes('youtu.be'), 'caption must not contain youtu.be');
+    }
+    if (res.input_message_content?.message_text) {
+      assert.ok(!res.input_message_content.message_text.includes('youtube.com'));
+    }
+    if (res.reply_markup?.inline_keyboard) {
+      for (const row of res.reply_markup.inline_keyboard) {
+        for (const btn of row) {
+          assert.equal(btn.style, 'primary');
+          if (btn.url) {
+            assert.ok(!btn.url.includes('youtube.com'), 'button must not point to youtube.com');
+            assert.ok(!btn.url.includes('youtu.be'), 'button must not point to youtu.be');
+          }
+        }
+      }
+    }
+  }
+
+  db.close();
+});
+
 

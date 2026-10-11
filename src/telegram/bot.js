@@ -15,11 +15,11 @@ import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
 
 const execFileAsync = promisify(execFile);
-const inlineSearchCache = new Map();
-const inlinePinterestCache = new Map();
-const inlineTikTokCache = new Map();
-const inlineUrlCache = new Map();
-const recentInlineSearchResults = new Map();
+export const inlineSearchCache = new Map();
+export const inlinePinterestCache = new Map();
+export const inlineTikTokCache = new Map();
+export const inlineUrlCache = new Map();
+export const recentInlineSearchResults = new Map();
 
 export async function searchYouTubeFast(query) {
   const clean = String(query || '').trim();
@@ -152,6 +152,7 @@ export class TelegramController extends EventEmitter {
     this.userScreenMessage = new Map(); // tgId -> { chatId, messageId }
     this.mediaDeliveryMessageIds = new Set(); // messageId -> boolean
     this.pendingAudioCaches = new Set(); // query -> boolean
+    this.pendingVideoCaches = new Set(); // videoId -> boolean
   }
 
   /** Mark a message as containing delivered media (video, album, audio, stickers). */
@@ -358,6 +359,10 @@ export class TelegramController extends EventEmitter {
 
   async handleInlineQuery(inlineQuery) {
     return this.#handleInlineQuery(inlineQuery);
+  }
+
+  async handleChosenInlineResult(chosen) {
+    return this.#handleChosenInlineResult(chosen);
   }
 
   async #handleUpdate(update) {
@@ -610,6 +615,69 @@ export class TelegramController extends EventEmitter {
     }
   }
 
+  async #cacheVideoTrack(videoId, title = '', query = '', timeoutMs = 25000) {
+    if (!videoId) return null;
+    const cleanKey = String(videoId).trim();
+    if (this.pendingVideoCaches.has(cleanKey)) return null;
+
+    try {
+      const row = this.db.prepare(
+        'SELECT file_id FROM cached_video_tracks WHERE query = ? OR title = ? LIMIT 1'
+      ).get(cleanKey, title);
+      if (row?.file_id) return row.file_id;
+    } catch {}
+
+    this.pendingVideoCaches.add(cleanKey);
+
+    const cachingTask = (async () => {
+      try {
+        if (!this.app?.mediaDownloader) return null;
+        const targetUrl = `https://www.youtube.com/watch?v=${cleanKey}`;
+        const res = await this.app.mediaDownloader.download(targetUrl);
+        const videoItem = res?.mediaItems?.find((m) => m.type === 'video');
+        if (!videoItem?.buffer) return null;
+
+        const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+        const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
+        const sent = await this.api.sendVideo(ownerId, videoItem.buffer, {
+          caption: `🎬 ${res.title || title || 'Clip'}`,
+          ...(durSec > 0 ? { duration: durSec } : {}),
+          disable_notification: true
+        });
+
+        const fileId = sent?.video?.file_id;
+        if (fileId) {
+          if (sent.message_id) {
+            await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+          }
+          const vidTitle = res.title || title || 'Clip';
+          try {
+            const sql = 'INSERT OR REPLACE INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)';
+            this.db.prepare(sql).run(cleanKey, fileId, vidTitle, durSec);
+            if (vidTitle) this.db.prepare(sql).run(vidTitle.toLowerCase().trim(), fileId, vidTitle, durSec);
+            if (query) this.db.prepare(sql).run(query.toLowerCase().trim(), fileId, vidTitle, durSec);
+          } catch {}
+          return fileId;
+        }
+      } catch (err) {
+        this.log.debug({ err: err?.message, videoId: cleanKey }, 'video background caching failed');
+      } finally {
+        this.pendingVideoCaches.delete(cleanKey);
+      }
+      return null;
+    })();
+
+    try {
+      const result = await Promise.race([
+        cachingTask,
+        new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs))
+      ]);
+      return result;
+    } catch {
+      return null;
+    }
+  }
+
   async #handleChosenInlineResult(chosen) {
     if (!chosen) return;
     this.log.info({ chosen }, 'processing chosen_inline_result');
@@ -617,95 +685,243 @@ export class TelegramController extends EventEmitter {
     const inlineMessageId = chosen.inline_message_id;
     if (!inlineMessageId) return;
 
-    if (!resultId.startsWith('fresh_aud_')) return;
+    // Handle video chosen results (tt_)
+    if (resultId.startsWith('tt_')) {
+      const cachedInfo = recentInlineSearchResults.get(resultId);
+      const videoId = cachedInfo?.videoId || (resultId.split('_')[1] || '');
+      const videoTitle = cachedInfo?.title || chosen.query?.replace(/^(tt|tiktok)\s*/i, '') || 'TikTok HD Clip';
+      const videoDuration = cachedInfo?.duration || 'HD Clip';
+      const queryTopic = cachedInfo?.query || chosen.query?.replace(/^(tt|tiktok)\s*/i, '') || '';
+      const botUser = this.botUsername || 'Lancy_easy_bot';
 
-    const cachedInfo = recentInlineSearchResults.get(resultId);
-    const searchQuery = cachedInfo ? `${cachedInfo.title} ${cachedInfo.artist}`.trim() : (chosen.query || '');
-    if (!searchQuery) return;
+      let fileId = null;
 
-    let fileId = null;
-    let trackTitle = cachedInfo?.title || chosen.query;
-    let trackArtist = cachedInfo?.artist || 'Music';
-    let trackDuration = cachedInfo?.duration || 0;
-
-    try {
-      const queryTerms = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
-      const rows = this.db.prepare(
-        'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 50'
-      ).all();
-      const match = (rows || []).find((row) => {
-        const rowText = `${row.query || ''} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
-        return queryTerms.every((term) => rowText.includes(term));
-      });
-      if (match?.file_id) {
-        fileId = match.file_id;
-        trackTitle = match.title;
-        trackArtist = match.artist || trackArtist;
-        trackDuration = match.duration || trackDuration;
-      }
-    } catch {}
-
-    if (!fileId && this.app?.mediaDownloader) {
+      // 1. Check SQLite cached_video_tracks
       try {
-        const res = await this.app.mediaDownloader.download(searchQuery);
-        if (res?.audioTrack?.buffer) {
-          const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
-          const durSec = res.duration ? parseDurationToSeconds(res.duration) : trackDuration;
-          const sent = await this.api.sendAudio(ownerId, res.audioTrack.buffer, {
-            title: res.title || trackTitle,
-            performer: res.artist || res.author || trackArtist,
-            ...(durSec > 0 ? { duration: durSec } : {}),
-            disable_notification: true
-          });
-          const uploadedFileId = sent?.audio?.file_id;
-          if (uploadedFileId) {
-            fileId = uploadedFileId;
-            trackTitle = res.title || trackTitle;
-            trackArtist = res.artist || res.author || trackArtist;
-            trackDuration = durSec;
-            if (sent.message_id) {
-              await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
-            }
-            try {
-              const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
-              this.db.prepare(sql).run(searchQuery.toLowerCase().trim(), fileId, trackTitle, trackArtist, trackDuration);
-              if (trackTitle && trackTitle.toLowerCase().trim() !== searchQuery.toLowerCase().trim()) {
-                this.db.prepare(sql).run(trackTitle.toLowerCase().trim(), fileId, trackTitle, trackArtist, trackDuration);
-              }
-            } catch {}
-          }
+        const row = this.db.prepare(
+          'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? OR query = ? OR title = ? LIMIT 1'
+        ).get(videoId, videoTitle.toLowerCase().trim(), videoTitle);
+        if (row?.file_id) {
+          fileId = row.file_id;
+          if (row.title) videoTitle = row.title;
+          if (row.duration) videoDuration = `${Math.floor(row.duration / 60)}:${String(row.duration % 60).padStart(2, '0')}`;
         }
-      } catch (err) {
-        this.log.debug({ err, searchQuery }, 'chosen inline result download failed');
+      } catch {}
+
+      // 2. Download video if not cached
+      if (!fileId && this.app?.mediaDownloader) {
+        try {
+          const videoTarget = videoId ? `https://www.youtube.com/watch?v=${videoId}` : (queryTopic || videoTitle);
+          const res = await this.app.mediaDownloader.download(videoTarget);
+          const videoItem = res?.mediaItems?.find((m) => m.type === 'video');
+          if (videoItem?.buffer) {
+            const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+            const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
+            const sent = await this.api.sendVideo(ownerId, videoItem.buffer, {
+              caption: `🎬 ${res.title || videoTitle}`,
+              ...(durSec > 0 ? { duration: durSec } : {}),
+              disable_notification: true
+            });
+            const uploadedFileId = sent?.video?.file_id;
+            if (uploadedFileId) {
+              fileId = uploadedFileId;
+              if (sent.message_id) {
+                await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+              }
+              try {
+                const sql = 'INSERT OR REPLACE INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)';
+                if (videoId) this.db.prepare(sql).run(videoId, fileId, videoTitle, durSec);
+                this.db.prepare(sql).run(videoTitle.toLowerCase().trim(), fileId, videoTitle, durSec);
+                if (queryTopic) this.db.prepare(sql).run(queryTopic.toLowerCase().trim(), fileId, videoTitle, durSec);
+              } catch {}
+            }
+          }
+        } catch (err) {
+          this.log.debug({ err: err?.message, videoId, videoTitle }, 'chosen inline video download failed');
+        }
       }
+
+      if (fileId) {
+        try {
+          await this.api.editMessageMedia({
+            inline_message_id: inlineMessageId,
+            media: {
+              type: 'video',
+              media: fileId,
+              caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote>⏱ <b>Duration:</b> ${escapeHtml(videoDuration)}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎙️ Recognize Music / Search Song ♡',
+                    switch_inline_query_current_chat: `${videoTitle.slice(0, 30)} song`,
+                    style: 'primary'
+                  }
+                ],
+                [
+                  {
+                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          });
+          this.log.info({ inlineMessageId, fileId, title: videoTitle }, 'upgraded inline message to full playable video');
+        } catch (editErr) {
+          this.log.warn({ editErr, inlineMessageId }, 'failed to edit inline message media to video');
+        }
+      } else {
+        try {
+          await this.api.editMessageCaption({
+            inline_message_id: inlineMessageId,
+            caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote>⚠️ <i>Could not load clip right now. Tap below to search again ♡</i></blockquote>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          }).catch(() => {});
+        } catch {}
+      }
+      return;
     }
 
-    if (fileId) {
+    // Handle audio chosen results (yt_aud_ or fresh_aud_)
+    if (resultId.startsWith('yt_aud_') || resultId.startsWith('fresh_aud_')) {
+      const cachedInfo = recentInlineSearchResults.get(resultId);
+      const videoId = cachedInfo?.videoId || (resultId.split('_')[2] || '');
+      let trackTitle = cachedInfo?.title || chosen.query || 'Music Track';
+      let trackArtist = cachedInfo?.artist || 'Music';
+      const trackDuration = cachedInfo?.duration || 0;
+      const searchQuery = cachedInfo ? `${cachedInfo.title} ${cachedInfo.artist}`.trim() : (chosen.query || '');
+      const botUser = this.botUsername || 'Lancy_easy_bot';
+
+      let fileId = null;
+      let durSec = typeof trackDuration === 'number' ? trackDuration : parseDurationToSeconds(trackDuration);
+
       try {
-        await this.api.editMessageMedia({
-          inline_message_id: inlineMessageId,
-          media: {
-            type: 'audio',
-            media: fileId,
-            caption: `🎵 <b>${escapeHtml(trackTitle)}</b> — <i>${escapeHtml(trackArtist)}</i>\n✨ <i>Full Audio via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
-            parse_mode: 'HTML'
-          },
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '✨ 📥 Full MP3 & Lyrics ♡',
-                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(trackTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
-                  style: 'primary'
-                }
-              ]
-            ]
-          }
+        const queryTerms = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+        const rows = this.db.prepare(
+          'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 50'
+        ).all();
+        const match = (rows || []).find((row) => {
+          if (videoId && (row.query === videoId || row.file_id.includes(videoId))) return true;
+          const rowText = `${row.query || ''} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
+          return queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
         });
-        this.log.info({ inlineMessageId, fileId, title: trackTitle }, 'upgraded inline message to full audio track');
-      } catch (editErr) {
-        this.log.warn({ editErr, inlineMessageId }, 'failed to edit inline message media');
+        if (match?.file_id) {
+          fileId = match.file_id;
+          if (match.title) trackTitle = match.title;
+          if (match.artist) trackArtist = match.artist;
+          if (match.duration) durSec = match.duration;
+        }
+      } catch {}
+
+      if (!fileId && this.app?.mediaDownloader) {
+        try {
+          const downloadTarget = videoId ? `https://www.youtube.com/watch?v=${videoId}` : searchQuery;
+          const res = await this.app.mediaDownloader.download(downloadTarget);
+          if (res?.audioTrack?.buffer) {
+            const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+            const resDur = res.duration ? parseDurationToSeconds(res.duration) : durSec;
+            if (res.title) trackTitle = res.title;
+            if (res.artist || res.author) trackArtist = res.artist || res.author;
+            const sent = await this.api.sendAudio(ownerId, res.audioTrack.buffer, {
+              title: trackTitle,
+              performer: trackArtist,
+              ...(resDur > 0 ? { duration: resDur } : {}),
+              disable_notification: true
+            });
+            const uploadedFileId = sent?.audio?.file_id;
+            if (uploadedFileId) {
+              fileId = uploadedFileId;
+              durSec = resDur;
+              if (sent.message_id) {
+                await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+              }
+              try {
+                const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                if (videoId) this.db.prepare(sql).run(videoId, fileId, trackTitle, trackArtist, durSec);
+                this.db.prepare(sql).run(searchQuery.toLowerCase().trim(), fileId, trackTitle, trackArtist, durSec);
+                if (trackTitle && trackTitle.toLowerCase().trim() !== searchQuery.toLowerCase().trim()) {
+                  this.db.prepare(sql).run(trackTitle.toLowerCase().trim(), fileId, trackTitle, trackArtist, durSec);
+                }
+              } catch {}
+            }
+          }
+        } catch (err) {
+          this.log.debug({ err: err?.message, searchQuery }, 'chosen inline audio download failed');
+        }
       }
+
+      if (fileId) {
+        try {
+          const min = Math.floor(durSec / 60);
+          const sec = String(durSec % 60).padStart(2, '0');
+          const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
+          await this.api.editMessageMedia({
+            inline_message_id: inlineMessageId,
+            media: {
+              type: 'audio',
+              media: fileId,
+              caption: `🎵 <b>${escapeHtml(trackTitle)}</b> — <i>${escapeHtml(trackArtist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '📜 Lyrics & Info ♡',
+                    url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(trackTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                    style: 'primary'
+                  }
+                ],
+                [
+                  {
+                    text: '🎵 Search Music Live',
+                    switch_inline_query_current_chat: '',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          });
+          this.log.info({ inlineMessageId, fileId, title: trackTitle }, 'upgraded inline message to full audio track');
+        } catch (editErr) {
+          this.log.warn({ editErr, inlineMessageId }, 'failed to edit inline message media to audio');
+        }
+      } else {
+        try {
+          await this.api.editMessageCaption({
+            inline_message_id: inlineMessageId,
+            caption: `🎵 <b>${escapeHtml(trackTitle)}</b> — <i>${escapeHtml(trackArtist)}</i>\n<blockquote>⚠️ <i>Could not stream track right now. Tap below to search again ♡</i></blockquote>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎵 Search Music Live',
+                    switch_inline_query_current_chat: '',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          }).catch(() => {});
+        } catch {}
+      }
+      return;
     }
   }
 
@@ -834,8 +1050,15 @@ export class TelegramController extends EventEmitter {
             inline_keyboard: [
               [
                 {
-                  text: '📌 View on Pinterest',
-                  url: resolvedUrl || url,
+                  text: '🔍 Search More HD Pins ♡',
+                  switch_inline_query_current_chat: 'pint ',
+                  style: 'primary'
+                }
+              ],
+              [
+                {
+                  text: '📥 Universal Downloader',
+                  url: `https://t.me/${botUser}?start=dl`,
                   style: 'primary'
                 }
               ]
@@ -858,8 +1081,15 @@ export class TelegramController extends EventEmitter {
             inline_keyboard: [
               [
                 {
-                  text: '📌 View on Pinterest',
-                  url: resolvedUrl || url,
+                  text: '🔍 Search More HD Pins ♡',
+                  switch_inline_query_current_chat: 'pint ',
+                  style: 'primary'
+                }
+              ],
+              [
+                {
+                  text: '📥 Universal Downloader',
+                  url: `https://t.me/${botUser}?start=dl`,
                   style: 'primary'
                 }
               ]
@@ -882,8 +1112,15 @@ export class TelegramController extends EventEmitter {
               inline_keyboard: [
                 [
                   {
-                    text: '📌 View on Pinterest',
-                    url: resolvedUrl || url,
+                    text: '🔍 Search More HD Pins ♡',
+                    switch_inline_query_current_chat: 'pint ',
+                    style: 'primary'
+                  }
+                ],
+                [
+                  {
+                    text: '📥 Universal Downloader',
+                    url: `https://t.me/${botUser}?start=dl`,
                     style: 'primary'
                   }
                 ]
@@ -1086,47 +1323,91 @@ export class TelegramController extends EventEmitter {
         const duration = item.duration || 'HD Clip';
         const views = item.views ? `${item.views}` : 'Trending';
         const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
-        const videoUrl = `https://www.youtube.com/watch?v=${item.videoId}`;
+        const resId = `tt_${item.videoId}_${offset}_${idx}`;
 
-        results.push({
-          type: 'video',
-          id: `tt_${item.videoId}_${offset}_${idx}`,
-          video_url: videoUrl,
-          mime_type: 'text/html',
-          thumbnail_url: thumb,
-          thumb_url: thumb,
-          title: `🎬 ${title.slice(0, 50)}`,
-          description: `⏱ ${duration} • 👁 ${views} ♡`,
-          caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
-          parse_mode: 'HTML',
-          input_message_content: {
-            message_text: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>\n${videoUrl}`,
-            parse_mode: 'HTML'
-          },
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '🎙️ Recognize Music / Search Song ♡',
-                  switch_inline_query_current_chat: `${title.slice(0, 30)} song`,
-                  style: 'primary'
-                }
-              ],
-              [
-                {
-                  text: `🔍 More "${queryTopic.slice(0, 15)}"`,
-                  switch_inline_query_current_chat: `tt ${queryTopic}`,
-                  style: 'primary'
-                },
-                {
-                  text: '▶️ Watch Clip ♡',
-                  url: videoUrl,
-                  style: 'primary'
-                }
+        // Check if video is already cached on Telegram servers
+        let cachedVid = null;
+        try {
+          cachedVid = this.db.prepare(
+            'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? OR query = ? OR title = ? LIMIT 1'
+          ).get(item.videoId, title.toLowerCase().trim(), title);
+        } catch {}
+
+        if (cachedVid?.file_id) {
+          results.push({
+            type: 'video',
+            id: `cached_vid_${cachedVid.file_id.slice(-8)}_${idx}`,
+            video_file_id: cachedVid.file_id,
+            title: `🎬 ${title.slice(0, 50)}`,
+            description: `⏱ ${duration} • 👁 ${views} ♡`,
+            caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎙️ Recognize Music / Search Song ♡',
+                    switch_inline_query_current_chat: `${title.slice(0, 30)} song`,
+                    style: 'primary'
+                  }
+                ],
+                [
+                  {
+                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    style: 'primary'
+                  }
+                ]
               ]
-            ]
+            }
+          });
+        } else {
+          recentInlineSearchResults.set(resId, {
+            type: 'video',
+            videoId: item.videoId,
+            title,
+            duration,
+            query: queryTopic
+          });
+          if (recentInlineSearchResults.size > 500) {
+            const firstKey = recentInlineSearchResults.keys().next().value;
+            recentInlineSearchResults.delete(firstKey);
           }
-        });
+
+          results.push({
+            type: 'photo',
+            id: resId,
+            photo_url: thumb,
+            thumb_url: thumb,
+            title: `🎬 ${title.slice(0, 50)}`,
+            description: `⏱ ${duration} • 👁 ${views} ♡`,
+            caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>Downloading &amp; delivering HD clip via @${botUser}… ♡</i></blockquote>`,
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎙️ Recognize Music / Search Song ♡',
+                    switch_inline_query_current_chat: `${title.slice(0, 30)} song`,
+                    style: 'primary'
+                  }
+                ],
+                [
+                  {
+                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          });
+        }
+      }
+
+      // Pre-cache top result in background if not already cached
+      if (paged.length > 0 && !results[0]?.video_file_id) {
+        this.#cacheVideoTrack(paged[0].videoId, paged[0].title, queryTopic).catch(() => {});
       }
       return results;
     } catch (err) {
@@ -1152,15 +1433,15 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '📷 Open HD Image',
-                url: cleanUrl,
+                text: '🔍 Search More Media',
+                switch_inline_query_current_chat: '',
                 style: 'primary'
               }
             ],
             [
               {
-                text: '🔍 Search More Media',
-                switch_inline_query_current_chat: '',
+                text: '📥 Universal Downloader',
+                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=dl`,
                 style: 'primary'
               }
             ]
@@ -1182,15 +1463,15 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '▶️ Watch Video ♡',
-                url: cleanUrl,
+                text: '🎬 Search More Videos',
+                switch_inline_query_current_chat: 'tt ',
                 style: 'primary'
               }
             ],
             [
               {
-                text: '🎬 Search More Videos',
-                switch_inline_query_current_chat: 'tt ',
+                text: '📥 Universal Downloader',
+                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=dl`,
                 style: 'primary'
               }
             ]
@@ -1210,15 +1491,15 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '▶️ Listen Audio ♡',
-                url: cleanUrl,
+                text: '🎵 Search Music Live',
+                switch_inline_query_current_chat: '',
                 style: 'primary'
               }
             ],
             [
               {
-                text: '🎵 Search More Songs',
-                switch_inline_query_current_chat: '',
+                text: '📥 Universal Downloader',
+                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=dl`,
                 style: 'primary'
               }
             ]
@@ -1965,47 +2246,92 @@ export class TelegramController extends EventEmitter {
               const duration = item.duration || 'HD Track';
               const artist = item.author || 'Music';
               const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
-              const videoUrl = `https://www.youtube.com/watch?v=${item.videoId}`;
+              const resId = `yt_aud_${item.videoId}_${offset}_${idx}`;
 
-              combinedMusicResults.push({
-                type: 'video',
-                id: `yt_aud_${item.videoId}_${offset}_${idx}`,
-                video_url: videoUrl,
-                mime_type: 'text/html',
-                thumbnail_url: thumb,
-                thumb_url: thumb,
-                title: `🎵 ${title.slice(0, 50)}`,
-                description: `⏱ ${duration} • 👤 ${artist} ♡`,
-                caption: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>`,
-                parse_mode: 'HTML',
-                input_message_content: {
-                  message_text: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>\n${videoUrl}`,
-                  parse_mode: 'HTML'
-                },
-                reply_markup: {
-                  inline_keyboard: [
-                    [
-                      {
-                        text: '▶️ Stream / Watch Now ♡',
-                        url: videoUrl,
-                        style: 'primary'
-                      }
-                    ],
-                    [
-                      {
-                        text: '📜 Lyrics & Info ♡',
-                        url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
-                        style: 'primary'
-                      },
-                      {
-                        text: '🎵 Search Music Live',
-                        switch_inline_query_current_chat: '',
-                        style: 'primary'
-                      }
+              // Check if track is already cached in SQLite
+              let cachedTrack = null;
+              try {
+                cachedTrack = this.db.prepare(
+                  'SELECT file_id, title, artist, duration FROM cached_audio_tracks WHERE query = ? OR title = ? LIMIT 1'
+                ).get(item.videoId, titleLower);
+              } catch {}
+
+              if (cachedTrack?.file_id) {
+                const durSec = cachedTrack.duration || 0;
+                const min = Math.floor(durSec / 60);
+                const sec = String(durSec % 60).padStart(2, '0');
+                const durStr = durSec > 0 ? `${min}:${sec}` : duration;
+                combinedMusicResults.push({
+                  type: 'audio',
+                  id: `cached_aud_${cachedTrack.file_id.slice(-8)}_${idx}`,
+                  audio_file_id: cachedTrack.file_id,
+                  title: cachedTrack.title || title,
+                  performer: cachedTrack.artist || artist,
+                  ...(durSec > 0 ? { audio_duration: durSec } : {}),
+                  caption: `🎵 <b>${escapeHtml(cachedTrack.title || title)}</b> — <i>${escapeHtml(cachedTrack.artist || artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
+                  parse_mode: 'HTML',
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        {
+                          text: '📜 Lyrics & Info ♡',
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent((cachedTrack.title || title).replace(/\s+/g, '_')).slice(0, 32)}`,
+                          style: 'primary'
+                        }
+                      ],
+                      [
+                        {
+                          text: '🎵 Search Music Live',
+                          switch_inline_query_current_chat: '',
+                          style: 'primary'
+                        }
+                      ]
                     ]
-                  ]
+                  }
+                });
+              } else {
+                recentInlineSearchResults.set(resId, {
+                  type: 'audio',
+                  videoId: item.videoId,
+                  title,
+                  artist,
+                  duration,
+                  query: cleanSongQuery
+                });
+                if (recentInlineSearchResults.size > 500) {
+                  const firstKey = recentInlineSearchResults.keys().next().value;
+                  recentInlineSearchResults.delete(firstKey);
                 }
-              });
+
+                combinedMusicResults.push({
+                  type: 'photo',
+                  id: resId,
+                  photo_url: thumb,
+                  thumb_url: thumb,
+                  title: `🎵 ${title.slice(0, 50)}`,
+                  description: `⏱ ${duration} • 👤 ${artist} ♡`,
+                  caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 🎧 <b>320 kbps HD</b>\n✨ <i>Extracting &amp; delivering full MP3 via @${botUser}… ♡</i></blockquote>`,
+                  parse_mode: 'HTML',
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        {
+                          text: '📜 Lyrics & Info ♡',
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                          style: 'primary'
+                        }
+                      ],
+                      [
+                        {
+                          text: '🎵 Search Music Live',
+                          switch_inline_query_current_chat: '',
+                          style: 'primary'
+                        }
+                      ]
+                    ]
+                  }
+                });
+              }
             }
           }
         }
