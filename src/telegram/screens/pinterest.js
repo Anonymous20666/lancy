@@ -86,10 +86,11 @@ export function createPinterestScreen({ app }) {
     }
   }
 
-  async function askCount(ctx, query, mode = 'normal') {
+  async function askCount(ctx, query, mode = 'normal', opts = {}) {
     const isVideo = mode === 'videos';
     const tgId = String(ctx.tgId);
     const sm = ctx.sm ?? ctx.machine;
+    const replyToMessageId = opts.replyToMessageId ?? null;
     const screenMsgId = ctx.messageId ?? ctx.screenMessageId ?? sm?.for(tgId)?.screenMessageId ?? sm?.context?.(tgId)?.screenMessageId;
     if (ctx.transition) {
       await ctx.transition(States.PINTEREST_SEARCH, {
@@ -152,13 +153,47 @@ export function createPinterestScreen({ app }) {
     b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));
     b.validate();
-    const sent = await editOrSend(ctx, b.toJSON());
-    if (sent?.message_id) {
-      if (ctx.update) {
-        ctx.update({ screenMessageId: sent.message_id });
+
+    const api = ctx.api || app.telegram.api;
+    const chatId = ctx.chatId ?? Number(tgId);
+    let sent;
+    if (replyToMessageId) {
+      sent = await api.sendRichMessage(chatId, b.toJSON(), {
+        reply_parameters: { message_id: replyToMessageId },
+        reply_to_message_id: replyToMessageId
+      });
+    } else {
+      sent = await editOrSend(ctx, b.toJSON());
+    }
+
+    const effectiveMsgId = sent?.message_id || screenMsgId;
+    if (effectiveMsgId) {
+      ctx.messageId = effectiveMsgId;
+      ctx.screenMessageId = effectiveMsgId;
+      if (ctx.transition) {
+        await ctx.transition(States.PINTEREST_SEARCH, {
+          context: { mode, query, stage: 'count', screenMessageId: effectiveMsgId },
+          chatId,
+          screenMessageId: effectiveMsgId
+        });
       } else if (sm) {
-        sm.update(tgId, { screenMessageId: sent.message_id });
+        await sm.transition(tgId, States.PINTEREST_SEARCH, {
+          context: { mode, query, stage: 'count', screenMessageId: effectiveMsgId },
+          chatId,
+          screenMessageId: effectiveMsgId
+        });
       }
+      if (ctx.update) {
+        ctx.update({ mode, query, stage: 'count', screenMessageId: effectiveMsgId });
+      } else if (sm) {
+        sm.update(tgId, { mode, query, stage: 'count', screenMessageId: effectiveMsgId });
+      }
+      ctx.controller?.userScreenMessage?.set(tgId, { chatId, messageId: effectiveMsgId });
+      app.telegram?.controller?.userScreenMessage?.set(tgId, { chatId, messageId: effectiveMsgId });
+      ctx.db?.run?.(
+        'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
+        effectiveMsgId, Number(tgId)
+      );
     }
   }
 
@@ -197,8 +232,9 @@ export function createPinterestScreen({ app }) {
     const api = sctx.api || app.telegram.api;
     const chatId = sctx.chatId;
 
-    // Delete user input message to keep chat totally clean & un-spammy
-    if (sctx.message?.message_id && app.settings.get('telegram.messageCleanup')) {
+    // Delete user input message to keep chat totally clean & un-spammy in DM
+    const isGroup = Boolean(sctx.isGroup || sctx.message?.chat?.type === 'group' || sctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
+    if (!isGroup && sctx.message?.message_id && app.settings.get('telegram.messageCleanup')) {
       await api.deleteMessage(chatId, sctx.message.message_id).catch(() => {});
     }
 
@@ -674,21 +710,43 @@ export function createPinterestScreen({ app }) {
       onMessage: async (sctx, message) => {
         const text = (message.text ?? '').trim();
         if (!text) return false;
-        if (message.message_id) {
-          await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
-        }
+
+        const isGroup = Boolean(sctx.isGroup || message.chat?.type === 'group' || message.chat?.type === 'supergroup' || (sctx.chatId && Number(sctx.chatId) < 0));
+
         if (sctx.context.stage === 'historySearch') {
+          if (!isGroup && message.message_id) {
+            await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+          }
           await showHistory(sctx, 0, text);
           return true;
         }
+
         if (sctx.context.stage === 'count') {
           const parsed = parseInt(text, 10);
           if (!isNaN(parsed) && parsed > 0) {
+            if (!isGroup && message.message_id) {
+              await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+            }
             await runSearch(sctx, sctx.context.query, parsed);
             return true;
           }
         }
-        await askCount(sctx, text, sctx.context.mode || 'normal');
+
+        if (isGroup) {
+          // In group chat: delete bot's prompt message so outdated message higher up in GC is removed
+          const botPromptMsgId = message.reply_to_message?.message_id || sctx.screenMessageId || sctx.context?.screenMessageId;
+          if (botPromptMsgId) {
+            await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, botPromptMsgId).catch(() => {});
+          }
+          // Do NOT delete the user's message; quote it for the amount selection card
+          await askCount(sctx, text, sctx.context.mode || 'normal', { replyToMessageId: message.message_id });
+        } else {
+          // In private chat: delete user's message to maintain clean in-place screen
+          if (message.message_id) {
+            await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+          }
+          await askCount(sctx, text, sctx.context.mode || 'normal');
+        }
         return true;
       },
       onTimeout: async (sctx) => {

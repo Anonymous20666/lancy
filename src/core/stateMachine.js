@@ -158,6 +158,12 @@ export class StateMachine extends EventEmitter {
     if (previous === nextState) {
       // Same-state refresh (e.g. re-render): merge context, re-enter.
       record.context = { ...record.context, ...context };
+      if (screenMessageId !== null && screenMessageId !== undefined) {
+        record.screenMessageId = screenMessageId;
+      }
+      if (chatId !== null && chatId !== undefined) {
+        record.chatId = chatId;
+      }
       this.#persistRecord(key, record);
       await handler.onEnter?.(this.#ctx(key, record), { reason: 'refresh' });
       return record;
@@ -192,7 +198,15 @@ export class StateMachine extends EventEmitter {
   update(tgId, patch) {
     const key = String(tgId);
     const record = this.for(key);
-    record.context = { ...record.context, ...patch };
+    if (patch && typeof patch === 'object') {
+      if (patch.screenMessageId !== undefined) {
+        record.screenMessageId = patch.screenMessageId;
+      }
+      if (patch.chatId !== undefined) {
+        record.chatId = patch.chatId;
+      }
+      record.context = { ...record.context, ...patch };
+    }
     this.#persistRecord(key, record);
     return record.context;
   }

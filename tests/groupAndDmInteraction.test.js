@@ -7,6 +7,7 @@ import { TelegramController } from '../src/telegram/bot.js';
 import { createDashboardScreen } from '../src/telegram/screens/dashboard.js';
 import { createHelpScreen } from '../src/telegram/screens/help.js';
 import { createPinterestScreen } from '../src/telegram/screens/pinterest.js';
+import { createStickersScreen } from '../src/telegram/screens/stickers.js';
 import { richTextToString } from '../src/telegram/rich.js';
 
 test('AI Assistant: strictly responds in DM (private chat), NEVER in group chats (GC)', async () => {
@@ -307,3 +308,110 @@ test('Dashboard and Help: include heads-up banner and expandable superpowers gui
 
   db.close();
 });
+
+test('Pinterest Search in GC: replying to bot deletes prompt, preserves user message, and quotes user query for amount selection', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  const deletedMsgIds = [];
+  let sentRichMessage = null;
+  let sentExtra = null;
+  const fakeApi = {
+    editMessageRich: async () => ({ message_id: 500 }),
+    sendRichMessage: async (chatId, rich, extra) => {
+      sentRichMessage = rich;
+      sentExtra = extra;
+      return { message_id: 888 };
+    },
+    deleteMessage: async (chatId, messageId) => {
+      deletedMsgIds.push(messageId);
+      return { ok: true };
+    }
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: fakeApi, controller: { userScreenMessage: new Map() } },
+    pinterest: { db },
+    media: { cache: { read: () => null } }
+  };
+
+  const pinterestScreen = createPinterestScreen({ app });
+  pinterestScreen.registerStateHandlers(sm);
+
+  // Bot had sent prompt at message_id: 500 in group chat -100999
+  await sm.transition('1001', States.PINTEREST_SEARCH, {
+    context: { mode: 'images', screenMessageId: 500 },
+    screenMessageId: 500
+  });
+
+  const ctx = {
+    tgId: '1001',
+    chatId: -100999,
+    isGroup: true,
+    screenMessageId: 500,
+    sm,
+    api: fakeApi,
+    settings,
+    controller: app.telegram.controller
+  };
+
+  // User replies to prompt message 500 with message 501: "gojo satoru"
+  const handled = await sm.handleMessage('1001', {
+    message_id: 501,
+    from: { id: 1001 },
+    chat: { id: -100999, type: 'supergroup' },
+    reply_to_message: { message_id: 500 },
+    text: 'gojo satoru'
+  }, ctx);
+
+  assert.equal(handled, true);
+  // Prompt message 500 must be deleted!
+  assert.ok(deletedMsgIds.includes(500), 'Bot prompt message must be deleted');
+  // User message 501 must NOT be deleted!
+  assert.ok(!deletedMsgIds.includes(501), 'User query message must be preserved');
+  // A new rich message must be sent quoting user message 501
+  assert.ok(sentRichMessage, 'Must send amount selection rich message');
+  assert.equal(sentExtra?.reply_parameters?.message_id, 501, 'Must quote user message via reply_parameters');
+  assert.equal(sentExtra?.reply_to_message_id, 501, 'Must quote user message via reply_to_message_id');
+
+  // Verify the screen message ID in state machine was updated to the new message 888
+  const stateRecord = sm.for('1001');
+  assert.equal(stateRecord.screenMessageId, 888, 'Screen message ID must be updated to amount selection message');
+
+  db.close();
+});
+
+test('Group Chat sticker completion & help: omit WhatsApp Studio and WhatsApp Detailed Guide', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const fakeApi = {
+    editMessageRich: async () => ({ ok: true }),
+    sendRichMessage: async () => ({ message_id: 123 })
+  };
+  const app = {
+    db,
+    settings,
+    telegram: { api: fakeApi, controller: { userScreenMessage: new Map() } },
+    pinterest: { db },
+    media: { cache: { read: () => null } }
+  };
+
+  // 1. Help screen in group chat
+  const helpScreen = createHelpScreen({ app });
+  let groupHelpRich = null;
+  await helpScreen.open({
+    tgId: '1001',
+    chatId: -100999,
+    isGroup: true,
+    editScreen: async (rich) => { groupHelpRich = rich; }
+  });
+  assert.ok(groupHelpRich);
+  const helpWaButton = groupHelpRich.blocks.flatMap(b => b.buttons || []).flat().find(btn => /whatsapp/i.test(btn.text || btn.url || btn.callback_data));
+  assert.equal(helpWaButton, undefined, 'WhatsApp Detailed Guide button must be omitted in group chat');
+
+  db.close();
+});
+

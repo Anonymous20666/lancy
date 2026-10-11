@@ -323,10 +323,12 @@ export function createStickersScreen({ app }) {
         if (ctx.sm?.for(ctx.tgId)?.state !== States.PINTEREST_RESULTS) {
           await ctx.sm?.transition?.(ctx.tgId, States.IDLE, { context: {}, chatId, pushHistory: false });
         }
+        const isGroup = Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
         await tracker.finish(completionRich(settings, result, {
           duplicates: 0,
           query,
-          extraPacks: result.extraPacks ?? []
+          extraPacks: result.extraPacks ?? [],
+          isGroup
         }));
       } catch (error) {
         await tracker.finish(packErrorRich(error));
@@ -419,8 +421,8 @@ export function createStickersScreen({ app }) {
       app.pinterest.markResultsDelivered(userId, search.searchId, unique);
       app.db.audit(userId, 'pack.created', { packId: result.packId, query, count: result.count });
 
-      await sctx.transition(States.IDLE, { context: {}, chatId, pushHistory: false });
-      await tracker.finish(completionRich(settings, result, { duplicates: search.stats.duplicatesFound, query, extraPacks: result.extraPacks }));
+      const isGroup = Boolean(sctx.isGroup || sctx.message?.chat?.type === 'group' || sctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
+      await tracker.finish(completionRich(settings, result, { duplicates: search.stats.duplicatesFound, query, extraPacks: result.extraPacks, isGroup }));
     } catch (error) {
       await tracker.finish(packErrorRich(error));
       await sctx.reset({ reason: 'pack-failed' });
@@ -616,9 +618,8 @@ export function createStickersScreen({ app }) {
         })
       }, { attempts: 1 });
 
-      app.db.audit(userId, 'pack.created', { packId: result.packId, source: 'manual', count: result.count });
-      await sctx.transition(States.IDLE, { context: {}, chatId, pushHistory: false });
-      await tracker.finish(completionRich(app.settings, result, { duplicates: collector.collected.length - descriptors.length, query: 'manual selection' }));
+      const isGroup = Boolean(sctx.isGroup || sctx.message?.chat?.type === 'group' || sctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
+      await tracker.finish(completionRich(app.settings, result, { duplicates: collector.collected.length - descriptors.length, query: 'manual selection', isGroup }));
     } catch (error) {
       await tracker.finish(packErrorRich(error));
       await sctx.reset({ reason: 'manual-failed' });
@@ -1384,7 +1385,8 @@ export function createStickersScreen({ app }) {
       app.db.audit(userId, 'pack.updated', { packId, count: result.count, split: Boolean(result.splitPack) });
 
       await ctx.sm.transition(ctx.tgId, States.IDLE, { context: {}, chatId, pushHistory: false });
-      await tracker.finish(completionRich(settings, result, { duplicates: 0, query, extraPacks }));
+      const isGroup = Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
+      await tracker.finish(completionRich(settings, result, { duplicates: 0, query, extraPacks, isGroup }));
     } catch (error) {
       await tracker.finish(packErrorRich(error));
       await ctx.sm.reset({ reason: 'add-failed' });
@@ -1710,7 +1712,8 @@ export function packProgressRich({ stage, count, query, mode = 'normal', done = 
   return b.toJSON();
 }
 
-function completionRich(settings, pack, { duplicates = 0, query = '', extraPacks = [] } = {}) {
+function completionRich(settings, pack, { duplicates = 0, query = '', extraPacks = [], isGroup = false } = {}) {
+  const isGroupPack = Boolean(isGroup || pack?.isGroup);
   const b = new RichMessageBuilder();
   b.paragraph(rt.bold(banner([
     '𓆩♡𓆪 STICKER PACK READY 𓆩♡𓆪',
@@ -1745,7 +1748,11 @@ function completionRich(settings, pack, { duplicates = 0, query = '', extraPacks
     b.divider();
   }
 
-  b.paragraph(rt.bold('₊˚⊹♡ your aesthetic pack is ready on Telegram!'), rt.text('\nʕ•ᴥ•ʔ tap below to open it in Telegram, get source media, or publish to WhatsApp!'));
+  if (isGroupPack) {
+    b.paragraph(rt.bold('₊˚⊹♡ your aesthetic pack is ready on Telegram!'), rt.text('\nʕ•ᴥ•ʔ tap below to open it in Telegram or get source media!'));
+  } else {
+    b.paragraph(rt.bold('₊˚⊹♡ your aesthetic pack is ready on Telegram!'), rt.text('\nʕ•ᴥ•ʔ tap below to open it in Telegram, get source media, or publish to WhatsApp!'));
+  }
 
   const linkButtons = [];
   if (pack.link) linkButtons.push(richButton.url(extraPacks?.length > 0 ? '🔗 Open Pack 01' : '🔗 Open Pack', pack.link, { style: 'primary' }));
@@ -1758,10 +1765,16 @@ function completionRich(settings, pack, { duplicates = 0, query = '', extraPacks
   }
   if (linkButtons.length > 0) b.buttons(linkButtons);
 
-  b.buttons([
-    richButton.callback('📥 Get Source Media', encodeCallback('stickers', 'getMedia', String(pack.packId ?? pack.id)), { style: 'primary' }),
-    richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'publishPack', String(pack.packId ?? pack.id)), { style: 'primary' })
-  ]);
+  if (isGroupPack) {
+    b.buttons([
+      richButton.callback('📥 Get Source Media', encodeCallback('stickers', 'getMedia', String(pack.packId ?? pack.id)), { style: 'primary' })
+    ]);
+  } else {
+    b.buttons([
+      richButton.callback('📥 Get Source Media', encodeCallback('stickers', 'getMedia', String(pack.packId ?? pack.id)), { style: 'primary' }),
+      richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'publishPack', String(pack.packId ?? pack.id)), { style: 'primary' })
+    ]);
+  }
   b.buttons([
     richButton.callback('✨ Create Another', encodeCallback('stickers', 'p2s'), { style: 'primary' }),
     richButton.callback('✓ Done', encodeCallback('dashboard', 'open'), { style: 'success' })

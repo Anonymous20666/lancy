@@ -3280,7 +3280,7 @@ export class TelegramController extends EventEmitter {
     const fromMedia = Boolean(opts.fromMedia || source?.fromMedia || forceNew);
 
     const chatType = queryMessage?.chat?.type ?? directMessage?.chat?.type ?? message?.chat?.type ?? 'private';
-    const isGroup = chatType === 'group' || chatType === 'supergroup';
+    const isGroup = chatType === 'group' || chatType === 'supergroup' || Number(chatId) < 0;
 
     let userLang = 'en';
     try {

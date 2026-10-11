@@ -78,9 +78,12 @@ export function createHelpScreen({ app }) {
       [{ text: rt.bold('/help'), align: 'left', valign: 'middle' }, { text: 'Open this guide', align: 'left', valign: 'middle' }]
     ], { compact: true });
     b.divider();
-    b.buttons([
-      richButton.callback('📖 WhatsApp Detailed Guide', encodeCallback('whatsapp', 'help'), { style: 'primary' })
-    ]);
+    const isGroup = Boolean(ctx.isGroup || (ctx.chatId && Number(ctx.chatId) < 0));
+    if (!isGroup) {
+      b.buttons([
+        richButton.callback('📖 WhatsApp Detailed Guide', encodeCallback('whatsapp', 'help'), { style: 'primary' })
+      ]);
+    }
     b.buttons(navButtons(id, { back: false, home: true }));
     b.footer(rt.italic(`version ${app.version ?? '1.0.0'} • made with love ♡`));
     b.validate();
