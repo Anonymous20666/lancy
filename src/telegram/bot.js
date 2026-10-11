@@ -88,6 +88,12 @@ export class TelegramController extends EventEmitter {
     this.mediaDeliveryMessageIds = new Set(); // messageId -> boolean
     this.pendingAudioCaches = new Set(); // query -> boolean
     this.pendingVideoCaches = new Set(); // videoId -> boolean
+    this.audioMetadataMap = new Map(); // trackId -> { id, title, artist, album, cover, previewUrl }
+  }
+
+  getInlineAudioMetadata(trackId) {
+    if (!trackId) return null;
+    return this.audioMetadataMap.get(String(trackId));
   }
 
   /** Mark a message as containing delivered media (video, album, audio, stickers). */
@@ -805,20 +811,30 @@ export class TelegramController extends EventEmitter {
       let durSec = typeof trackDuration === 'number' ? trackDuration : parseDurationToSeconds(trackDuration);
 
       try {
-        const queryTerms = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
-        const rows = this.db.prepare(
-          'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 50'
-        ).all();
-        const match = (rows || []).find((row) => {
-          if (videoId && (row.query === videoId || row.file_id.includes(videoId))) return true;
-          const rowText = `${row.query || ''} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
-          return queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
-        });
-        if (match?.file_id) {
-          fileId = match.file_id;
-          if (match.title) trackTitle = match.title;
-          if (match.artist) trackArtist = match.artist;
-          if (match.duration) durSec = match.duration;
+        const directMatch = this.db.prepare(
+          'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks WHERE LOWER(query) = ? OR LOWER(title) = ? LIMIT 1'
+        ).get(searchQuery.toLowerCase().trim(), trackTitle.toLowerCase().trim());
+        if (directMatch?.file_id) {
+          fileId = directMatch.file_id;
+          if (directMatch.title) trackTitle = directMatch.title;
+          if (directMatch.artist) trackArtist = directMatch.artist;
+          if (directMatch.duration) durSec = directMatch.duration;
+        } else {
+          const queryTerms = searchQuery.toLowerCase().split(/\s+/).filter(Boolean);
+          const rows = this.db.prepare(
+            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC'
+          ).all();
+          const match = (rows || []).find((row) => {
+            if (videoId && (row.query === videoId || row.file_id.includes(videoId))) return true;
+            const rowText = `${row.query || ''} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
+            return queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
+          });
+          if (match?.file_id) {
+            fileId = match.file_id;
+            if (match.title) trackTitle = match.title;
+            if (match.artist) trackArtist = match.artist;
+            if (match.duration) durSec = match.duration;
+          }
         }
       } catch {}
 
@@ -1468,20 +1484,16 @@ export class TelegramController extends EventEmitter {
       const legacyKey = `mus_${cleanTopic.toLowerCase()}`;
       const legacyCached = inlineMusicCache.get(legacyKey) || inlineSearchCache.get(legacyKey);
 
-      if (!cached || !Array.isArray(cached.items) || (Date.now() - cached.timestamp > 180000)) {
-        if (Array.isArray(legacyCached)) {
+      if (!cached || !Array.isArray(cached.items) || (Date.now() - cached.timestamp > 120000)) {
+        if (Array.isArray(legacyCached) && legacyCached.length > 0) {
           cached = {
             items: legacyCached,
-            combosTried: 99,
-            dzIndex: 0,
             seenKeys: new Set(legacyCached.map((i) => i.fileId || i.id || i.videoId || i.title)),
             timestamp: Date.now()
           };
         } else {
           cached = {
             items: [],
-            combosTried: 0,
-            dzIndex: 0,
             seenKeys: new Set(),
             timestamp: Date.now()
           };
@@ -1493,12 +1505,12 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      // 1. Initial SQLite cached_audio_tracks lookup
+      // 1. Check SQLite cached_audio_tracks first (0ms latency, permanent full Telegram tracks)
       if (cached.items.length === 0) {
         try {
           const queryTerms = cleanTopic.toLowerCase().split(/\s+/).filter(Boolean);
           const allCached = this.db?.prepare?.(
-            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 300'
+            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC'
           )?.all?.() || [];
 
           for (const row of allCached) {
@@ -1538,110 +1550,101 @@ export class TelegramController extends EventEmitter {
           cached.items.sort((a, b) => (b.score || 0) - (a.score || 0));
           const exactCachedCount = allCached.filter((r) => (r.query || '').toLowerCase().trim() === cleanTopic.toLowerCase().trim()).length;
           if (exactCachedCount >= 25) {
-            cached.combosTried = 99;
+            cached.externalFetched = true;
           }
         } catch {}
       }
 
-      const combos = [
-        cleanTopic,
-        `${cleanTopic} songs`,
-        `${cleanTopic} remix`,
-        `${cleanTopic} unreleased`,
-        `${cleanTopic} official audio`,
-        `${cleanTopic} album`,
-        `${cleanTopic} hits`,
-        `${cleanTopic} greatest hits`,
-        `${cleanTopic} full album`
-      ];
-
-      // 2. Expand pool until offset + 15 items are collected or combos exhausted
-      while (cached.items.length < (offset + 15) && cached.combosTried < combos.length) {
-        const comboTerm = combos[cached.combosTried % combos.length];
-        const dzIdx = cached.dzIndex || 0;
-
-        let addedCount = 0;
+      // 2. Fast Parallel Live Search (Deezer API + YouTube fast InnerTube in parallel <300ms)
+      if (!cached.externalFetched && cached.items.length < (offset + 15)) {
+        cached.externalFetched = true;
         try {
-          const dzUrl = `https://api.deezer.com/search?q=${encodeURIComponent(comboTerm)}&index=${dzIdx}&limit=50`;
-          const dzRes = await fetch(dzUrl, { signal: AbortSignal.timeout(3500) }).then((r) => r.json()).catch(() => null);
+          const [dzRes, ytRes] = await Promise.allSettled([
+            fetch(`https://api.deezer.com/search?q=${encodeURIComponent(cleanTopic)}&limit=30`, {
+              signal: AbortSignal.timeout(1800)
+            }).then((r) => r.json()).catch(() => null),
+            searchYouTubeFast(cleanTopic).catch(() => [])
+          ]);
 
-          if (Array.isArray(dzRes?.data) && dzRes.data.length > 0) {
-            for (const item of dzRes.data) {
-              if (!item?.title || !item?.preview) continue;
+          const dzData = dzRes.status === 'fulfilled' ? dzRes.value : null;
+          const ytItems = ytRes.status === 'fulfilled' && Array.isArray(ytRes.value) ? ytRes.value : [];
+
+          if (Array.isArray(dzData?.data) && dzData.data.length > 0) {
+            for (const item of dzData.data) {
+              if (!item?.title) continue;
               const normTitle = (item.title || '').toLowerCase().trim();
               const normArtist = (item.artist?.name || '').toLowerCase().trim();
               const normKey = `${normTitle} ${normArtist}`.trim();
 
               if (!cached.seenKeys.has(item.id) && !cached.seenKeys.has(normKey) && !cached.seenKeys.has(normTitle)) {
+                // Check if already in SQLite cached_audio_tracks
                 let matchingFileId = null;
                 try {
                   const matchRow = this.db?.prepare?.(
-                    'SELECT file_id, duration FROM cached_audio_tracks WHERE query = ? OR title = ? LIMIT 1'
-                  )?.get?.(normTitle, item.title);
+                    'SELECT file_id, duration, title, artist FROM cached_audio_tracks WHERE query = ? OR title = ? OR LOWER(title) = ? OR LOWER(query) = ? LIMIT 1'
+                  )?.get?.(normKey, item.title, normTitle, normTitle);
                   if (matchRow?.file_id) matchingFileId = matchRow.file_id;
                 } catch {}
 
-                if (matchingFileId && cached.seenKeys.has(matchingFileId)) {
-                  continue;
-                }
-
-                const isDupe = cached.items.some((i) => {
-                  const iTitle = (i.title || '').toLowerCase().trim();
-                  const iArtist = (i.artist || '').toLowerCase().trim();
-                  return (iTitle === normTitle || (normTitle.includes(iTitle) && iTitle.length >= 4) || (iTitle.includes(normTitle) && normTitle.length >= 4)) &&
-                         (!normArtist || !iArtist || iArtist === normArtist || normArtist.includes(iArtist) || iArtist.includes(normArtist));
-                });
-                if (isDupe) continue;
+                if (matchingFileId && cached.seenKeys.has(matchingFileId)) continue;
 
                 cached.seenKeys.add(item.id);
                 if (normKey) cached.seenKeys.add(normKey);
                 if (normTitle) cached.seenKeys.add(normTitle);
                 if (matchingFileId) cached.seenKeys.add(matchingFileId);
 
-                let audioUrl = item.preview;
-                if (existsSync(`/data/audio_cache/${item.id}.mp3`)) {
-                  audioUrl = `https://pappysonghttps.duckdns.org/audio/${item.id}.mp3`;
-                }
+                const safeArt = (item.artist?.name || 'Music').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
+                const safeTit = (item.title || 'Track').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
+                const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
+                const streamUrl = existsSync(`/data/audio_cache/${item.id}.mp3`)
+                  ? `https://pappysonghttps.duckdns.org/audio/${item.id}.mp3`
+                  : `https://pappysonghttps.duckdns.org/audio/live/${item.id}/${cleanSlug}`;
+
+                this.audioMetadataMap?.set(String(item.id), {
+                  id: item.id,
+                  title: item.title,
+                  artist: item.artist?.name || 'Music',
+                  album: item.album?.title,
+                  cover: item.album?.cover_medium || item.album?.cover_big,
+                  previewUrl: item.preview
+                });
 
                 cached.items.push({
                   source: matchingFileId ? 'cached' : 'deezer',
                   id: item.id,
                   fileId: matchingFileId,
-                  audioUrl: matchingFileId ? null : audioUrl,
+                  audioUrl: streamUrl,
+                  preview: item.preview,
+                  album: item.album,
                   title: item.title,
                   artist: item.artist?.name || 'Music',
-                  duration: item.duration || 30
+                  duration: item.duration || 180
                 });
-                addedCount++;
               }
             }
           }
-        } catch {}
 
-        if (cached.items.length < (offset + 15)) {
-          try {
-            const ytItems = await searchYouTubeFast(comboTerm).catch(() => []);
-            for (const yt of ytItems || []) {
+          // Merge YouTube results if pool is small
+          if (cached.items.length < (offset + 10) && ytItems.length > 0) {
+            for (const yt of ytItems) {
               if (!yt?.videoId || !yt?.title) continue;
               const normTitle = (yt.title || '').toLowerCase().trim();
               if (!cached.seenKeys.has(yt.videoId) && !cached.seenKeys.has(normTitle)) {
                 let ytFileId = null;
                 try {
                   const row = this.db?.prepare?.(
-                    'SELECT file_id, duration FROM cached_audio_tracks WHERE query = ? OR title = ? LIMIT 1'
-                  )?.get?.(yt.videoId, yt.title);
+                    'SELECT file_id, duration FROM cached_audio_tracks WHERE query = ? OR title = ? OR LOWER(title) = ? LIMIT 1'
+                  )?.get?.(yt.videoId, yt.title, normTitle);
                   if (row?.file_id) ytFileId = row.file_id;
                 } catch {}
 
-                if (ytFileId && cached.seenKeys.has(ytFileId)) {
-                  continue;
-                }
+                if (ytFileId && cached.seenKeys.has(ytFileId)) continue;
 
                 cached.seenKeys.add(yt.videoId);
                 cached.seenKeys.add(normTitle);
+                if (ytFileId) cached.seenKeys.add(ytFileId);
 
                 if (ytFileId) {
-                  cached.seenKeys.add(ytFileId);
                   cached.items.push({
                     source: 'cached',
                     videoId: yt.videoId,
@@ -1650,9 +1653,7 @@ export class TelegramController extends EventEmitter {
                     artist: yt.author || 'Music',
                     duration: yt.duration || 0
                   });
-                  addedCount++;
                 } else if (cached.items.length === 0) {
-                  // Fallback to real video card if Deezer returned zero items
                   cached.items.push({
                     source: 'youtube_video',
                     videoId: yt.videoId,
@@ -1661,17 +1662,12 @@ export class TelegramController extends EventEmitter {
                     duration: yt.duration || 'HD Clip',
                     thumb: yt.thumb
                   });
-                  addedCount++;
                 }
               }
             }
-          } catch {}
-        }
-
-        cached.dzIndex = (cached.dzIndex || 0) + 50;
-        if (cached.dzIndex >= 150 || addedCount === 0) {
-          cached.dzIndex = 0;
-          cached.combosTried++;
+          }
+        } catch (searchErr) {
+          this.log?.debug?.({ err: searchErr?.message, cleanTopic }, 'fast live music search error');
         }
       }
 
@@ -1681,8 +1677,9 @@ export class TelegramController extends EventEmitter {
 
       const PAGE_SIZE = 10;
       const paged = cached.items.slice(offset, offset + PAGE_SIZE);
-      const hasMore = (offset + paged.length < cached.items.length) || (cached.combosTried < combos.length);
-      const nextOffset = hasMore && paged.length > 0 ? String(offset + paged.length) : '';
+      const nextOffset = (offset + paged.length < cached.items.length) && paged.length > 0
+        ? String(offset + paged.length)
+        : '';
 
       const results = [];
       for (let idx = 0; idx < paged.length; idx++) {
@@ -1744,8 +1741,21 @@ export class TelegramController extends EventEmitter {
             reply_markup: { inline_keyboard: keyboard }
           });
         } else if (item.audioUrl || item.preview) {
-          const streamUrl = item.audioUrl || item.preview;
+          const safeArt = safeArtist.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
+          const safeTit = safeTitle.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
+          const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
+          const streamUrl = item.audioUrl || `https://pappysonghttps.duckdns.org/audio/live/${item.id || idx}/${cleanSlug}`;
           const resId = `live_aud_${item.id || idx}_${offset}_${idx}`;
+
+          this.audioMetadataMap?.set(String(item.id || idx), {
+            id: item.id || idx,
+            title: safeTitle,
+            artist: safeArtist,
+            album: item.album?.title,
+            cover: item.album?.cover_medium,
+            previewUrl: item.preview
+          });
+
           recentInlineSearchResults.set(resId, {
             type: 'audio',
             id: item.id,
@@ -1773,7 +1783,8 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      if (paged.length > 0 && !paged[0].fileId) {
+      // Pre-warm top uncached audio track in background for instant full song delivery
+      if (paged.length > 0 && !paged[0].fileId && paged[0].title) {
         this.#cacheAudioTrack(`${paged[0].title} ${paged[0].artist}`, 0).catch(() => {});
       }
 
@@ -2396,7 +2407,7 @@ export class TelegramController extends EventEmitter {
                 ]
               }
             }],
-            cache_time: 10,
+            cache_time: 2,
             is_personal: false
           });
           return;
@@ -2409,7 +2420,7 @@ export class TelegramController extends EventEmitter {
             inline_query_id: qId,
             results: ttResults,
             next_offset: nextOffset,
-            cache_time: 20,
+            cache_time: 2,
             is_personal: false
           });
           return;
@@ -2441,7 +2452,7 @@ export class TelegramController extends EventEmitter {
               ]
             }
           }],
-          cache_time: 15,
+          cache_time: 2,
           is_personal: false
         });
         return;
@@ -2456,7 +2467,7 @@ export class TelegramController extends EventEmitter {
           inline_query_id: qId,
           results: musicResults,
           next_offset: nextOffset,
-          cache_time: 15,
+          cache_time: 2,
           is_personal: false
         };
 
@@ -2499,7 +2510,7 @@ export class TelegramController extends EventEmitter {
               ]
             }
           }],
-          cache_time: 15,
+          cache_time: 2,
           is_personal: false
         });
         return;
