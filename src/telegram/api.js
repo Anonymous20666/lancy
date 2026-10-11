@@ -10,6 +10,49 @@ import { RichMessageBuilder } from './rich.js';
  * rich_message) are brand new in Bot API 10.1–10.3 and library support is
  * uneven. This client supports JSON and multipart uploads natively.
  */
+function sanitizeInlineResults(results) {
+  if (!Array.isArray(results)) return results;
+  return results.map(item => {
+    if (!item || typeof item !== 'object') return item;
+    const sanitized = { ...item };
+    if (typeof sanitized.title === 'string') {
+      sanitized.title = [...sanitized.title.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
+    }
+    if (typeof sanitized.description === 'string') {
+      sanitized.description = [...sanitized.description.toWellFormed()].slice(0, 100).join('').trim().toWellFormed();
+    }
+    if (typeof sanitized.caption === 'string') {
+      sanitized.caption = [...sanitized.caption.toWellFormed()].slice(0, 1024).join('').toWellFormed();
+    }
+    if (sanitized.reply_markup?.inline_keyboard) {
+      sanitized.reply_markup = {
+        ...sanitized.reply_markup,
+        inline_keyboard: sanitized.reply_markup.inline_keyboard.map(row =>
+          Array.isArray(row) ? row.map(btn => {
+            if (!btn || typeof btn !== 'object') return btn;
+            const b = { ...btn };
+            if (typeof b.text === 'string') {
+              b.text = [...b.text.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
+            }
+            if (typeof b.switch_inline_query_current_chat === 'string') {
+              const norm = b.switch_inline_query_current_chat.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+              const clean = norm.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+              b.switch_inline_query_current_chat = [...clean.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
+            }
+            if (typeof b.switch_inline_query === 'string') {
+              const norm = b.switch_inline_query.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+              const clean = norm.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+              b.switch_inline_query = [...clean.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
+            }
+            return b;
+          }) : row
+        )
+      };
+    }
+    return sanitized;
+  });
+}
+
 export class TelegramAPI {
   constructor(token, { baseUrl = 'https://api.telegram.org', timeoutMs = 60000, log } = {}) {
     if (!token) throw new Error('TelegramAPI: BOT_TOKEN is required');
@@ -21,6 +64,9 @@ export class TelegramAPI {
   }
 
   async call(method, params = {}, { files = null, timeoutMs = this.timeoutMs, dropOnFloodWait = false } = {}) {
+    if (method === 'answerInlineQuery' && Array.isArray(params?.results)) {
+      params = { ...params, results: sanitizeInlineResults(params.results) };
+    }
     const url = `${this.baseUrl}/${method}`;
     let body;
     let headers = {};

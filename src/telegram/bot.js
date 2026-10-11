@@ -23,6 +23,20 @@ export const inlineMusicCache = new Map();
 export const inlineUrlCache = new Map();
 export const recentInlineSearchResults = new Map();
 
+export function safeInlineQueryString(str, maxLen = 32) {
+  if (!str) return '';
+  const normalized = String(str).normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  const clean = normalized.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
+  const codePoints = [...clean.toWellFormed()];
+  return codePoints.slice(0, maxLen).join('').trim().toWellFormed();
+}
+
+export function safeText(str, maxChars = 50) {
+  if (!str) return '';
+  const codePoints = [...String(str).toWellFormed()];
+  return codePoints.slice(0, maxChars).join('').trim().toWellFormed();
+}
+
 export async function searchYouTubeFast(query) {
   const clean = String(query || '').trim();
   if (!clean) return [];
@@ -814,7 +828,7 @@ export class TelegramController extends EventEmitter {
                 [
                   {
                     text: '🎙️ Recognize Music / Search Song ♡',
-                    switch_inline_query_current_chat: `${videoTitle.slice(0, 30)} song`,
+                    switch_inline_query_current_chat: `${safeInlineQueryString(videoTitle, 28) || 'song'} song`,
                     style: 'primary'
                   }
                 ],
@@ -836,14 +850,14 @@ export class TelegramController extends EventEmitter {
         try {
           await this.api.editMessageCaption({
             inline_message_id: inlineMessageId,
-            caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote>⚠️ <i>Could not load clip right now. Tap below to search again ♡</i></blockquote>`,
+            caption: `🎬 <b>${escapeHtml(safeText(videoTitle, 60))}</b>\n<blockquote>⚠️ <i>Could not load clip right now. Tap below to search again ♡</i></blockquote>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    text: `🔍 More "${safeText(queryTopic, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${safeInlineQueryString(queryTopic, 25)}`,
                     style: 'primary'
                   }
                 ]
@@ -1276,21 +1290,21 @@ export class TelegramController extends EventEmitter {
             video_url: item.mediaUrl,
             mime_type: 'video/mp4',
             thumb_url: item.thumbnailUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
-            title: `🎬 HD Video: ${cleanTopic.slice(0, 35)}`,
+            title: `🎬 HD Video: ${safeText(cleanTopic, 35)}`,
             description: `Pinterest HD Video ♡`,
-            caption: `🎬 <b>${escapeHtml(cleanTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            caption: `🎬 <b>${escapeHtml(safeText(cleanTopic, 50))}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: `🔍 More "${cleanTopic.slice(0, 12)}"`,
-                    switch_inline_query_current_chat: `pint ${cleanTopic}`,
+                    text: `🔍 More "${safeText(cleanTopic, 12)}"`,
+                    switch_inline_query_current_chat: `pint ${safeInlineQueryString(cleanTopic, 20)}`,
                     style: 'primary'
                   },
                   {
                     text: '🎵 Search Music',
-                    switch_inline_query_current_chat: cleanTopic,
+                    switch_inline_query_current_chat: safeInlineQueryString(cleanTopic, 30),
                     style: 'primary'
                   }
                 ]
@@ -1303,21 +1317,21 @@ export class TelegramController extends EventEmitter {
             id: `pin_pic_${item.pinId || idx}_${offset}_${idx}`,
             photo_url: item.mediaUrl,
             thumb_url: item.thumbnailUrl || item.mediaUrl,
-            title: `📷 ${cleanTopic.slice(0, 35)}`,
+            title: `📷 ${safeText(cleanTopic, 35)}`,
             description: `HD Aesthetic Photo ♡`,
-            caption: `📷 <b>${escapeHtml(cleanTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            caption: `📷 <b>${escapeHtml(safeText(cleanTopic, 50))}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: `🔍 More "${cleanTopic.slice(0, 12)}"`,
-                    switch_inline_query_current_chat: `pint ${cleanTopic}`,
+                    text: `🔍 More "${safeText(cleanTopic, 12)}"`,
+                    switch_inline_query_current_chat: `pint ${safeInlineQueryString(cleanTopic, 20)}`,
                     style: 'primary'
                   },
                   {
                     text: '🎵 Search Music',
-                    switch_inline_query_current_chat: cleanTopic,
+                    switch_inline_query_current_chat: safeInlineQueryString(cleanTopic, 30),
                     style: 'primary'
                   }
                 ]
@@ -1383,8 +1397,11 @@ export class TelegramController extends EventEmitter {
         `${cleanTopic} viral shorts`
       ];
 
-      // Expand video items in the pool until offset + 10 is reached or combos exhausted
-      while (cached.items.length < (offset + 10) && cached.combosTried < 25) {
+      // Expand video items in the pool until offset + 10 is reached or timeout/combos exhausted
+      const searchStart = Date.now();
+      let comboLoops = 0;
+      while (cached.items.length < (offset + 10) && cached.combosTried < 25 && comboLoops < 3 && (Date.now() - searchStart < 1800)) {
+        comboLoops++;
         const mod = cached.combosTried < combos.length
           ? combos[cached.combosTried]
           : `${cleanTopic} tiktok part ${cached.combosTried - combos.length + 2}`;
@@ -1399,6 +1416,7 @@ export class TelegramController extends EventEmitter {
             }
           }
         }
+        if (cached.items.length >= offset + 5) break;
       }
 
       // Synchronize legacy key for backwards-compatibility with tests checking raw array
@@ -1429,8 +1447,8 @@ export class TelegramController extends EventEmitter {
           ).get(item.videoId);
         } catch {}
 
-        const safeTitle = [...String(title)].slice(0, 50).join('').trim();
-        const cleanSwitchSong = safeTitle.replace(/[^\p{L}\p{N}\s]/gu, '').trim().slice(0, 30);
+        const safeTitle = safeText(title, 50);
+        const cleanSwitchSong = safeInlineQueryString(safeTitle, 28);
         const caption = `🎬 <b>${escapeHtml(safeTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`;
 
         const keyboard = [
@@ -1988,16 +2006,16 @@ export class TelegramController extends EventEmitter {
                 id: `tt_img_${idx}_${Date.now()}`,
                 photo_url: fullUrl,
                 thumb_url: fullUrl,
-                title: `🖼 ${safeTitle.slice(0, 35)} (${idx + 1}/${images.length})`,
-                description: `👤 ${safeAuthor} • Slide ${idx + 1} of ${images.length} ♡`,
-                caption: `🖼 <b>${escapeHtml(safeTitle)}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(safeAuthor)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+                title: `🖼 ${safeText(safeTitle, 35)} (${idx + 1}/${images.length})`,
+                description: `👤 ${safeText(safeAuthor, 30)} • Slide ${idx + 1} of ${images.length} ♡`,
+                caption: `🖼 <b>${escapeHtml(safeText(safeTitle, 50))}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(safeText(safeAuthor, 30))}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
                 parse_mode: 'HTML',
                 reply_markup: {
                   inline_keyboard: [
                     [
                       {
                         text: '🎙️ Recognize Music / Search Song ♡',
-                        switch_inline_query_current_chat: musicSearchQuery,
+                        switch_inline_query_current_chat: safeInlineQueryString(musicSearchQuery, 32),
                         style: 'primary'
                       }
                     ],
@@ -2027,16 +2045,16 @@ export class TelegramController extends EventEmitter {
               mime_type: 'video/mp4',
               video_duration: d.duration || 30,
               thumb_url: cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
-              title: `🎬 HD Video: ${safeTitle.slice(0, 45)}`,
-              description: `👤 ${safeAuthor} • Direct No-Watermark MP4 ♡`,
-              caption: `🎬 <b>${escapeHtml(safeTitle)}</b>\n👤 <i>${escapeHtml(safeAuthor)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+              title: `🎬 HD Video: ${safeText(safeTitle, 45)}`,
+              description: `👤 ${safeText(safeAuthor, 30)} • Direct No-Watermark MP4 ♡`,
+              caption: `🎬 <b>${escapeHtml(safeText(safeTitle, 50))}</b>\n👤 <i>${escapeHtml(safeText(safeAuthor, 30))}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
               parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [
                   [
                     {
                       text: '🎙️ Recognize Music / Search Song ♡',
-                      switch_inline_query_current_chat: musicSearchQuery,
+                      switch_inline_query_current_chat: safeInlineQueryString(musicSearchQuery, 32),
                       style: 'primary'
                     }
                   ],
@@ -2449,7 +2467,7 @@ export class TelegramController extends EventEmitter {
                   [
                     {
                       text: '🎬 Search Trending TikToks',
-                      switch_inline_query_current_chat: `${rawText} dance `,
+                      switch_inline_query_current_chat: `${safeInlineQueryString(rawText, 15)} dance `,
                       style: 'primary'
                     }
                   ]
