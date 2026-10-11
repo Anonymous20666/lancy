@@ -3586,7 +3586,8 @@ export class TelegramController extends EventEmitter {
 
     // 3. Determine announcement text and options
     const isVisible = rest.includes('-v') || rest.includes('--visible');
-    const cleanArgs = rest.filter((a) => a !== '-v' && a !== '--visible');
+    const shouldPin = rest.some((arg) => /^(?:pin|--pin|-p)$/i.test(arg));
+    const cleanArgs = rest.filter((a) => !/^(?:pin|--pin|-p|-v|--visible)$/i.test(a));
     const customText = cleanArgs.join(' ').trim();
 
     let bodyText = '';
@@ -3633,14 +3634,24 @@ export class TelegramController extends EventEmitter {
       sendOptions.reply_to_message_id = message.reply_to_message.message_id;
     }
 
+    let sent = null;
     try {
-      await this.api.sendMessage(chatId, finalHtml, sendOptions);
+      sent = await this.api.sendMessage(chatId, finalHtml, sendOptions);
     } catch (err) {
       this.log.error({ err, chatId }, 'failed to send hidetag message');
       try {
-        await this.api.sendMessage(chatId, bodyText, sendOptions);
+        sent = await this.api.sendMessage(chatId, bodyText, sendOptions);
       } catch (fbErr) {
         this.log.error({ fbErr, chatId }, 'fallback hidetag sendMessage failed');
+      }
+    }
+
+    // If requested, pin the announcement with notification enabled so ALL members (even 2k+) get alerted
+    if (sent?.message_id && shouldPin && typeof this.api.pinChatMessage === 'function') {
+      try {
+        await this.api.pinChatMessage(chatId, sent.message_id, { disableNotification: false });
+      } catch (pinErr) {
+        this.log.warn({ pinErr, chatId }, 'failed to pin hidetag message');
       }
     }
   }

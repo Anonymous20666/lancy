@@ -361,3 +361,52 @@ test('TelegramController handleUpdate: passively tracks group members and suppor
 
   db.close();
 });
+
+test('TelegramController /hidetag pin: pins announcement with notification so all 2k members are alerted', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sentMessages = [];
+  const pinnedMessages = [];
+  const chatId = -100444;
+
+  const mockApi = {
+    me: { id: 8859351350, username: 'Lancy_easy_bot' },
+    getChatMember: async () => ({ status: 'creator' }),
+    getChatAdministrators: async () => [],
+    deleteMessage: async () => true,
+    sendMessage: async (cid, text, opts) => {
+      sentMessages.push({ cid, text, opts });
+      return { message_id: 505 };
+    },
+    pinChatMessage: async (cid, mid, opts) => {
+      pinnedMessages.push({ cid, mid, opts });
+      return true;
+    }
+  };
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: new StateMachine(db)
+  });
+
+  const msg = {
+    message_id: 22,
+    chat: { id: chatId, type: 'supergroup' },
+    from: { id: 1001, first_name: 'Creator' },
+    text: '/hidetag pin Big news today!'
+  };
+
+  await controller.handleHideTag(msg, ['pin', 'Big', 'news', 'today!']);
+
+  assert.equal(sentMessages.length, 1);
+  assert.match(sentMessages[0].text, /Big news today!/);
+
+  // Pinned with loud notification for all members
+  assert.equal(pinnedMessages.length, 1);
+  assert.equal(pinnedMessages[0].mid, 505);
+  assert.equal(pinnedMessages[0].opts.disableNotification, false);
+
+  db.close();
+});
