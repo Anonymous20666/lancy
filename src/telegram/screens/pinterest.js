@@ -4,6 +4,7 @@ import { States } from '../../core/stateMachine.js';
 import { ProgressTracker } from '../progress.js';
 import { SEARCH_MODES } from '../../pinterest/search.js';
 import { truncate } from '../../utils/text.js';
+import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 
 /**
  * Pinterest screen + deep search flow.
@@ -236,6 +237,24 @@ export function createPinterestScreen({ app }) {
     const isGroup = Boolean(sctx.isGroup || sctx.message?.chat?.type === 'group' || sctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
     if (!isGroup && sctx.message?.message_id && app.settings.get('telegram.messageCleanup')) {
       await api.deleteMessage(chatId, sctx.message.message_id).catch(() => {});
+    }
+
+    if (isGroup && api) {
+      const caps = await checkChatMediaPermissions(api, chatId);
+      if (!caps.canSendPhotos && !caps.canSendVideos) {
+        const botUser = app.telegram?.botUsername || 'Lancy_easy_bot';
+        const notice = formatMediaRestrictedNotice({
+          botUsername: botUser,
+          url: null,
+          mediaType: 'photos or videos',
+          actionTitle: 'Search in Private DM'
+        });
+        await api.sendMessage(chatId, notice.text, {
+          parse_mode: 'HTML',
+          reply_markup: notice.reply_markup
+        }).catch(() => {});
+        return;
+      }
     }
 
     // Reuse existing screen message so it updates in-place with ticking heartbeat timer

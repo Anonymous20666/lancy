@@ -14,6 +14,7 @@ import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recogn
 import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
+import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from './permissions.js';
 
 const execFileAsync = promisify(execFile);
 export const inlineSearchCache = new Map();
@@ -2616,7 +2617,11 @@ export class TelegramController extends EventEmitter {
         action === 'moreAlbum' ||
         action === 'prevAlbum' ||
         action === 'moreVideos' ||
-        action === 'prevVideos'
+        action === 'prevVideos' ||
+        action === 'moreSlide' ||
+        action === 'prevSlide' ||
+        action === 'more_slide' ||
+        action === 'prev_slide'
       );
 
       const isFromMedia = !isPagination && Boolean(
@@ -2845,14 +2850,16 @@ export class TelegramController extends EventEmitter {
             return;
           }
         }
-        if (startPayload && /^dl_/i.test(startPayload)) {
-          const rawQuery = startPayload.replace(/^dl_/i, '').replace(/_/g, ' ').trim();
-          let cleanQuery = rawQuery;
-          try { cleanQuery = decodeURIComponent(rawQuery); } catch {}
-          if (cleanQuery) {
+        if (startPayload && /^(?:dl_|grab_)/i.test(startPayload)) {
+          const rawPayload = startPayload.replace(/^(?:dl_|grab_)/i, '').trim();
+          let targetUrl = resolvePendingDownload(rawPayload, this.db);
+          if (!targetUrl) {
+            try { targetUrl = decodeURIComponent(rawPayload); } catch { targetUrl = rawPayload; }
+          }
+          if (targetUrl) {
             await this.sm.reset(tgId, { reason: 'start_dl' });
             const downloaderScreen = this.screens.get('downloader');
-            await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), cleanQuery);
+            await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), targetUrl);
             return;
           }
         }

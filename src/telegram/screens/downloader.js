@@ -11,6 +11,7 @@ import { getLyrics, formatBlockquoteLyrics, chunkLyrics, escapeHtml } from '../.
 import { extractMediaForMusicRecognition, recognizeAudio } from '../../media/recognizer.js';
 import { sleep, parseDurationToSeconds } from '../../utils/time.js';
 import { toTelegramStaticSticker } from '../../media/convert.js';
+import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -19,6 +20,7 @@ const lyricsCache = new Map();
 const trackAudioCache = new Map();
 const audioMetaCache = new Map();
 const imageStickerCache = new Map();
+const albumCache = new Map();
 
 function saveMediaImages(key, items) {
   if (imageStickerCache.size > 50) {
@@ -27,10 +29,11 @@ function saveMediaImages(key, items) {
   }
   imageStickerCache.set(key, items);
   try {
-    for (let i = 0; i < Math.min(items.length, 15); i++) {
+    const maxCount = Math.min(items.length, 100);
+    for (let i = 0; i < maxCount; i++) {
       writeFileSync(join(tmpdir(), `lancy_img_${key}_${i}.jpg`), items[i].buffer);
     }
-    writeFileSync(join(tmpdir(), `lancy_img_${key}_meta.json`), JSON.stringify({ count: Math.min(items.length, 15) }));
+    writeFileSync(join(tmpdir(), `lancy_img_${key}_meta.json`), JSON.stringify({ count: maxCount }));
   } catch {}
 }
 
@@ -53,6 +56,79 @@ function getMediaImages(key) {
     } catch {}
   }
   return items || [];
+}
+
+function saveAlbum(key, data) {
+  if (albumCache.size > 50) {
+    const oldestKey = albumCache.keys().next().value;
+    albumCache.delete(oldestKey);
+  }
+  albumCache.set(key, data);
+  try {
+    const meta = {
+      platform: data.platform || 'Media',
+      title: data.title || 'Downloaded Media',
+      totalCount: data.mediaItems?.length || 0,
+      audioKey: data.audioKey || null,
+      imageKey: data.imageKey || null,
+      audioTitle: data.audioTrack?.title || null,
+      audioPerformer: data.audioTrack?.performer || null
+    };
+    writeFileSync(join(tmpdir(), `lancy_album_${key}_meta.json`), JSON.stringify(meta));
+    if (Array.isArray(data.mediaItems)) {
+      const maxSave = Math.min(data.mediaItems.length, 100);
+      for (let i = 0; i < maxSave; i++) {
+        const item = data.mediaItems[i];
+        const ext = item.type === 'video' ? 'mp4' : 'jpg';
+        writeFileSync(join(tmpdir(), `lancy_album_${key}_${i}.${ext}`), item.buffer);
+      }
+    }
+    if (data.audioTrack?.buffer) {
+      writeFileSync(join(tmpdir(), `lancy_album_${key}_audio.mp3`), data.audioTrack.buffer);
+    }
+  } catch {}
+}
+
+function getAlbum(key) {
+  let album = albumCache.get(key);
+  if (!album && key) {
+    try {
+      const metaPath = join(tmpdir(), `lancy_album_${key}_meta.json`);
+      if (existsSync(metaPath)) {
+        const meta = JSON.parse(readFileSync(metaPath, 'utf8'));
+        const mediaItems = [];
+        for (let i = 0; i < (meta.totalCount || 0); i++) {
+          const vidPath = join(tmpdir(), `lancy_album_${key}_${i}.mp4`);
+          const imgPath = join(tmpdir(), `lancy_album_${key}_${i}.jpg`);
+          if (existsSync(vidPath)) {
+            mediaItems.push({ type: 'video', buffer: readFileSync(vidPath), filename: `media_${i}.mp4`, mimeType: 'video/mp4' });
+          } else if (existsSync(imgPath)) {
+            mediaItems.push({ type: 'photo', buffer: readFileSync(imgPath), filename: `media_${i}.jpg`, mimeType: 'image/jpeg' });
+          }
+        }
+        let audioTrack = null;
+        const audioPath = join(tmpdir(), `lancy_album_${key}_audio.mp3`);
+        if (existsSync(audioPath)) {
+          audioTrack = {
+            buffer: readFileSync(audioPath),
+            filename: 'audio.mp3',
+            title: meta.audioTitle || 'Audio Track',
+            performer: meta.audioPerformer || 'Artist'
+          };
+        }
+        album = {
+          platform: meta.platform || 'Media',
+          title: meta.title || 'Downloaded Media',
+          mediaItems,
+          audioTrack,
+          audioKey: meta.audioKey,
+          imageKey: meta.imageKey
+        };
+        albumCache.set(key, album);
+      }
+    } catch {}
+  }
+  return album;
 }
 
 function saveTrackAudio(key, buffer, meta = null, thumb = null) {
@@ -326,9 +402,246 @@ export function createDownloaderScreen({ app }) {
     return b.toJSON();
   }
 
+  const SLIDESHOW_PAGE_SIZE = 10;
+
+  function buildDeliveryRichMessage({
+    mediaItems = [],
+    audioTrack = null,
+    platform = 'Media',
+    title = 'Downloaded Media',
+    result = {},
+    ctx,
+    offset = 0,
+    albumKey = null,
+    imageKey = null,
+    audioKey = null
+  }) {
+    const files = {};
+    const b = new RichMessageBuilder();
+
+    b.header(`𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`, 1);
+    b.paragraph(rt.italic('₊˚⊹♡ aesthetic media delivery ♡ ˙ᵕ˙'));
+    b.divider();
+
+    // 1. Embed Downloaded Media (Video / Photo / Single Slideshow block) inside Rich Message
+    if (mediaItems.length === 1) {
+      const item = mediaItems[0];
+      const field = `${item.type}_0`;
+      files[field] = {
+        buffer: item.buffer,
+        filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
+        contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
+      };
+      if (item.type === 'video') {
+        b.video(`attach://${field}`);
+      } else {
+        b.photo(`attach://${field}`);
+      }
+    } else if (mediaItems.length > 1) {
+      // Telegram Bot API allows AT MOST ONE slideshow / media group block per message (max 10 items).
+      // We slice exactly one page (up to 10 items) for this message to prevent client button detachment:
+      const pageSlice = mediaItems.slice(offset, offset + SLIDESHOW_PAGE_SIZE);
+      const chunkBlocks = pageSlice.map((item, idx) => {
+        const globalIdx = offset + idx;
+        const field = `${item.type}_${globalIdx}`;
+        files[field] = {
+          buffer: item.buffer,
+          filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
+          contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
+        };
+        return item.type === 'video' ? block.video(`attach://${field}`) : block.photo(`attach://${field}`);
+      });
+      b.slideshow(chunkBlocks);
+    }
+
+    // 2. Embed Audio / Music Track inside the same Rich Message!
+    const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result?.artist);
+    if (audioTrack && audioTrack.buffer) {
+      const audioField = 'audio_track';
+      files[audioField] = {
+        buffer: audioTrack.buffer,
+        filename: audioTrack.filename || `${(title || 'soundtrack').replace(/[^\w\s-]/g, '') || 'soundtrack'}.mp3`,
+        contentType: 'audio/mpeg'
+      };
+
+      const parsedDuration = parseDurationToSeconds(audioTrack.duration || result?.duration);
+      const audioMediaObj = {
+        media: `attach://${audioField}`,
+        title: audioTrack.title || result?.title || title || 'Audio Track',
+        performer: audioTrack.performer || result?.artist || result?.author || 'Artist',
+        ...(parsedDuration > 0 ? { duration: parsedDuration } : {})
+      };
+
+      if (isMusic) {
+        b.audio(audioMediaObj);
+      } else {
+        b.audio(audioMediaObj, '🎵 Extracted Video Soundtrack (MP3) ♡');
+      }
+    }
+
+    // 3. Metadata Table
+    b.divider();
+    const videoCount = mediaItems.filter((m) => m.type === 'video').length;
+    const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
+
+    if (isMusic) {
+      const musicRows = [
+        ['📱 Platform', 'SPOTIFY / MUSIC ♡'],
+        ['🎵 Title', truncate(result?.title || title, 40)],
+        ['🎧 Artist', truncate(result?.artist || result?.author || 'Spotify', 36)]
+      ];
+      if (result?.album) musicRows.push(['💿 Album', truncate(result.album, 36)]);
+      if (result?.year) musicRows.push(['📅 Release', String(result.year)]);
+      if (result?.duration) musicRows.push(['⏱ Duration', String(result.duration)]);
+      musicRows.push(['📦 Audio Quality', 'High-Speed MP3 (192k) + Artwork ♡']);
+      if (ctx?.isGroup) {
+        musicRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
+      }
+      b.table(kvTable(musicRows), { compact: true });
+    } else {
+      const isPaged = mediaItems.length > SLIDESHOW_PAGE_SIZE;
+      const rangeText = isPaged ? ` • Showing ${offset + 1}–${Math.min(offset + SLIDESHOW_PAGE_SIZE, mediaItems.length)}` : '';
+      const metaRows = [
+        ['📱 Platform', platform.toUpperCase()],
+        ['🏷 Title', truncate(title, 36)],
+        ['📦 Media Items', `${mediaItems.length} item(s) (${photoCount} photos, ${videoCount} videos)${rangeText}`],
+        ['🎵 Sound / Audio', audioTrack ? 'Extracted & Included (MP3) ♡' : 'None in source']
+      ];
+      if (ctx?.isGroup) {
+        metaRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
+      }
+      b.table(kvTable(metaRows), { compact: true });
+    }
+    b.divider();
+
+    // 4. Audio Action Row (send audio / lyrics / recognize)
+    const audioActionRow = [];
+    if (audioKey) {
+      audioActionRow.push(
+        richButton.callback('🎵 Send Audio File', encodeCallback(id, 'send_audio', audioKey), { style: 'primary' })
+      );
+    }
+    if (isMusic) {
+      const lyricKey = Math.random().toString(36).slice(2, 8);
+      const songMeta = {
+        title: result?.title || title,
+        artist: result?.artist || result?.author || ''
+      };
+      lyricsCache.set(lyricKey, songMeta);
+      const db = app.db || ctx?.db;
+      try {
+        db?.run?.(
+          'INSERT OR REPLACE INTO bot_settings (key, value_json) VALUES (?, ?)',
+          `lyric_${lyricKey}`,
+          JSON.stringify(songMeta)
+        );
+      } catch {}
+      audioActionRow.push(
+        richButton.callback('📜 Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' })
+      );
+    } else if (audioKey) {
+      audioActionRow.push(
+        richButton.callback('🎙️ Recognize Music / Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
+      );
+    }
+
+    if (audioActionRow.length > 0) {
+      b.buttons(audioActionRow);
+    }
+
+    // 5. Album Pagination Row (when total media > 10)
+    if (mediaItems.length > SLIDESHOW_PAGE_SIZE && albumKey) {
+      const hasPrev = offset > 0;
+      const hasNext = offset + SLIDESHOW_PAGE_SIZE < mediaItems.length;
+      const prevOffset = Math.max(0, offset - SLIDESHOW_PAGE_SIZE);
+      const nextOffset = offset + SLIDESHOW_PAGE_SIZE;
+      const nextBatch = Math.min(SLIDESHOW_PAGE_SIZE, mediaItems.length - nextOffset);
+
+      if (hasPrev && hasNext) {
+        b.buttons([
+          richButton.callback(`← Prev (${prevOffset + 1}–${offset})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' }),
+          richButton.callback(`Next (${nextOffset + 1}–${Math.min(nextOffset + SLIDESHOW_PAGE_SIZE, mediaItems.length)}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
+        ]);
+      } else if (hasNext) {
+        b.buttons([
+          richButton.callback(`🖼 Next ${nextBatch} Slides (${nextOffset + 1}–${Math.min(nextOffset + SLIDESHOW_PAGE_SIZE, mediaItems.length)}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
+        ]);
+      } else if (hasPrev) {
+        b.buttons([
+          richButton.callback(`← 🖼 Prev Slides (${prevOffset + 1}–${offset})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' })
+        ]);
+      }
+    }
+
+    // 6. Action Buttons
+    const mediaRow = [
+      richButton.callback('📥 Download Link', encodeCallback(id, 'input', 'from_media'), { style: 'primary' })
+    ];
+    const keyForStickers = imageKey || albumKey;
+    if (photoCount > 0 && keyForStickers) {
+      mediaRow.push(
+        richButton.callback(
+          photoCount > 1 ? `🎨 Turn to Sticker (${photoCount})` : '🎨 Turn to Sticker',
+          encodeCallback(id, 'to_sticker', keyForStickers, 'from_media'),
+          { style: 'primary' }
+        )
+      );
+      mediaRow.push(
+        richButton.callback('✦ Sticker Pack', encodeCallback('stickers', 'open', 'from_media'), { style: 'primary' })
+      );
+    }
+    b.buttons(mediaRow);
+
+    b.buttons([
+      richButton.callback('🎵 Play Another', encodeCallback(id, 'play', 'from_media'), { style: 'primary' }),
+      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
+    ]);
+    b.footer(rt.italic(`Delivered with aesthetic love by ${ctx?.botName || 'Lancy Bot'} ♡`));
+    b.validate();
+
+    return { rich: b.toJSON(), files };
+  }
+
   async function executeDownload(ctx, url) {
     const isGroup = Boolean(ctx.isGroup);
     const forceNew = Boolean(ctx.forceNew);
+    const api = ctx.api || app.telegram?.api;
+
+    // Pre-flight permission check for group chats to prevent entering download/retry loops
+    // when admin permissions restrict non-admin bots from sending media.
+    if (isGroup && api) {
+      const isMusicQuery = !/^https?:\/\//i.test(url);
+      const caps = await checkChatMediaPermissions(api, ctx.chatId);
+      if (!isMusicQuery && !caps.canSendVideos && !caps.canSendPhotos) {
+        const botUser = ctx.botUsername || app.telegram?.botUsername || 'Lancy_easy_bot';
+        const notice = formatMediaRestrictedNotice({
+          botUsername: botUser,
+          url,
+          mediaType: 'photos or videos',
+          actionTitle: 'Get in Private DM'
+        });
+        await api.sendMessage(ctx.chatId, notice.text, {
+          parse_mode: 'HTML',
+          reply_markup: notice.reply_markup
+        }).catch(() => {});
+        return;
+      }
+      if (isMusicQuery && !caps.canSendAudios && !caps.canSendMedia) {
+        const botUser = ctx.botUsername || app.telegram?.botUsername || 'Lancy_easy_bot';
+        const notice = formatMediaRestrictedNotice({
+          botUsername: botUser,
+          url,
+          mediaType: 'audio files',
+          actionTitle: 'Play in Private DM'
+        });
+        await api.sendMessage(ctx.chatId, notice.text, {
+          parse_mode: 'HTML',
+          reply_markup: notice.reply_markup
+        }).catch(() => {});
+        return;
+      }
+    }
+
     const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
     const tracker = new ProgressTracker({
       api: ctx.api || app.telegram.api,
@@ -357,105 +670,7 @@ export function createDownloaderScreen({ app }) {
       const hasVideo = mediaItems.some((m) => m.type === 'video');
       tracker.setAction(hasVideo ? 'upload_video' : 'upload_photo');
 
-      // Prepare unified files map and Rich Message following Lancy's signature pattern
-      const files = {};
-      const b = new RichMessageBuilder();
-
-      b.header(`𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`, 1);
-      b.paragraph(rt.italic('₊˚⊹♡ aesthetic media delivery ♡ ˙ᵕ˙'));
-      b.divider();
-
-      // 1. Embed Downloaded Media (Video / Photo / Collage) inside Rich Message
-      if (mediaItems.length === 1) {
-        const item = mediaItems[0];
-        const field = `${item.type}_0`;
-        files[field] = {
-          buffer: item.buffer,
-          filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
-          contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
-        };
-        if (item.type === 'video') {
-          b.video(`attach://${field}`);
-        } else {
-          b.photo(`attach://${field}`);
-        }
-      } else if (mediaItems.length > 1) {
-        // Chunk media into swipeable slideshows (up to 10 items per slideshow)
-        for (let i = 0; i < mediaItems.length; i += 10) {
-          const chunk = mediaItems.slice(i, i + 10);
-          const chunkBlocks = chunk.map((item, idx) => {
-            const globalIdx = i + idx;
-            const field = `${item.type}_${globalIdx}`;
-            files[field] = {
-              buffer: item.buffer,
-              filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
-              contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
-            };
-            return item.type === 'video' ? block.video(`attach://${field}`) : block.photo(`attach://${field}`);
-          });
-          b.slideshow(chunkBlocks);
-        }
-      }
-
-      // 2. Embed Audio / Music Track inside the same Rich Message!
       const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result.artist);
-      if (audioTrack && audioTrack.buffer) {
-        const audioField = 'audio_track';
-        files[audioField] = {
-          buffer: audioTrack.buffer,
-          filename: audioTrack.filename || `${(title || 'soundtrack').replace(/[^\w\s-]/g, '') || 'soundtrack'}.mp3`,
-          contentType: 'audio/mpeg'
-        };
-
-        const parsedDuration = parseDurationToSeconds(audioTrack.duration || result.duration);
-        const audioMediaObj = {
-          media: `attach://${audioField}`,
-          title: audioTrack.title || result.title || title || 'Audio Track',
-          performer: audioTrack.performer || result.artist || result.author || 'Artist',
-          ...(parsedDuration > 0 ? { duration: parsedDuration } : {})
-        };
-
-        if (isMusic) {
-          b.audio(audioMediaObj);
-        } else {
-          b.audio(audioMediaObj, '🎵 Extracted Video Soundtrack (MP3) ♡');
-        }
-      }
-
-      // 3. Metadata Table
-      b.divider();
-      const videoCount = mediaItems.filter((m) => m.type === 'video').length;
-      const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
-
-      if (isMusic) {
-        const musicRows = [
-          ['📱 Platform', 'SPOTIFY / MUSIC ♡'],
-          ['🎵 Title', truncate(result.title || title, 40)],
-          ['🎧 Artist', truncate(result.artist || result.author || 'Spotify', 36)]
-        ];
-        if (result.album) musicRows.push(['💿 Album', truncate(result.album, 36)]);
-        if (result.year) musicRows.push(['📅 Release', String(result.year)]);
-        if (result.duration) musicRows.push(['⏱ Duration', String(result.duration)]);
-        musicRows.push(['📦 Audio Quality', 'High-Speed MP3 (192k) + Artwork ♡']);
-        if (ctx.isGroup) {
-          musicRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
-        }
-        b.table(kvTable(musicRows), { compact: true });
-      } else {
-        const metaRows = [
-          ['📱 Platform', platform.toUpperCase()],
-          ['🏷 Title', truncate(title, 36)],
-          ['📦 Media Items', `${mediaItems.length} item(s) (${photoCount} photos, ${videoCount} videos)`],
-          ['🎵 Sound / Audio', audioTrack ? 'Extracted & Included (MP3) ♡' : 'None in source']
-        ];
-        if (ctx.isGroup) {
-          metaRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
-        }
-        b.table(kvTable(metaRows), { compact: true });
-      }
-      b.divider();
-
-      // 4. Action Buttons
       const photoItem = mediaItems.find((m) => m.type === 'photo');
       const photoItems = mediaItems.filter((m) => m.type === 'photo');
       const thumbBuf = photoItem?.buffer || null;
@@ -491,69 +706,50 @@ export function createDownloaderScreen({ app }) {
         } catch {}
       }
 
-      const audioActionRow = [];
-      if (audioKey) {
-        audioActionRow.push(
-          richButton.callback('🎵 Send Audio File', encodeCallback(id, 'send_audio', audioKey), { style: 'primary' })
-        );
-      }
-      if (isMusic) {
-        const lyricKey = Math.random().toString(36).slice(2, 8);
-        const songMeta = {
-          title: result.title || title,
-          artist: result.artist || result.author || ''
-        };
-        lyricsCache.set(lyricKey, songMeta);
-        const db = app.db || ctx.db;
-        try {
-          db?.run?.(
-            'INSERT OR REPLACE INTO bot_settings (key, value_json) VALUES (?, ?)',
-            `lyric_${lyricKey}`,
-            JSON.stringify(songMeta)
-          );
-        } catch {}
-        audioActionRow.push(
-          richButton.callback('📜 Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' })
-        );
-      } else if (audioKey) {
-        audioActionRow.push(
-          richButton.callback('🎙️ Recognize Music / Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
-        );
+      const albumKey = mediaItems.length > 1 ? Math.random().toString(36).slice(2, 8) : null;
+      if (albumKey) {
+        saveAlbum(albumKey, { mediaItems, audioTrack, platform, title, result, audioKey, imageKey });
       }
 
-      if (audioActionRow.length > 0) {
-        b.buttons(audioActionRow);
+      const { rich, files } = buildDeliveryRichMessage({
+        mediaItems,
+        audioTrack,
+        platform,
+        title,
+        result,
+        ctx,
+        offset: 0,
+        albumKey,
+        imageKey,
+        audioKey
+      });
+
+      // Deliver Media
+      let sent = null;
+      if (isGroup && audioTrack && audioTrack.buffer) {
+        const caps = await checkChatMediaPermissions(ctx.api || app.telegram?.api, ctx.chatId);
+        if (caps.canSendAudios && !caps.canSendPhotos) {
+          await tracker.cleanup();
+          const cleanFilename = `${(title || 'audio').replace(/[^\w\s-]/g, '') || 'audio'}.mp3`;
+          sent = await (ctx.api || app.telegram?.api).sendAudio(ctx.chatId, audioTrack.buffer, {
+            title: audioTrack.title || result.title || title || 'Audio Track',
+            performer: audioTrack.performer || result.artist || result.author || 'Spotify',
+            caption: `🎵 <b>${escapeHtml(result.title || title || 'Audio Track')}</b>` +
+              (result.artist ? ` — <i>${escapeHtml(result.artist)}</i>` : '') +
+              `\n<blockquote>⏱ <b>Delivered to group chat</b> (photos restricted by admin) ♡</blockquote>`,
+            parse_mode: 'HTML',
+            filename: cleanFilename
+          }).catch(() => null);
+        }
       }
 
-      const mediaRow = [
-        richButton.callback('📥 Download Link', encodeCallback(id, 'input', ['from_media']), { style: 'primary' })
-      ];
-      if (photoCount > 0 && imageKey) {
-        mediaRow.push(
-          richButton.callback(
-            photoCount > 1 ? `🎨 Turn to Sticker (${photoCount})` : '🎨 Turn to Sticker',
-            encodeCallback(id, 'to_sticker', imageKey, 'from_media'),
-            { style: 'primary' }
-          )
-        );
-        mediaRow.push(
-          richButton.callback('✦ Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' })
-        );
+      if (!sent) {
+        sent = await tracker.finish(rich, files);
       }
-      b.buttons(mediaRow);
-
-      b.buttons([
-        richButton.callback('🎵 Play Another', encodeCallback(id, 'play', ['from_media']), { style: 'primary' }),
-        richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']), { style: 'primary' })
-      ]);
-      b.footer(rt.italic(`Delivered with aesthetic love by ${ctx.botName || 'Lancy Bot'} ♡`));
-      b.validate();
-
-      // 5. Deliver Rich Message
-      const sent = await tracker.finish(b.toJSON(), files);
-      if (tracker.messageId) {
+      if (tracker.messageId && sent && !sent.permissionError) {
         (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(tracker.messageId);
         app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
+        (ctx.controller || app.telegram?.controller)?.userScreenMessage?.set?.(ctx.tgId, { chatId: ctx.chatId, messageId: tracker.messageId });
       }
 
       // Auto-cache audio track in SQLite cached_audio_tracks for instant live inline playback
@@ -597,6 +793,22 @@ export function createDownloaderScreen({ app }) {
       await ctx.sm?.reset(ctx.tgId, { reason: 'download_complete' });
     } catch (err) {
       log.error({ err, url }, 'download failed');
+      if (isPermissionError(err)) {
+        await tracker.cleanup();
+        const botUser = ctx.botUsername || app.telegram?.botUsername || 'Lancy_easy_bot';
+        const notice = formatMediaRestrictedNotice({
+          botUsername: botUser,
+          url,
+          mediaType: 'photos or videos',
+          actionTitle: 'Get in Private DM'
+        });
+        await (ctx.api || app.telegram?.api).sendMessage(ctx.chatId, notice.text, {
+          parse_mode: 'HTML',
+          reply_markup: notice.reply_markup
+        }).catch(() => {});
+        await ctx.sm?.reset(ctx.tgId, { reason: 'download_permission_denied' });
+        return;
+      }
       const b = new RichMessageBuilder();
       b.paragraph(rt.bold(banner([
         '𓆩♡𓆪 DOWNLOAD FAILED 𓆩♡𓆪',
@@ -640,6 +852,26 @@ export function createDownloaderScreen({ app }) {
     if (!q) return;
     const isGroup = Boolean(ctx.isGroup);
     const forceNew = Boolean(ctx.forceNew);
+    const api = ctx.api || app.telegram?.api;
+
+    if (isGroup && api) {
+      const caps = await checkChatMediaPermissions(api, ctx.chatId);
+      if (!caps.canSendVideos) {
+        const botUser = ctx.botUsername || app.telegram?.botUsername || 'Lancy_easy_bot';
+        const notice = formatMediaRestrictedNotice({
+          botUsername: botUser,
+          url: null,
+          mediaType: 'video clips',
+          actionTitle: 'Search in Private DM'
+        });
+        await api.sendMessage(ctx.chatId, notice.text, {
+          parse_mode: 'HTML',
+          reply_markup: notice.reply_markup
+        }).catch(() => {});
+        return;
+      }
+    }
+
     const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
     const tracker = new ProgressTracker({
       api: ctx.api || app.telegram.api,
@@ -747,24 +979,99 @@ export function createDownloaderScreen({ app }) {
       const fromMedia = Boolean(args?.includes('from_media') || ctx.fromMedia || ctx.forceNew);
       switch (action) {
         case 'open':
-          if (fromMedia) return ctx.replyRich(renderMainMenu(ctx));
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderMainMenu(ctx));
+            } catch {
+              return await ctx.reply('𓆩♡𓆪 URL DOWNLOADER STUDIO 𓆩♡𓆪\nSend any media link or use /grab <url> ♡');
+            }
+          }
           return this.open(ctx);
         case 'input':
           await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT, { context: { mode: 'url' } });
-          if (fromMedia) return ctx.replyRich(renderInputPrompt());
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderInputPrompt());
+            } catch {
+              return await ctx.reply('🌸 Send any media link to download, or use /grab <url> ♡');
+            }
+          }
           return ctx.editScreen(renderInputPrompt());
         case 'tiktokSearch':
           await ctx.sm?.transition(ctx.tgId, States.TIKTOK_SEARCH_INPUT, { context: { mode: 'tiktok' } });
-          if (fromMedia) return ctx.replyRich(renderTikTokSearchPrompt(ctx));
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderTikTokSearchPrompt(ctx));
+            } catch {
+              return await ctx.reply('🎬 Send any topic to search TikTok clips, or use /tt <topic> ♡');
+            }
+          }
           return ctx.editScreen(renderTikTokSearchPrompt(ctx));
         case 'play':
           await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
-          if (fromMedia) return ctx.replyRich(renderMusicSearchPrompt(ctx));
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderMusicSearchPrompt(ctx));
+            } catch {
+              return await ctx.reply('🎵 Send song title or artist to search & play music, or use /play <song> ♡');
+            }
+          }
           return ctx.editScreen(renderMusicSearchPrompt(ctx));
         case 'recognize':
           await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
-          if (fromMedia) return ctx.replyRich(renderAudioRecognitionPrompt());
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderAudioRecognitionPrompt());
+            } catch {
+              return await ctx.reply('🎙️ Send voice note or audio clip to identify music ♡');
+            }
+          }
           return ctx.editScreen(renderAudioRecognitionPrompt());
+        case 'more_slide':
+        case 'moreSlide':
+        case 'prev_slide':
+        case 'prevSlide': {
+          const albumKey = args[0];
+          const offset = Math.max(0, Number(args[1] || 0));
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id).catch(() => {});
+          }
+          const album = getAlbum(albumKey);
+          if (!album || !album.mediaItems?.length) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, {
+              text: '♡ Slide album session expired. Send link again to browse! ♡',
+              showAlert: true
+            }).catch(() => {});
+            return;
+          }
+
+          const { rich, files } = buildDeliveryRichMessage({
+            ...album,
+            ctx,
+            offset,
+            albumKey,
+            audioKey: album.audioKey,
+            imageKey: album.imageKey
+          });
+
+          const chatId = ctx.chatId;
+          const targetMsgId = ctx.query?.message?.message_id || ctx.messageId;
+
+          try {
+            const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+            if (sent?.message_id) {
+              if (targetMsgId && sent.message_id !== targetMsgId) {
+                await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
+              }
+              ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+              app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+              ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+            }
+          } catch (err) {
+            log.warn({ err }, 'failed to page slide album');
+          }
+          return;
+        }
         case 'lyrics': {
           const lyricKey = args[0];
           let cached = lyricsCache.get(lyricKey);
@@ -1363,7 +1670,15 @@ export function createDownloaderScreen({ app }) {
         }
         case 'to_sticker': {
           const imageKey = (args[0] || '').split(',')[0];
+          const rawOffset = parseInt(args[1], 10);
+          const offset = Number.isFinite(rawOffset) && rawOffset >= 0 ? rawOffset : 0;
           let images = getMediaImages(imageKey);
+          if (!images || images.length === 0) {
+            const album = getAlbum(imageKey);
+            if (album?.mediaItems) {
+              images = album.mediaItems.filter((m) => m.type === 'photo');
+            }
+          }
 
           if (ctx.query?.id) {
             await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎨 Turning into sticker(s)… ♡' }).catch(() => {});
@@ -1392,29 +1707,48 @@ export function createDownloaderScreen({ app }) {
             return;
           }
 
+          const STICKER_BATCH = 10;
+          const currentBatch = images.slice(offset, offset + STICKER_BATCH);
           let successCount = 0;
-          for (let i = 0; i < Math.min(images.length, 10); i++) {
+          for (let i = 0; i < currentBatch.length; i++) {
             try {
-              const stickerRes = await toTelegramStaticSticker(images[i].buffer);
+              const stickerRes = await toTelegramStaticSticker(currentBatch[i].buffer);
               if (stickerRes?.buffer) {
                 await ctx.api.sendSticker(ctx.chatId, stickerRes.buffer, { emoji: '✨' });
                 successCount++;
               }
             } catch (err) {
-              log.debug({ err: err?.message, idx: i }, 'failed to convert image to sticker');
+              log.debug({ err: err?.message, idx: offset + i }, 'failed to convert image to sticker');
             }
           }
 
           if (successCount > 0) {
             const b = new RichMessageBuilder();
+            const totalConverted = offset + successCount;
             b.paragraph(rt.bold(`✨ Created ${successCount} aesthetic sticker${successCount > 1 ? 's' : ''}! ♡`));
-            b.paragraph(rt.text('Delivered directly above as native Telegram stickers ˙ᵕ˙'));
+            b.paragraph(rt.text(`Delivered directly above as native Telegram stickers (${totalConverted} of ${images.length} photos converted) ˙ᵕ˙`));
             b.divider();
-            b.buttons([
-              richButton.callback('✦ Save to Sticker Pack', encodeCallback('stickers', 'open', ['from_media']), { style: 'primary' }),
-              richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', ['from_media']))
-            ]);
-            await ctx.replyRich(b.toJSON()).catch(() => {});
+            const stickerBtns = [];
+            const remaining = images.length - totalConverted;
+            if (remaining > 0) {
+              stickerBtns.push(
+                richButton.callback(
+                  `🎨 Convert Next ${Math.min(STICKER_BATCH, remaining)} Stickers`,
+                  encodeCallback(id, 'to_sticker', imageKey, String(totalConverted), 'from_media'),
+                  { style: 'primary' }
+                )
+              );
+            }
+            stickerBtns.push(
+              richButton.callback('✦ Save to Sticker Pack', encodeCallback('stickers', 'open', 'from_media'), { style: 'primary' })
+            );
+            stickerBtns.push(
+              richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', 'from_media'))
+            );
+            b.buttons(stickerBtns);
+            await ctx.replyRich(b.toJSON()).catch(async () => {
+              await ctx.reply(`✨ Created ${successCount} aesthetic sticker${successCount > 1 ? 's' : ''} above! ♡`);
+            });
           } else {
             await ctx.api.sendMessage(
               ctx.chatId,

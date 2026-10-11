@@ -267,12 +267,16 @@ ${stickerSection}
       const rich = render(ctx, stats, hasPfp);
       const files = pfpBuffer ? { pfp: { buffer: pfpBuffer, filename: 'pfp.jpg', contentType: 'image/jpeg' } } : null;
       if (forceNew || ctx.forceNew) {
-        const sent = await ctx.sendRichMessage(rich, {}, files);
-        if (sent?.message_id) {
-          ctx.controller?.userScreenMessage?.set(ctx.tgId, { chatId: ctx.chatId, messageId: sent.message_id });
-          ctx.sm?.update(ctx.tgId, { screenMessageId: sent.message_id });
+        try {
+          const sent = await ctx.sendRichMessage(rich, {}, files);
+          if (sent?.message_id) {
+            ctx.controller?.userScreenMessage?.set(ctx.tgId, { chatId: ctx.chatId, messageId: sent.message_id });
+            ctx.sm?.update(ctx.tgId, { screenMessageId: sent.message_id });
+          }
+          return sent;
+        } catch {
+          return await ctx.reply('𓆩♡𓆪 LANCY BOT DASHBOARD 𓆩♡𓆪\nSend /menu or /start in private DM to open full dashboard ♡');
         }
-        return sent;
       }
       return ctx.editScreen(rich, {}, files);
     },

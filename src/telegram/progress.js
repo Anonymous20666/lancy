@@ -1,6 +1,7 @@
 import { throttle } from '../utils/time.js';
 import { logger } from '../core/logger.js';
 import { ActionIndicator } from './indicator.js';
+import { isPermissionError, recordChatPermissionRestriction, formatMediaRestrictedNotice } from './permissions.js';
 
 /**
  * ProgressTracker — ONE editable Rich Message that streams live progress.
@@ -127,11 +128,34 @@ export class ProgressTracker {
     this.#edit.cancel?.();
   }
 
+  async #handlePermissionDenied() {
+    recordChatPermissionRestriction(this.chatId, { canSendPhotos: false, canSendVideos: false });
+    if (this.messageId) {
+      const prevId = this.messageId;
+      this.messageId = null;
+      await this.api.deleteMessage(this.chatId, prevId).catch(() => {});
+    }
+    const botUser = this.api.botUsername || this.api.me?.username || 'Lancy_easy_bot';
+    const notice = formatMediaRestrictedNotice({
+      botUsername: botUser,
+      url: this.state?.url || null
+    });
+    return await this.api.sendMessage(this.chatId, notice.text, {
+      parse_mode: 'HTML',
+      reply_markup: notice.reply_markup
+    }).catch(() => null);
+  }
+
   /** Final edit + unthrottle. Optional files for media-bearing final cards. */
   async finish(richMessage, files = null) {
     this.#stop();
     if (!this.messageId) {
-      const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch(() => null);
+      const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch(async (err) => {
+        if (isPermissionError(err)) {
+          return await this.#handlePermissionDenied();
+        }
+        return null;
+      });
       this.messageId = sent?.message_id ?? null;
       return sent;
     }
@@ -141,10 +165,16 @@ export class ProgressTracker {
       return res;
     } catch (error) {
       if (/not modified/i.test(String(error?.description ?? error?.message))) return null;
+      if (isPermissionError(error)) {
+        return await this.#handlePermissionDenied();
+      }
       // Message vanished (user deleted it) or could not be edited with media → send a fresh one.
       const prevMsgId = this.messageId;
-      const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch((err) => {
+      const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch(async (err) => {
         this.log.warn({ err }, 'final progress edit failed');
+        if (isPermissionError(err)) {
+          return await this.#handlePermissionDenied();
+        }
         return null;
       });
       if (prevMsgId && sent?.message_id && sent.message_id !== prevMsgId) {

@@ -137,6 +137,10 @@ export class TelegramAPI {
     return this.call('getChat', { chat_id: chatId });
   }
 
+  getChatMember(chatId, userId) {
+    return this.call('getChatMember', { chat_id: chatId, user_id: userId });
+  }
+
   get botUsername() {
     return this.me?.username ?? '';
   }

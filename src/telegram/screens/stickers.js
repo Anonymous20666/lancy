@@ -61,13 +61,17 @@ export function createStickersScreen({ app }) {
         return await app.telegram.api.editMessageRich(chatId, messageId, rich, {}, files);
       } catch (err) {
         if (!/message is not modified/i.test(err?.message)) {
-          return await app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+          return await app.telegram.api.sendRichMessage(chatId, rich, {}, files).catch(async () => {
+            return await app.telegram.api.sendMessage(chatId, '𓆩♡𓆪 TG STICKERS 𓆩♡𓆪\nSend /stickers in private DM to open sticker studio ♡');
+          });
         }
         return;
       }
     }
     if (chatId) {
-      return await app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+      return await app.telegram.api.sendRichMessage(chatId, rich, {}, files).catch(async () => {
+        return await app.telegram.api.sendMessage(chatId, '𓆩♡𓆪 TG STICKERS 𓆩♡𓆪\nSend /stickers in private DM to open sticker studio ♡');
+      });
     }
   }
 
