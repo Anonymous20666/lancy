@@ -1082,14 +1082,21 @@ export class MediaDownloader {
       // 1. YouTube Primary Search (ytsearch5 ranked by query relevance)
       const queryTerms = clean.toLowerCase().split(/\s+/).filter(Boolean);
       try {
-        const { stdout } = await execFileAsync('yt-dlp', [
-          '--no-warnings',
-          '--js-runtimes', 'node:/usr/bin/node',
-          '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(upload_date)s ||| %(thumbnail)s',
-          `ytsearch5:${clean}`
-        ], { timeout: 15000 });
+        let stdout = '';
+        try {
+          const res = await execFileAsync('yt-dlp', [
+            '--no-warnings',
+            '--js-runtimes', 'node:/usr/bin/node',
+            '--ignore-errors',
+            '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(upload_date)s ||| %(thumbnail)s',
+            `ytsearch5:${clean}`
+          ], { timeout: 15000 });
+          stdout = res.stdout || '';
+        } catch (ytErr) {
+          stdout = ytErr.stdout || '';
+        }
 
-        const lines = stdout.trim().split('\n').filter(Boolean);
+        const lines = stdout.trim().split('\n').filter((l) => l.includes(' ||| '));
         const candidates = [];
 
         for (const line of lines) {
@@ -1168,6 +1175,7 @@ export class MediaDownloader {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
             '--js-runtimes', 'node:/usr/bin/node',
+            '--ignore-errors',
             '--extractor-args', 'youtube:player_client=android,web',
             '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
             '-f', 'ba/b',
@@ -1191,6 +1199,7 @@ export class MediaDownloader {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
             '--js-runtimes', 'node:/usr/bin/node',
+            '--ignore-errors',
             '--extractor-args', 'youtube:player_client=android,web',
             '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
             '-f', 'ba/b',

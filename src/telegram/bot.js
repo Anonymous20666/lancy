@@ -376,14 +376,21 @@ export class TelegramController extends EventEmitter {
     // 3. Fallback to yt-dlp search if external catalogs return nothing
     try {
       const searchTarget = `ytsearch5:${clean} song audio`;
-      const { stdout } = await execFileAsync('yt-dlp', [
-        '--no-warnings',
-        '--js-runtimes', 'node:/usr/bin/node',
-        '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(thumbnail)s',
-        searchTarget
-      ], { timeout: 4000 });
+      let stdout = '';
+      try {
+        const res = await execFileAsync('yt-dlp', [
+          '--no-warnings',
+          '--js-runtimes', 'node:/usr/bin/node',
+          '--ignore-errors',
+          '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(thumbnail)s',
+          searchTarget
+        ], { timeout: 4500 });
+        stdout = res.stdout || '';
+      } catch (err) {
+        stdout = err.stdout || '';
+      }
 
-      const lines = stdout.trim().split('\n').filter(Boolean);
+      const lines = stdout.trim().split('\n').filter((l) => l.includes(' ||| '));
       const items = [];
       for (const line of lines) {
         const parts = line.split(' ||| ');
@@ -463,8 +470,20 @@ export class TelegramController extends EventEmitter {
           try {
             const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
             this.db.prepare(sql).run(cleanKey, fileId, songTitle, songArtist, durSec);
-            if (songTitle && songTitle.toLowerCase().trim() !== cleanKey) {
-              this.db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
+            const lowerTitle = (songTitle || '').toLowerCase().trim();
+            const lowerArtist = (songArtist || '').toLowerCase().trim();
+            if (lowerTitle && lowerTitle !== cleanKey) {
+              this.db.prepare(sql).run(lowerTitle, fileId, songTitle, songArtist, durSec);
+            }
+            if (lowerTitle && lowerArtist) {
+              const combo1 = `${lowerTitle} ${lowerArtist}`.trim();
+              const combo2 = `${lowerArtist} ${lowerTitle}`.trim();
+              if (combo1 !== cleanKey && combo1 !== lowerTitle) {
+                this.db.prepare(sql).run(combo1, fileId, songTitle, songArtist, durSec);
+              }
+              if (combo2 !== cleanKey && combo2 !== lowerTitle && combo2 !== combo1) {
+                this.db.prepare(sql).run(combo2, fileId, songTitle, songArtist, durSec);
+              }
             }
           } catch {}
           return fileId;
@@ -1434,21 +1453,34 @@ export class TelegramController extends EventEmitter {
       const lookupCached = () => {
         try {
           const rows = this.db.prepare(
-            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 50'
+            'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks ORDER BY id DESC LIMIT 200'
           ).all();
           const seen = new Set();
-          return (rows || []).filter((row) => {
-            if (seen.has(row.file_id)) return false;
+          const matches = [];
+
+          for (const row of rows || []) {
+            if (!row?.file_id) continue;
+            const normKey = `${(row.title || '').toLowerCase().trim()} ${(row.artist || '').toLowerCase().trim()}`.trim();
+            if (seen.has(row.file_id) || (normKey && seen.has(normKey))) continue;
+
             const rowQuery = (row.query || '').toLowerCase().trim();
-            if (rowQuery === cleanSongQuery.toLowerCase().trim()) {
+            const rowTitle = (row.title || '').toLowerCase().trim();
+            const rowArtist = (row.artist || '').toLowerCase().trim();
+            const cleanLower = cleanSongQuery.toLowerCase().trim();
+
+            const isExact = rowQuery === cleanLower || rowTitle === cleanLower || `${rowTitle} ${rowArtist}` === cleanLower || `${rowArtist} ${rowTitle}` === cleanLower;
+            const rowText = `${rowQuery} ${rowTitle} ${rowArtist}`;
+            const termsMatch = queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
+
+            if (isExact || termsMatch) {
               seen.add(row.file_id);
-              return true;
+              if (normKey) seen.add(normKey);
+              matches.push({ ...row, isExact });
             }
-            const rowText = `${rowQuery} ${row.title || ''} ${row.artist || ''}`.toLowerCase();
-            const matches = queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
-            if (matches) seen.add(row.file_id);
-            return matches;
-          }).slice(0, 4);
+          }
+
+          matches.sort((a, b) => (b.isExact ? 1 : 0) - (a.isExact ? 1 : 0));
+          return matches.slice(0, 10);
         } catch {
           return [];
         }
@@ -1458,76 +1490,39 @@ export class TelegramController extends EventEmitter {
 
       // If not yet cached and query has at least 2 chars, synchronously cache top track so it delivers 100% full audio
       if (cachedAudioRows.length === 0 && cleanSongQuery.length >= 2) {
-        await this.#cacheAudioTrack(cleanSongQuery, 2500);
+        await this.#cacheAudioTrack(cleanSongQuery, 3500);
         cachedAudioRows = lookupCached();
       }
 
-      const cachedResults = (cachedAudioRows || []).map((row, idx) => ({
-        type: 'audio',
-        id: `cached_aud_${row.file_id.slice(-8)}_${idx}`,
-        audio_file_id: row.file_id,
-        title: row.title,
-        performer: row.artist || 'Music',
-        ...(row.duration ? { audio_duration: row.duration } : {}),
-        caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n✨ <i>Full Audio (100%) via @${this.botUsername || 'Lancy_easy_bot'} ♡</i>`,
-        parse_mode: 'HTML',
-        reply_markup: {
-          inline_keyboard: [
-            [
-              {
-                text: '✨ 📥 Full MP3 & Lyrics ♡',
-                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`,
-                style: 'primary'
-              }
-            ]
-          ]
-        }
-      }));
+      const cachedResults = (cachedAudioRows || []).map((row, idx) => {
+        const durSec = row.duration || 0;
+        const min = Math.floor(durSec / 60);
+        const sec = String(durSec % 60).padStart(2, '0');
+        const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
+        const botUser = this.botUsername || 'Lancy_easy_bot';
 
-      let searchItems = inlineSearchCache.get(cleanSongQuery.toLowerCase());
-      if (!searchItems) {
-        searchItems = await this.#fetchInlineMusicTracks(cleanSongQuery);
-        if (searchItems?.length) {
-          inlineSearchCache.set(cleanSongQuery.toLowerCase(), searchItems);
-          if (inlineSearchCache.size > 200) {
-            const firstKey = inlineSearchCache.keys().next().value;
-            inlineSearchCache.delete(firstKey);
-          }
-        }
-      }
-
-      // Filter out tracks that are already in cachedResults to prevent duplicate entries
-      const cachedTrackKeys = new Set(cachedAudioRows.map((r) => `${(r.title || '').toLowerCase()} ${(r.artist || '').toLowerCase()}`.trim()));
-      const filteredSearchItems = (searchItems || []).filter((item) => {
-        const itemKey = `${(item.title || '').toLowerCase()} ${(item.artist || '').toLowerCase()}`.trim();
-        return !cachedTrackKeys.has(itemKey);
-      });
-
-      const freshResults = filteredSearchItems.slice(0, 6).map((item, index) => {
-        const title = item.title || cleanSongQuery;
-        const artist = item.artist || 'Music';
-        const duration = item.duration ? `⏱ ${item.duration}` : '🎵 Full Audio Track';
-
-        // NOTE: We deliberately do NOT return 30-second preview clips as type: 'audio'
-        // Every audio result must be 100% full song via audio_file_id.
-        // Secondary suggestions are delivered as interactive cards with 1-tap full download buttons.
         return {
-          type: 'article',
-          id: `song_${item.id || index}_${Date.now()}`,
-          title: `🎵 ${title}`,
-          description: `🎧 ${artist} • ${duration} ♡ (Tap to download full audio)`,
-          thumb_url: item.thumbnail || undefined,
-          thumbnail_url: item.thumbnail || undefined,
-          input_message_content: {
-            message_text: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>✨ <i>Full Audio Track • Tap below to play/download! ♡</i></blockquote>`,
-            parse_mode: 'HTML'
-          },
+          type: 'audio',
+          id: `cached_aud_${row.file_id.slice(-8)}_${idx}`,
+          audio_file_id: row.file_id,
+          title: row.title,
+          performer: row.artist || 'Music',
+          ...(durSec > 0 ? { audio_duration: durSec } : {}),
+          caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
+          parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
               [
                 {
-                  text: '✨ 📥 Download Full MP3 ♡',
-                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                  text: '📜 Lyrics & Info ♡',
+                  url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(row.title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                  style: 'primary'
+                }
+              ],
+              [
+                {
+                  text: '🎵 Search Music Live',
+                  switch_inline_query_current_chat: '',
                   style: 'primary'
                 }
               ]
@@ -1536,7 +1531,37 @@ export class TelegramController extends EventEmitter {
         };
       });
 
-      const results = [...cachedResults, ...freshResults];
+      let results = cachedResults;
+
+      // If no cached tracks yet, trigger background caching and show interactive live refresh card
+      if (results.length === 0 && cleanSongQuery.length >= 2) {
+        this.#cacheAudioTrack(cleanSongQuery, 100).catch(() => {});
+
+        const botUser = this.botUsername || 'Lancy_easy_bot';
+        results = [{
+          type: 'article',
+          id: `music_prep_${Date.now()}`,
+          title: `⏳ Loading "${cleanSongQuery.slice(0, 40)}"…`,
+          description: `Preparing 100% full audio track… Tap button below to drop audio! ♡`,
+          thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+          thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+          input_message_content: {
+            message_text: `🎵 <b>Preparing Audio:</b> <code>${escapeHtml(cleanSongQuery)}</code>\n<blockquote>⏳ <i>Downloading full 320k audio track to Telegram CDN…\nTap button below to drop playable audio into chat! ♡</i></blockquote>`,
+            parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '🔄 🎵 Drop Full Audio Track ♡',
+                  switch_inline_query_current_chat: cleanSongQuery,
+                  style: 'primary'
+                }
+              ]
+            ]
+          }
+        }];
+      }
 
       // 5. If no music results and query is generic, fall back to Pinterest pictures
       if (results.length === 0 && cleanSongQuery.length >= 2) {
@@ -1552,36 +1577,10 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      if (results.length === 0) {
-        results.push({
-          type: 'article',
-          id: 'manual_' + Date.now(),
-          title: `🎵 Play "${cleanSongQuery}"`,
-          description: `Download high-speed MP3 audio with cover art & lyrics ♡`,
-          thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
-          thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
-          input_message_content: {
-            message_text: `<blockquote>🎵 <b>Music Search</b>\nQuery: <code>${escapeHtml(cleanSongQuery)}</code>\n\nTip: Send <code>/play ${escapeHtml(cleanSongQuery)}</code> in this chat to stream! ♡</blockquote>`,
-            parse_mode: 'HTML'
-          },
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '✨ 📥 Download Full MP3 ♡',
-                  url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=play_${encodeURIComponent(cleanSongQuery.replace(/\s+/g, '_')).slice(0, 32)}`,
-                  style: 'primary'
-                }
-              ]
-            ]
-          }
-        });
-      }
-
       const answerPayload = {
         inline_query_id: qId,
         results,
-        cache_time: 15,
+        cache_time: results[0]?.type === 'audio' ? 30 : 2,
         is_personal: false
       };
 
@@ -1845,6 +1844,17 @@ export class TelegramController extends EventEmitter {
             await this.sm.reset(tgId, { reason: 'start_play' });
             const downloaderScreen = this.screens.get('downloader');
             await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), cleanQuery);
+            return;
+          }
+        }
+        if (startPayload && /^lyrics_/i.test(startPayload)) {
+          const rawQuery = startPayload.replace(/^lyrics_/i, '').replace(/_/g, ' ').trim();
+          let cleanQuery = rawQuery;
+          try { cleanQuery = decodeURIComponent(rawQuery); } catch {}
+          if (cleanQuery) {
+            await this.sm.reset(tgId, { reason: 'start_lyrics' });
+            const downloaderScreen = this.screens.get('downloader');
+            await downloaderScreen?.handle(this.#ctx(tgId, { message }, { forceNew: true }), 'lyrics', [cleanQuery]);
             return;
           }
         }

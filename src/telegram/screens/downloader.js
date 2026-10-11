@@ -575,16 +575,21 @@ export function createDownloaderScreen({ app }) {
           const parsedDur = parseDurationToSeconds(audioTrack?.duration || result.duration) || 0;
           const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
           const cleanQuery = (url || '').toLowerCase().trim();
-          if (typeof db?.run === 'function') {
-            db.run(sql, cleanQuery, richAudioFileId, songTitle, songPerformer, parsedDur);
-            if (songTitle && songTitle.toLowerCase() !== cleanQuery) {
-              db.run(sql, songTitle.toLowerCase().trim(), richAudioFileId, songTitle, songPerformer, parsedDur);
-            }
-          } else if (typeof db?.prepare === 'function') {
-            db.prepare(sql).run(cleanQuery, richAudioFileId, songTitle, songPerformer, parsedDur);
-            if (songTitle && songTitle.toLowerCase() !== cleanQuery) {
-              db.prepare(sql).run(songTitle.toLowerCase().trim(), richAudioFileId, songTitle, songPerformer, parsedDur);
-            }
+          const cleanTitle = (songTitle || '').toLowerCase().trim();
+          const cleanArtist = (songPerformer || '').toLowerCase().trim();
+          const dbExec = (q, f, t, a, d) => {
+            if (typeof db?.run === 'function') db.run(sql, q, f, t, a, d);
+            else if (typeof db?.prepare === 'function') db.prepare(sql).run(q, f, t, a, d);
+          };
+          if (cleanQuery) dbExec(cleanQuery, richAudioFileId, songTitle, songPerformer, parsedDur);
+          if (cleanTitle && cleanTitle !== cleanQuery) {
+            dbExec(cleanTitle, richAudioFileId, songTitle, songPerformer, parsedDur);
+          }
+          if (cleanTitle && cleanArtist) {
+            const combo1 = `${cleanTitle} ${cleanArtist}`.trim();
+            const combo2 = `${cleanArtist} ${cleanTitle}`.trim();
+            if (combo1 !== cleanQuery && combo1 !== cleanTitle) dbExec(combo1, richAudioFileId, songTitle, songPerformer, parsedDur);
+            if (combo2 !== cleanQuery && combo2 !== cleanTitle && combo2 !== combo1) dbExec(combo2, richAudioFileId, songTitle, songPerformer, parsedDur);
           }
         } catch {}
       }
@@ -762,7 +767,7 @@ export function createDownloaderScreen({ app }) {
             } catch {}
           }
 
-          // If still not found (e.g. from an older message), inspect message text/caption
+          // If still not found (e.g. from an older message), inspect message text/caption first
           if (!cached || !cached.title || cached.title.toLowerCase() === 'song') {
             const msgText = String(ctx.query?.message?.text || ctx.query?.message?.caption || '');
             const titleMatch = msgText.match(/🎵\s*Title\s*\n\s*([^\n]+)/i);
@@ -772,6 +777,14 @@ export function createDownloaderScreen({ app }) {
                 title: titleMatch[1].replace(/[…\.]+$/, '').trim(),
                 artist: (artistMatch && artistMatch[1]) ? artistMatch[1].replace(/[…\.]+$/, '').trim() : ''
               };
+            }
+          }
+
+          // If still not found (e.g. from deep-link), inspect lyricKey
+          if ((!cached || !cached.title) && lyricKey) {
+            const cleanKeyTitle = String(lyricKey).replace(/_/g, ' ').trim();
+            if (cleanKeyTitle.length > 1 && !/^[0-9a-f]{6,}$/i.test(lyricKey) && !lyricKey.includes('key')) {
+              cached = { title: cleanKeyTitle, artist: '' };
             }
           }
 

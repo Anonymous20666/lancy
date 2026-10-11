@@ -843,4 +843,115 @@ test('DownloaderScreen: main menu includes TikTok search button and executes Tik
   db.close();
 });
 
+test('TelegramController: live inline audio drops 100% full audio player with rich blockquote and lyrics deep link', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [1001];
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot', first_name: 'Lancy' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  db.prepare(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      artist TEXT,
+      duration INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `).run();
+
+  // Seed cached track
+  db.prepare('INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)').run(
+    'hold out lithe',
+    'CQACAgQAAxkDAAIDh2rKreV6zQqdL9tRalLAbHHeDzPlAAJEIQACZahRUnAynHRyR1PXPQQ',
+    'Hold Out',
+    'Lithe',
+    121
+  );
+
+  let lyricsHandled = null;
+  const screens = new Map();
+  screens.set('downloader', {
+    handle: async (ctx, action, args) => {
+      if (action === 'lyrics') {
+        lyricsHandled = args[0];
+        return { message_id: 555 };
+      }
+    }
+  });
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens,
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // 1. Live inline search for Lithe
+  await controller.handleInlineQuery({
+    id: 'query_lithe_live',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'Lithe',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.equal(inlineAnswer.results.length, 1, 'should return exactly 1 cached audio track without article duplicates');
+
+  const audioItem = inlineAnswer.results[0];
+  assert.equal(audioItem.type, 'audio', 'must deliver native audio type to drop player into chat');
+  assert.equal(audioItem.audio_file_id, 'CQACAgQAAxkDAAIDh2rKreV6zQqdL9tRalLAbHHeDzPlAAJEIQACZahRUnAynHRyR1PXPQQ');
+  assert.equal(audioItem.title, 'Hold Out');
+  assert.equal(audioItem.performer, 'Lithe');
+  assert.equal(audioItem.audio_duration, 121);
+
+  // Check rich caption formatting
+  assert.ok(audioItem.caption.includes('<blockquote>'), 'caption must include rich blockquote');
+  assert.ok(audioItem.caption.includes('<b>Duration:</b> 2:01'), 'caption must display formatted duration');
+  assert.ok(audioItem.caption.includes('320 kbps HD'), 'caption must display audio quality');
+
+  // Check inline buttons
+  const buttons = audioItem.reply_markup.inline_keyboard;
+  assert.equal(buttons.length, 2, 'must have 2 button rows');
+  assert.equal(buttons[0][0].text, '📜 Lyrics & Info ♡');
+  assert.match(buttons[0][0].url, /start=lyrics_Hold_Out/);
+  assert.equal(buttons[0][0].style, 'primary');
+
+  assert.equal(buttons[1][0].text, '🎵 Search Music Live');
+  assert.equal(buttons[1][0].switch_inline_query_current_chat, '');
+  assert.equal(buttons[1][0].style, 'primary');
+
+  // 2. Test /start lyrics_Hold_Out deep-link execution
+  await controller.handleUpdate({
+    update_id: 101,
+    message: {
+      message_id: 111,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: 1001, type: 'private' },
+      text: '/start lyrics_Hold_Out'
+    }
+  });
+
+  assert.equal(lyricsHandled, 'Hold Out', 'deep-link should pass clean song title to lyrics handler');
+
+  db.close();
+});
+
 
