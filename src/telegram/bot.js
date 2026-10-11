@@ -2582,7 +2582,7 @@ export class TelegramController extends EventEmitter {
     const chatId = message.chat.id;
 
     // Commands
-    const rawText = message.text ?? '';
+    const rawText = message.text ?? message.caption ?? '';
     let text = rawText.trim();
     if (/^(rm\s*bot|remove\s*bot|delete\s*bot)(\s+.*)?$/i.test(text)) {
       text = text.replace(/^(rm\s*bot|remove\s*bot|delete\s*bot)/i, '/rmbot');
@@ -2883,7 +2883,20 @@ export class TelegramController extends EventEmitter {
       if (command === '/lyrics') {
         const query = rest.join(' ').trim();
         if (!query) {
+          const downloaderScreen = this.screens.get('downloader');
+          if (downloaderScreen?.handle) {
+            const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+            const sent = await downloaderScreen.handle(ctx, 'searchLyrics', []);
+            updateScreenMsg(sent);
+            return;
+          }
           await this.api.sendMessage(chatId, '♡ Usage: `/lyrics <song title>` or `/lyrics <artist> - <song>` or `/lyrics <lyrics snippet>` ♡');
+          return;
+        }
+        const downloaderScreen = this.screens.get('downloader');
+        if (downloaderScreen?.executeLyricsSearch) {
+          const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+          await downloaderScreen.executeLyricsSearch(ctx, query);
           return;
         }
         const lyricsRes = await getLyrics(query);
@@ -3041,18 +3054,6 @@ export class TelegramController extends EventEmitter {
 
     // Route to the state machine (flows handle text/photos/documents).
     try {
-      // Check if user uploaded/sent a video, audio file, or voice note for music recognition:
-      const recMedia = extractMediaForMusicRecognition(message);
-      if (recMedia && recMedia.obj?.file_id) {
-        const currentState = this.sm.state(tgId);
-        // Only recognize music if user is explicitly in the downloader or music input flow
-        if (currentState === States.URL_DOWNLOADER_INPUT || currentState === States.MUSIC_SEARCH_INPUT) {
-          const ctx = this.#ctx(tgId, { message });
-          await this.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
-          return;
-        }
-      }
-
       const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
       const isPrivate = !isGroup;
 
@@ -3071,17 +3072,39 @@ export class TelegramController extends EventEmitter {
         (botUsername && new RegExp(`@?${botUsername}\\b`, 'i').test(text))
       );
 
+      // Check if user uploaded/sent a video, audio file, or voice note for music recognition:
+      const recMedia = extractMediaForMusicRecognition(message);
+      if (recMedia && recMedia.obj?.file_id) {
+        const currentState = this.sm.state(tgId);
+        // Only recognize music if user is explicitly in the downloader or music input flow.
+        // In group chats: interactive menu inputs REQUIRE replying to the bot or tagging the bot!
+        const canListen = isPrivate || isReplyToBot || isTag;
+        if (canListen && (currentState === States.URL_DOWNLOADER_INPUT || currentState === States.MUSIC_SEARCH_INPUT)) {
+          const ctx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
+          await this.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
+          return;
+        }
+      }
+
       // In DM (private chat): state inputs work directly without needing to quote or tag!
       // In Group Chat: interactive prompt input requires replying to the bot or tagging @bot
       // to avoid chat conflicts when group members talk with each other.
       const shouldHandleState = isPrivate || isReplyToBot || isTag;
-      const ctx = this.#ctx(tgId, { message });
+      const ctx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
       const handled = shouldHandleState ? await this.sm.handleMessage(tgId, { ...message, chatId }, ctx) : false;
       if (!handled) {
         if (text) {
           // Check if message is a reply to the bot's prompt cards in group or private chat:
           if (isReplyToBot || isPrivate) {
             const promptText = String(message.reply_to_message?.text || message.reply_to_message?.caption || '');
+            if (isReplyToBot && /SEARCH SONG LYRICS|search any song lyrics/i.test(promptText)) {
+              const downloaderScreen = this.screens.get('downloader');
+              if (downloaderScreen?.executeLyricsSearch) {
+                const dlCtx = this.#ctx(tgId, { message }, { forceNew: true });
+                await downloaderScreen.executeLyricsSearch(dlCtx, text);
+                return;
+              }
+            }
             if (isReplyToBot && /PLAY & DOWNLOAD MUSIC|how to play & download|Search Music Live|song title & artist/i.test(promptText)) {
               const downloaderScreen = this.screens.get('downloader');
               if (downloaderScreen?.executeDownload) {

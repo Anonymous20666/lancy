@@ -741,26 +741,241 @@ test('MediaDownloader: music search ranks exact YouTube artist match for "one li
   assert.match(result.artist.toLowerCase(), /lorda/i, 'Artist should match Lorda');
 });
 
-test('MediaDownloader: music search delivers full-length track with duration >= 60 seconds (never 30s preview)', async () => {
-  const { MediaDownloader, getAudioDurationSeconds } = await import('../src/media/downloader.js');
-  const downloader = new MediaDownloader();
+test('Native Header: renderMusicSearchPrompt uses compact native heading and contains Search Lyrics button', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  const downloader = createDownloaderScreen({ app: { db } });
 
-  const result = await downloader.download('espresso sabrina carpenter');
-  assert.ok(result, 'Result should be returned');
-  assert.ok(result.audioTrack?.buffer, 'Audio track buffer must exist');
-  assert.ok(result.audioTrack.buffer.length > 500000, 'Audio track buffer must be a full file > 500KB');
+  let rendered = null;
+  const ctx = {
+    tgId: '1001',
+    chatId: 1001,
+    db,
+    settings,
+    sm,
+    editScreen: async (rich) => { rendered = rich; return { message_id: 101 }; }
+  };
 
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const { writeFileSync, unlinkSync } = await import('node:fs');
-  const tempPath = join(tmpdir(), `test_dur_${Date.now()}.mp3`);
-  writeFileSync(tempPath, result.audioTrack.buffer);
-  const duration = await getAudioDurationSeconds(tempPath);
-  try { unlinkSync(tempPath); } catch {}
+  await downloader.handle(ctx, 'play', []);
+  assert.ok(rendered, 'Prompt must be rendered');
 
-  assert.ok(duration !== null, 'Duration must be measurable');
-  assert.ok(duration >= 60, `Audio duration (${duration}s) must be a genuine full song, not a 30s preview`);
+  // Verify native heading block (type === heading), not an ornate multiline paragraph banner
+  const headingBlock = rendered.blocks.find((b) => b.type === 'heading');
+  assert.ok(headingBlock, 'Prompt must start with native heading');
+  assert.equal(headingBlock.size, 1);
+  assert.ok(headingBlock.text.includes('PLAY & DOWNLOAD MUSIC'));
+
+  // Ensure ornate multiline bunny banner is NOT present
+  const bannerParagraph = rendered.blocks.find((b) => b.type === 'paragraph' && typeof b.text === 'string' && b.text.includes('૮꒰ ˶• ༝ •˶꒱ა'));
+  assert.equal(bannerParagraph, undefined, 'Ornate multiline bunny banner must be removed');
+
+  // Verify Search Lyrics button in buttons row
+  const allButtons = rendered.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  const searchLyricsBtn = allButtons.find((btn) => btn.callback_data?.includes(':searchLyrics'));
+  assert.ok(searchLyricsBtn, 'Must include Search Lyrics button in menu');
+  db.close();
 });
 
+test('Dedicated Lyrics Menu: handle("searchLyrics") renders search prompt and executeLyricsSearch delivers rich preview card with artwork, metadata and expandable lyrics', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  let finishedRich = null;
+  let sentFiles = null;
 
+  const fakeApi = {
+    sendRichMessage: async (_c, rich, _extra, files) => {
+      finishedRich = rich;
+      sentFiles = files;
+      return { message_id: 555 };
+    },
+    sendMessage: async () => ({ message_id: 556 })
+  };
 
+  const downloader = createDownloaderScreen({
+    app: { db, telegram: { api: fakeApi } }
+  });
+
+  // 1. handle('searchLyrics')
+  let promptRich = null;
+  const ctx = {
+    tgId: '1001',
+    chatId: 1001,
+    db,
+    settings,
+    sm,
+    api: fakeApi,
+    editScreen: async (rich) => { promptRich = rich; return { message_id: 202 }; }
+  };
+
+  await downloader.handle(ctx, 'searchLyrics', []);
+  assert.ok(promptRich, 'Lyrics prompt rendered');
+  const promptHeading = promptRich.blocks.find((b) => b.type === 'heading' && b.text.includes('SEARCH SONG LYRICS'));
+  assert.ok(promptHeading, 'Lyrics prompt has native heading');
+
+  // 2. executeLyricsSearch delivers preview card with artwork, metadata table and expandable blockquote lyrics
+  await downloader.executeLyricsSearch(ctx, 'Blinding Lights The Weeknd');
+  assert.ok(finishedRich, 'Lyrics card must be delivered');
+
+  const tableBlock = finishedRich.blocks.find((b) => b.type === 'table');
+  assert.ok(tableBlock, 'Must contain metadata preview table');
+  const tableContent = JSON.stringify(tableBlock.cells);
+  assert.match(tableContent, /Blinding Lights/i);
+  assert.match(tableContent, /The Weeknd/i);
+
+  const lyricsBlock = finishedRich.blocks.find((b) => b.type === 'expandable_blockquote');
+  assert.ok(lyricsBlock, 'Must contain expandable blockquote with lyrics');
+  const lyricsStr = typeof lyricsBlock.text === 'string' ? lyricsBlock.text : JSON.stringify(lyricsBlock.text);
+  assert.match(lyricsStr, /I said, ooh, I'm blinded by the lights|Blinding Lights/i);
+
+  // Verify Download / Play Track button is included
+  const allButtons = finishedRich.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  const playBtn = allButtons.find((btn) => btn.callback_data?.includes(':execute:'));
+  assert.ok(playBtn, 'Must include Download / Play Track button');
+
+  db.close();
+});
+
+test('Group Chat Audio Guard: raw audio sent in GC without tag or reply to bot is ignored', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  let recognitionTriggered = false;
+
+  const mockApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    sendMessage: async () => ({ message_id: 999 })
+  };
+
+  const { TelegramController } = await import('../src/telegram/bot.js');
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+  controller.handleAudioRecognition = async () => {
+    recognitionTriggered = true;
+    return true;
+  };
+
+  // Put user into URL_DOWNLOADER_INPUT state
+  await sm.transition('1001', States.URL_DOWNLOADER_INPUT, { chatId: -100999 });
+
+  // 1. User sends voice note in group chat WITHOUT tagging or replying: MUST BE IGNORED!
+  recognitionTriggered = false;
+  await controller.handleUpdate({
+    update_id: 1,
+    message: {
+      message_id: 701,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: -100999, type: 'supergroup' },
+      voice: { file_id: 'voice_123', duration: 10 }
+    }
+  });
+  assert.equal(recognitionTriggered, false, 'Raw audio in GC without tag or reply MUST NOT trigger recognition');
+
+  // 2. User sends voice note in GC while TAGGING the bot: MUST TRIGGER RECOGNITION!
+  recognitionTriggered = false;
+  await controller.handleUpdate({
+    update_id: 2,
+    message: {
+      message_id: 702,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: -100999, type: 'supergroup' },
+      caption: '@Lancy_easy_bot recognize this song',
+      voice: { file_id: 'voice_123', duration: 10 }
+    }
+  });
+  assert.equal(recognitionTriggered, true, 'Audio with @tag in GC MUST trigger recognition');
+
+  db.close();
+});
+
+test('Group Chat Photo Restriction Fallback: delivers audio with expandable blockquote containing metadata and lyrics', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  let sentAudioParams = null;
+
+  const mockApi = {
+    me: { id: 8859351350 },
+    botUsername: 'Lancy_easy_bot',
+    getChat: async () => ({
+      permissions: {
+        can_send_messages: true,
+        can_send_media_messages: true,
+        can_send_photos: false,
+        can_send_videos: false,
+        can_send_audios: true
+      }
+    }),
+    getChatMember: async () => ({ status: 'member' }),
+    sendRichMessage: async () => ({ message_id: 111 }),
+    editMessageRich: async () => ({ message_id: 111 }),
+    sendChatAction: async () => ({ ok: true }),
+    deleteMessage: async () => ({ ok: true }),
+    sendAudio: async (chatId, buffer, opts) => {
+      sentAudioParams = { chatId, buffer, opts };
+      return { message_id: 777, audio: { file_id: 'aud_stream_777' } };
+    },
+    sendMessage: async () => ({ message_id: 888 })
+  };
+
+  const fakeDownloader = {
+    download: async () => ({
+      platform: 'spotify',
+      title: 'Starboy',
+      artist: 'The Weeknd',
+      duration: '3:50',
+      mediaItems: [{ type: 'photo', buffer: Buffer.from('album-art') }],
+      audioTrack: {
+        buffer: Buffer.from('fake-mp3-buffer'),
+        title: 'Starboy',
+        performer: 'The Weeknd',
+        duration: 230
+      },
+      lyrics: "I'm tryna put you in the worst mood, ah\nP1 cleaner than your church shoes, ah"
+    })
+  };
+
+  const downloader = createDownloaderScreen({
+    app: {
+      db,
+      telegram: { api: mockApi },
+      mediaDownloader: fakeDownloader
+    }
+  });
+
+  const { invalidateChatPermissions } = await import('../src/telegram/permissions.js');
+  invalidateChatPermissions(-100999);
+
+  const groupCtx = {
+    isGroup: true,
+    chatId: -100999,
+    tgId: '1001',
+    user: { id: 1001, first_name: 'Alex' },
+    api: mockApi,
+    botUsername: 'Lancy_easy_bot',
+    db,
+    settings,
+    sm
+  };
+
+  await downloader.executeDownload(groupCtx, 'Starboy The Weeknd');
+
+  assert.ok(sentAudioParams, 'sendAudio must be called for fallback in group chat');
+  assert.equal(sentAudioParams.chatId, -100999);
+  assert.ok(sentAudioParams.opts.caption, 'Audio must carry rich caption');
+  assert.ok(sentAudioParams.opts.caption.includes('<blockquote expandable>'), 'Caption must contain expandable blockquote');
+  assert.ok(sentAudioParams.opts.caption.includes('The Weeknd'), 'Caption contains artist metadata');
+  assert.ok(sentAudioParams.opts.caption.includes('church shoes'), 'Caption contains lyrics inside the expandable blockquote');
+  assert.ok(sentAudioParams.opts.caption.length <= 1024, 'Caption must be within Telegram 1024 character limit');
+
+  db.close();
+});

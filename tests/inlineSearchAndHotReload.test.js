@@ -595,9 +595,11 @@ test('Rich Music Drop: /play command produces full Rich Message with audio, meta
   assert.ok(sendAudioBtn, 'Must include Send Audio File button');
   assert.match(sendAudioBtn.callback_data, /send_audio/);
 
-  const lyricsBtn = allButtons.find((btn) => btn.callback_data?.includes(':lyrics:'));
-  assert.ok(lyricsBtn, 'Must include Lyrics button');
-  assert.match(lyricsBtn.callback_data, /lyrics/);
+  // Lyrics embedded directly in rich message as expandable blockquote after the table!
+  const lyricsBlock = deliveredRich.blocks.find((b) => b.type === 'expandable_blockquote');
+  assert.ok(lyricsBlock, 'Must include expandable blockquote with lyrics');
+  const lyricsStr = typeof lyricsBlock.text === 'string' ? lyricsBlock.text : JSON.stringify(lyricsBlock.text);
+  assert.match(lyricsStr, /Lyrics/);
 
   db.close();
 });

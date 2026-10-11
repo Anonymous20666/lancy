@@ -237,9 +237,10 @@ export function createDownloaderScreen({ app }) {
     ]);
     b.buttons([
       richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
-      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' })
+      richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
     ]);
     b.buttons([
+      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
       richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
     ]);
 
@@ -307,15 +308,46 @@ export function createDownloaderScreen({ app }) {
     return b.toJSON();
   }
 
+  function renderLyricsSearchPrompt(ctx = null) {
+    const b = new RichMessageBuilder();
+    const isGroup = Boolean(ctx?.isGroup);
+
+    b.header('𓆩♡𓆪 SEARCH SONG LYRICS 𓆩♡𓆪', 1);
+    b.divider();
+    b.heading('୨୧ search any song lyrics', 3);
+    if (isGroup) {
+      b.paragraph(rt.text(
+        '• 🎵 Type /lyrics <song title> directly in this chat\n' +
+        '• 📝 Or reply to this card with any song title, artist, or lyric verse snippet!'
+      ));
+    } else {
+      b.paragraph(rt.text(
+        '• 🎵 Type song title & artist (e.g. Blinding Lights The Weeknd)\n' +
+        '• 📝 Or paste any verse or chorus lyrics snippet!'
+      ));
+    }
+    b.divider();
+    b.quote(rt.text(
+      '✨ Lancy will fetch full lyrics with album artwork & metadata ♡'
+    ));
+    b.divider();
+    b.buttons([
+      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
+      richButton.callback('« Downloader', encodeCallback(id, 'open'))
+    ]);
+    b.buttons([
+      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
   function renderMusicSearchPrompt(ctx = null) {
     const b = new RichMessageBuilder();
     const botName = ctx?.bot?.botName || ctx?.botName || 'Lancy';
     const isGroup = Boolean(ctx?.isGroup);
 
-    b.paragraph(rt.bold(banner([
-      '𓆩♡𓆪 PLAY & DOWNLOAD MUSIC 𓆩♡𓆪',
-      'search, stream & recognize music ♡'
-    ])));
+    b.header('𓆩♡𓆪 PLAY & DOWNLOAD MUSIC 𓆩♡𓆪', 1);
     b.divider();
     b.heading('୨୧ how to play & download', 3);
     if (isGroup) {
@@ -340,10 +372,13 @@ export function createDownloaderScreen({ app }) {
     b.divider();
     b.buttons([
       richButton.switchInlineCurrent('🔍 Search Music Live', ''),
-      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' })
+      richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('« Downloader', encodeCallback(id, 'open')),
+      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
+      richButton.callback('« Downloader', encodeCallback(id, 'open'))
+    ]);
+    b.buttons([
       richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
     ]);
     b.validate();
@@ -414,7 +449,8 @@ export function createDownloaderScreen({ app }) {
     offset = 0,
     albumKey = null,
     imageKey = null,
-    audioKey = null
+    audioKey = null,
+    lyrics = null
   }) {
     const files = {};
     const b = new RichMessageBuilder();
@@ -498,6 +534,9 @@ export function createDownloaderScreen({ app }) {
         musicRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
       }
       b.table(kvTable(musicRows), { compact: true });
+      if (lyrics) {
+        b.expandableBlockquote(`📜 Lyrics • ${truncate(result?.title || title, 36)}\n\n${lyrics}`);
+      }
     } else {
       const isPaged = mediaItems.length > SLIDESHOW_PAGE_SIZE;
       const rangeText = isPaged ? ` • Showing ${offset + 1}–${Math.min(offset + SLIDESHOW_PAGE_SIZE, mediaItems.length)}` : '';
@@ -514,7 +553,7 @@ export function createDownloaderScreen({ app }) {
     }
     b.divider();
 
-    // 4. Audio Action Row (send audio / lyrics / recognize)
+    // 4. Audio Action Row (send audio / recognize)
     const audioActionRow = [];
     if (audioKey) {
       audioActionRow.push(
@@ -536,9 +575,6 @@ export function createDownloaderScreen({ app }) {
           JSON.stringify(songMeta)
         );
       } catch {}
-      audioActionRow.push(
-        richButton.callback('📜 Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' })
-      );
     } else if (audioKey) {
       audioActionRow.push(
         richButton.callback('🎙️ Recognize Music / Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
@@ -711,6 +747,22 @@ export function createDownloaderScreen({ app }) {
         saveAlbum(albumKey, { mediaItems, audioTrack, platform, title, result, audioKey, imageKey });
       }
 
+      // Fetch lyrics if music track
+      let lyricsText = result.lyrics || null;
+      if (isMusic && !lyricsText) {
+        try {
+          const songTitle = result.title || title;
+          const songArtist = result.artist || result.author || '';
+          const lRes = await Promise.race([
+            getLyrics(songTitle, songArtist),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000))
+          ]);
+          if (lRes?.found && lRes.lyrics) {
+            lyricsText = lRes.lyrics;
+          }
+        } catch {}
+      }
+
       const { rich, files } = buildDeliveryRichMessage({
         mediaItems,
         audioTrack,
@@ -721,7 +773,8 @@ export function createDownloaderScreen({ app }) {
         offset: 0,
         albumKey,
         imageKey,
-        audioKey
+        audioKey,
+        lyrics: lyricsText
       });
 
       // Deliver Media
@@ -731,12 +784,34 @@ export function createDownloaderScreen({ app }) {
         if (caps.canSendAudios && !caps.canSendPhotos) {
           await tracker.cleanup();
           const cleanFilename = `${(title || 'audio').replace(/[^\w\s-]/g, '') || 'audio'}.mp3`;
+          const songTitle = audioTrack.title || result.title || title || 'Audio Track';
+          const songArtist = audioTrack.performer || result.artist || result.author || 'Artist';
+          const album = result.album || null;
+          const durStr = result.duration || (audioTrack.duration ? `${Math.floor(audioTrack.duration / 60)}:${String(audioTrack.duration % 60).padStart(2, '0')}` : null);
+          const requester = ctx.user?.first_name || null;
+
+          let metaBlock = `🎵 <b>Title:</b> ${escapeHtml(songTitle)}\n` +
+            `🎧 <b>Artist:</b> ${escapeHtml(songArtist)}\n`;
+          if (album) metaBlock += `💿 <b>Album:</b> ${escapeHtml(album)}\n`;
+          if (durStr) metaBlock += `⏱ <b>Duration:</b> ${escapeHtml(durStr)}\n`;
+          if (requester) metaBlock += `👤 <b>Requested by:</b> ${escapeHtml(requester)}\n`;
+
+          let lyricSnippet = '';
+          if (lyricsText) {
+            const availLen = Math.max(0, 950 - metaBlock.length - 30);
+            if (availLen > 50) {
+              const sliced = lyricsText.slice(0, availLen).trim();
+              lyricSnippet = `\n📜 <b>Lyrics:</b>\n${escapeHtml(sliced)}${lyricsText.length > availLen ? '…' : ''}`;
+            }
+          }
+
+          const caption = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n` +
+            `<blockquote expandable>\n${metaBlock}${lyricSnippet}\n</blockquote>`;
+
           sent = await (ctx.api || app.telegram?.api).sendAudio(ctx.chatId, audioTrack.buffer, {
-            title: audioTrack.title || result.title || title || 'Audio Track',
-            performer: audioTrack.performer || result.artist || result.author || 'Spotify',
-            caption: `🎵 <b>${escapeHtml(result.title || title || 'Audio Track')}</b>` +
-              (result.artist ? ` — <i>${escapeHtml(result.artist)}</i>` : '') +
-              `\n<blockquote>⏱ <b>Delivered to group chat</b> (photos restricted by admin) ♡</blockquote>`,
+            title: songTitle,
+            performer: songArtist,
+            caption,
             parse_mode: 'HTML',
             filename: cleanFilename
           }).catch(() => null);
@@ -972,10 +1047,123 @@ export function createDownloaderScreen({ app }) {
     }
   }
 
+  async function executeLyricsSearch(ctx, query) {
+    const cleanQuery = String(query || '').trim();
+    if (!cleanQuery) return;
+
+    const api = ctx.api || app.telegram?.api;
+    const tracker = new ProgressTracker({
+      api,
+      chatId: ctx.chatId,
+      messageId: ctx.isGroup ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId),
+      heartbeatMs: 2000,
+      action: 'typing'
+    });
+
+    await tracker.live(() => ({
+      blocks: [
+        block.heading('𓆩♡𓆪 SEARCHING LYRICS 𓆩♡𓆪', 1),
+        block.paragraph(rt.italic(`Searching lyrics for "${truncate(cleanQuery, 40)}"… ♡`))
+      ]
+    }));
+
+    try {
+      const lyricsRes = await getLyrics(cleanQuery);
+      if (!lyricsRes.found || !lyricsRes.lyrics) {
+        await tracker.cleanup();
+        await api.sendMessage(
+          ctx.chatId,
+          `<blockquote>♡ Could not find lyrics for "<b>${escapeHtml(cleanQuery)}</b>" ♡\nPlease check the spelling or send a longer lyric snippet!</blockquote>`,
+          {
+            parse_mode: 'HTML',
+            reply_markup: inlineKeyboard([
+              [ikButton('🔍 Try Another Search', encodeCallback(id, 'searchLyrics')), ikButton('« Downloader', encodeCallback(id, 'open'))]
+            ])
+          }
+        );
+        return;
+      }
+
+      let trackTitle = lyricsRes.title || cleanQuery;
+      let trackArtist = lyricsRes.artist || 'Artist';
+      let albumTitle = lyricsRes.album || null;
+      let coverUrl = null;
+      let coverBuf = null;
+
+      try {
+        const dzRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(`${trackTitle} ${trackArtist}`)}&limit=1`, {
+          signal: AbortSignal.timeout(4000)
+        });
+        if (dzRes.ok) {
+          const dzData = await dzRes.json();
+          const first = dzData.data?.[0];
+          if (first) {
+            trackTitle = first.title || trackTitle;
+            trackArtist = first.artist?.name || trackArtist;
+            albumTitle = first.album?.title || albumTitle;
+            coverUrl = first.album?.cover_big || first.album?.cover_medium;
+          }
+        }
+      } catch {}
+
+      if (coverUrl) {
+        try {
+          const imgRes = await fetch(coverUrl, { signal: AbortSignal.timeout(5000) });
+          if (imgRes.ok) {
+            const ab = await imgRes.arrayBuffer();
+            coverBuf = Buffer.from(ab);
+          }
+        } catch {}
+      }
+
+      const b = new RichMessageBuilder();
+      const files = {};
+      b.header('𓆩♡𓆪 SONG LYRICS 𓆩♡𓆪', 1);
+      b.divider();
+
+      if (coverBuf) {
+        files['cover_photo'] = { buffer: coverBuf, filename: 'cover.jpg', contentType: 'image/jpeg' };
+        b.photo('attach://cover_photo');
+      }
+
+      const metaRows = [
+        ['🎵 Title', truncate(trackTitle, 40)],
+        ['🎧 Artist', truncate(trackArtist, 36)]
+      ];
+      if (albumTitle) metaRows.push(['💿 Album', truncate(albumTitle, 36)]);
+      metaRows.push(['📜 Source', lyricsRes.source?.toUpperCase() || 'LRCLIB']);
+      b.table(kvTable(metaRows), { compact: true });
+      b.divider();
+
+      b.expandableBlockquote(`📜 Lyrics • ${trackTitle}\n\n${lyricsRes.lyrics}`);
+      b.divider();
+
+      const dlQuery = `${trackTitle} ${trackArtist}`.trim();
+      b.buttons([
+        richButton.callback('🎵 Download / Play Track', encodeCallback(id, 'execute', dlQuery), { style: 'primary' }),
+        richButton.callback('🔍 Search Another Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
+      ]);
+      b.buttons([
+        richButton.callback('« Downloader Menu', encodeCallback(id, 'open'))
+      ]);
+      b.validate();
+
+      await tracker.finish(b.toJSON(), files);
+    } catch (err) {
+      await tracker.cleanup();
+      await api.sendMessage(
+        ctx.chatId,
+        `<blockquote>✕ An error occurred while searching lyrics: ${escapeHtml(err.message)}</blockquote>`,
+        { parse_mode: 'HTML' }
+      );
+    }
+  }
+
   return {
     id,
     executeDownload,
     executeTikTokSearch,
+    executeLyricsSearch,
     async open(ctx) {
       return ctx.editScreen(renderMainMenu(ctx));
     },
@@ -1021,6 +1209,16 @@ export function createDownloaderScreen({ app }) {
             }
           }
           return ctx.editScreen(renderMusicSearchPrompt(ctx));
+        case 'searchLyrics':
+          await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT, { context: { mode: 'lyrics' } });
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderLyricsSearchPrompt(ctx));
+            } catch {
+              return await ctx.reply('📜 Send song title or lyrics snippet to search lyrics ♡');
+            }
+          }
+          return ctx.editScreen(renderLyricsSearchPrompt(ctx));
         case 'recognize':
           await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
           if (fromMedia) {
@@ -1782,6 +1980,7 @@ export function createDownloaderScreen({ app }) {
     },
     executeDownload,
     executeTikTokSearch,
+    executeLyricsSearch,
     registerStates(sm) {
       return this.registerStateHandlers(sm);
     },
@@ -1793,6 +1992,9 @@ export function createDownloaderScreen({ app }) {
         onMessage: async (sctx, message) => {
           const recMedia = extractMediaForMusicRecognition(message);
           if (recMedia && recMedia.obj?.file_id) {
+            if (sctx.isGroup && !sctx.isReplyToBot && !sctx.isTag) {
+              return false;
+            }
             const controller = app.telegram?.controller;
             if (controller?.handleAudioRecognition) {
               const ctx = {
@@ -1809,6 +2011,21 @@ export function createDownloaderScreen({ app }) {
 
           const text = String(message.text || message.caption || '').trim();
           if (!text) return true;
+
+          const dlCtx = {
+            ...sctx,
+            controller: sctx.controller || app.telegram?.controller,
+            api: sctx.api || app.telegram?.api,
+            chatId: message.chat?.id || sctx.chatId,
+            tgId: sctx.tgId || String(message.from?.id),
+            message
+          };
+
+          if (sctx.context?.mode === 'lyrics') {
+            await executeLyricsSearch(dlCtx, text);
+            return true;
+          }
+
           const match = text.match(/https?:\/\/[^\s]+/i);
           if (sctx.context?.mode === 'url' && !match) {
             const b = new RichMessageBuilder();
@@ -1840,14 +2057,6 @@ export function createDownloaderScreen({ app }) {
           }
 
           const target = match ? match[0] : text;
-          const dlCtx = {
-            ...sctx,
-            controller: sctx.controller || app.telegram?.controller,
-            api: sctx.api || app.telegram?.api,
-            chatId: message.chat?.id || sctx.chatId,
-            tgId: sctx.tgId || String(message.from?.id),
-            message
-          };
           await executeDownload(dlCtx, target);
           return true;
         },
@@ -1863,6 +2072,9 @@ export function createDownloaderScreen({ app }) {
         onMessage: async (sctx, message) => {
           const recMedia = extractMediaForMusicRecognition(message);
           if (recMedia && recMedia.obj?.file_id) {
+            if (sctx.isGroup && !sctx.isReplyToBot && !sctx.isTag) {
+              return false;
+            }
             const controller = sctx.controller || app.telegram?.controller;
             if (controller?.handleAudioRecognition) {
               const ctx = {
