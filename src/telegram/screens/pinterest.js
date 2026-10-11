@@ -276,6 +276,7 @@ export function createPinterestScreen({ app }) {
 
       result.mode = mode;
       const rich = resultsRich(result, previewBlocks.length, totalMedia, previewBlocks, 0);
+      const files = previewBlocks.length > 0 ? mediaFiles : null;
       try {
         await tracker.finish(rich, files);
       } catch (finishErr) {

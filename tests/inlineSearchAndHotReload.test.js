@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { Database } from '../src/core/db.js';
 import { SettingsManager } from '../src/config/settings.js';
 import { StateMachine } from '../src/core/stateMachine.js';
-import { TelegramController } from '../src/telegram/bot.js';
+import { TelegramController, searchYouTubeFast, fetchSearchSuggestions } from '../src/telegram/bot.js';
 import { MultiBotManager } from '../src/telegram/multiBotManager.js';
 import { createDownloaderScreen } from '../src/telegram/screens/downloader.js';
 
@@ -1108,6 +1108,85 @@ test('TelegramController: live inline search for uncached music delivers playabl
   db.close();
 });
 
+test('Fast Search: searchYouTubeFast and fetchSearchSuggestions respond with rich items and suggestions', async () => {
+  const suggestions = await fetchSearchSuggestions('jjk');
+  assert.ok(Array.isArray(suggestions), 'suggestions must be an array');
 
+  const videos = await searchYouTubeFast('jjk');
+  assert.ok(Array.isArray(videos), 'videos must be an array');
+  assert.ok(videos.length > 0, 'must return video results');
+  const first = videos[0];
+  assert.ok(first.videoId, 'must have videoId');
+  assert.ok(first.title, 'must have title');
+  assert.ok(first.duration, 'must have duration');
+  assert.ok(first.thumb, 'must have thumbnail');
+});
 
+test('TelegramController: TikTok live search supports infinite pagination without DM redirect', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
 
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // 1. Initial page
+  await controller.handleInlineQuery({
+    id: 'query_tt_page_1',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'tt anime edit',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.ok(inlineAnswer.results.length >= 1, 'must return video cards');
+  assert.equal(inlineAnswer.results[0].type, 'video');
+  for (const res of inlineAnswer.results) {
+    if (res.reply_markup?.inline_keyboard) {
+      for (const row of res.reply_markup.inline_keyboard) {
+        for (const btn of row) {
+          assert.equal(btn.style, 'primary', `button "${btn.text}" must have style primary`);
+          if (btn.url) {
+            assert.ok(!btn.url.includes('start=dl_'), 'must never redirect to download DM');
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Next page with offset
+  const nextOff = inlineAnswer.next_offset;
+  if (nextOff) {
+    inlineAnswer = null;
+    await controller.handleInlineQuery({
+      id: 'query_tt_page_2',
+      from: { id: 1001, first_name: 'Alex' },
+      query: 'tt anime edit',
+      offset: nextOff
+    });
+    assert.ok(inlineAnswer, 'second page must return results');
+    assert.ok(inlineAnswer.results.length >= 1, 'second page must have items');
+  }
+
+  db.close();
+});

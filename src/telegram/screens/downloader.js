@@ -651,9 +651,18 @@ export function createDownloaderScreen({ app }) {
 
     try {
       tracker.set({ stage: 'search', text: `Searching TikTok clips for "${truncate(q, 30)}"… ♡` });
-      const { yts } = await import('btch-downloader');
-      const res = await yts(q + ' tiktok');
-      const vids = res?.result?.videos || res?.result?.all || [];
+      let vids = [];
+      try {
+        const { searchYouTubeFast } = await import('../bot.js');
+        vids = await searchYouTubeFast(q + ' tiktok');
+      } catch {}
+      if (!vids.length) {
+        try {
+          const { yts } = await import('btch-downloader');
+          const res = await yts(q + ' tiktok');
+          vids = res?.result?.videos || res?.result?.all || [];
+        } catch {}
+      }
 
       if (!vids.length) {
         const b = new RichMessageBuilder();

@@ -21,6 +21,109 @@ const inlineTikTokCache = new Map();
 const inlineUrlCache = new Map();
 const recentInlineSearchResults = new Map();
 
+export async function searchYouTubeFast(query) {
+  const clean = String(query || '').trim();
+  if (!clean) return [];
+  try {
+    const res = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: 'WEB',
+            clientVersion: '2.20240101.00.00',
+            hl: 'en',
+            gl: 'US'
+          }
+        },
+        query: clean
+      }),
+      signal: AbortSignal.timeout(2200)
+    });
+    const data = await res.json();
+    const videos = [];
+    const seen = new Set();
+
+    function walk(node) {
+      if (!node || typeof node !== 'object') return;
+      if (node.videoId && (node.title || node.headline)) {
+        let vid = String(node.videoId).replace(/^shorts-lockup-/, '').replace(/^shorts-shelf-item-/, '');
+        if (vid.length === 11 && !seen.has(vid)) {
+          seen.add(vid);
+          const title = node.title?.runs?.[0]?.text || node.title?.simpleText || node.headline?.simpleText || '';
+          const duration = node.lengthText?.simpleText || 'HD';
+          const views = node.viewCountText?.simpleText || node.shortViewCountText?.simpleText || '';
+          const author = node.ownerText?.runs?.[0]?.text || node.shortBylineText?.runs?.[0]?.text || 'Music';
+          const thumb = node.thumbnail?.thumbnails?.pop()?.url || `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
+          if (title) {
+            videos.push({ videoId: vid, title, duration, views, author, thumb });
+          }
+        }
+      }
+      if (node.shortsLockupViewModel) {
+        const vm = node.shortsLockupViewModel;
+        let vid = String(vm.entityId || '').replace(/^shorts-lockup-/, '').replace(/^shorts-shelf-item-/, '');
+        if (!vid && vm.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId) {
+          vid = vm.onTap.innertubeCommand.reelWatchEndpoint.videoId;
+        }
+        if (vid && vid.length === 11 && !seen.has(vid)) {
+          seen.add(vid);
+          const title = vm.overlayMetadata?.primaryText?.content || '';
+          const views = vm.overlayMetadata?.secondaryText?.content || '';
+          const thumb = vm.thumbnail?.sources?.pop()?.url || `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
+          if (title) {
+            videos.push({ videoId: vid, title, duration: 'Short', views, author: 'Shorts', thumb });
+          }
+        }
+      }
+      for (const k of Object.keys(node)) {
+        walk(node[k]);
+      }
+    }
+
+    walk(data);
+    if (videos.length > 0) return videos;
+  } catch {}
+
+  try {
+    const { yts } = await import('btch-downloader');
+    const res = await yts(clean);
+    const vids = res?.result?.videos || res?.result?.all || [];
+    return vids.map(v => ({
+      videoId: v.videoId || (v.url ? v.url.split('v=')[1] : ''),
+      title: v.title || clean,
+      duration: v.timestamp || v.duration?.timestamp || 'HD',
+      views: v.views ? String(v.views) : '',
+      author: v.author?.name || 'Music',
+      thumb: v.thumbnail || v.image || ''
+    })).filter(v => Boolean(v.videoId));
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchSearchSuggestions(query) {
+  const clean = String(query || '').trim();
+  if (!clean || clean.length < 2) return [];
+  try {
+    const res = await fetch(`https://suggestqueries.google.com/complete/search?client=firefox&ds=yt&q=${encodeURIComponent(clean)}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      signal: AbortSignal.timeout(1200)
+    });
+    const data = await res.json();
+    if (Array.isArray(data?.[1])) {
+      return data[1].slice(0, 5).filter(s => typeof s === 'string' && s.trim());
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
 /**
  * TelegramController — the control center.
  *
@@ -865,44 +968,57 @@ export class TelegramController extends EventEmitter {
   async #fetchInlineTikTokSearch(queryTopic, offset = 0) {
     if (!queryTopic) return [];
     try {
-      const { yts } = await import('btch-downloader');
       const botUser = this.botUsername || 'Lancy_easy_bot';
+      const cacheKey = `tt_${queryTopic.toLowerCase()}`;
+      let cachedVids = inlineTikTokCache.get(cacheKey);
 
-      const modifiers = [
-        'tiktok',
-        'tiktok viral',
-        'tiktok trending',
-        'tiktok shorts',
-        'tiktok compilation',
-        'tiktok clips',
-        'tiktok dance',
-        'tiktok edit',
-        'tiktok best',
-        'tiktok popular',
-        'tiktok funny',
-        'tiktok 2026'
-      ];
+      if (!cachedVids || offset >= cachedVids.length) {
+        const modifiers = [
+          'tiktok',
+          'tiktok shorts',
+          'tiktok viral',
+          'tiktok trending',
+          'tiktok compilation',
+          'tiktok dance',
+          'tiktok edit',
+          'tiktok funny'
+        ];
+        const pageIdx = Math.floor(offset / 10);
+        const mod = modifiers[pageIdx % modifiers.length];
+        const vids = await searchYouTubeFast(`${queryTopic} ${mod}`);
+        if (vids.length > 0) {
+          if (!cachedVids) cachedVids = [];
+          const seen = new Set(cachedVids.map((v) => v.videoId));
+          for (const v of vids) {
+            if (!seen.has(v.videoId)) {
+              seen.add(v.videoId);
+              cachedVids.push(v);
+            }
+          }
+          inlineTikTokCache.set(cacheKey, cachedVids);
+          if (inlineTikTokCache.size > 200) {
+            const firstKey = inlineTikTokCache.keys().next().value;
+            inlineTikTokCache.delete(firstKey);
+          }
+        }
+      }
 
-      const pageIndex = Math.floor(offset / 10);
-      const mod = modifiers[pageIndex % modifiers.length];
-      const searchTerm = `${queryTopic} ${mod}`;
+      if (!cachedVids || cachedVids.length === 0) return [];
 
-      const res = await yts(searchTerm);
-      const vids = res?.result?.videos || res?.result?.all || [];
-      if (!vids.length) return [];
+      const paged = cachedVids.slice(offset, offset + 10);
       const results = [];
 
-      for (let idx = 0; idx < Math.min(vids.length, 10); idx++) {
-        const item = vids[idx];
+      for (let idx = 0; idx < paged.length; idx++) {
+        const item = paged[idx];
         const title = item.title || queryTopic;
-        const duration = item.timestamp || item.duration?.timestamp || 'HD Clip';
-        const views = item.views ? `${Number(item.views).toLocaleString()} views` : 'Trending';
-        const thumb = item.thumbnail || item.image || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150';
-        const videoUrl = item.url || `https://youtube.com/watch?v=${item.videoId}`;
+        const duration = item.duration || 'HD Clip';
+        const views = item.views ? `${item.views}` : 'Trending';
+        const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
+        const videoUrl = `https://www.youtube.com/watch?v=${item.videoId}`;
 
         results.push({
           type: 'video',
-          id: `tt_${item.videoId || idx}_${offset}_${idx}`,
+          id: `tt_${item.videoId}_${offset}_${idx}`,
           video_url: videoUrl,
           mime_type: 'text/html',
           thumbnail_url: thumb,
@@ -915,7 +1031,7 @@ export class TelegramController extends EventEmitter {
             inline_keyboard: [
               [
                 {
-                  text: '✨ 🎬 Open Clip ♡',
+                  text: '🎬 Watch Clip ♡',
                   url: videoUrl,
                   style: 'primary'
                 }
@@ -955,8 +1071,15 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '📥 Open in Downloader',
-                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=dl`,
+                text: '📷 Open HD Image',
+                url: cleanUrl,
+                style: 'primary'
+              }
+            ],
+            [
+              {
+                text: '🔍 Search More Media',
+                switch_inline_query_current_chat: '',
                 style: 'primary'
               }
             ]
@@ -978,8 +1101,15 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '📥 Open in Downloader',
-                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=dl`,
+                text: '▶️ Watch Video ♡',
+                url: cleanUrl,
+                style: 'primary'
+              }
+            ],
+            [
+              {
+                text: '🎬 Search More Videos',
+                switch_inline_query_current_chat: 'tt ',
                 style: 'primary'
               }
             ]
@@ -999,8 +1129,15 @@ export class TelegramController extends EventEmitter {
           inline_keyboard: [
             [
               {
-                text: '📥 Open in Downloader',
-                url: `https://t.me/${this.botUsername || 'Lancy_easy_bot'}?start=dl`,
+                text: '▶️ Listen Audio ♡',
+                url: cleanUrl,
+                style: 'primary'
+              }
+            ],
+            [
+              {
+                text: '🎵 Search More Songs',
+                switch_inline_query_current_chat: '',
                 style: 'primary'
               }
             ]
@@ -1513,13 +1650,7 @@ export class TelegramController extends EventEmitter {
         }
       };
 
-      let cachedAudioRows = lookupCached();
-
-      // If not yet cached and query has at least 2 chars, synchronously cache top track so it delivers 100% full audio
-      if (cachedAudioRows.length === 0 && cleanSongQuery.length >= 2) {
-        await this.#cacheAudioTrack(cleanSongQuery, 3500);
-        cachedAudioRows = lookupCached();
-      }
+      const cachedAudioRows = lookupCached();
 
       const cachedResults = (cachedAudioRows || []).map((row, idx) => {
         const durSec = row.duration || 0;
@@ -1566,88 +1697,91 @@ export class TelegramController extends EventEmitter {
         nextOffset = (offset + pagedAudioResults.length < cachedResults.length) ? String(offset + pagedAudioResults.length) : '';
         results = pagedAudioResults;
       } else if (cleanSongQuery.length >= 2) {
-        // Track not yet cached in SQLite: fetch instant online playable media via yts (~300ms) and trigger background MP3 caching
-        this.#cacheAudioTrack(cleanSongQuery, 100).catch(() => {});
+        // Track not yet cached in SQLite: fetch fast playable media via searchYouTubeFast (~450ms) and trigger background MP3 caching
+        this.#cacheAudioTrack(cleanSongQuery, 0).catch(() => {});
 
-        const pageIdx = Math.floor(offset / 10);
-        const cacheKey = `mus_${cleanSongQuery.toLowerCase()}_off_${pageIdx}`;
-        let onlineMusicResults = inlineSearchCache.get(cacheKey);
+        const cacheKey = `mus_${cleanSongQuery.toLowerCase()}`;
+        let onlineVideos = inlineSearchCache.get(cacheKey);
 
-        if (!onlineMusicResults) {
-          try {
-            const { yts } = await import('btch-downloader');
-            const searchTerms = [
-              cleanSongQuery,
-              `${cleanSongQuery} audio`,
-              `${cleanSongQuery} music`,
-              `${cleanSongQuery} official audio`,
-              `${cleanSongQuery} song`,
-              `${cleanSongQuery} lyric video`
-            ];
-            const term = searchTerms[pageIdx % searchTerms.length];
-            const res = await yts(term);
-            const vids = res?.result?.videos || res?.result?.all || [];
-            if (vids.length > 0) {
-              const seenYt = new Set();
-              onlineMusicResults = [];
-              for (let idx = 0; idx < Math.min(vids.length, 10); idx++) {
-                const item = vids[idx];
-                const vId = item.videoId || item.url || idx;
-                if (seenYt.has(vId)) continue;
-                seenYt.add(vId);
-
-                const title = item.title || cleanSongQuery;
-                const duration = item.timestamp || item.duration?.timestamp || 'HD Track';
-                const artist = item.author?.name || 'Music';
-                const thumb = item.thumbnail || item.image || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150';
-                const videoUrl = item.url || `https://youtube.com/watch?v=${item.videoId}`;
-
-                onlineMusicResults.push({
-                  type: 'video',
-                  id: `yt_aud_${item.videoId || idx}_${offset}_${idx}`,
-                  video_url: videoUrl,
-                  mime_type: 'text/html',
-                  thumbnail_url: thumb,
-                  thumb_url: thumb,
-                  title: `🎵 ${title.slice(0, 50)}`,
-                  description: `⏱ ${duration} • 👤 ${artist} ♡`,
-                  caption: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>`,
-                  parse_mode: 'HTML',
-                  reply_markup: {
-                    inline_keyboard: [
-                      [
-                        {
-                          text: '📜 Lyrics & Info ♡',
-                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
-                          style: 'primary'
-                        }
-                      ],
-                      [
-                        {
-                          text: '🎵 Search Music Live',
-                          switch_inline_query_current_chat: '',
-                          style: 'primary'
-                        }
-                      ]
-                    ]
-                  }
-                });
-              }
-
-              if (onlineMusicResults.length > 0) {
-                inlineSearchCache.set(cacheKey, onlineMusicResults);
-                if (inlineSearchCache.size > 200) {
-                  const firstKey = inlineSearchCache.keys().next().value;
-                  inlineSearchCache.delete(firstKey);
-                }
+        if (!onlineVideos || offset >= onlineVideos.length) {
+          const searchTerms = [
+            cleanSongQuery,
+            `${cleanSongQuery} audio`,
+            `${cleanSongQuery} music`,
+            `${cleanSongQuery} song`,
+            `${cleanSongQuery} official audio`
+          ];
+          const pageIdx = Math.floor(offset / 10);
+          const term = searchTerms[pageIdx % searchTerms.length];
+          const vids = await searchYouTubeFast(term);
+          if (vids.length > 0) {
+            if (!onlineVideos) onlineVideos = [];
+            const seen = new Set(onlineVideos.map((v) => v.videoId));
+            for (const v of vids) {
+              if (!seen.has(v.videoId)) {
+                seen.add(v.videoId);
+                onlineVideos.push(v);
               }
             }
-          } catch {}
+            inlineSearchCache.set(cacheKey, onlineVideos);
+            if (inlineSearchCache.size > 200) {
+              const firstKey = inlineSearchCache.keys().next().value;
+              inlineSearchCache.delete(firstKey);
+            }
+          }
         }
 
-        if (onlineMusicResults && onlineMusicResults.length > 0) {
-          results = onlineMusicResults;
-          nextOffset = onlineMusicResults.length >= 8 ? String(offset + onlineMusicResults.length) : '';
+        if (onlineVideos && onlineVideos.length > 0) {
+          const pagedVids = onlineVideos.slice(offset, offset + 10);
+          const botUser = this.botUsername || 'Lancy_easy_bot';
+
+          results = pagedVids.map((item, idx) => {
+            const title = item.title || cleanSongQuery;
+            const duration = item.duration || 'HD Track';
+            const artist = item.author || 'Music';
+            const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
+            const videoUrl = `https://www.youtube.com/watch?v=${item.videoId}`;
+
+            return {
+              type: 'video',
+              id: `yt_aud_${item.videoId}_${offset}_${idx}`,
+              video_url: videoUrl,
+              mime_type: 'text/html',
+              thumbnail_url: thumb,
+              thumb_url: thumb,
+              title: `🎵 ${title.slice(0, 50)}`,
+              description: `⏱ ${duration} • 👤 ${artist} ♡`,
+              caption: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>`,
+              parse_mode: 'HTML',
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '▶️ Stream / Watch Now ♡',
+                      url: videoUrl,
+                      style: 'primary'
+                    }
+                  ],
+                  [
+                    {
+                      text: '📜 Lyrics & Info ♡',
+                      url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                      style: 'primary'
+                    },
+                    {
+                      text: '🎵 Search Music Live',
+                      switch_inline_query_current_chat: '',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            };
+          });
+
+          nextOffset = (offset + results.length < onlineVideos.length) || results.length >= 8
+            ? String(offset + results.length)
+            : '';
         }
       }
 
