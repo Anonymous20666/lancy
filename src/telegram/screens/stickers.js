@@ -287,7 +287,9 @@ export function createStickersScreen({ app }) {
             });
           }
           idx++;
-          tracker.set({ stage: 'downloading', count, query, mode: isVideoSearch ? 'videos' : 'normal', done: idx, total: count });
+          if (idx % 10 === 0 || idx === count) {
+            tracker.set({ stage: 'downloading', count, query, mode: isVideoSearch ? 'videos' : 'normal', done: idx, total: count });
+          }
         }
 
         if (!descriptors.length) {
@@ -302,11 +304,15 @@ export function createStickersScreen({ app }) {
           stickerType,
           onProgress: (info) => {
             if (info.stage === 'converting') {
-              tracker.set({ stage: 'converting', count: descriptors.length, query, mode: isVideoSearch ? 'videos' : 'normal', done: info.done, total: info.total });
+              if (info.done % 10 === 0 || info.done === info.total) {
+                tracker.set({ stage: 'converting', count: descriptors.length, query, mode: isVideoSearch ? 'videos' : 'normal', done: info.done, total: info.total });
+              }
             } else if (info.stage === 'creating') {
               tracker.set({ stage: 'creating', count: descriptors.length, query, mode: isVideoSearch ? 'videos' : 'normal', done: 0, total: descriptors.length });
             } else if (info.stage === 'adding') {
-              tracker.set({ stage: 'adding', count: descriptors.length, query, mode: isVideoSearch ? 'videos' : 'normal', done: info.done, total: info.total });
+              if (info.done % 10 === 0 || info.done === info.total) {
+                tracker.set({ stage: 'adding', count: descriptors.length, query, mode: isVideoSearch ? 'videos' : 'normal', done: info.done, total: info.total });
+              }
             }
           }
         });
@@ -314,7 +320,9 @@ export function createStickersScreen({ app }) {
         app.pinterest.markResultsDelivered(userId, searchId, descriptors);
         app.db.audit(userId, 'pack.created', { packId: result.packId, query, count: result.count });
 
-        await ctx.sm.transition(ctx.tgId, States.IDLE, { context: {}, chatId, pushHistory: false });
+        if (ctx.sm?.for(ctx.tgId)?.state !== States.PINTEREST_RESULTS) {
+          await ctx.sm?.transition?.(ctx.tgId, States.IDLE, { context: {}, chatId, pushHistory: false });
+        }
         await tracker.finish(completionRich(settings, result, {
           duplicates: 0,
           query,
@@ -1341,7 +1349,9 @@ export function createStickersScreen({ app }) {
           });
         }
         idx++;
-        tracker.set({ stage: 'downloading', count: allMediaRows.length, query, mode: isVideo ? 'videos' : 'normal', done: idx, total: allMediaRows.length });
+        if (idx % 10 === 0 || idx === allMediaRows.length) {
+          tracker.set({ stage: 'downloading', count: allMediaRows.length, query, mode: isVideo ? 'videos' : 'normal', done: idx, total: allMediaRows.length });
+        }
       }
 
       const result = await app.packs.addToPack({
@@ -1351,9 +1361,13 @@ export function createStickersScreen({ app }) {
         stickerType: pack.stickerType,
         onProgress: (info) => {
           if (info.stage === 'converting') {
-            tracker.set({ stage: 'converting', count: descriptors.length, query, mode: isVideo ? 'videos' : 'normal', done: info.done, total: info.total });
+            if (info.done % 10 === 0 || info.done === info.total) {
+              tracker.set({ stage: 'converting', count: descriptors.length, query, mode: isVideo ? 'videos' : 'normal', done: info.done, total: info.total });
+            }
           } else if (info.stage === 'adding') {
-            tracker.set({ stage: 'adding', count: descriptors.length, query, mode: isVideo ? 'videos' : 'normal', done: info.done, total: info.total });
+            if (info.done % 10 === 0 || info.done === info.total) {
+              tracker.set({ stage: 'adding', count: descriptors.length, query, mode: isVideo ? 'videos' : 'normal', done: info.done, total: info.total });
+            }
           }
         }
       });

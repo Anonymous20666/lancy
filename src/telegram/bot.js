@@ -3231,6 +3231,9 @@ export class TelegramController extends EventEmitter {
           }
           const sent = await this.api.sendRichMessage(targetChatId, rich, extra, files);
           if (sent?.message_id) {
+            if (targetMsgId && sent.message_id !== targetMsgId) {
+              await this.api.call?.('deleteMessage', { chat_id: targetChatId, message_id: targetMsgId })?.catch?.(() => {});
+            }
             this.userScreenMessage.set(tgId, { chatId: targetChatId, messageId: sent.message_id });
             this.sm?.update?.(tgId, { screenMessageId: sent.message_id });
             this.db.run(

@@ -20,7 +20,7 @@ export class TelegramAPI {
     this.me = null;
   }
 
-  async call(method, params = {}, { files = null, timeoutMs = this.timeoutMs } = {}) {
+  async call(method, params = {}, { files = null, timeoutMs = this.timeoutMs, dropOnFloodWait = false } = {}) {
     const url = `${this.baseUrl}/${method}`;
     let body;
     let headers = {};
@@ -62,12 +62,17 @@ export class TelegramAPI {
       err.errorCode = data.error_code;
       err.parameters = data.parameters;
       err.retryable = data.error_code === 429 || (data.error_code >= 500 && data.error_code < 600);
-      // Flood wait: back off once, transparently.
+      // Flood wait handling: if caller requests dropping on flood wait, immediately reject without blocking
       if (data.error_code === 429 && data.parameters?.retry_after) {
+        if (dropOnFloodWait) {
+          err.code = 'FLOOD_WAIT';
+          err.retryAfter = data.parameters.retry_after;
+          throw err;
+        }
         const wait = Math.min(30, Number(data.parameters.retry_after) + 1);
         this.log.warn({ method, wait }, 'flood wait — backing off');
         await sleep(wait * 1000);
-        return this.call(method, params, { files, timeoutMs });
+        return this.call(method, params, { files, timeoutMs, dropOnFloodWait });
       }
       throw err;
     }
@@ -117,12 +122,13 @@ export class TelegramAPI {
     } else if (richMessage && typeof richMessage.html === 'string') {
       payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
     }
+    const dropOnFloodWait = Boolean(extra?.dropOnFloodWait);
     return this.call('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
       rich_message: payload,
       ...extra
-    }, { files });
+    }, { files, dropOnFloodWait });
   }
 
   editMessageText(chatId, messageId, text, extra = {}) {

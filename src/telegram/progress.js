@@ -11,7 +11,7 @@ import { ActionIndicator } from './indicator.js';
  * re-renders on every `set(patch)` AND on a heartbeat, so elapsed time and
  * ETA keep ticking even when the underlying job is quiet for a while.
  */
-const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests/i;
+const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests|flood wait dropped|FLOOD_WAIT/i;
 
 export class ProgressTracker {
   constructor({ api, chatId, messageId = null, heartbeatMs = 2500, action = 'typing', log } = {}) {
@@ -105,17 +105,17 @@ export class ProgressTracker {
     this.#edit(richMessage);
   }
 
-  /** Throttled edit (leading + trailing). */
+  /** Throttled edit (leading + trailing) — stays safely under Telegram's ~20 edits/min limit. */
   #edit = throttle(async (richMessage) => {
     if (this.closed) return;
     try {
-      await this.api.editMessageRich(this.chatId, this.messageId, richMessage);
+      await this.api.editMessageRich(this.chatId, this.messageId, richMessage, { dropOnFloodWait: true });
     } catch (error) {
-      if (!BENIGN_EDIT_ERRORS.test(String(error?.description ?? error?.message))) {
+      if (!BENIGN_EDIT_ERRORS.test(String(error?.description ?? error?.message ?? error?.code))) {
         this.log.warn({ err: error }, 'progress edit failed');
       }
     }
-  }, 1100);
+  }, 3000);
 
   #stop() {
     this.closed = true;

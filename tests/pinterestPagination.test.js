@@ -501,4 +501,135 @@ test('Pinterest search card: Home and Make Sticker send fresh message, Next/Prev
   db.close();
 });
 
+test('Pinterest Multitasking: user clicking Next while creating sticker pack updates in place or cleanly replaces without duplicate message', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine({ db });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pinterest_searches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      query TEXT NOT NULL,
+      normalized_query TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'normal',
+      depth TEXT NOT NULL DEFAULT 'deep',
+      result_count INTEGER NOT NULL DEFAULT 0,
+      duplicates_found INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pinterest_media (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      search_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      pin_id TEXT,
+      media_url TEXT NOT NULL,
+      sha256 TEXT,
+      type TEXT NOT NULL DEFAULT 'photo',
+      mime TEXT,
+      quality_score REAL NOT NULL DEFAULT 1.0,
+      is_duplicate INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'valid',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  // Insert search 50 with 30 results
+  db.run(`INSERT INTO pinterest_searches (id, user_id, query, normalized_query, mode, result_count) VALUES (50, 1001, 'cyberpunk anime', 'cyberpunk anime', 'normal', 30)`);
+  for (let i = 1; i <= 30; i++) {
+    db.run(
+      `INSERT INTO pinterest_media (search_id, user_id, pin_id, media_url, sha256, type, quality_score, is_duplicate, status)
+       VALUES (50, 1001, ?, ?, ?, 'photo', ?, 0, 'valid')`,
+      `pin_${i}`, `https://example.com/p_${i}.jpg`, `sha_${i}`, 100 - i
+    );
+  }
+
+  let deletedMessages = [];
+  let sentMessages = [];
+  let editedMessages = [];
+  let msgIdCounter = 600;
+
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, opts, files) => {
+      const nextId = ++msgIdCounter;
+      const msg = { message_id: nextId, chat: { id: chatId } };
+      sentMessages.push({ chatId, msgId: nextId, rich, files });
+      return msg;
+    },
+    editMessageRich: async (chatId, messageId, rich, opts, files) => {
+      editedMessages.push({ chatId, messageId, rich });
+      return { message_id: messageId };
+    },
+    deleteMessage: async (chatId, messageId) => {
+      deletedMessages.push({ chatId, messageId });
+      return true;
+    }
+  };
+
+  const app = {
+    settings,
+    telegram: { api: mockApi },
+    pinterest: { db, markResultsDelivered: () => {} },
+    media: { cache: { read: (sha) => Buffer.from(`data-${sha}`) } }
+  };
+
+  const screen = createPinterestScreen({ app });
+
+  // Simulate user browsing Pinterest: active search card message is 500
+  const ctx = {
+    tgId: 1001,
+    chatId: -1003965634225, // group chat
+    messageId: 500,         // Pinterest search card message
+    api: mockApi,
+    sm,
+    settings
+  };
+
+  // 1. In-place edit succeeds
+  await screen.handle(ctx, 'moreAlbum', ['50', '10']);
+  assert.equal(editedMessages.length, 1);
+  assert.equal(editedMessages[0].messageId, 500, 'Must target message 500 directly');
+
+  // 2. Now simulate Telegram rejecting in-place edit with files:
+  // Fallback to sending new card AND deleting message 500 so no duplicate exists!
+  mockApi.editMessageRich = async () => {
+    throw new Error('Telegram editMessageText: Bad Request: message can\'t be edited');
+  };
+
+  deletedMessages = [];
+  sentMessages = [];
+  await screen.handle(ctx, 'moreAlbum', ['50', '20']);
+
+  assert.equal(sentMessages.length, 1, 'Should send replacement card when in-place edit is rejected');
+  assert.equal(deletedMessages.length, 1, 'MUST delete previous card message 500 so no duplicate message is created');
+  assert.equal(deletedMessages[0].messageId, 500);
+
+  // 3. Multi-user group chat: User B (1002) clicks Next on User A's (1001) search card
+  const ctxUserB = {
+    tgId: 1002,
+    chatId: -1003965634225,
+    messageId: 601,
+    api: mockApi,
+    sm,
+    settings
+  };
+
+  deletedMessages = [];
+  sentMessages = [];
+  await screen.handle(ctxUserB, 'moreAlbum', ['50', '10']);
+  assert.equal(sentMessages.length, 1);
+  assert.equal(deletedMessages.length, 1, 'Must delete previous card 601 when user B clicks Next');
+  assert.equal(deletedMessages[0].messageId, 601);
+
+  // 4. Test reuseSearch in group chat by User B
+  const reuseResult = await screen.handle(ctxUserB, 'reuse', ['50']);
+  assert.ok(sentMessages.length >= 2, 'User B can view shared search 50 without "SEARCH EXPIRED" error');
+
+  db.close();
+});
+
+
 

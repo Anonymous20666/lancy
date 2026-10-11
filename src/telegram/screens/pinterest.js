@@ -52,7 +52,11 @@ export function createPinterestScreen({ app }) {
       const res = await api.editMessageRich(chatId, targetMsgId, rich, {}, files).catch(() => null);
       if (res) return res;
     }
-    return api.sendRichMessage(chatId, rich, {}, files);
+    const sent = await api.sendRichMessage(chatId, rich, {}, files);
+    if (targetMsgId && sent?.message_id && sent.message_id !== targetMsgId) {
+      await api.deleteMessage(chatId, targetMsgId).catch(() => {});
+    }
+    return sent;
   }
 
   async function openMenu(ctx) {
@@ -472,10 +476,16 @@ export function createPinterestScreen({ app }) {
   }
 
   async function reuseSearch(ctx, searchId) {
-    const row = app.pinterest.db.get(
+    let row = app.pinterest.db.get(
       'SELECT * FROM pinterest_searches WHERE id = ? AND user_id = ?',
       Number(searchId), Number(ctx.tgId)
     );
+    if (!row) {
+      row = app.pinterest.db.get(
+        'SELECT * FROM pinterest_searches WHERE id = ?',
+        Number(searchId)
+      );
+    }
     if (!row) {
       const b = new RichMessageBuilder();
       b.heading('🕘 SEARCH EXPIRED', 2);
@@ -622,23 +632,35 @@ export function createPinterestScreen({ app }) {
     // In-place update with new slideshow in the SAME message!
     const rich = resultsRich(resultStub, nextOffset, totalMedia, previewBlocks, numOffset);
     const files = previewBlocks.length > 0 ? mediaFiles : null;
-    const screenMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
-    if (screenMsgId) {
-      await api.editMessageRich(chatId, screenMsgId, rich, {}, files).catch(async () => {
+    const targetMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
+    if (targetMsgId) {
+      try {
+        await api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+        return { message_id: targetMsgId };
+      } catch (err) {
+        const errMsg = String(err?.description ?? err?.message);
+        if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
+        // Edit in-place failed (e.g. Telegram Bot API rejects editing media attachments in-place)
+        // Clean replacement: send the new card and delete the old card so only ONE message exists!
         const cardMsg = await api.sendRichMessage(chatId, rich, {}, files);
         if (cardMsg?.message_id) {
+          if (targetMsgId && cardMsg.message_id !== targetMsgId) {
+            await api.deleteMessage(chatId, targetMsgId).catch(() => {});
+          }
           app.telegram?.markMediaDeliveryMessage?.(cardMsg.message_id);
           app.telegram.userScreenMessage?.set(ctx.tgId, { chatId, messageId: cardMsg.message_id });
-          ctx.sm?.update(ctx.tgId, { screenMessageId: cardMsg.message_id });
+          ctx.sm?.update?.(ctx.tgId, { screenMessageId: cardMsg.message_id });
         }
-      });
+        return cardMsg;
+      }
     } else {
       const cardMsg = await api.sendRichMessage(chatId, rich, {}, files);
       if (cardMsg?.message_id) {
         app.telegram?.markMediaDeliveryMessage?.(cardMsg.message_id);
         app.telegram.userScreenMessage?.set(ctx.tgId, { chatId, messageId: cardMsg.message_id });
-        ctx.sm?.update(ctx.tgId, { screenMessageId: cardMsg.message_id });
+        ctx.sm?.update?.(ctx.tgId, { screenMessageId: cardMsg.message_id });
       }
+      return cardMsg;
     }
   }
 
