@@ -864,6 +864,247 @@ export function createDownloaderScreen({ app }) {
           }
           return;
         }
+        case 'live_audio': {
+          const videoId = args[0];
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎵 Fetching full MP3 file now… ♡' }).catch(() => {});
+          }
+
+          const db = app.db || ctx.db;
+          const botUser = ctx.botUsername || app.telegram?.botUsername || 'Lancy_easy_bot';
+          const inlineMsgId = ctx.query?.inline_message_id;
+          const targetChatId = ctx.chatId || ctx.query?.message?.chat?.id;
+
+          // 1. Check if track is already cached in SQLite
+          let cached = null;
+          if (videoId) {
+            try {
+              cached = db.prepare(
+                'SELECT file_id, title, artist, duration, query FROM cached_audio_tracks WHERE query = ? OR file_id LIKE ? LIMIT 1'
+              ).get(videoId, `%${videoId}%`);
+            } catch {}
+          }
+
+          if (cached?.file_id) {
+            const durSec = cached.duration || 0;
+            const min = Math.floor(durSec / 60);
+            const sec = String(durSec % 60).padStart(2, '0');
+            const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
+            const songTitle = cached.title || 'Audio Track';
+            const songArtist = cached.artist || 'Music';
+            const caption = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`;
+
+            // If triggered from inline message, upgrade the message inline!
+            if (inlineMsgId) {
+              try {
+                await ctx.api.call('editMessageMedia', {
+                  inline_message_id: inlineMsgId,
+                  media: {
+                    type: 'audio',
+                    media: cached.file_id,
+                    title: songTitle,
+                    performer: songArtist,
+                    caption,
+                    parse_mode: 'HTML'
+                  },
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        {
+                          text: '📜 Lyrics & Info ♡',
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(songTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                          style: 'primary'
+                        }
+                      ],
+                      [
+                        {
+                          text: '🎵 Search Music Live',
+                          switch_inline_query_current_chat: '',
+                          style: 'primary'
+                        }
+                      ]
+                    ]
+                  }
+                });
+                return;
+              } catch {}
+            }
+
+            // Otherwise deliver audio to the chat
+            if (targetChatId) {
+              await ctx.api.sendChatAction(targetChatId, 'upload_voice').catch(() => {});
+              const sent = await ctx.api.sendAudio(targetChatId, cached.file_id, {
+                title: songTitle,
+                performer: songArtist,
+                caption,
+                parse_mode: 'HTML',
+                ...(durSec > 0 ? { duration: durSec } : {}),
+                reply_markup: {
+                  inline_keyboard: [
+                    [
+                      {
+                        text: '📜 Lyrics & Info ♡',
+                        url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(songTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                        style: 'primary'
+                      }
+                    ],
+                    [
+                      {
+                        text: '🎵 Search Music Live',
+                        switch_inline_query_current_chat: '',
+                        style: 'primary'
+                      }
+                    ]
+                  ]
+                }
+              });
+              if (sent?.message_id) {
+                (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sent.message_id);
+                app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+              }
+              return;
+            }
+          }
+
+          // 2. Not cached yet — download track via mediaDownloader
+          if (targetChatId) {
+            await ctx.api.sendChatAction(targetChatId, 'upload_voice').catch(() => {});
+          }
+
+          const downloadTarget = videoId?.startsWith('http') ? videoId : `https://www.youtube.com/watch?v=${videoId}`;
+          let downloadRes = null;
+          try {
+            downloadRes = await app.mediaDownloader?.download?.(downloadTarget);
+          } catch {}
+
+          if (!downloadRes?.audioTrack?.buffer) {
+            if (targetChatId) {
+              await ctx.api.sendMessage(
+                targetChatId,
+                '<blockquote>⚠️ <i>Could not download this audio track right now. Please try searching again! ♡</i></blockquote>',
+                { parse_mode: 'HTML' }
+              );
+            }
+            return;
+          }
+
+          const durSec = downloadRes.duration ? parseDurationToSeconds(downloadRes.duration) : 0;
+          const min = Math.floor(durSec / 60);
+          const sec = String(durSec % 60).padStart(2, '0');
+          const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
+          const songTitle = downloadRes.title || 'Audio Track';
+          const songArtist = downloadRes.artist || downloadRes.author || 'Music';
+          const caption = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`;
+
+          // If triggered from inline message, upload via owner/bot to get file_id then upgrade inline message!
+          if (inlineMsgId) {
+            const ownerId = (ctx.settings?.get?.('telegram.ownerIds') || [])[0] || 8380969639;
+            const tempSent = await ctx.api.sendAudio(ownerId, downloadRes.audioTrack.buffer, {
+              title: songTitle,
+              performer: songArtist,
+              ...(durSec > 0 ? { duration: durSec } : {}),
+              disable_notification: true
+            }).catch(() => null);
+
+            if (tempSent?.audio?.file_id) {
+              const fileId = tempSent.audio.file_id;
+              if (tempSent.message_id) {
+                await ctx.api.call('deleteMessage', { chat_id: ownerId, message_id: tempSent.message_id }).catch(() => {});
+              }
+
+              // Cache in SQLite
+              try {
+                const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                if (videoId) db.prepare(sql).run(videoId, fileId, songTitle, songArtist, durSec);
+                db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
+                if (songArtist && songArtist !== 'Music') {
+                  db.prepare(sql).run(`${songTitle.toLowerCase().trim()} ${songArtist.toLowerCase().trim()}`, fileId, songTitle, songArtist, durSec);
+                }
+              } catch {}
+
+              try {
+                await ctx.api.call('editMessageMedia', {
+                  inline_message_id: inlineMsgId,
+                  media: {
+                    type: 'audio',
+                    media: fileId,
+                    title: songTitle,
+                    performer: songArtist,
+                    caption,
+                    parse_mode: 'HTML'
+                  },
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        {
+                          text: '📜 Lyrics & Info ♡',
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(songTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                          style: 'primary'
+                        }
+                      ],
+                      [
+                        {
+                          text: '🎵 Search Music Live',
+                          switch_inline_query_current_chat: '',
+                          style: 'primary'
+                        }
+                      ]
+                    ]
+                  }
+                });
+                return;
+              } catch {}
+            }
+          }
+
+          // Deliver directly to target chat
+          const destinationChat = targetChatId || ctx.tgId;
+          if (destinationChat) {
+            const sent = await ctx.api.sendAudio(destinationChat, downloadRes.audioTrack.buffer, {
+              title: songTitle,
+              performer: songArtist,
+              caption,
+              parse_mode: 'HTML',
+              ...(durSec > 0 ? { duration: durSec } : {}),
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '📜 Lyrics & Info ♡',
+                      url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(songTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
+                      style: 'primary'
+                    }
+                  ],
+                  [
+                    {
+                      text: '🎵 Search Music Live',
+                      switch_inline_query_current_chat: '',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            });
+
+            if (sent?.message_id) {
+              (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sent.message_id);
+              app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+            }
+
+            if (sent?.audio?.file_id) {
+              const fileId = sent.audio.file_id;
+              try {
+                const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                if (videoId) db.prepare(sql).run(videoId, fileId, songTitle, songArtist, durSec);
+                db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
+                if (songArtist && songArtist !== 'Music') {
+                  db.prepare(sql).run(`${songTitle.toLowerCase().trim()} ${songArtist.toLowerCase().trim()}`, fileId, songTitle, songArtist, durSec);
+                }
+              } catch {}
+            }
+          }
+          return;
+        }
         case 'send_audio': {
           const audioKey = args[0];
           if (ctx.query?.id) {

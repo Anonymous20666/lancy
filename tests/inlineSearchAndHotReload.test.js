@@ -928,7 +928,7 @@ test('TelegramController: live inline audio drops 100% full audio player with ri
   assert.equal(audioItem.audio_duration, 121);
 
   // Check rich caption formatting
-  assert.ok(audioItem.caption.includes('<blockquote>'), 'caption must include rich blockquote');
+  assert.ok(audioItem.caption.includes('<blockquote'), 'caption must include rich blockquote');
   assert.ok(audioItem.caption.includes('<b>Duration:</b> 2:01'), 'caption must display formatted duration');
   assert.ok(audioItem.caption.includes('320 kbps HD'), 'caption must display audio quality');
 

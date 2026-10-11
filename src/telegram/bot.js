@@ -524,7 +524,7 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  async #cacheAudioTrack(query, timeoutMs = 2500) {
+  async #cacheAudioTrack(query, timeoutMs = 2500, videoId = null) {
     const clean = String(query || '').trim();
     if (!clean || clean.length < 2) return null;
     const cleanKey = clean.toLowerCase();
@@ -556,7 +556,8 @@ export class TelegramController extends EventEmitter {
       try {
         if (!this.app?.mediaDownloader) return null;
 
-        const res = await this.app.mediaDownloader.download(clean);
+        const downloadTarget = videoId ? `https://www.youtube.com/watch?v=${videoId}` : clean;
+        const res = await this.app.mediaDownloader.download(downloadTarget);
         if (!res?.audioTrack?.buffer) return null;
 
         const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
@@ -578,6 +579,9 @@ export class TelegramController extends EventEmitter {
           try {
             const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
             this.db.prepare(sql).run(cleanKey, fileId, songTitle, songArtist, durSec);
+            if (videoId) {
+              this.db.prepare(sql).run(videoId, fileId, songTitle, songArtist, durSec);
+            }
             const lowerTitle = (songTitle || '').toLowerCase().trim();
             const lowerArtist = (songArtist || '').toLowerCase().trim();
             if (lowerTitle && lowerTitle !== cleanKey) {
@@ -613,6 +617,45 @@ export class TelegramController extends EventEmitter {
     } catch {
       return null;
     }
+  }
+
+  #matchCachedAudio(item, allCachedRows) {
+    if (!item || !allCachedRows?.length) return null;
+    const vid = item.videoId || '';
+    const ytTitle = (item.title || '').toLowerCase().trim();
+    const ytAuthor = (item.author || '').toLowerCase().trim();
+    const cleanYt = ytTitle
+      .replace(/\s*[\(\[](official\s*(music\s*video|video|audio|lyric\s*video|hd|4k)?|lyrics|audio|remix)[\)\]]/gi, '')
+      .replace(/[\-–—]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const fullYt = `${ytTitle} ${ytAuthor} ${cleanYt}`.toLowerCase();
+
+    return allCachedRows.find((r) => {
+      if (vid && (r.query === vid || (r.file_id && r.file_id.includes(vid)))) return true;
+      const rTitle = (r.title || '').toLowerCase().trim();
+      const rArtist = (r.artist || '').toLowerCase().trim();
+      const rQuery = (r.query || '').toLowerCase().trim();
+      if (!rTitle && !rQuery) return false;
+
+      // Exact query match
+      if (rQuery && (rQuery === ytTitle || rQuery === cleanYt)) return true;
+
+      // Both title and artist match
+      if (rTitle.length >= 3 && (ytTitle.includes(rTitle) || cleanYt.includes(rTitle))) {
+        if (!rArtist || rArtist === 'music' || rArtist === 'artist') return true;
+        if (fullYt.includes(rArtist)) return true;
+        if (rQuery && rQuery.includes(rArtist) && fullYt.includes(rTitle)) return true;
+      }
+
+      // Query words match (at least 2 words)
+      if (rQuery.length >= 4) {
+        const queryWords = rQuery.split(/\s+/).filter((w) => w.length >= 3);
+        if (queryWords.length >= 2 && queryWords.every((w) => fullYt.includes(w))) return true;
+      }
+
+      return false;
+    }) || null;
   }
 
   async #cacheVideoTrack(videoId, title = '', query = '', timeoutMs = 25000) {
@@ -2140,15 +2183,21 @@ export class TelegramController extends EventEmitter {
             const isExact = rowQuery === cleanLower || rowTitle === cleanLower || `${rowTitle} ${rowArtist}` === cleanLower || `${rowArtist} ${rowTitle}` === cleanLower;
             const rowText = `${rowQuery} ${rowTitle} ${rowArtist}`;
             const termsMatch = queryTerms.length > 0 && queryTerms.every((term) => rowText.includes(term));
+            const matchingTermsCount = queryTerms.filter((term) => term.length >= 3 && rowText.includes(term)).length;
 
-            if (isExact || termsMatch) {
+            let score = 0;
+            if (isExact) score = 100;
+            else if (termsMatch) score = 50 + queryTerms.length;
+            else if (matchingTermsCount > 0) score = 10 * matchingTermsCount;
+
+            if (score > 0) {
               seen.add(row.file_id);
               if (normKey) seen.add(normKey);
-              matches.push({ ...row, isExact });
+              matches.push({ ...row, isExact, score });
             }
           }
 
-          matches.sort((a, b) => (b.isExact ? 1 : 0) - (a.isExact ? 1 : 0));
+          matches.sort((a, b) => b.score - a.score);
           return matches.slice(0, 50);
         } catch {
           return [];
@@ -2171,7 +2220,7 @@ export class TelegramController extends EventEmitter {
           title: row.title,
           performer: row.artist || 'Music',
           ...(durSec > 0 ? { audio_duration: durSec } : {}),
-          caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
+          caption: `🎵 <b>${escapeHtml(row.title)}</b> — <i>${escapeHtml(row.artist || 'Music')}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
@@ -2208,9 +2257,11 @@ export class TelegramController extends EventEmitter {
         const combinedMusicResults = [];
         const seenTitles = new Set();
         const seenVids = new Set();
+        const seenFileIds = new Set();
 
         // 1. Add matching cached native audio tracks first (they drop native full MP3!)
         for (const row of cachedResults) {
+          if (row.audio_file_id) seenFileIds.add(row.audio_file_id);
           seenTitles.add((row.title || '').toLowerCase().trim());
           combinedMusicResults.push(row);
         }
@@ -2268,6 +2319,7 @@ export class TelegramController extends EventEmitter {
 
           if (cachedPool.items && cachedPool.items.length > 0) {
             const botUser = this.botUsername || 'Lancy_easy_bot';
+            const allCachedRows = this.db.prepare('SELECT file_id, title, artist, duration, query FROM cached_audio_tracks').all() || [];
 
             for (let idx = 0; idx < cachedPool.items.length; idx++) {
               const item = cachedPool.items[idx];
@@ -2282,8 +2334,8 @@ export class TelegramController extends EventEmitter {
                 const cTitle = (c.title || '').toLowerCase().trim();
                 const cArtist = (c.artist || '').toLowerCase().trim();
                 const vidFull = `${titleLower} ${(item.author || '').toLowerCase()}`;
-                if (cTitle && titleLower.includes(cTitle)) {
-                  if (!cArtist || vidFull.includes(cArtist)) return true;
+                if (cTitle && (titleLower.includes(cTitle) || cTitle.includes(titleLower))) {
+                  if (!cArtist || cArtist === 'music' || cArtist === 'artist' || vidFull.includes(cArtist)) return true;
                 }
                 return false;
               });
@@ -2296,34 +2348,34 @@ export class TelegramController extends EventEmitter {
               const artist = item.author || 'Music';
               const resId = `yt_aud_${item.videoId}_${offset}_${idx}`;
 
-              // Check if track is already cached in SQLite
-              let cachedTrack = null;
-              try {
-                cachedTrack = this.db.prepare(
-                  'SELECT file_id, title, artist, duration FROM cached_audio_tracks WHERE query = ? OR title = ? LIMIT 1'
-                ).get(item.videoId, titleLower);
-              } catch {}
+              // Check if track is already cached in SQLite with fuzzy matcher
+              const cachedTrack = this.#matchCachedAudio(item, allCachedRows);
 
               if (cachedTrack?.file_id) {
+                if (seenFileIds.has(cachedTrack.file_id)) continue;
+                seenFileIds.add(cachedTrack.file_id);
+
                 const durSec = cachedTrack.duration || 0;
                 const min = Math.floor(durSec / 60);
                 const sec = String(durSec % 60).padStart(2, '0');
                 const durStr = durSec > 0 ? `${min}:${sec}` : duration;
+                const songTitle = cachedTrack.title || title;
+                const songArtist = cachedTrack.artist || artist;
                 combinedMusicResults.push({
                   type: 'audio',
                   id: `cached_aud_${cachedTrack.file_id.slice(-8)}_${offset}_${idx}`,
                   audio_file_id: cachedTrack.file_id,
-                  title: cachedTrack.title || title,
-                  performer: cachedTrack.artist || artist,
+                  title: songTitle,
+                  performer: songArtist,
                   ...(durSec > 0 ? { audio_duration: durSec } : {}),
-                  caption: `🎵 <b>${escapeHtml(cachedTrack.title || title)}</b> — <i>${escapeHtml(cachedTrack.artist || artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
+                  caption: `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
                   parse_mode: 'HTML',
                   reply_markup: {
                     inline_keyboard: [
                       [
                         {
                           text: '📜 Lyrics & Info ♡',
-                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent((cachedTrack.title || title).replace(/\s+/g, '_')).slice(0, 32)}`,
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(songTitle.replace(/\s+/g, '_')).slice(0, 32)}`,
                           style: 'primary'
                         }
                       ],
@@ -2338,6 +2390,11 @@ export class TelegramController extends EventEmitter {
                   }
                 });
               } else {
+                // Pre-cache top uncached tracks in background
+                if (idx < 2) {
+                  this.#cacheAudioTrack(title, 0, item.videoId).catch(() => {});
+                }
+
                 recentInlineSearchResults.set(resId, {
                   type: 'audio',
                   videoId: item.videoId,
@@ -2357,22 +2414,27 @@ export class TelegramController extends EventEmitter {
                   audio_url: `https://www.youtube.com/watch?v=${item.videoId}`,
                   title: title.slice(0, 64),
                   performer: artist.slice(0, 64),
-                  caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 🎧 <b>320 kbps HD</b>\n✨ <i>Full Audio via @${botUser} ♡</i></blockquote>`,
+                  caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Tap below to drop full MP3 via @${botUser} ♡</i></blockquote>`,
                   parse_mode: 'HTML',
                   input_message_content: {
-                    message_text: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 🎧 <b>320 kbps HD</b>\n✨ <i>Extracting &amp; delivering full MP3 via @${botUser}… ♡</i></blockquote>`,
+                    message_text: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Tap below to drop full MP3 via @${botUser}… ♡</i></blockquote>`,
                     parse_mode: 'HTML'
                   },
                   reply_markup: {
                     inline_keyboard: [
                       [
                         {
-                          text: '📜 Lyrics & Info ♡',
-                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                          text: '📥 Drop Full MP3 File Now ♡',
+                          callback_data: encodeCallback('downloader', 'live_audio', item.videoId),
                           style: 'primary'
                         }
                       ],
                       [
+                        {
+                          text: '📜 Lyrics & Info ♡',
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                          style: 'primary'
+                        },
                         {
                           text: '🎵 Search Music Live',
                           switch_inline_query_current_chat: '',
