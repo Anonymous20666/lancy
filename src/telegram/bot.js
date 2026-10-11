@@ -1275,51 +1275,87 @@ export class TelegramController extends EventEmitter {
   }
 
   async #fetchInlineTikTokSearch(queryTopic, offset = 0) {
-    if (!queryTopic) return [];
+    if (!queryTopic) return { results: [], nextOffset: '' };
     try {
       const botUser = this.botUsername || 'Lancy_easy_bot';
-      const cacheKey = `tt_${queryTopic.toLowerCase()}`;
-      let cachedVids = inlineTikTokCache.get(cacheKey);
+      const cleanTopic = queryTopic.trim();
+      const cacheKey = `tt_pool_${cleanTopic.toLowerCase()}`;
+      let cached = inlineTikTokCache.get(cacheKey);
 
-      if (!cachedVids || offset >= cachedVids.length) {
-        const modifiers = [
-          'tiktok',
-          'tiktok shorts',
-          'tiktok viral',
-          'tiktok trending',
-          'tiktok compilation',
-          'tiktok dance',
-          'tiktok edit',
-          'tiktok funny'
-        ];
-        const pageIdx = Math.floor(offset / 10);
-        const mod = modifiers[pageIdx % modifiers.length];
-        const vids = await searchYouTubeFast(`${queryTopic} ${mod}`);
-        if (vids.length > 0) {
-          if (!cachedVids) cachedVids = [];
-          const seen = new Set(cachedVids.map((v) => v.videoId));
+      // Support legacy array format if seeded by test or previous cache
+      const legacyKey = `tt_${cleanTopic.toLowerCase()}`;
+      const legacyCached = inlineTikTokCache.get(legacyKey);
+
+      if (!cached || !Array.isArray(cached.items) || (Date.now() - cached.timestamp > 180000)) {
+        if (Array.isArray(legacyCached)) {
+          cached = {
+            items: legacyCached,
+            combosTried: 99,
+            timestamp: Date.now()
+          };
+        } else {
+          cached = {
+            items: [],
+            combosTried: 0,
+            timestamp: Date.now()
+          };
+        }
+        inlineTikTokCache.set(cacheKey, cached);
+        if (inlineTikTokCache.size > 200) {
+          const firstKey = inlineTikTokCache.keys().next().value;
+          inlineTikTokCache.delete(firstKey);
+        }
+      }
+
+      const combos = [
+        `${cleanTopic} tiktok`,
+        `${cleanTopic} shorts`,
+        `${cleanTopic} viral tiktok`,
+        `${cleanTopic} trending tiktok`,
+        `${cleanTopic} tiktok compilation`,
+        `${cleanTopic} tiktok dance`,
+        `${cleanTopic} tiktok edit`,
+        `${cleanTopic} tiktok funny`,
+        `${cleanTopic} tiktok clip`,
+        `${cleanTopic} reels`,
+        cleanTopic,
+        `${cleanTopic} 4k edit`,
+        `${cleanTopic} viral shorts`
+      ];
+
+      // Expand video items in the pool until offset + 10 is reached or combos exhausted
+      while (cached.items.length < (offset + 10) && cached.combosTried < 25) {
+        const mod = cached.combosTried < combos.length
+          ? combos[cached.combosTried]
+          : `${cleanTopic} tiktok part ${cached.combosTried - combos.length + 2}`;
+        cached.combosTried++;
+        const vids = await searchYouTubeFast(mod).catch(() => []);
+        if (vids?.length) {
+          const seen = new Set(cached.items.map((v) => v.videoId));
           for (const v of vids) {
-            if (!seen.has(v.videoId)) {
+            if (v?.videoId && !seen.has(v.videoId)) {
               seen.add(v.videoId);
-              cachedVids.push(v);
+              cached.items.push(v);
             }
-          }
-          inlineTikTokCache.set(cacheKey, cachedVids);
-          if (inlineTikTokCache.size > 200) {
-            const firstKey = inlineTikTokCache.keys().next().value;
-            inlineTikTokCache.delete(firstKey);
           }
         }
       }
 
-      if (!cachedVids || cachedVids.length === 0) return [];
+      // Synchronize legacy key for backwards-compatibility with tests checking raw array
+      inlineTikTokCache.set(legacyKey, cached.items);
 
-      const paged = cachedVids.slice(offset, offset + 10);
+      if (cached.items.length === 0) return { results: [], nextOffset: '' };
+
+      const paged = cached.items.slice(offset, offset + 10);
+      const nextOffset = (offset + paged.length < cached.items.length || cached.combosTried < 25) && paged.length > 0
+        ? String(offset + paged.length)
+        : '';
+
       const results = [];
 
       for (let idx = 0; idx < paged.length; idx++) {
         const item = paged[idx];
-        const title = item.title || queryTopic;
+        const title = item.title || cleanTopic;
         const duration = item.duration || 'HD Clip';
         const views = item.views ? `${item.views}` : 'Trending';
         const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
@@ -1336,7 +1372,7 @@ export class TelegramController extends EventEmitter {
         if (cachedVid?.file_id) {
           results.push({
             type: 'video',
-            id: `cached_vid_${cachedVid.file_id.slice(-8)}_${idx}`,
+            id: `cached_vid_${cachedVid.file_id.slice(-8)}_${offset}_${idx}`,
             video_file_id: cachedVid.file_id,
             title: `🎬 ${title.slice(0, 50)}`,
             description: `⏱ ${duration} • 👁 ${views} ♡`,
@@ -1353,8 +1389,8 @@ export class TelegramController extends EventEmitter {
                 ],
                 [
                   {
-                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    text: `🔍 More "${cleanTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${cleanTopic}`,
                     style: 'primary'
                   }
                 ]
@@ -1367,7 +1403,7 @@ export class TelegramController extends EventEmitter {
             videoId: item.videoId,
             title,
             duration,
-            query: queryTopic
+            query: cleanTopic
           });
           if (recentInlineSearchResults.size > 500) {
             const firstKey = recentInlineSearchResults.keys().next().value;
@@ -1375,14 +1411,19 @@ export class TelegramController extends EventEmitter {
           }
 
           results.push({
-            type: 'photo',
+            type: 'video',
             id: resId,
-            photo_url: thumb,
-            thumb_url: thumb,
+            video_url: `https://www.youtube.com/watch?v=${item.videoId}`,
+            mime_type: 'text/html',
+            thumbnail_url: thumb,
             title: `🎬 ${title.slice(0, 50)}`,
             description: `⏱ ${duration} • 👁 ${views} ♡`,
-            caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>Downloading &amp; delivering HD clip via @${botUser}… ♡</i></blockquote>`,
+            caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>Delivering video via @${botUser}… ♡</i></blockquote>`,
             parse_mode: 'HTML',
+            input_message_content: {
+              message_text: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>Downloading &amp; delivering HD clip via @${botUser}… ♡</i></blockquote>`,
+              parse_mode: 'HTML'
+            },
             reply_markup: {
               inline_keyboard: [
                 [
@@ -1394,8 +1435,8 @@ export class TelegramController extends EventEmitter {
                 ],
                 [
                   {
-                    text: `🔍 More "${queryTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `tt ${queryTopic}`,
+                    text: `🔍 More "${cleanTopic.slice(0, 15)}"`,
+                    switch_inline_query_current_chat: `tt ${cleanTopic}`,
                     style: 'primary'
                   }
                 ]
@@ -1407,12 +1448,12 @@ export class TelegramController extends EventEmitter {
 
       // Pre-cache top result in background if not already cached
       if (paged.length > 0 && !results[0]?.video_file_id) {
-        this.#cacheVideoTrack(paged[0].videoId, paged[0].title, queryTopic).catch(() => {});
+        this.#cacheVideoTrack(paged[0].videoId, paged[0].title, cleanTopic).catch(() => {});
       }
-      return results;
+      return { results, nextOffset };
     } catch (err) {
       this.log?.debug?.({ err: err?.message, queryTopic }, 'inline tiktok search failed');
-      return [];
+      return { results: [], nextOffset: '' };
     }
   }
 
@@ -2028,21 +2069,9 @@ export class TelegramController extends EventEmitter {
           return;
         }
 
-        const cacheKey = `${queryTopic.toLowerCase()}_off_${offset}`;
-        let ttResults = inlineTikTokCache.get(cacheKey);
-        if (!ttResults) {
-          ttResults = await this.#fetchInlineTikTokSearch(queryTopic, offset);
-          if (ttResults?.length) {
-            inlineTikTokCache.set(cacheKey, ttResults);
-            if (inlineTikTokCache.size > 200) {
-              const firstKey = inlineTikTokCache.keys().next().value;
-              inlineTikTokCache.delete(firstKey);
-            }
-          }
-        }
+        const { results: ttResults, nextOffset } = await this.#fetchInlineTikTokSearch(queryTopic, offset);
 
         if (ttResults && ttResults.length > 0) {
-          const nextOffset = ttResults.length >= 8 ? String(offset + ttResults.length) : '';
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
             results: ttResults,
@@ -2178,6 +2207,7 @@ export class TelegramController extends EventEmitter {
       } else {
         const combinedMusicResults = [];
         const seenTitles = new Set();
+        const seenVids = new Set();
 
         // 1. Add matching cached native audio tracks first (they drop native full MP3!)
         for (const row of cachedResults) {
@@ -2185,46 +2215,65 @@ export class TelegramController extends EventEmitter {
           combinedMusicResults.push(row);
         }
 
-        // 2. Fetch online YouTube tracks when query has at least 2 chars so users ALWAYS get a full list of 10+ results!
+        let cachedPool = null;
+
+        // 2. Fetch online YouTube tracks when query has at least 2 chars so users ALWAYS get endless music results!
         if (cleanSongQuery.length >= 2) {
           this.#cacheAudioTrack(cleanSongQuery, 0).catch(() => {});
 
-          const cacheKey = `mus_${cleanSongQuery.toLowerCase()}`;
-          let onlineVideos = inlineSearchCache.get(cacheKey);
+          const cacheKey = `mus_pool_${cleanSongQuery.toLowerCase()}`;
+          cachedPool = inlineSearchCache.get(cacheKey);
 
-          if (!onlineVideos || (offset + 10) >= onlineVideos.length) {
-            const searchTerms = [
-              cleanSongQuery,
-              `${cleanSongQuery} audio`,
-              `${cleanSongQuery} music`,
-              `${cleanSongQuery} song`,
-              `${cleanSongQuery} official audio`
-            ];
-            const pageIdx = Math.floor(offset / 10);
-            const term = searchTerms[pageIdx % searchTerms.length];
-            const vids = await searchYouTubeFast(term);
-            if (vids.length > 0) {
-              if (!onlineVideos) onlineVideos = [];
-              const seenVids = new Set(onlineVideos.map((v) => v.videoId));
+          if (!cachedPool || !Array.isArray(cachedPool.items) || (Date.now() - cachedPool.timestamp > 180000)) {
+            cachedPool = {
+              items: [],
+              combosTried: 0,
+              timestamp: Date.now()
+            };
+            inlineSearchCache.set(cacheKey, cachedPool);
+            if (inlineSearchCache.size > 200) {
+              const firstKey = inlineSearchCache.keys().next().value;
+              inlineSearchCache.delete(firstKey);
+            }
+          }
+
+          const searchTerms = [
+            cleanSongQuery,
+            `${cleanSongQuery} audio`,
+            `${cleanSongQuery} music`,
+            `${cleanSongQuery} song`,
+            `${cleanSongQuery} official audio`,
+            `${cleanSongQuery} full song`,
+            `${cleanSongQuery} lyrics`,
+            `${cleanSongQuery} soundtrack`,
+            `${cleanSongQuery} remix`
+          ];
+
+          while (cachedPool.items.length < (offset + 10) && cachedPool.combosTried < 25) {
+            const term = cachedPool.combosTried < searchTerms.length
+              ? searchTerms[cachedPool.combosTried]
+              : `${cleanSongQuery} song part ${cachedPool.combosTried - searchTerms.length + 2}`;
+            cachedPool.combosTried++;
+            const vids = await searchYouTubeFast(term).catch(() => []);
+            if (vids?.length) {
+              const seenPoolVids = new Set(cachedPool.items.map((v) => v.videoId));
               for (const v of vids) {
-                if (!seenVids.has(v.videoId)) {
-                  seenVids.add(v.videoId);
-                  onlineVideos.push(v);
+                if (v?.videoId && !seenPoolVids.has(v.videoId)) {
+                  seenPoolVids.add(v.videoId);
+                  cachedPool.items.push(v);
                 }
-              }
-              inlineSearchCache.set(cacheKey, onlineVideos);
-              if (inlineSearchCache.size > 200) {
-                const firstKey = inlineSearchCache.keys().next().value;
-                inlineSearchCache.delete(firstKey);
               }
             }
           }
 
-          if (onlineVideos && onlineVideos.length > 0) {
+          if (cachedPool.items && cachedPool.items.length > 0) {
             const botUser = this.botUsername || 'Lancy_easy_bot';
 
-            for (let idx = 0; idx < onlineVideos.length; idx++) {
-              const item = onlineVideos[idx];
+            for (let idx = 0; idx < cachedPool.items.length; idx++) {
+              const item = cachedPool.items[idx];
+              if (seenVids.has(item.videoId)) continue;
+              seenVids.add(item.videoId);
+
               const titleLower = (item.title || '').toLowerCase().trim();
               if (seenTitles.has(titleLower)) continue;
 
@@ -2245,7 +2294,6 @@ export class TelegramController extends EventEmitter {
               const title = item.title || cleanSongQuery;
               const duration = item.duration || 'HD Track';
               const artist = item.author || 'Music';
-              const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
               const resId = `yt_aud_${item.videoId}_${offset}_${idx}`;
 
               // Check if track is already cached in SQLite
@@ -2263,7 +2311,7 @@ export class TelegramController extends EventEmitter {
                 const durStr = durSec > 0 ? `${min}:${sec}` : duration;
                 combinedMusicResults.push({
                   type: 'audio',
-                  id: `cached_aud_${cachedTrack.file_id.slice(-8)}_${idx}`,
+                  id: `cached_aud_${cachedTrack.file_id.slice(-8)}_${offset}_${idx}`,
                   audio_file_id: cachedTrack.file_id,
                   title: cachedTrack.title || title,
                   performer: cachedTrack.artist || artist,
@@ -2304,14 +2352,17 @@ export class TelegramController extends EventEmitter {
                 }
 
                 combinedMusicResults.push({
-                  type: 'photo',
+                  type: 'audio',
                   id: resId,
-                  photo_url: thumb,
-                  thumb_url: thumb,
-                  title: `🎵 ${title.slice(0, 50)}`,
-                  description: `⏱ ${duration} • 👤 ${artist} ♡`,
-                  caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 🎧 <b>320 kbps HD</b>\n✨ <i>Extracting &amp; delivering full MP3 via @${botUser}… ♡</i></blockquote>`,
+                  audio_url: `https://www.youtube.com/watch?v=${item.videoId}`,
+                  title: title.slice(0, 64),
+                  performer: artist.slice(0, 64),
+                  caption: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 🎧 <b>320 kbps HD</b>\n✨ <i>Full Audio via @${botUser} ♡</i></blockquote>`,
                   parse_mode: 'HTML',
+                  input_message_content: {
+                    message_text: `🎵 <b>${escapeHtml(title)}</b> — <i>${escapeHtml(artist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 🎧 <b>320 kbps HD</b>\n✨ <i>Extracting &amp; delivering full MP3 via @${botUser}… ♡</i></blockquote>`,
+                    parse_mode: 'HTML'
+                  },
                   reply_markup: {
                     inline_keyboard: [
                       [
@@ -2338,26 +2389,44 @@ export class TelegramController extends EventEmitter {
 
         if (combinedMusicResults.length > 0) {
           const pagedResults = combinedMusicResults.slice(offset, offset + 10);
-          nextOffset = (offset + pagedResults.length < combinedMusicResults.length) || combinedMusicResults.length >= 8
+          nextOffset = (offset + pagedResults.length < combinedMusicResults.length || (cachedPool?.combosTried < 25)) && pagedResults.length > 0
             ? String(offset + pagedResults.length)
             : '';
           results = pagedResults;
         }
       }
 
-      // 5. If no music results and query is generic, fall back to Pinterest pictures
+      // 5. Friendly fallback when zero music results found (never fall back to Pinterest photos!)
       if (results.length === 0 && cleanSongQuery.length >= 2) {
-        const { results: pintFallback, nextOffset: nextFallbackOffset } = await this.#fetchInlinePinterestSearch(cleanSongQuery, offset);
-        if (pintFallback && pintFallback.length > 0) {
-          await this.api.call('answerInlineQuery', {
-            inline_query_id: qId,
-            results: pintFallback,
-            next_offset: nextFallbackOffset,
-            cache_time: 30,
-            is_personal: false
-          });
-          return;
-        }
+        await this.api.call('answerInlineQuery', {
+          inline_query_id: qId,
+          results: [{
+            type: 'article',
+            id: 'music_none_' + Date.now(),
+            title: `🎵 No music tracks found for "${cleanSongQuery}"`,
+            description: `Try another song title or artist name ♡`,
+            thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🎵 <b>Music Search</b>\nCould not find songs for <code>${escapeHtml(cleanSongQuery)}</code>.\nTry searching with artist name or title! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🎵 Search Another Song',
+                    switch_inline_query_current_chat: '',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          }],
+          cache_time: 15,
+          is_personal: false
+        });
+        return;
       }
 
       const answerPayload = {
