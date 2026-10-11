@@ -193,7 +193,7 @@ export function createDownloaderScreen({ app }) {
     ));
     b.divider();
     b.buttons([
-      richButton.callback('🎬 Search TikTok Live', '', { switch_inline_query_current_chat: 'tt ', style: 'primary' }),
+      richButton.switchInlineCurrent('🎬 Search TikTok Live', 'tt '),
       richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
     ]);
     b.validate();
