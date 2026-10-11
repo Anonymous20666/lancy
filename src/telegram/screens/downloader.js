@@ -769,6 +769,10 @@ export function createDownloaderScreen({ app }) {
           const songTitle = result.title || title || 'Audio Track';
           const songPerformer = result.artist || result.author || null;
           const parsedDur = parseDurationToSeconds(audioTrack?.duration || result.duration) || 0;
+          if (parsedDur > 0 && parsedDur < 45) {
+            // Strictly reject preview snippets from being cached
+            return;
+          }
           const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
           const cleanQuery = (url || '').toLowerCase().trim();
           const cleanTitle = (songTitle || '').toLowerCase().trim();
@@ -1495,12 +1499,13 @@ export function createDownloaderScreen({ app }) {
               }
             }
             if (fileId) {
+              const dur = meta.duration || 0;
+              if (dur > 0 && dur < 45) return; // Do NOT cache preview snippets
               const db = app.db || ctx.db;
               try {
                 const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
                 const cleanQuery = songTitle.toLowerCase().trim();
                 const cleanArtist = songPerformer !== 'Artist' ? songPerformer : null;
-                const dur = meta.duration || 0;
                 if (typeof db?.run === 'function') {
                   db.run(sql, cleanQuery, fileId, songTitle, cleanArtist, dur);
                 } else if (typeof db?.prepare === 'function') {

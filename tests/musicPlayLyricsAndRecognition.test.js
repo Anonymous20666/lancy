@@ -741,5 +741,26 @@ test('MediaDownloader: music search ranks exact YouTube artist match for "one li
   assert.match(result.artist.toLowerCase(), /lorda/i, 'Artist should match Lorda');
 });
 
+test('MediaDownloader: music search delivers full-length track with duration >= 60 seconds (never 30s preview)', async () => {
+  const { MediaDownloader, getAudioDurationSeconds } = await import('../src/media/downloader.js');
+  const downloader = new MediaDownloader();
+
+  const result = await downloader.download('espresso sabrina carpenter');
+  assert.ok(result, 'Result should be returned');
+  assert.ok(result.audioTrack?.buffer, 'Audio track buffer must exist');
+  assert.ok(result.audioTrack.buffer.length > 500000, 'Audio track buffer must be a full file > 500KB');
+
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { writeFileSync, unlinkSync } = await import('node:fs');
+  const tempPath = join(tmpdir(), `test_dur_${Date.now()}.mp3`);
+  writeFileSync(tempPath, result.audioTrack.buffer);
+  const duration = await getAudioDurationSeconds(tempPath);
+  try { unlinkSync(tempPath); } catch {}
+
+  assert.ok(duration !== null, 'Duration must be measurable');
+  assert.ok(duration >= 60, `Audio duration (${duration}s) must be a genuine full song, not a 30s preview`);
+});
+
 
 

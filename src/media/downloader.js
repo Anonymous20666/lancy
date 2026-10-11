@@ -18,8 +18,36 @@ import {
 } from 'social-dl';
 
 import { searchSongByLyrics, cleanSongMetadata } from './lyrics.js';
+import { searchYouTubeFast } from './youtubeSearch.js';
 
 const execFileAsync = promisify(execFile);
+
+export function getCookieArgs() {
+  const possiblePaths = [
+    join(process.cwd(), 'youtube_cookies.txt'),
+    '/data/youtube_cookies.txt',
+    join(process.cwd(), 'data', 'youtube_cookies.txt')
+  ];
+  for (const p of possiblePaths) {
+    if (existsSync(p)) return ['--cookies', p];
+  }
+  return [];
+}
+
+export async function getAudioDurationSeconds(filePath) {
+  try {
+    const { stdout } = await execFileAsync('ffprobe', [
+      '-v', 'error',
+      '-show_entries', 'format=duration',
+      '-of', 'default=noprint_wrappers=1:nokey=1',
+      filePath
+    ], { timeout: 5000 });
+    const dur = parseFloat(stdout.trim());
+    return Number.isFinite(dur) ? dur : null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Universal Media Downloader & Extractor
@@ -922,7 +950,7 @@ export class MediaDownloader {
       }
     } catch {}
 
-    // 3. Try social-dl
+    // 3. Try social-dl format only if it is a genuine full track (>= 50 seconds)
     try {
       const res = await spotifyDl(url);
       if (res?.title) title = res.title;
@@ -932,27 +960,36 @@ export class MediaDownloader {
         const musRes = await fetch(best.url, { signal: AbortSignal.timeout(30000) });
         if (musRes.ok) {
           let buf = Buffer.from(await musRes.arrayBuffer());
-          buf = await this.#optimizeAudioToCbrMp3(buf, { title, artist, album, year });
-          const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
-          return {
-            sourceUrl: url,
-            platform: 'spotify',
-            title,
-            artist,
-            author: artist || 'Spotify',
-            album,
-            year,
-            duration,
-            mediaItems,
-            audioTrack: {
-              buffer: buf,
-              filename: `${title.replace(/[^\w\s-]/g, '') || 'track'}.mp3`,
+          const tempCheckPath = join(tmpdir(), `lancy_sp_chk_${Date.now()}.mp3`);
+          writeFileSync(tempCheckPath, buf);
+          const dur = await getAudioDurationSeconds(tempCheckPath);
+          try { unlinkSync(tempCheckPath); } catch {}
+          if (dur && dur >= 50) {
+            buf = await this.#optimizeAudioToCbrMp3(buf, { title, artist, album, year });
+            const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
+            const min = Math.floor(dur / 60);
+            const sec = String(Math.floor(dur % 60)).padStart(2, '0');
+            return {
+              sourceUrl: url,
+              platform: 'spotify',
               title,
-              performer: artist || 'Spotify',
+              artist,
+              author: artist || 'Spotify',
               album,
-              year
-            }
-          };
+              year,
+              duration: `${min}:${sec}`,
+              mediaItems,
+              audioTrack: {
+                buffer: buf,
+                filename: `${title.replace(/[^\w\s-]/g, '') || 'track'}.mp3`,
+                title,
+                performer: artist || 'Spotify',
+                album,
+                year,
+                duration: dur
+              }
+            };
+          }
         }
       }
     } catch (err) {
@@ -964,61 +1001,107 @@ export class MediaDownloader {
       }
     }
 
-    // 4. Download clean audio match via ytsearch
+    // 4. Download genuine full audio match via YouTube & SoundCloud
     const primaryArtist = (artist || '').split(/[,&]/)[0].trim();
     const cleanTitle = (title || '').replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
 
     const candidateQueries = [
-      `${primaryArtist} ${cleanTitle} audio`,
-      `${artist} ${cleanTitle} audio`,
-      `${primaryArtist} ${title} audio`,
-      `${title} audio`
+      `${primaryArtist} ${cleanTitle}`,
+      `${artist} ${cleanTitle}`,
+      `${title} ${artist}`,
+      `${cleanTitle} audio`
     ].map((q) => q.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
 
-    onProgress?.(`Finding audio match for "${title}"… ♡`);
+    onProgress?.(`Finding full audio match for "${title}"… ♡`);
+    const cookieArgs = getCookieArgs();
 
     for (const query of candidateQueries) {
       const tempDir = join(tmpdir(), `lancy_sp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
       mkdirSync(tempDir, { recursive: true });
       try {
         let downloaded = false;
+
+        // Try fast search for exact YouTube video
         try {
-          await execFileAsync('yt-dlp', [
-            '--no-warnings',
-            '--js-runtimes', 'node:/usr/bin/node',
-            '--extractor-args', 'youtube:player_client=android,web',
-            '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
-            '-f', 'ba/b',
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '2',
-            '-o', join(tempDir, '%(title).60s.%(ext)s'),
-            `ytsearch1:${query}`
-          ], { timeout: 60000 });
-          downloaded = true;
-        } catch (ytErr) {
-          this.log.debug({ err: ytErr.message, query }, 'YouTube query failed, trying SoundCloud fallback');
-          await execFileAsync('yt-dlp', [
-            '--no-warnings',
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '2',
-            '-o', join(tempDir, '%(title).60s.%(ext)s'),
-            `scsearch1:${query}`
-          ], { timeout: 60000 });
-          downloaded = true;
+          const fastVids = await searchYouTubeFast(query);
+          if (fastVids.length > 0 && fastVids[0].videoId) {
+            await execFileAsync('yt-dlp', [
+              '--no-warnings',
+              ...cookieArgs,
+              '--js-runtimes', 'node:/usr/bin/node',
+              '-f', 'ba/b',
+              '-x',
+              '--audio-format', 'mp3',
+              '--audio-quality', '2',
+              '-o', join(tempDir, '%(title).60s.%(ext)s'),
+              `https://www.youtube.com/watch?v=${fastVids[0].videoId}`
+            ], { timeout: 60000 });
+            const files = readdirSync(tempDir);
+            const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+            if (foundAudio) {
+              const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
+              if (dur && dur >= 45) downloaded = true;
+            }
+          }
+        } catch {}
+
+        if (!downloaded) {
+          try {
+            await execFileAsync('yt-dlp', [
+              '--no-warnings',
+              ...cookieArgs,
+              '--js-runtimes', 'node:/usr/bin/node',
+              '-f', 'ba/b',
+              '-x',
+              '--audio-format', 'mp3',
+              '--audio-quality', '2',
+              '-o', join(tempDir, '%(title).60s.%(ext)s'),
+              `ytsearch1:${query}`
+            ], { timeout: 60000 });
+            const files = readdirSync(tempDir);
+            const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+            if (foundAudio) {
+              const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
+              if (dur && dur >= 45) downloaded = true;
+            }
+          } catch {}
+        }
+
+        if (!downloaded) {
+          try {
+            await execFileAsync('yt-dlp', [
+              '--no-warnings',
+              '-x',
+              '--audio-format', 'mp3',
+              '--audio-quality', '2',
+              '-o', join(tempDir, '%(title).60s.%(ext)s'),
+              `scsearch1:${query}`
+            ], { timeout: 60000 });
+            const files = readdirSync(tempDir);
+            const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+            if (foundAudio) {
+              const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
+              if (dur && dur >= 45) downloaded = true;
+            }
+          } catch {}
         }
 
         const files = readdirSync(tempDir);
         const audioFile = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
         if (audioFile) {
-          const audioBuf = await this.#optimizeAudioToCbrMp3(join(tempDir, audioFile), {
+          const fullAudioPath = join(tempDir, audioFile);
+          const durSec = await getAudioDurationSeconds(fullAudioPath);
+          if (durSec && durSec < 45) {
+            continue; // Skip preview clip and continue searching
+          }
+          const audioBuf = await this.#optimizeAudioToCbrMp3(fullAudioPath, {
             title,
             artist,
             album,
             year
           });
           const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
+          const durString = durSec ? `${Math.floor(durSec / 60)}:${String(Math.floor(durSec % 60)).padStart(2, '0')}` : duration;
           return {
             sourceUrl: url,
             platform: 'spotify',
@@ -1027,7 +1110,7 @@ export class MediaDownloader {
             author: artist || 'Spotify',
             album,
             year,
-            duration,
+            duration: durString,
             mediaItems,
             audioTrack: {
               buffer: audioBuf,
@@ -1035,7 +1118,8 @@ export class MediaDownloader {
               title,
               performer: artist || 'Spotify',
               album,
-              year
+              year,
+              duration: durSec
             }
           };
         }
@@ -1046,7 +1130,7 @@ export class MediaDownloader {
       }
     }
 
-    throw new Error(`Could not download audio track for "${title}".`);
+    throw new Error(`Could not download full audio track for "${title}". Please verify the title or try another song ♡`);
   }
 
   /**
@@ -1093,86 +1177,56 @@ export class MediaDownloader {
       let trackYear = null;
       let videoId = null;
 
-      // 1. YouTube Primary Search (ytsearch5 ranked by query relevance)
+      // 1. YouTube Fast Search (<100ms InnerTube endpoint)
       const queryTerms = clean.toLowerCase().split(/\s+/).filter(Boolean);
       try {
-        let stdout = '';
-        try {
-          const res = await execFileAsync('yt-dlp', [
-            '--no-warnings',
-            '--js-runtimes', 'node:/usr/bin/node',
-            '--ignore-errors',
-            '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(upload_date)s ||| %(thumbnail)s',
-            `ytsearch5:${clean}`
-          ], { timeout: 15000 });
-          stdout = res.stdout || '';
-        } catch (ytErr) {
-          stdout = ytErr.stdout || '';
+        const fastItems = await searchYouTubeFast(clean);
+        if (Array.isArray(fastItems) && fastItems.length > 0) {
+          const scored = fastItems.map((item) => {
+            const combined = `${item.title} ${item.author}`.toLowerCase();
+            const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
+            return { item, score };
+          });
+          scored.sort((a, b) => b.score - a.score);
+          const best = scored[0].item;
+          videoId = best.videoId;
+          trackTitle = best.title || trackTitle;
+          trackAuthor = best.author || trackAuthor;
+          trackDuration = best.duration || trackDuration;
+          trackThumbnailUrl = best.thumb || trackThumbnailUrl;
         }
-
-        const lines = stdout.trim().split('\n').filter((l) => l.includes(' ||| '));
-        const candidates = [];
-
-        for (const line of lines) {
-          const parts = line.split(' ||| ');
-          if (!parts[0]) continue;
-          const id = parts[0].trim();
-          const title = (parts[1] || '').trim();
-          const channel = (parts[2] || '').trim();
-          const duration = (parts[3] || '').trim();
-          const year = (parts[4] || '').slice(0, 4);
-          const thumb = (parts[5] || '').trim();
-
-          const combined = `${title} ${channel}`.toLowerCase();
-          const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
-          candidates.push({ id, title, channel, duration, year, thumb, score });
-        }
-
-        if (candidates.length > 0) {
-          candidates.sort((a, b) => b.score - a.score);
-          const best = candidates[0];
-          videoId = best.id;
-          trackTitle = best.title;
-          trackAuthor = best.channel;
-          trackDuration = best.duration;
-          trackYear = best.year;
-          trackThumbnailUrl = best.thumb;
-        }
-      } catch (ytErr) {
-        this.log.warn({ err: ytErr?.message, clean }, 'YouTube primary search failed, trying Spotify fallback');
+      } catch (err) {
+        this.log.warn({ err: err?.message, clean }, 'searchYouTubeFast failed, trying Deezer metadata');
       }
 
-      let dzPreviewUrl = null;
-      // 2. Spotify / Deezer Fallback (if YouTube search yielded no match)
-      if (!videoId) {
-        onProgress?.(`Trying Spotify metadata for "${clean}"… ♡`);
-        try {
-          const spRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=3`, {
-            signal: AbortSignal.timeout(5000)
-          });
-          if (spRes.ok) {
-            const spData = await spRes.json();
-            if (Array.isArray(spData.data) && spData.data.length > 0) {
-              const spCandidates = spData.data.map((item) => {
-                const combined = `${item.title} ${item.artist?.name || ''}`.toLowerCase();
-                const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
-                return { item, score };
-              });
-              spCandidates.sort((a, b) => b.score - a.score);
-              const bestSp = spCandidates[0].item;
+      // 2. High-res metadata and artwork enrichment via Deezer (Zero audio previews used!)
+      try {
+        const spRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=3`, {
+          signal: AbortSignal.timeout(5000)
+        });
+        if (spRes.ok) {
+          const spData = await spRes.json();
+          if (Array.isArray(spData.data) && spData.data.length > 0) {
+            const spCandidates = spData.data.map((item) => {
+              const combined = `${item.title} ${item.artist?.name || ''}`.toLowerCase();
+              const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
+              return { item, score };
+            });
+            spCandidates.sort((a, b) => b.score - a.score);
+            const bestSp = spCandidates[0].item;
+            if (!videoId) {
               trackTitle = bestSp.title || trackTitle;
               trackAuthor = bestSp.artist?.name || trackAuthor;
-              dzPreviewUrl = bestSp.preview || null;
-              if (bestSp.duration) {
-                const min = Math.floor(bestSp.duration / 60);
-                const sec = String(bestSp.duration % 60).padStart(2, '0');
-                trackDuration = `${min}:${sec}`;
-              }
-              trackThumbnailUrl = bestSp.album?.cover_big || bestSp.album?.cover_medium || trackThumbnailUrl;
             }
+            if (bestSp.duration && !trackDuration) {
+              const min = Math.floor(bestSp.duration / 60);
+              const sec = String(bestSp.duration % 60).padStart(2, '0');
+              trackDuration = `${min}:${sec}`;
+            }
+            trackThumbnailUrl = bestSp.album?.cover_big || bestSp.album?.cover_medium || trackThumbnailUrl;
           }
-        } catch {}
-      }
+        }
+      } catch {}
 
       // Clean track title & author from search if needed
       const initialClean = cleanSongMetadata(trackTitle, trackAuthor);
@@ -1181,27 +1235,36 @@ export class MediaDownloader {
         if (initialClean.artist) trackAuthor = initialClean.artist;
       }
 
-      onProgress?.(`Downloading audio track for "${trackTitle}"… ♡`);
+      onProgress?.(`Downloading full audio track for "${trackTitle}"… ♡`);
 
       let downloaded = false;
+      const cookieArgs = getCookieArgs();
 
-      const hasAudioFile = () => {
+      const getValidAudioFile = async () => {
         try {
-          return readdirSync(tempDir).some((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+          const files = readdirSync(tempDir);
+          const audio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+          if (!audio) return null;
+          const fullPath = join(tempDir, audio);
+          const dur = await getAudioDurationSeconds(fullPath);
+          if (dur !== null && dur < 45) {
+            // Delete preview snippet! Never accept truncated tracks.
+            try { unlinkSync(fullPath); } catch {}
+            return null;
+          }
+          return { filename: audio, path: fullPath, duration: dur };
         } catch {
-          return false;
+          return null;
         }
       };
 
-      // Layer 1: Download matched YouTube video with Android client (bypasses 403 SABR block)
+      // Layer 1: Download matched YouTube video with authenticated session & node challenge solver
       if (videoId) {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
+            ...cookieArgs,
             '--js-runtimes', 'node:/usr/bin/node',
-            '--ignore-errors',
-            '--extractor-args', 'youtube:player_client=android,web',
-            '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
             '-f', 'ba/b',
             '-x',
             '--audio-format', 'mp3',
@@ -1211,21 +1274,19 @@ export class MediaDownloader {
             '-o', '%(title).60s.%(ext)s',
             `https://www.youtube.com/watch?v=${videoId}`
           ], { timeout: 60000 });
-          if (hasAudioFile()) downloaded = true;
+          if (await getValidAudioFile()) downloaded = true;
         } catch (ytDlErr) {
-          this.log.warn({ err: ytDlErr.message, videoId }, 'YouTube direct video download failed, trying search fallback');
+          this.log.warn({ err: ytDlErr.message, videoId }, 'Direct YouTube video download failed, trying search fallback');
         }
       }
 
-      // Layer 2: Direct clean query search with Android client
+      // Layer 2: Direct clean query search with authenticated session & node challenge solver
       if (!downloaded) {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
+            ...cookieArgs,
             '--js-runtimes', 'node:/usr/bin/node',
-            '--ignore-errors',
-            '--extractor-args', 'youtube:player_client=android,web',
-            '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
             '-f', 'ba/b',
             '-x',
             '--audio-format', 'mp3',
@@ -1235,13 +1296,36 @@ export class MediaDownloader {
             '-o', '%(title).60s.%(ext)s',
             `ytsearch1:${clean}`
           ], { timeout: 60000 });
-          if (hasAudioFile()) downloaded = true;
+          if (await getValidAudioFile()) downloaded = true;
         } catch (ytSearchErr) {
-          this.log.warn({ err: ytSearchErr.message }, 'YouTube searchTarget download failed, trying SoundCloud fallback');
+          this.log.warn({ err: ytSearchErr.message }, 'YouTube query search failed, trying proxy fallback');
         }
       }
 
-      // Layer 3: SoundCloud Search fallback (zero 403 blocks)
+      // Layer 3: YouTube via SOCKS5 proxy fallback
+      if (!downloaded) {
+        try {
+          await execFileAsync('yt-dlp', [
+            '--no-warnings',
+            '--proxy', 'socks5h://127.0.0.1:9000',
+            ...cookieArgs,
+            '--js-runtimes', 'node:/usr/bin/node',
+            '-f', 'ba/b',
+            '-x',
+            '--audio-format', 'mp3',
+            '--audio-quality', '2',
+            '--write-thumbnail',
+            '-P', tempDir,
+            '-o', '%(title).60s.%(ext)s',
+            `ytsearch1:${clean}`
+          ], { timeout: 60000 });
+          if (await getValidAudioFile()) downloaded = true;
+        } catch (proxyErr) {
+          this.log.warn({ err: proxyErr.message }, 'YouTube proxy download failed, trying SoundCloud fallback');
+        }
+      }
+
+      // Layer 4: SoundCloud Search fallback (zero 403 blocks, downloads full non-DRM track)
       if (!downloaded) {
         onProgress?.(`Trying SoundCloud for "${clean}"… ♡`);
         try {
@@ -1255,56 +1339,21 @@ export class MediaDownloader {
             '-o', '%(title).60s.%(ext)s',
             `scsearch1:${clean}`
           ], { timeout: 60000 });
-          if (hasAudioFile()) downloaded = true;
+          if (await getValidAudioFile()) downloaded = true;
         } catch (scErr) {
-          this.log.error({ err: scErr.message }, 'SoundCloud search download also failed');
+          this.log.warn({ err: scErr.message }, 'SoundCloud search download also failed');
         }
       }
 
-      // Layer 4: Direct Deezer CDN stream download (guaranteed 200 OK, zero DRM, zero 403 blocks)
-      if (!downloaded && dzPreviewUrl) {
-        try {
-          const dzRes = await fetch(dzPreviewUrl, { signal: AbortSignal.timeout(10000) });
-          if (dzRes.ok) {
-            const dzBuf = Buffer.from(await dzRes.arrayBuffer());
-            if (dzBuf.length > 4096) {
-              writeFileSync(join(tempDir, `${(trackTitle || 'track').slice(0, 30)}.mp3`), dzBuf);
-              downloaded = true;
-            }
-          }
-        } catch {}
+      const validAudio = await getValidAudioFile();
+      if (!validAudio) {
+        throw new Error(`Could not download full audio track for "${clean}". Please check spelling and try again ♡`);
       }
-
-      if (!downloaded) {
-        try {
-          const dzRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=1`, { signal: AbortSignal.timeout(5000) });
-          if (dzRes.ok) {
-            const dzData = await dzRes.json();
-            const first = dzData?.data?.[0];
-            if (first?.preview) {
-              const audioRes = await fetch(first.preview, { signal: AbortSignal.timeout(10000) });
-              if (audioRes.ok) {
-                const dzBuf = Buffer.from(await audioRes.arrayBuffer());
-                if (dzBuf.length > 4096) {
-                  if (!trackTitle || trackTitle.toLowerCase() === 'song') {
-                    trackTitle = first.title || trackTitle;
-                  }
-                  if (!trackAuthor || trackAuthor.toLowerCase() === 'artist') {
-                    trackAuthor = first.artist?.name || trackAuthor;
-                  }
-                  writeFileSync(join(tempDir, `${(trackTitle || 'track').slice(0, 30)}.mp3`), dzBuf);
-                  downloaded = true;
-                }
-              }
-            }
-          }
-        } catch {}
-      }
-
-      const files = readdirSync(tempDir);
-      const audioFile = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
-      if (!audioFile) {
-        throw new Error(`Could not download audio for "${clean}". Please check spelling and try again ♡`);
+      const audioFile = validAudio.filename;
+      if (validAudio.duration && !trackDuration) {
+        const min = Math.floor(validAudio.duration / 60);
+        const sec = String(Math.floor(validAudio.duration % 60)).padStart(2, '0');
+        trackDuration = `${min}:${sec}`;
       }
 
       const finalClean = cleanSongMetadata(trackTitle, trackAuthor);
@@ -1318,6 +1367,7 @@ export class MediaDownloader {
       });
 
       let coverBuf = null;
+      const files = readdirSync(tempDir);
       const thumbFile = files.find((f) => /\.(webp|jpg|jpeg|png)$/i.test(f));
       if (thumbFile) {
         try {
@@ -1358,7 +1408,8 @@ export class MediaDownloader {
           filename: safeFilename,
           title: trackTitle,
           performer: trackAuthor,
-          year: trackYear
+          year: trackYear,
+          duration: validAudio.duration
         }
       };
     } finally {
@@ -1436,21 +1487,25 @@ export class MediaDownloader {
     onProgress?.('Running engine & extracting files… ♡');
 
     try {
+      const cookieArgs = getCookieArgs();
       const args = [
         '--no-warnings',
         '--no-playlist',
         '--write-thumbnail',
         '--js-runtimes', 'node:/usr/bin/node',
         '--ffmpeg-location', '/usr/bin/ffmpeg',
-        '--extractor-args', 'youtube:player_client=android,web',
-        '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36',
         '-P', tempDir,
         '-o', '%(autonumber)02d_%(title).50s.%(ext)s',
         url
       ];
 
-      if (existsSync('/data/youtube_cookies.txt')) {
-        args.splice(1, 0, '--cookies', '/data/youtube_cookies.txt');
+      if (cookieArgs.length > 0) {
+        args.splice(1, 0, ...cookieArgs);
+      } else {
+        args.splice(1, 0,
+          '--extractor-args', 'youtube:player_client=android,web',
+          '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36'
+        );
       }
 
       if (platform === 'tiktok' || /tiktok\.com/i.test(url)) {

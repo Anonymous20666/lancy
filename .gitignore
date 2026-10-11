@@ -10,3 +10,4 @@ logs/
 *.sqlite-*
 sessions/
 .DS_Store
+*cookies.txt
