@@ -320,9 +320,52 @@ export class TelegramController extends EventEmitter {
       this.log.info({ chosen: update.chosen_inline_result }, 'received chosen_inline_result');
       return this.#handleChosenInlineResult(update.chosen_inline_result);
     }
+    if (update.chat_member) return this.#handleChatMemberUpdated(update.chat_member);
+    if (update.my_chat_member) return this.#handleMyChatMemberUpdated(update.my_chat_member);
+    if (update.chat_join_request) return this.#handleChatJoinRequest(update.chat_join_request);
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
+  }
+
+  #handleChatMemberUpdated(chatMember) {
+    if (!chatMember?.chat?.id) return;
+    const chatId = chatMember.chat.id;
+    const isGroup = Boolean(chatMember.chat.type === 'group' || chatMember.chat.type === 'supergroup');
+    if (!isGroup) return;
+
+    if (chatMember.from && !chatMember.from.is_bot) {
+      this.db.recordGroupMember(chatId, chatMember.from);
+    }
+
+    const newUser = chatMember.new_chat_member?.user;
+    const newStatus = chatMember.new_chat_member?.status;
+
+    if (newUser && !newUser.is_bot) {
+      if (['member', 'administrator', 'restricted', 'creator'].includes(newStatus)) {
+        this.log.info({ chatId, userId: newUser.id, username: newUser.username, status: newStatus }, 'new/updated group member recorded');
+        this.db.recordGroupMember(chatId, newUser);
+      } else if (newStatus === 'left' || newStatus === 'kicked') {
+        this.log.info({ chatId, userId: newUser.id, status: newStatus }, 'group member left or removed');
+        this.db.removeGroupMember(chatId, newUser.id);
+      }
+    }
+  }
+
+  #handleMyChatMemberUpdated(myChatMember) {
+    if (!myChatMember?.chat?.id) return;
+    const chatId = myChatMember.chat.id;
+    if (myChatMember.from && !myChatMember.from.is_bot) {
+      this.db.recordGroupMember(chatId, myChatMember.from);
+    }
+  }
+
+  #handleChatJoinRequest(joinRequest) {
+    if (!joinRequest?.chat?.id) return;
+    const chatId = joinRequest.chat.id;
+    if (joinRequest.from && !joinRequest.from.is_bot) {
+      this.db.recordGroupMember(chatId, joinRequest.from);
+    }
   }
 
   #upsertUser(user) {
@@ -2636,11 +2679,34 @@ export class TelegramController extends EventEmitter {
           }
         }
       }
+      if (message.new_chat_member && !message.new_chat_member.is_bot) {
+        this.db.recordGroupMember(chatId, message.new_chat_member);
+      }
+      if (message.new_chat_participant && !message.new_chat_participant.is_bot) {
+        this.db.recordGroupMember(chatId, message.new_chat_participant);
+      }
       if (message.left_chat_member?.id) {
         this.db.removeGroupMember(chatId, message.left_chat_member.id);
       }
+      if (message.left_chat_participant?.id) {
+        this.db.removeGroupMember(chatId, message.left_chat_participant.id);
+      }
       if (message.reply_to_message?.from && !message.reply_to_message.from.is_bot) {
         this.db.recordGroupMember(chatId, message.reply_to_message.from);
+      }
+      if (message.forward_from && !message.forward_from.is_bot) {
+        this.db.recordGroupMember(chatId, message.forward_from);
+      }
+      if (message.pinned_message?.from && !message.pinned_message.from.is_bot) {
+        this.db.recordGroupMember(chatId, message.pinned_message.from);
+      }
+      const entities = message.entities || message.caption_entities;
+      if (Array.isArray(entities)) {
+        for (const ent of entities) {
+          if (ent?.type === 'text_mention' && ent.user && !ent.user.is_bot) {
+            this.db.recordGroupMember(chatId, ent.user);
+          }
+        }
       }
     }
 

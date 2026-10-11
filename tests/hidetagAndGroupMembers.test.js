@@ -517,3 +517,79 @@ test('TelegramController /hidetag: large groups (>80 members) use ghost batches 
 
   db.close();
 });
+
+test('TelegramController handleUpdate: processes chat_member updates for newly added members and leaves', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const chatId = -100999;
+
+  const mockApi = {
+    me: { id: 8859351350, username: 'Lancy_easy_bot' },
+    getChatMember: async () => ({ status: 'administrator' }),
+    getChatAdministrators: async () => []
+  };
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: new StateMachine(db)
+  });
+
+  // 1. Newly added member update
+  await controller.handleUpdate({
+    update_id: 501,
+    chat_member: {
+      chat: { id: chatId, type: 'supergroup', title: 'Test Group' },
+      from: { id: 1001, is_bot: false, first_name: 'Admin' },
+      new_chat_member: {
+        status: 'member',
+        user: { id: 9111, is_bot: false, first_name: 'NewlyJoined', username: 'new_guy' }
+      }
+    }
+  });
+
+  let members = db.getGroupMembers(chatId);
+  assert.ok(members.some((m) => m.user_id === 9111));
+  assert.ok(members.some((m) => m.user_id === 1001)); // inviter recorded too
+
+  // 2. Member leaves
+  await controller.handleUpdate({
+    update_id: 502,
+    chat_member: {
+      chat: { id: chatId, type: 'supergroup' },
+      from: { id: 9111, is_bot: false, first_name: 'NewlyJoined' },
+      new_chat_member: {
+        status: 'left',
+        user: { id: 9111, is_bot: false, first_name: 'NewlyJoined' }
+      }
+    }
+  });
+
+  members = db.getGroupMembers(chatId);
+  assert.ok(!members.some((m) => m.user_id === 9111));
+
+  // 3. Message with text_mention entity records mentioned user
+  await controller.handleUpdate({
+    update_id: 503,
+    message: {
+      message_id: 111,
+      chat: { id: chatId, type: 'supergroup' },
+      from: { id: 1001, is_bot: false, first_name: 'Admin' },
+      text: 'Welcome John!',
+      entities: [
+        {
+          type: 'text_mention',
+          offset: 8,
+          length: 4,
+          user: { id: 9222, is_bot: false, first_name: 'John', username: 'johnny' }
+        }
+      ]
+    }
+  });
+
+  members = db.getGroupMembers(chatId);
+  assert.ok(members.some((m) => m.user_id === 9222));
+
+  db.close();
+});

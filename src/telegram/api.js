@@ -400,7 +400,16 @@ export class TelegramAPI {
     const params = {
       offset,
       timeout,
-      allowed_updates: ['message', 'callback_query', 'edited_message', 'inline_query', 'chosen_inline_result']
+      allowed_updates: [
+        'message',
+        'callback_query',
+        'edited_message',
+        'inline_query',
+        'chosen_inline_result',
+        'chat_member',
+        'my_chat_member',
+        'chat_join_request'
+      ]
     };
     const controller = new AbortController();
     const onAbort = () => controller.abort();
