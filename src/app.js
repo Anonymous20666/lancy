@@ -27,6 +27,7 @@ import { LancyAssistant } from './ai/assistant.js';
 import { AutonomousScheduler } from './ai/scheduler.js';
 
 import { MediaDownloader } from './media/downloader.js';
+import { VideoStreamingServer } from './media/streamingServer.js';
 import { createDashboardScreen } from './telegram/screens/dashboard.js';
 import { createPinterestScreen } from './telegram/screens/pinterest.js';
 import { createStickersScreen } from './telegram/screens/stickers.js';
@@ -139,6 +140,7 @@ export class LancyApp {
     this.scheduler = new AutonomousScheduler({ app: this });
 
     this.mediaDownloader = new MediaDownloader({ log: this.log });
+    this.videoServer = new VideoStreamingServer({ app: this, port: 3055, log: this.log });
 
     // ── Screens ──
     this.screens = new Map();
@@ -253,6 +255,9 @@ export class LancyApp {
       this.cleanupTimer.unref?.();
     }
 
+    // Video HTTP Streaming Server for Telegram Live Inline & Instant Playback
+    await this.videoServer.start().catch((err) => this.log.error({ err }, 'failed to start video streaming server'));
+
     // Telegram polling.
     await this.telegram.controller.start();
     await this.multiBotManager.startAll();
@@ -326,6 +331,7 @@ export class LancyApp {
     clearInterval(this.cleanupTimer);
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
+    await this.videoServer?.stop().catch(() => {});
     await this.multiBotManager?.stopAll();
     await this.telegram.controller?.stop();
     await this.whatsapp.stopAll();

@@ -680,13 +680,21 @@ export class TelegramController extends EventEmitter {
         const targetUrl = `https://www.youtube.com/watch?v=${cleanKey}`;
         const res = await this.app.mediaDownloader.download(targetUrl);
         const videoItem = res?.mediaItems?.find((m) => m.type === 'video');
-        if (!videoItem?.buffer) return null;
+        let vidBuf = videoItem.buffer;
+        try {
+          vidBuf = await this.app.mediaDownloader.optimizeVideo(vidBuf) || vidBuf;
+        } catch {}
+
+        try {
+          writeFileSync(`/data/video_cache/${cleanKey}.mp4`, vidBuf);
+        } catch {}
 
         const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
-        const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
-        const sent = await this.api.sendVideo(ownerId, videoItem.buffer, {
+        const durSec = res.duration ? parseDurationToSeconds(res.duration) : 30;
+        const sent = await this.api.sendVideo(ownerId, vidBuf, {
           caption: `🎬 ${res.title || title || 'Clip'}`,
           ...(durSec > 0 ? { duration: durSec } : {}),
+          supports_streaming: true,
           disable_notification: true
         });
 
@@ -760,14 +768,19 @@ export class TelegramController extends EventEmitter {
           const res = await this.app.mediaDownloader.download(videoTarget);
           const videoItem = res?.mediaItems?.find((m) => m.type === 'video');
           if (videoItem?.buffer) {
+            let vidBuf = videoItem.buffer;
             try {
-              if (videoId) writeFileSync(`/data/video_cache/${videoId}.mp4`, videoItem.buffer);
+              vidBuf = await this.app.mediaDownloader.optimizeVideo(vidBuf) || vidBuf;
+            } catch {}
+            try {
+              if (videoId) writeFileSync(`/data/video_cache/${videoId}.mp4`, vidBuf);
             } catch {}
             const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
-            const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
-            const sent = await this.api.sendVideo(ownerId, videoItem.buffer, {
+            const durSec = res.duration ? parseDurationToSeconds(res.duration) : 30;
+            const sent = await this.api.sendVideo(ownerId, vidBuf, {
               caption: `🎬 ${res.title || videoTitle}`,
               ...(durSec > 0 ? { duration: durSec } : {}),
+              supports_streaming: true,
               disable_notification: true
             });
             const uploadedFileId = sent?.video?.file_id;
@@ -797,7 +810,8 @@ export class TelegramController extends EventEmitter {
               type: 'video',
               media: fileId,
               caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${escapeHtml(videoDuration)}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
-              parse_mode: 'HTML'
+              parse_mode: 'HTML',
+              supports_streaming: true
             },
             reply_markup: {
               inline_keyboard: [
@@ -1083,6 +1097,7 @@ export class TelegramController extends EventEmitter {
 
       const results = [];
       const botUser = this.botUsername || 'bot';
+      const safeTitle = truncate(title || 'Pinterest Media', 200);
 
       if (videoUrl) {
         results.push({
@@ -1091,9 +1106,9 @@ export class TelegramController extends EventEmitter {
           video_url: videoUrl,
           mime_type: 'video/mp4',
           thumb_url: imageUrls[0] || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
-          title: `🎬 HD Video: ${title.slice(0, 45)}`,
+          title: `🎬 HD Video: ${safeTitle.slice(0, 45)}`,
           description: `Pinterest HD Video ♡`,
-          caption: `🎬 <b>${escapeHtml(title)}</b>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+          caption: `🎬 <b>${escapeHtml(safeTitle)}</b>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
@@ -1122,9 +1137,9 @@ export class TelegramController extends EventEmitter {
           id: 'pin_pic_' + Date.now(),
           photo_url: imageUrls[0],
           thumb_url: imageUrls[0],
-          title: `📷 ${title.slice(0, 45)}`,
+          title: `📷 ${safeTitle.slice(0, 45)}`,
           description: `Pinterest HD Photo ♡`,
-          caption: `📷 <b>${escapeHtml(title)}</b>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+          caption: `📷 <b>${escapeHtml(safeTitle)}</b>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
           parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
@@ -1153,9 +1168,9 @@ export class TelegramController extends EventEmitter {
             id: `pin_album_${idx}_${Date.now()}`,
             photo_url: imgUrl,
             thumb_url: imgUrl,
-            title: `🖼 ${title.slice(0, 35)} (${idx + 1}/${imageUrls.length})`,
+            title: `🖼 ${safeTitle.slice(0, 35)} (${idx + 1}/${imageUrls.length})`,
             description: `Pinterest Album • Slide ${idx + 1} of ${imageUrls.length} ♡`,
-            caption: `🖼 <b>${escapeHtml(title)}</b> [${idx + 1}/${imageUrls.length}]\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+            caption: `🖼 <b>${escapeHtml(safeTitle)}</b> [${idx + 1}/${imageUrls.length}]\n✨ <i>Downloaded via @${botUser} ♡</i>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
@@ -1418,6 +1433,14 @@ export class TelegramController extends EventEmitter {
           ).get(item.videoId, title.toLowerCase().trim(), title);
         } catch {}
 
+        if (!cachedVid) {
+          try {
+            cachedVid = this.db.prepare(
+              'SELECT file_id, title, duration FROM cached_video_tracks WHERE query = ? OR query = ? LIMIT 1'
+            ).get(cleanTopic.toLowerCase().trim(), cleanTopic);
+          } catch {}
+        }
+
         const safeTitle = [...String(title)].slice(0, 50).join('').trim();
         const caption = `🎬 <b>${escapeHtml(safeTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`;
 
@@ -1469,6 +1492,7 @@ export class TelegramController extends EventEmitter {
             ? `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`
             : (item.videoUrl || `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`);
 
+          const durSec = parseDurationToSeconds(item.duration) || 30;
           results.push({
             type: 'video',
             id: resId,
@@ -1477,6 +1501,7 @@ export class TelegramController extends EventEmitter {
             thumbnail_url: thumb,
             title: `🎬 ${safeTitle}`,
             description: `⏱ ${duration} • 👁 ${views} ♡`,
+            video_duration: durSec,
             caption,
             parse_mode: 'HTML',
             reply_markup: {
@@ -1486,9 +1511,11 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      // Pre-cache top result in background if not already cached
-      if (paged.length > 0 && !results[0]?.video_file_id) {
-        this.#cacheVideoTrack(paged[0].videoId, paged[0].title, cleanTopic).catch(() => {});
+      // Pre-cache top results in background if not already cached
+      for (let i = 0; i < Math.min(paged.length, 2); i++) {
+        if (!results[i]?.video_file_id && paged[i]?.videoId) {
+          this.#cacheVideoTrack(paged[i].videoId, paged[i].title, cleanTopic).catch(() => {});
+        }
       }
       return { results, nextOffset };
     } catch (err) {
@@ -1943,8 +1970,11 @@ export class TelegramController extends EventEmitter {
           const d = json.data;
           const videoUrl = d.play?.startsWith('http') ? d.play : (d.play ? 'https://www.tikwm.com' + d.play : null);
           const audioUrl = d.music?.startsWith('http') ? d.music : (d.music ? 'https://www.tikwm.com' + d.music : null);
-          const title = d.title || 'TikTok Media';
-          const author = d.author?.nickname || d.author?.unique_id || 'TikTok';
+          const rawTitle = d.title || 'TikTok Media';
+          const safeTitle = truncate(rawTitle, 200);
+          const safeAuthor = truncate(d.author?.nickname || d.author?.unique_id || 'TikTok', 50);
+          const title = safeTitle;
+          const author = safeAuthor;
           const cover = d.cover?.startsWith('http') ? d.cover : (d.cover ? 'https://www.tikwm.com' + d.cover : undefined);
           const images = Array.isArray(d.images) ? d.images : [];
           const soundTitle = d.music_info?.title || '';
@@ -1953,7 +1983,7 @@ export class TelegramController extends EventEmitter {
           if (soundTitle && !/^original sound/i.test(soundTitle)) {
             musicSearchQuery = `${soundTitle} ${soundAuthor}`.trim();
           } else {
-            musicSearchQuery = title.replace(/#[^\s]+/g, '').trim() || 'Soundtrack';
+            musicSearchQuery = rawTitle.replace(/#[^\s]+/g, '').trim().slice(0, 50) || 'Soundtrack';
           }
           const botUser = this.botUsername || 'Lancy_easy_bot';
           const cleanSongKey = musicSearchQuery.replace(/\s+/g, '_').slice(0, 32);
@@ -1969,9 +1999,9 @@ export class TelegramController extends EventEmitter {
                 id: `tt_img_${idx}_${Date.now()}`,
                 photo_url: fullUrl,
                 thumb_url: fullUrl,
-                title: `🖼 ${title.slice(0, 35)} (${idx + 1}/${images.length})`,
-                description: `👤 ${author} • Slide ${idx + 1} of ${images.length} ♡`,
-                caption: `🖼 <b>${escapeHtml(title)}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+                title: `🖼 ${safeTitle.slice(0, 35)} (${idx + 1}/${images.length})`,
+                description: `👤 ${safeAuthor} • Slide ${idx + 1} of ${images.length} ♡`,
+                caption: `🖼 <b>${escapeHtml(safeTitle)}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(safeAuthor)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
                 parse_mode: 'HTML',
                 reply_markup: {
                   inline_keyboard: [
@@ -2006,10 +2036,11 @@ export class TelegramController extends EventEmitter {
               id: 'tt_vid_' + Date.now(),
               video_url: videoUrl,
               mime_type: 'video/mp4',
+              video_duration: d.duration || 30,
               thumb_url: cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
-              title: `🎬 HD Video: ${title.slice(0, 45)}`,
-              description: `👤 ${author} • Direct No-Watermark MP4 ♡`,
-              caption: `🎬 <b>${escapeHtml(title)}</b>\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
+              title: `🎬 HD Video: ${safeTitle.slice(0, 45)}`,
+              description: `👤 ${safeAuthor} • Direct No-Watermark MP4 ♡`,
+              caption: `🎬 <b>${escapeHtml(safeTitle)}</b>\n👤 <i>${escapeHtml(safeAuthor)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
               parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [
@@ -2038,13 +2069,15 @@ export class TelegramController extends EventEmitter {
           }
 
           if (audioUrl) {
+            const rawAudioTitle = d.music_info?.title || rawTitle.slice(0, 30) || 'Soundtrack';
+            const safeAudioTitle = truncate(rawAudioTitle, 80);
             results.push({
               type: 'audio',
               id: 'tt_aud_' + Date.now(),
               audio_url: audioUrl,
-              title: d.music_info?.title || title.slice(0, 30) || 'Soundtrack',
-              performer: d.music_info?.author || author,
-              caption: `🎵 <b>${escapeHtml(d.music_info?.title || title)}</b>\n👤 <i>${escapeHtml(d.music_info?.author || author)}</i>\n✨ <i>Extracted audio via @${botUser} ♡</i>`,
+              title: safeAudioTitle,
+              performer: safeAuthor,
+              caption: `🎵 <b>${escapeHtml(safeAudioTitle)}</b>\n👤 <i>${escapeHtml(safeAuthor)}</i>\n✨ <i>Extracted audio via @${botUser} ♡</i>`,
               parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [

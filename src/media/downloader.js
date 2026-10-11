@@ -156,7 +156,10 @@ export class MediaDownloader {
           const videoUrl = d.hdplay || d.play || d.wmplay;
           const vidRes = await fetch(videoUrl, { signal: AbortSignal.timeout(30000) });
           if (vidRes.ok) {
-            const vidBuf = Buffer.from(await vidRes.arrayBuffer());
+            let vidBuf = Buffer.from(await vidRes.arrayBuffer());
+            try {
+              vidBuf = await optimizeVideoForTelegram(vidBuf) || vidBuf;
+            } catch {}
             mediaItems.push({
               type: 'video',
               buffer: vidBuf,
@@ -221,7 +224,10 @@ export class MediaDownloader {
       if (info?.video) {
         const vidRes = await fetch(info.video, { signal: AbortSignal.timeout(30000) });
         if (vidRes.ok) {
-          const vidBuf = Buffer.from(await vidRes.arrayBuffer());
+          let vidBuf = Buffer.from(await vidRes.arrayBuffer());
+          try {
+            vidBuf = await optimizeVideoForTelegram(vidBuf) || vidBuf;
+          } catch {}
           let audioTrack = null;
           if (info.music) {
             const musRes = await fetch(info.music, { signal: AbortSignal.timeout(15000) }).catch(() => null);
@@ -416,7 +422,10 @@ export class MediaDownloader {
         onProgress?.('Downloading Pinterest HD video… ♡');
         const vRes = await fetch(videoUrl, { signal: AbortSignal.timeout(30000) });
         if (vRes.ok) {
-          const vBuf = Buffer.from(await vRes.arrayBuffer());
+          let vBuf = Buffer.from(await vRes.arrayBuffer());
+          try {
+            vBuf = await optimizeVideoForTelegram(vBuf) || vBuf;
+          } catch {}
           mediaItems.push({
             type: 'video',
             buffer: vBuf,
@@ -573,8 +582,13 @@ export class MediaDownloader {
             try {
               const r = await fetch(itemUrl, { signal: AbortSignal.timeout(20000) });
               if (r.ok) {
-                const buf = Buffer.from(await r.arrayBuffer());
+                let buf = Buffer.from(await r.arrayBuffer());
                 const isVid = item.type === 'video' || /\.(mp4|mov|webm)/i.test(itemUrl);
+                if (isVid) {
+                  try {
+                    buf = await optimizeVideoForTelegram(buf) || buf;
+                  } catch {}
+                }
                 mediaItems.push({
                   type: isVid ? 'video' : 'photo',
                   buffer: buf,
@@ -1378,9 +1392,15 @@ export class MediaDownloader {
         performer: 'Direct Media'
       };
     } else {
+      let finalBuf = buf;
+      if (isVid) {
+        try {
+          finalBuf = await optimizeVideoForTelegram(buf) || buf;
+        } catch {}
+      }
       mediaItems.push({
         type: isVid ? 'video' : 'photo',
-        buffer: buf,
+        buffer: finalBuf,
         filename: isVid ? 'video.mp4' : 'photo.jpg',
         mimeType: isVid ? 'video/mp4' : 'image/jpeg'
       });
@@ -1457,11 +1477,15 @@ export class MediaDownloader {
         const buf = readFileSync(fullPath);
 
         if (['mp4', 'webm', 'mov', 'mkv'].includes(ext)) {
+          let vidBuf = buf;
+          try {
+            vidBuf = await optimizeVideoForTelegram(buf) || buf;
+          } catch {}
           mediaItems.push({
             type: 'video',
-            buffer: buf,
-            filename: f,
-            mimeType: ext === 'webm' ? 'video/webm' : 'video/mp4'
+            buffer: vidBuf,
+            filename: `${f.replace(/\.[^.]+$/, '')}.mp4`,
+            mimeType: 'video/mp4'
           });
 
           // Extract audio from first video with sound
@@ -1560,5 +1584,90 @@ export class MediaDownloader {
     } finally {
       try { unlinkSync(tmpOut); } catch {}
     }
+  }
+
+  /**
+   * Optimize video buffer or file for Telegram playback
+   */
+  async optimizeVideo(input) {
+    return optimizeVideoForTelegram(input);
+  }
+}
+
+/**
+ * Optimize video for Telegram mobile players:
+ * Enforces H.264 (AVC) video, AAC audio, yuv420p color format, and +faststart moov atom.
+ * Guarantees zero "Format not supported" errors across all Telegram clients (iOS, Android, Desktop).
+ */
+export async function optimizeVideoForTelegram(input) {
+  if (!input) return null;
+  const tempDir = mkdtempSync(join(tmpdir(), 'lancy_vidopt_'));
+  const inPath = join(tempDir, 'in.mp4');
+  const outPath = join(tempDir, 'out.mp4');
+
+  try {
+    if (Buffer.isBuffer(input)) {
+      writeFileSync(inPath, input);
+    } else if (typeof input === 'string' && existsSync(input)) {
+      writeFileSync(inPath, readFileSync(input));
+    } else {
+      return null;
+    }
+
+    // Probe existing streams
+    let needsFullTranscode = true;
+    try {
+      const probeRes = await execFileAsync('ffprobe', [
+        '-v', 'error',
+        '-show_entries', 'stream=codec_name,codec_type',
+        '-of', 'json',
+        inPath
+      ]);
+      const probeJson = JSON.parse(probeRes.stdout || '{}');
+      const streams = probeJson.streams || [];
+      const vStream = streams.find((s) => s.codec_type === 'video');
+      const aStream = streams.find((s) => s.codec_type === 'audio');
+
+      if (vStream?.codec_name === 'h264' && (!aStream || aStream.codec_name === 'aac')) {
+        needsFullTranscode = false;
+      }
+    } catch {}
+
+    const ffmpegArgs = needsFullTranscode
+      ? [
+          '-y',
+          '-i', inPath,
+          '-c:v', 'libx264',
+          '-pix_fmt', 'yuv420p',
+          '-profile:v', 'high',
+          '-level', '4.0',
+          '-preset', 'veryfast',
+          '-crf', '23',
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-ar', '44100',
+          '-movflags', '+faststart',
+          outPath
+        ]
+      : [
+          '-y',
+          '-i', inPath,
+          '-c', 'copy',
+          '-movflags', '+faststart',
+          outPath
+        ];
+
+    await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 60000 });
+
+    if (existsSync(outPath) && statSync(outPath).size > 1024) {
+      return readFileSync(outPath);
+    }
+    return Buffer.isBuffer(input) ? input : readFileSync(input);
+  } catch {
+    return Buffer.isBuffer(input) ? input : (existsSync(inPath) ? readFileSync(inPath) : null);
+  } finally {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
   }
 }

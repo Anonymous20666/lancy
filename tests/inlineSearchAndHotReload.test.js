@@ -1777,6 +1777,49 @@ test('TelegramController: TikTok live search delivers real video media cards wit
   db.close();
 });
 
+test('VideoStreamingServer: streams H.264 MP4 videos with HTTP Range 206 and health endpoint', async () => {
+  const { mkdtempSync, rmSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { VideoStreamingServer } = await import('../src/media/streamingServer.js');
+  const tempDir = mkdtempSync(join(tmpdir(), 'lancy_stream_test_'));
+  const testVidPath = join(tempDir, 'sample_test_vid.mp4');
+  writeFileSync(testVidPath, Buffer.alloc(2048, 'A'));
 
+  const server = new VideoStreamingServer({
+    port: 3056,
+    cacheDir: tempDir,
+    log: { info: () => {}, error: () => {}, debug: () => {} }
+  });
 
+  await server.start();
 
+  try {
+    // 1. Health check
+    const healthRes = await fetch('http://127.0.0.1:3056/health');
+    assert.equal(healthRes.status, 200);
+    const healthJson = await healthRes.json();
+    assert.equal(healthJson.service, 'video-streamer');
+
+    // 2. Full video fetch
+    const fullRes = await fetch('http://127.0.0.1:3056/video/sample_test_vid.mp4');
+    assert.equal(fullRes.status, 200);
+    assert.equal(fullRes.headers.get('content-type'), 'video/mp4');
+    assert.equal(fullRes.headers.get('accept-ranges'), 'bytes');
+    assert.equal(fullRes.headers.get('content-length'), '2048');
+
+    // 3. HTTP Range partial fetch
+    const rangeRes = await fetch('http://127.0.0.1:3056/video/sample_test_vid.mp4', {
+      headers: { Range: 'bytes=0-99' }
+    });
+    assert.equal(rangeRes.status, 206);
+    assert.equal(rangeRes.headers.get('content-type'), 'video/mp4');
+    assert.equal(rangeRes.headers.get('content-range'), 'bytes 0-99/2048');
+    assert.equal(rangeRes.headers.get('content-length'), '100');
+    const chunk = await rangeRes.arrayBuffer();
+    assert.equal(chunk.byteLength, 100);
+  } finally {
+    await server.stop();
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+});
