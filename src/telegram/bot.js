@@ -900,34 +900,100 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  async #fetchInlinePinterestSearch(queryTopic) {
-    if (!queryTopic) return [];
+  async #fetchInlinePinterestSearch(queryTopic, offset = 0) {
+    if (!queryTopic) return { results: [], nextOffset: '' };
     try {
-      const provider = this.app?.pinterest?.provider || new PinterestWebProvider();
-      const res = await provider.search({ query: queryTopic });
-      if (!res?.items?.length) return [];
-      const results = [];
-      const botUser = this.botUsername || 'bot';
+      const botUser = this.botUsername || 'Lancy_easy_bot';
+      const cleanTopic = queryTopic.trim();
+      const cacheKey = `pint_${cleanTopic.toLowerCase()}`;
+      let cached = inlinePinterestCache.get(cacheKey);
 
-      for (let idx = 0; idx < Math.min(res.items.length, 15); idx++) {
-        const item = res.items[idx];
+      if (!cached || (Date.now() - cached.timestamp > 180000)) {
+        cached = {
+          items: [],
+          bookmark: null,
+          combosTried: 0,
+          timestamp: Date.now()
+        };
+        inlinePinterestCache.set(cacheKey, cached);
+        if (inlinePinterestCache.size > 200) {
+          const firstKey = inlinePinterestCache.keys().next().value;
+          inlinePinterestCache.delete(firstKey);
+        }
+      }
+
+      const combos = [
+        cleanTopic,
+        `${cleanTopic} aesthetic`,
+        `${cleanTopic} wallpaper`,
+        `${cleanTopic} art`,
+        `${cleanTopic} dark`,
+        `${cleanTopic} hd 4k`,
+        `${cleanTopic} photography`
+      ];
+
+      const provider = this.app?.pinterest?.provider || new PinterestWebProvider();
+
+      // Ensure we have enough items in the pool for the requested offset + 15
+      while (cached.items.length < (offset + 15) && cached.combosTried < combos.length) {
+        let res = null;
+        if (cached.bookmark && cached.combosTried === 0) {
+          res = await provider.search({ query: cleanTopic, bookmark: cached.bookmark }).catch(() => null);
+        }
+        if (!res?.items?.length) {
+          const nextTerm = combos[cached.combosTried % combos.length];
+          cached.combosTried++;
+          res = await provider.search({ query: nextTerm }).catch(() => null);
+        }
+        if (res?.bookmark) {
+          cached.bookmark = res.bookmark;
+        }
+        if (res?.items?.length) {
+          const seen = new Set(cached.items.map((i) => i.mediaUrl || i.pinId));
+          for (const item of res.items) {
+            const key = item.mediaUrl || item.pinId;
+            if (key && !seen.has(key)) {
+              seen.add(key);
+              cached.items.push(item);
+            }
+          }
+        } else {
+          cached.combosTried++;
+        }
+      }
+
+      if (cached.items.length === 0) return { results: [], nextOffset: '' };
+
+      const paged = cached.items.slice(offset, offset + 15);
+      const nextOffset = (offset + paged.length < cached.items.length || cached.combosTried < combos.length) && paged.length >= 8
+        ? String(offset + paged.length)
+        : '';
+
+      const results = [];
+      for (let idx = 0; idx < paged.length; idx++) {
+        const item = paged[idx];
         if (item.type === 'video' && item.mediaUrl) {
           results.push({
             type: 'video',
-            id: `pin_vid_${item.pinId || idx}_${Date.now()}`,
+            id: `pin_vid_${item.pinId || idx}_${offset}_${idx}`,
             video_url: item.mediaUrl,
             mime_type: 'video/mp4',
             thumb_url: item.thumbnailUrl || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
-            title: `🎬 HD Video: ${queryTopic.slice(0, 35)}`,
+            title: `🎬 HD Video: ${cleanTopic.slice(0, 35)}`,
             description: `Pinterest HD Video ♡`,
-            caption: `🎬 <b>${escapeHtml(queryTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            caption: `🎬 <b>${escapeHtml(cleanTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: `🔍 Search More "${queryTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `pint ${queryTopic}`,
+                    text: `🔍 More "${cleanTopic.slice(0, 12)}"`,
+                    switch_inline_query_current_chat: `pint ${cleanTopic}`,
+                    style: 'primary'
+                  },
+                  {
+                    text: '🎵 Search Music',
+                    switch_inline_query_current_chat: cleanTopic,
                     style: 'primary'
                   }
                 ]
@@ -937,19 +1003,24 @@ export class TelegramController extends EventEmitter {
         } else if (item.mediaUrl) {
           results.push({
             type: 'photo',
-            id: `pin_pic_${item.pinId || idx}_${Date.now()}`,
+            id: `pin_pic_${item.pinId || idx}_${offset}_${idx}`,
             photo_url: item.mediaUrl,
             thumb_url: item.thumbnailUrl || item.mediaUrl,
-            title: `📷 ${queryTopic.slice(0, 35)}`,
+            title: `📷 ${cleanTopic.slice(0, 35)}`,
             description: `HD Aesthetic Photo ♡`,
-            caption: `📷 <b>${escapeHtml(queryTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            caption: `📷 <b>${escapeHtml(cleanTopic)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
             parse_mode: 'HTML',
             reply_markup: {
               inline_keyboard: [
                 [
                   {
-                    text: `🔍 Search More "${queryTopic.slice(0, 15)}"`,
-                    switch_inline_query_current_chat: `pint ${queryTopic}`,
+                    text: `🔍 More "${cleanTopic.slice(0, 12)}"`,
+                    switch_inline_query_current_chat: `pint ${cleanTopic}`,
+                    style: 'primary'
+                  },
+                  {
+                    text: '🎵 Search Music',
+                    switch_inline_query_current_chat: cleanTopic,
                     style: 'primary'
                   }
                 ]
@@ -958,10 +1029,11 @@ export class TelegramController extends EventEmitter {
           });
         }
       }
-      return results;
+
+      return { results, nextOffset };
     } catch (err) {
-      this.log.debug({ err: err?.message }, 'inline pinterest search failed');
-      return [];
+      this.log?.debug?.({ err: err?.message, queryTopic }, 'inline pinterest search failed');
+      return { results: [], nextOffset: '' };
     }
   }
 
@@ -1035,15 +1107,20 @@ export class TelegramController extends EventEmitter {
             inline_keyboard: [
               [
                 {
-                  text: '🎬 Watch Clip ♡',
-                  url: videoUrl,
+                  text: '🎙️ Recognize Music / Search Song ♡',
+                  switch_inline_query_current_chat: `${title.slice(0, 30)} song`,
                   style: 'primary'
                 }
               ],
               [
                 {
-                  text: `🔍 Search More "${queryTopic.slice(0, 15)}"`,
+                  text: `🔍 More "${queryTopic.slice(0, 15)}"`,
                   switch_inline_query_current_chat: `tt ${queryTopic}`,
+                  style: 'primary'
+                },
+                {
+                  text: '▶️ Watch Clip ♡',
+                  url: videoUrl,
                   style: 'primary'
                 }
               ]
@@ -1177,6 +1254,17 @@ export class TelegramController extends EventEmitter {
           const author = d.author?.nickname || d.author?.unique_id || 'TikTok';
           const cover = d.cover?.startsWith('http') ? d.cover : (d.cover ? 'https://www.tikwm.com' + d.cover : undefined);
           const images = Array.isArray(d.images) ? d.images : [];
+          const soundTitle = d.music_info?.title || '';
+          const soundAuthor = d.music_info?.author || '';
+          let musicSearchQuery = '';
+          if (soundTitle && !/^original sound/i.test(soundTitle)) {
+            musicSearchQuery = `${soundTitle} ${soundAuthor}`.trim();
+          } else {
+            musicSearchQuery = title.replace(/#[^\s]+/g, '').trim() || 'Soundtrack';
+          }
+          const botUser = this.botUsername || 'Lancy_easy_bot';
+          const cleanSongKey = musicSearchQuery.replace(/\s+/g, '_').slice(0, 32);
+
           const results = [];
 
           // If TikTok photo album / carousel (slideshow)
@@ -1190,14 +1278,26 @@ export class TelegramController extends EventEmitter {
                 thumb_url: fullUrl,
                 title: `🖼 ${title.slice(0, 35)} (${idx + 1}/${images.length})`,
                 description: `👤 ${author} • Slide ${idx + 1} of ${images.length} ♡`,
-                caption: `🖼 <b>${escapeHtml(title)}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${this.botUsername || 'bot'} ♡</i>`,
+                caption: `🖼 <b>${escapeHtml(title)}</b> [${idx + 1}/${images.length}]\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
                 parse_mode: 'HTML',
                 reply_markup: {
                   inline_keyboard: [
                     [
                       {
-                        text: '🎬 View on TikTok',
-                        url: cleanUrl,
+                        text: '🎙️ Recognize Music / Search Song ♡',
+                        switch_inline_query_current_chat: musicSearchQuery,
+                        style: 'primary'
+                      }
+                    ],
+                    [
+                      {
+                        text: '🎵 Full Song in DM ♡',
+                        url: `https://t.me/${botUser}?start=play_${encodeURIComponent(cleanSongKey)}`,
+                        style: 'primary'
+                      },
+                      {
+                        text: '🎬 Search TikTok Live',
+                        switch_inline_query_current_chat: 'tt ',
                         style: 'primary'
                       }
                     ]
@@ -1216,14 +1316,26 @@ export class TelegramController extends EventEmitter {
               thumb_url: cover || 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
               title: `🎬 HD Video: ${title.slice(0, 45)}`,
               description: `👤 ${author} • Direct No-Watermark MP4 ♡`,
-              caption: `🎬 <b>${escapeHtml(title)}</b>\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${this.botUsername || 'bot'} ♡</i>`,
+              caption: `🎬 <b>${escapeHtml(title)}</b>\n👤 <i>${escapeHtml(author)}</i>\n✨ <i>Downloaded via @${botUser} ♡</i>`,
               parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [
                   [
                     {
-                      text: '🎬 View on TikTok',
-                      url: cleanUrl,
+                      text: '🎙️ Recognize Music / Search Song ♡',
+                      switch_inline_query_current_chat: musicSearchQuery,
+                      style: 'primary'
+                    }
+                  ],
+                  [
+                    {
+                      text: '🎵 Full Song in DM ♡',
+                      url: `https://t.me/${botUser}?start=play_${encodeURIComponent(cleanSongKey)}`,
+                      style: 'primary'
+                    },
+                    {
+                      text: '🎬 Search TikTok Live',
+                      switch_inline_query_current_chat: 'tt ',
                       style: 'primary'
                     }
                   ]
@@ -1239,14 +1351,26 @@ export class TelegramController extends EventEmitter {
               audio_url: audioUrl,
               title: d.music_info?.title || title.slice(0, 30) || 'Soundtrack',
               performer: d.music_info?.author || author,
-              caption: `🎵 <b>${escapeHtml(d.music_info?.title || title)}</b>\n👤 <i>${escapeHtml(d.music_info?.author || author)}</i>\n✨ <i>Extracted audio via @${this.botUsername || 'bot'} ♡</i>`,
+              caption: `🎵 <b>${escapeHtml(d.music_info?.title || title)}</b>\n👤 <i>${escapeHtml(d.music_info?.author || author)}</i>\n✨ <i>Extracted audio via @${botUser} ♡</i>`,
               parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [
                   [
                     {
-                      text: '🎬 View on TikTok',
-                      url: cleanUrl,
+                      text: '🎙️ Recognize Music / Search Song ♡',
+                      switch_inline_query_current_chat: musicSearchQuery,
+                      style: 'primary'
+                    }
+                  ],
+                  [
+                    {
+                      text: '📜 Lyrics & Info ♡',
+                      url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(cleanSongKey)}`,
+                      style: 'primary'
+                    },
+                    {
+                      text: '🎵 Full Song in DM ♡',
+                      url: `https://t.me/${botUser}?start=play_${encodeURIComponent(cleanSongKey)}`,
                       style: 'primary'
                     }
                   ]
@@ -1433,57 +1557,124 @@ export class TelegramController extends EventEmitter {
       if (/^(pint|pinterest|photo|photos|pic|pics|wallpaper|wallpapers|image|images|art)\b/i.test(rawText)) {
         const queryTopic = rawText.replace(/^(pint|pinterest|photo|photos|pic|pics|wallpaper|wallpapers|image|images|art)\s*/i, '').trim();
         if (!queryTopic) {
-          await this.api.call('answerInlineQuery', {
-            inline_query_id: qId,
-            results: [{
+          const suggestionCards = [
+            {
               type: 'article',
-              id: 'hint_type_topic',
-              title: '🔍 Type a topic to search HD pictures',
-              description: `e.g. "${rawText} anime aesthetic", "${rawText} cute kittens" ♡`,
-              thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
-              thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+              id: 'sug_pint_dark',
+              title: '🖤 Dark Aesthetic & Evil Aura',
+              description: 'Browse dark fantasy, moody vibes & evil aura wallpapers ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
               input_message_content: {
-                message_text: `<blockquote>🔍 <b>${botName} Image Search</b>\nType <code>@${this.botUsername || 'bot'} ${rawText} &lt;topic&gt;</code> to browse and send HD aesthetic photos live! ♡</blockquote>`,
+                message_text: `<blockquote>🖤 <b>Dark Fantasy &amp; Evil Aura</b>\nType <code>@${this.botUsername || 'bot'} pint evil aura</code> to browse dark aesthetic pins! ♡</blockquote>`,
                 parse_mode: 'HTML'
               },
               reply_markup: {
                 inline_keyboard: [
                   [
                     {
-                      text: '🔍 Search HD Aesthetic Pins',
-                      switch_inline_query_current_chat: `${rawText} aesthetic `,
+                      text: '🖤 Browse Evil Aura Pins',
+                      switch_inline_query_current_chat: 'pint evil aura',
                       style: 'primary'
                     }
                   ]
                 ]
               }
-            }],
-            cache_time: 10,
+            },
+            {
+              type: 'article',
+              id: 'sug_pint_anime',
+              title: '🎨 Anime Aesthetic 4K Wallpapers',
+              description: 'High-res anime landscapes, characters & cyberpunk art ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1578632767115-351597cf2477?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1578632767115-351597cf2477?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🎨 <b>Anime Aesthetic 4K</b>\nType <code>@${this.botUsername || 'bot'} pint anime aesthetic</code> to browse HD pins! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🎨 Browse Anime Pins',
+                      switch_inline_query_current_chat: 'pint anime aesthetic',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              type: 'article',
+              id: 'sug_pint_cyber',
+              title: '🌌 Cyberpunk & Neon Glow City',
+              description: 'Futuristic cities, neon lights & retro wave aesthetic ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🌌 <b>Cyberpunk &amp; Neon City</b>\nType <code>@${this.botUsername || 'bot'} pint cyberpunk neon</code> to browse neon pins! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🌌 Browse Cyberpunk Pins',
+                      switch_inline_query_current_chat: 'pint cyberpunk neon',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              type: 'article',
+              id: 'sug_pint_nature',
+              title: '🌿 Nature & Chill Minimalist',
+              description: 'Scenic mountains, tranquil forests & aesthetic greens ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1470071459604-3b5ec3a7fe05?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🌿 <b>Nature &amp; Minimalist Aesthetic</b>\nType <code>@${this.botUsername || 'bot'} pint nature aesthetic</code> to browse green pins! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🌿 Browse Nature Pins',
+                      switch_inline_query_current_chat: 'pint nature aesthetic',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            }
+          ];
+
+          let trendingPhotos = [];
+          try {
+            const trend = await this.#fetchInlinePinterestSearch('aesthetic wallpaper', 0);
+            if (trend?.results?.length) trendingPhotos = trend.results.slice(0, 10);
+          } catch {}
+
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: [...suggestionCards, ...trendingPhotos],
+            cache_time: 15,
             is_personal: false
           });
           return;
         }
 
-        let pintResults = inlinePinterestCache.get(queryTopic.toLowerCase());
-        if (!pintResults) {
-          pintResults = await this.#fetchInlinePinterestSearch(queryTopic);
-          if (pintResults?.length) {
-            inlinePinterestCache.set(queryTopic.toLowerCase(), pintResults);
-            if (inlinePinterestCache.size > 200) {
-              const firstKey = inlinePinterestCache.keys().next().value;
-              inlinePinterestCache.delete(firstKey);
-            }
-          }
-        }
+        const { results: pintResults, nextOffset } = await this.#fetchInlinePinterestSearch(queryTopic, offset);
 
         if (pintResults && pintResults.length > 0) {
-          const pagedPins = pintResults.slice(offset, offset + 15);
-          const nextOffset = (offset + pagedPins.length < pintResults.length) ? String(offset + pagedPins.length) : '';
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
-            results: pagedPins,
+            results: pintResults,
             next_offset: nextOffset,
-            cache_time: 30,
+            cache_time: 15,
             is_personal: false
           });
           return;
@@ -1830,13 +2021,11 @@ export class TelegramController extends EventEmitter {
 
       // 5. If no music results and query is generic, fall back to Pinterest pictures
       if (results.length === 0 && cleanSongQuery.length >= 2) {
-        const pintFallback = await this.#fetchInlinePinterestSearch(cleanSongQuery);
+        const { results: pintFallback, nextOffset: nextFallbackOffset } = await this.#fetchInlinePinterestSearch(cleanSongQuery, offset);
         if (pintFallback && pintFallback.length > 0) {
-          const pagedFallback = pintFallback.slice(offset, offset + 15);
-          const nextFallbackOffset = (offset + pagedFallback.length < pintFallback.length) ? String(offset + pagedFallback.length) : '';
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
-            results: pagedFallback,
+            results: pintFallback,
             next_offset: nextFallbackOffset,
             cache_time: 30,
             is_personal: false

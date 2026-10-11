@@ -1189,3 +1189,95 @@ test('TelegramController: TikTok live search supports infinite pagination withou
 
   db.close();
 });
+
+test('TelegramController: live inline Pinterest search supports infinite scrolling and suggestions on empty topic', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  // Mock Pinterest provider returning 35 items
+  const mockItems = [];
+  for (let i = 1; i <= 35; i++) {
+    mockItems.push({
+      pinId: `pin_${i}`,
+      mediaUrl: `https://i.pinimg.com/originals/photo_${i}.jpg`,
+      thumbnailUrl: `https://i.pinimg.com/736x/thumb_${i}.jpg`,
+      type: 'image'
+    });
+  }
+
+  const fakePinterestProvider = {
+    search: async ({ query }) => ({
+      items: mockItems,
+      bookmark: 'bm_page_2'
+    })
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: { pinterest: { provider: fakePinterestProvider } },
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // 1. Empty topic 'pint' should return suggestion cards
+  await controller.handleInlineQuery({
+    id: 'query_pint_empty',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pint',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.ok(inlineAnswer.results.length >= 4, 'must return category suggestions');
+  assert.equal(inlineAnswer.results[0].type, 'article');
+  assert.match(inlineAnswer.results[0].title, /Dark Aesthetic & Evil Aura/i);
+
+  // 2. Query 'pint evil aura' page 1
+  inlineAnswer = null;
+  await controller.handleInlineQuery({
+    id: 'query_pint_p1',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pint evil aura',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called for page 1');
+  assert.equal(inlineAnswer.results.length, 15, 'page 1 must contain 15 pins');
+  assert.equal(inlineAnswer.next_offset, '15', 'next_offset must point to item 15');
+  assert.equal(inlineAnswer.results[0].type, 'photo');
+  assert.equal(inlineAnswer.results[0].reply_markup.inline_keyboard[0][0].style, 'primary');
+
+  // 3. Query 'pint evil aura' page 2 (infinite scrolling)
+  inlineAnswer = null;
+  await controller.handleInlineQuery({
+    id: 'query_pint_p2',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'pint evil aura',
+    offset: '15'
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called for page 2');
+  assert.equal(inlineAnswer.results.length, 15, 'page 2 must contain 15 pins');
+  assert.equal(inlineAnswer.next_offset, '30', 'next_offset must point to item 30');
+  assert.equal(inlineAnswer.results[0].photo_url, 'https://i.pinimg.com/originals/photo_16.jpg');
+
+  db.close();
+});
+

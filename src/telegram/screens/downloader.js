@@ -517,7 +517,7 @@ export function createDownloaderScreen({ app }) {
         );
       } else if (audioKey) {
         audioActionRow.push(
-          richButton.callback('🎧 Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
+          richButton.callback('🎙️ Recognize Music / Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
         );
       }
 
@@ -1081,6 +1081,17 @@ export function createDownloaderScreen({ app }) {
               ...ctx,
               messageId: progressMsg?.message_id,
               initialStage: `Identified: "${title}" by ${artist || 'Unknown'} ♡`
+            };
+            await executeDownload(dlCtx, query);
+            return;
+          }
+
+          if (hintTitle && !/^original sound/i.test(hintTitle)) {
+            const query = `${hintTitle} ${hintPerformer}`.trim();
+            const dlCtx = {
+              ...ctx,
+              messageId: progressMsg?.message_id,
+              initialStage: `Identified from soundtrack: "${hintTitle}" ♡`
             };
             await executeDownload(dlCtx, query);
             return;

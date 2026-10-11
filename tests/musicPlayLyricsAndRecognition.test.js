@@ -445,7 +445,7 @@ test('Video Download with AudioTrack renders 🎧 Identify Song button and handl
   const identifyBtn = allButtons.find((btn) => btn.callback_data.includes(':identify:'));
   assert.ok(identifyBtn, 'Action buttons include 🎧 Identify Song');
   const btnText = typeof identifyBtn.text === 'string' ? identifyBtn.text : JSON.stringify(identifyBtn.text);
-  assert.ok(btnText.includes('Identify Song'), 'Button label is 🎧 Identify Song');
+  assert.ok(btnText.includes('Identify Song') || btnText.includes('Recognize'), 'Button label is Recognize Music / Identify Song');
 
   // Extract trackKey from callback data
   const parts = identifyBtn.callback_data.split(':');
