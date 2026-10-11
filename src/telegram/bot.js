@@ -1027,6 +1027,10 @@ export class TelegramController extends EventEmitter {
           description: `⏱ ${duration} • 👁 ${views} ♡`,
           caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
           parse_mode: 'HTML',
+          input_message_content: {
+            message_text: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>\n${videoUrl}`,
+            parse_mode: 'HTML'
+          },
           reply_markup: {
             inline_keyboard: [
               [
@@ -1692,96 +1696,135 @@ export class TelegramController extends EventEmitter {
       let results = [];
       let nextOffset = '';
 
-      if (cachedResults.length > 0) {
+      if (cachedResults.length >= 10) {
         const pagedAudioResults = cachedResults.slice(offset, offset + 10);
-        nextOffset = (offset + pagedAudioResults.length < cachedResults.length) ? String(offset + pagedAudioResults.length) : '';
+        const nextAudioOffset = (offset + pagedAudioResults.length < cachedResults.length)
+          ? String(offset + pagedAudioResults.length)
+          : '';
         results = pagedAudioResults;
-      } else if (cleanSongQuery.length >= 2) {
-        // Track not yet cached in SQLite: fetch fast playable media via searchYouTubeFast (~450ms) and trigger background MP3 caching
-        this.#cacheAudioTrack(cleanSongQuery, 0).catch(() => {});
+        nextOffset = nextAudioOffset;
+      } else {
+        const combinedMusicResults = [];
+        const seenTitles = new Set();
 
-        const cacheKey = `mus_${cleanSongQuery.toLowerCase()}`;
-        let onlineVideos = inlineSearchCache.get(cacheKey);
+        // 1. Add matching cached native audio tracks first (they drop native full MP3!)
+        for (const row of cachedResults) {
+          seenTitles.add((row.title || '').toLowerCase().trim());
+          combinedMusicResults.push(row);
+        }
 
-        if (!onlineVideos || offset >= onlineVideos.length) {
-          const searchTerms = [
-            cleanSongQuery,
-            `${cleanSongQuery} audio`,
-            `${cleanSongQuery} music`,
-            `${cleanSongQuery} song`,
-            `${cleanSongQuery} official audio`
-          ];
-          const pageIdx = Math.floor(offset / 10);
-          const term = searchTerms[pageIdx % searchTerms.length];
-          const vids = await searchYouTubeFast(term);
-          if (vids.length > 0) {
-            if (!onlineVideos) onlineVideos = [];
-            const seen = new Set(onlineVideos.map((v) => v.videoId));
-            for (const v of vids) {
-              if (!seen.has(v.videoId)) {
-                seen.add(v.videoId);
-                onlineVideos.push(v);
+        // 2. Fetch online YouTube tracks when query has at least 2 chars so users ALWAYS get a full list of 10+ results!
+        if (cleanSongQuery.length >= 2) {
+          this.#cacheAudioTrack(cleanSongQuery, 0).catch(() => {});
+
+          const cacheKey = `mus_${cleanSongQuery.toLowerCase()}`;
+          let onlineVideos = inlineSearchCache.get(cacheKey);
+
+          if (!onlineVideos || (offset + 10) >= onlineVideos.length) {
+            const searchTerms = [
+              cleanSongQuery,
+              `${cleanSongQuery} audio`,
+              `${cleanSongQuery} music`,
+              `${cleanSongQuery} song`,
+              `${cleanSongQuery} official audio`
+            ];
+            const pageIdx = Math.floor(offset / 10);
+            const term = searchTerms[pageIdx % searchTerms.length];
+            const vids = await searchYouTubeFast(term);
+            if (vids.length > 0) {
+              if (!onlineVideos) onlineVideos = [];
+              const seenVids = new Set(onlineVideos.map((v) => v.videoId));
+              for (const v of vids) {
+                if (!seenVids.has(v.videoId)) {
+                  seenVids.add(v.videoId);
+                  onlineVideos.push(v);
+                }
+              }
+              inlineSearchCache.set(cacheKey, onlineVideos);
+              if (inlineSearchCache.size > 200) {
+                const firstKey = inlineSearchCache.keys().next().value;
+                inlineSearchCache.delete(firstKey);
               }
             }
-            inlineSearchCache.set(cacheKey, onlineVideos);
-            if (inlineSearchCache.size > 200) {
-              const firstKey = inlineSearchCache.keys().next().value;
-              inlineSearchCache.delete(firstKey);
+          }
+
+          if (onlineVideos && onlineVideos.length > 0) {
+            const botUser = this.botUsername || 'Lancy_easy_bot';
+
+            for (let idx = 0; idx < onlineVideos.length; idx++) {
+              const item = onlineVideos[idx];
+              const titleLower = (item.title || '').toLowerCase().trim();
+              if (seenTitles.has(titleLower)) continue;
+
+              // Check if duplicate of any cached track
+              const isDupe = cachedAudioRows.some((c) => {
+                const cTitle = (c.title || '').toLowerCase().trim();
+                const cArtist = (c.artist || '').toLowerCase().trim();
+                const vidFull = `${titleLower} ${(item.author || '').toLowerCase()}`;
+                if (cTitle && titleLower.includes(cTitle)) {
+                  if (!cArtist || vidFull.includes(cArtist)) return true;
+                }
+                return false;
+              });
+              if (isDupe) continue;
+
+              seenTitles.add(titleLower);
+
+              const title = item.title || cleanSongQuery;
+              const duration = item.duration || 'HD Track';
+              const artist = item.author || 'Music';
+              const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
+              const videoUrl = `https://www.youtube.com/watch?v=${item.videoId}`;
+
+              combinedMusicResults.push({
+                type: 'video',
+                id: `yt_aud_${item.videoId}_${offset}_${idx}`,
+                video_url: videoUrl,
+                mime_type: 'text/html',
+                thumbnail_url: thumb,
+                thumb_url: thumb,
+                title: `🎵 ${title.slice(0, 50)}`,
+                description: `⏱ ${duration} • 👤 ${artist} ♡`,
+                caption: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>`,
+                parse_mode: 'HTML',
+                input_message_content: {
+                  message_text: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>\n${videoUrl}`,
+                  parse_mode: 'HTML'
+                },
+                reply_markup: {
+                  inline_keyboard: [
+                    [
+                      {
+                        text: '▶️ Stream / Watch Now ♡',
+                        url: videoUrl,
+                        style: 'primary'
+                      }
+                    ],
+                    [
+                      {
+                        text: '📜 Lyrics & Info ♡',
+                        url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                        style: 'primary'
+                      },
+                      {
+                        text: '🎵 Search Music Live',
+                        switch_inline_query_current_chat: '',
+                        style: 'primary'
+                      }
+                    ]
+                  ]
+                }
+              });
             }
           }
         }
 
-        if (onlineVideos && onlineVideos.length > 0) {
-          const pagedVids = onlineVideos.slice(offset, offset + 10);
-          const botUser = this.botUsername || 'Lancy_easy_bot';
-
-          results = pagedVids.map((item, idx) => {
-            const title = item.title || cleanSongQuery;
-            const duration = item.duration || 'HD Track';
-            const artist = item.author || 'Music';
-            const thumb = item.thumb || `https://i.ytimg.com/vi/${item.videoId}/hqdefault.jpg`;
-            const videoUrl = `https://www.youtube.com/watch?v=${item.videoId}`;
-
-            return {
-              type: 'video',
-              id: `yt_aud_${item.videoId}_${offset}_${idx}`,
-              video_url: videoUrl,
-              mime_type: 'text/html',
-              thumbnail_url: thumb,
-              thumb_url: thumb,
-              title: `🎵 ${title.slice(0, 50)}`,
-              description: `⏱ ${duration} • 👤 ${artist} ♡`,
-              caption: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>`,
-              parse_mode: 'HTML',
-              reply_markup: {
-                inline_keyboard: [
-                  [
-                    {
-                      text: '▶️ Stream / Watch Now ♡',
-                      url: videoUrl,
-                      style: 'primary'
-                    }
-                  ],
-                  [
-                    {
-                      text: '📜 Lyrics & Info ♡',
-                      url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
-                      style: 'primary'
-                    },
-                    {
-                      text: '🎵 Search Music Live',
-                      switch_inline_query_current_chat: '',
-                      style: 'primary'
-                    }
-                  ]
-                ]
-              }
-            };
-          });
-
-          nextOffset = (offset + results.length < onlineVideos.length) || results.length >= 8
-            ? String(offset + results.length)
+        if (combinedMusicResults.length > 0) {
+          const pagedResults = combinedMusicResults.slice(offset, offset + 10);
+          nextOffset = (offset + pagedResults.length < combinedMusicResults.length) || combinedMusicResults.length >= 8
+            ? String(offset + pagedResults.length)
             : '';
+          results = pagedResults;
         }
       }
 
@@ -1816,13 +1859,14 @@ export class TelegramController extends EventEmitter {
           text: `🎵 Search in ${botName}`,
           start_parameter: 'music'
         }
-      }).catch(async () => {
-        await this.api.call('answerInlineQuery', answerPayload).catch((err) => {
-          this.log.debug({ err: err?.message, qId }, 'answerInlineQuery failed');
+      }).catch(async (err) => {
+        this.log.error({ err: err?.message, qId }, 'answerInlineQuery with button failed, retrying without button');
+        await this.api.call('answerInlineQuery', answerPayload).catch((retryErr) => {
+          this.log.error({ err: retryErr?.message, qId }, 'answerInlineQuery failed completely');
         });
       });
     } catch (err) {
-      this.log.debug({ err: err?.message, qId }, 'answerInlineQuery failed');
+      this.log.error({ err: err?.message, qId }, 'answerInlineQuery failed');
     }
   }
 
