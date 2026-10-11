@@ -901,22 +901,22 @@ export class TelegramController extends EventEmitter {
         const videoUrl = item.url || `https://youtube.com/watch?v=${item.videoId}`;
 
         results.push({
-          type: 'article',
+          type: 'video',
           id: `tt_${item.videoId || idx}_${offset}_${idx}`,
-          title: `🎬 ${title.slice(0, 50)}`,
-          description: `⏱ ${duration} • 👁 ${views} ♡ (Tap to download)`,
-          thumb_url: thumb,
+          video_url: videoUrl,
+          mime_type: 'text/html',
           thumbnail_url: thumb,
-          input_message_content: {
-            message_text: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <i>${duration} • 👁 ${views} • TikTok &amp; Shorts HD Clip ♡</i></blockquote>`,
-            parse_mode: 'HTML'
-          },
+          thumb_url: thumb,
+          title: `🎬 ${title.slice(0, 50)}`,
+          description: `⏱ ${duration} • 👁 ${views} ♡`,
+          caption: `🎬 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👁 <b>Views:</b> ${views}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
+          parse_mode: 'HTML',
           reply_markup: {
             inline_keyboard: [
               [
                 {
-                  text: '✨ 📥 Download No-Watermark Video ♡',
-                  url: `https://t.me/${botUser}?start=dl_${encodeURIComponent(videoUrl).slice(0, 48)}`,
+                  text: '✨ 🎬 Open Clip ♡',
+                  url: videoUrl,
                   style: 'primary'
                 }
               ],
@@ -1558,38 +1558,97 @@ export class TelegramController extends EventEmitter {
         };
       });
 
-      const pagedAudioResults = cachedResults.slice(offset, offset + 10);
-      const nextOffset = (offset + pagedAudioResults.length < cachedResults.length) ? String(offset + pagedAudioResults.length) : '';
-      let results = pagedAudioResults;
+      let results = [];
+      let nextOffset = '';
 
-      // If offset === 0 and no cached tracks yet, trigger background caching and show interactive live refresh card
-      if (offset === 0 && results.length === 0 && cleanSongQuery.length >= 2) {
+      if (cachedResults.length > 0) {
+        const pagedAudioResults = cachedResults.slice(offset, offset + 10);
+        nextOffset = (offset + pagedAudioResults.length < cachedResults.length) ? String(offset + pagedAudioResults.length) : '';
+        results = pagedAudioResults;
+      } else if (cleanSongQuery.length >= 2) {
+        // Track not yet cached in SQLite: fetch instant online playable media via yts (~300ms) and trigger background MP3 caching
         this.#cacheAudioTrack(cleanSongQuery, 100).catch(() => {});
 
-        const botUser = this.botUsername || 'Lancy_easy_bot';
-        results = [{
-          type: 'article',
-          id: `music_prep_${Date.now()}`,
-          title: `⏳ Loading "${cleanSongQuery.slice(0, 40)}"…`,
-          description: `Preparing 100% full audio track… Tap button below to drop audio! ♡`,
-          thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
-          thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
-          input_message_content: {
-            message_text: `🎵 <b>Preparing Audio:</b> <code>${escapeHtml(cleanSongQuery)}</code>\n<blockquote>⏳ <i>Downloading full 320k audio track to Telegram CDN…\nTap button below to drop playable audio into chat! ♡</i></blockquote>`,
-            parse_mode: 'HTML'
-          },
-          reply_markup: {
-            inline_keyboard: [
-              [
-                {
-                  text: '🔄 🎵 Drop Full Audio Track ♡',
-                  switch_inline_query_current_chat: cleanSongQuery,
-                  style: 'primary'
+        const pageIdx = Math.floor(offset / 10);
+        const cacheKey = `mus_${cleanSongQuery.toLowerCase()}_off_${pageIdx}`;
+        let onlineMusicResults = inlineSearchCache.get(cacheKey);
+
+        if (!onlineMusicResults) {
+          try {
+            const { yts } = await import('btch-downloader');
+            const searchTerms = [
+              cleanSongQuery,
+              `${cleanSongQuery} audio`,
+              `${cleanSongQuery} music`,
+              `${cleanSongQuery} official audio`,
+              `${cleanSongQuery} song`,
+              `${cleanSongQuery} lyric video`
+            ];
+            const term = searchTerms[pageIdx % searchTerms.length];
+            const res = await yts(term);
+            const vids = res?.result?.videos || res?.result?.all || [];
+            if (vids.length > 0) {
+              const seenYt = new Set();
+              onlineMusicResults = [];
+              for (let idx = 0; idx < Math.min(vids.length, 10); idx++) {
+                const item = vids[idx];
+                const vId = item.videoId || item.url || idx;
+                if (seenYt.has(vId)) continue;
+                seenYt.add(vId);
+
+                const title = item.title || cleanSongQuery;
+                const duration = item.timestamp || item.duration?.timestamp || 'HD Track';
+                const artist = item.author?.name || 'Music';
+                const thumb = item.thumbnail || item.image || 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150';
+                const videoUrl = item.url || `https://youtube.com/watch?v=${item.videoId}`;
+
+                onlineMusicResults.push({
+                  type: 'video',
+                  id: `yt_aud_${item.videoId || idx}_${offset}_${idx}`,
+                  video_url: videoUrl,
+                  mime_type: 'text/html',
+                  thumbnail_url: thumb,
+                  thumb_url: thumb,
+                  title: `🎵 ${title.slice(0, 50)}`,
+                  description: `⏱ ${duration} • 👤 ${artist} ♡`,
+                  caption: `🎵 <b>${escapeHtml(title)}</b>\n<blockquote>⏱ <b>Duration:</b> ${duration} • 👤 <b>Artist:</b> ${escapeHtml(artist)}\n✨ <i>Playable Track via @${botUser} ♡</i></blockquote>`,
+                  parse_mode: 'HTML',
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        {
+                          text: '📜 Lyrics & Info ♡',
+                          url: `https://t.me/${botUser}?start=lyrics_${encodeURIComponent(title.replace(/\s+/g, '_')).slice(0, 32)}`,
+                          style: 'primary'
+                        }
+                      ],
+                      [
+                        {
+                          text: '🎵 Search Music Live',
+                          switch_inline_query_current_chat: '',
+                          style: 'primary'
+                        }
+                      ]
+                    ]
+                  }
+                });
+              }
+
+              if (onlineMusicResults.length > 0) {
+                inlineSearchCache.set(cacheKey, onlineMusicResults);
+                if (inlineSearchCache.size > 200) {
+                  const firstKey = inlineSearchCache.keys().next().value;
+                  inlineSearchCache.delete(firstKey);
                 }
-              ]
-            ]
-          }
-        }];
+              }
+            }
+          } catch {}
+        }
+
+        if (onlineMusicResults && onlineMusicResults.length > 0) {
+          results = onlineMusicResults;
+          nextOffset = onlineMusicResults.length >= 8 ? String(offset + onlineMusicResults.length) : '';
+        }
       }
 
       // 5. If no music results and query is generic, fall back to Pinterest pictures

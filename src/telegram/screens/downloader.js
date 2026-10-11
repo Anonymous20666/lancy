@@ -695,14 +695,16 @@ export function createDownloaderScreen({ app }) {
       const botUsername = ctx.bot?.botUsername || app?.telegram?.botUsername || 'Lancy_easy_bot';
       for (let i = 0; i < Math.min(topClips.length, 3); i++) {
         const v = topClips[i];
-        const vUrl = v.url || `https://youtube.com/watch?v=${v.videoId}`;
-        b.buttons([
-          richButton.url(
-            `✨ 📥 Download Clip ${i + 1} (${truncate(v.title || '', 20)}) ♡`,
-            `https://t.me/${botUsername}?start=dl_${encodeURIComponent(vUrl).slice(0, 48)}`,
-            { style: 'primary' }
-          )
-        ]);
+        const vId = v.videoId || (v.url ? v.url.split('v=')[1] : null);
+        if (vId) {
+          b.buttons([
+            richButton.callback(
+              `✨ 📥 Download Clip ${i + 1} (${truncate(v.title || '', 20)}) ♡`,
+              encodeCallback(id, 'execVid', vId),
+              { style: 'primary' }
+            )
+          ]);
+        }
       }
 
       b.buttons([
@@ -1167,6 +1169,11 @@ export function createDownloaderScreen({ app }) {
         case 'execute': {
           const url = args[0];
           if (url) return executeDownload(ctx, url);
+          return this.open(ctx);
+        }
+        case 'execVid': {
+          const vidId = args[0];
+          if (vidId) return executeDownload(ctx, `https://youtube.com/watch?v=${vidId}`);
           return this.open(ctx);
         }
         default:

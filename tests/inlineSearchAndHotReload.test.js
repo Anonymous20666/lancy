@@ -773,7 +773,8 @@ test('TelegramController: live inline search handles tt / tiktok query and retur
   assert.ok(inlineAnswer, 'answerInlineQuery should be called');
   assert.ok(inlineAnswer.results.length >= 1, 'should return video cards');
   const firstVideo = inlineAnswer.results[0];
-  assert.equal(firstVideo.type, 'article');
+  assert.equal(firstVideo.type, 'video', 'must return video type to drop playable media into chat');
+  assert.ok(firstVideo.video_url, 'must provide video_url');
   assert.ok(firstVideo.reply_markup?.inline_keyboard, 'must have inline keyboard');
   for (const row of firstVideo.reply_markup.inline_keyboard) {
     for (const btn of row) {
@@ -1044,6 +1045,69 @@ test('TelegramController: live inline search supports infinite pagination with n
 
   db.close();
 });
+
+test('TelegramController: live inline search for uncached music delivers playable media and zero text articles', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  let inlineAnswer = null;
+  const fakeApi = {
+    getMe: async () => ({ id: 100, username: 'Lancy_easy_bot', first_name: 'Lancy' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswer = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: {},
+    screens: new Map(),
+    botContext: { botName: 'Lancy', botUsername: 'Lancy_easy_bot' }
+  });
+  controller.botUsername = 'Lancy_easy_bot';
+
+  // Live inline search for a song not yet cached in DB
+  await controller.handleInlineQuery({
+    id: 'query_uncached_song',
+    from: { id: 1001, first_name: 'Alex' },
+    query: 'Espresso Sabrina Carpenter',
+    offset: ''
+  });
+
+  assert.ok(inlineAnswer, 'answerInlineQuery should be called');
+  assert.ok(inlineAnswer.results.length >= 1, 'must return tracks');
+
+  // Verify that all results are real media (video, audio, or photo), NEVER article
+  for (const track of inlineAnswer.results) {
+    assert.notEqual(track.type, 'article', 'live music results must never be text articles');
+    assert.ok(track.type === 'video' || track.type === 'audio' || track.type === 'photo', 'must be real media');
+    if (track.type === 'video') {
+      assert.ok(track.video_url, 'must have video_url');
+      assert.equal(track.mime_type, 'text/html');
+    }
+    if (track.reply_markup?.inline_keyboard) {
+      for (const row of track.reply_markup.inline_keyboard) {
+        for (const btn of row) {
+          assert.equal(btn.style, 'primary', `button "${btn.text}" must have style primary`);
+          if (btn.url) {
+            assert.ok(!btn.url.includes('start=dl_'), 'button must not redirect to dl DM');
+          }
+        }
+      }
+    }
+  }
+
+  db.close();
+});
+
 
 
 
