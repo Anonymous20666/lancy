@@ -22,21 +22,21 @@ export function header(title, { emoji = WINGS } = {}) {
 }
 
 export function banner(lines) {
-  // Ornate gothic/girly heavy aesthetic header
-  const textLines = lines.map(String);
-  const top = `୨୧ ━━━ 𓆩♡𓆪 ━━━━━━━━━━━━━━ 𓆩♡𓆪 ━━━ ୨୧`;
-  const bottom = `୨୧ ━━━━━━━━━ ૮꒰ ˶• ༝ •˶꒱ა ━━━━━━━━━ ୨୧`;
-  const body = textLines.map((l) => `    ₊˚⊹♡  ${l}  ˙ᵕ˙`);
-  return [top, ...body, bottom].join('\n');
+  const textLines = lines.map(String).filter(Boolean);
+  if (textLines.length === 0) return '';
+  const first = textLines[0].replace(/[𓆩♡𓆪]/g, '').trim();
+  const title = `𓆩♡𓆪 ${first.toUpperCase()} 𓆩♡𓆪`;
+  if (textLines.length === 1) return title;
+  const subs = textLines.slice(1).map((l) => {
+    const clean = l.replace(/^[ ₊˚⊹♡˙ᵕ˙]+|[ ₊˚⊹♡˙ᵕ˙]+$/g, '').trim();
+    return `₊˚⊹♡  ${clean}  ˙ᵕ˙`;
+  });
+  return [title, ...subs].join('\n');
 }
 
 export function gothicCard(title, subtitle) {
-  return [
-    `୨୧ ━━━━━━━ 𓆩♡𓆪 ━━━━━━━ ୨୧`,
-    `   ⛧ ${String(title).toUpperCase()} ⛧`,
-    subtitle ? `   ૮꒰ ˶• ༝ •˶꒱ა ${subtitle}` : '',
-    `୨୧ ━━━━━━━━━━━━━━━━━━━━ ୨୧`
-  ].filter(Boolean).join('\n');
+  const cleanTitle = `𓆩♡𓆪 ${String(title).replace(/[𓆩♡𓆪⛧]/g, '').trim().toUpperCase()} 𓆩♡𓆪`;
+  return subtitle ? `${cleanTitle}\n₊˚⊹♡  ${subtitle}  ˙ᵕ˙` : cleanTitle;
 }
 
 /** Status dot for sessions/channels. */

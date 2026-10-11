@@ -417,13 +417,11 @@ export function createDownloaderScreen({ app }) {
 
   function renderDownloadProgress({ stage, platform, url, elapsedMs = 0, current = 0, total = 0 }) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
-      '𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪',
-      'processing your media ♡'
-    ])));
+    b.header('𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡  processing your media  ˙ᵕ˙'));
     b.divider();
 
-    const elapsedSec = (elapsedMs / 1000).toFixed(1);
+    const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
     b.quote(rt.text(
       `⏳ Stage: ${stage}\n` +
       `🔗 Link: ${truncate(url, 40)}\n` +
@@ -796,17 +794,21 @@ export function createDownloaderScreen({ app }) {
           if (durStr) metaBlock += `⏱ <b>Duration:</b> ${escapeHtml(durStr)}\n`;
           if (requester) metaBlock += `👤 <b>Requested by:</b> ${escapeHtml(requester)}\n`;
 
+          const topHeader = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>`;
+          const normalQuote = `<blockquote>\n${metaBlock.trim()}\n</blockquote>`;
+
           let lyricSnippet = '';
+          let sendFollowupLyrics = false;
           if (lyricsText) {
-            const availLen = Math.max(0, 950 - metaBlock.length - 30);
-            if (availLen > 50) {
-              const sliced = lyricsText.slice(0, availLen).trim();
-              lyricSnippet = `\n📜 <b>Lyrics:</b>\n${escapeHtml(sliced)}${lyricsText.length > availLen ? '…' : ''}`;
+            const availLen = Math.max(0, 950 - normalQuote.length - topHeader.length - 30);
+            if (lyricsText.length <= availLen) {
+              lyricSnippet = `\n<blockquote expandable>\n📜 <b>Lyrics:</b>\n${escapeHtml(lyricsText)}\n</blockquote>`;
+            } else {
+              sendFollowupLyrics = true;
             }
           }
 
-          const caption = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n` +
-            `<blockquote expandable>\n${metaBlock}${lyricSnippet}\n</blockquote>`;
+          const caption = `${topHeader}\n${normalQuote}${lyricSnippet}`;
 
           sent = await (ctx.api || app.telegram?.api).sendAudio(ctx.chatId, audioTrack.buffer, {
             title: songTitle,
@@ -815,6 +817,14 @@ export function createDownloaderScreen({ app }) {
             parse_mode: 'HTML',
             filename: cleanFilename
           }).catch(() => null);
+
+          if (sent && sendFollowupLyrics && lyricsText) {
+            const fullLyricsQuote = `<blockquote expandable>\n📜 <b>Lyrics • ${escapeHtml(songTitle)} — ${escapeHtml(songArtist)}</b>\n\n${escapeHtml(lyricsText)}\n</blockquote>`;
+            await (ctx.api || app.telegram?.api).sendMessage(ctx.chatId, fullLyricsQuote, {
+              parse_mode: 'HTML',
+              reply_to_message_id: sent.message_id
+            }).catch(() => null);
+          }
         }
       }
 

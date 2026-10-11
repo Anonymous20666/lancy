@@ -11,7 +11,7 @@ import { States } from '../core/stateMachine.js';
 import { sleep, parseDurationToSeconds } from '../utils/time.js';
 import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
-import { getLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
+import { getLyrics, getCachedLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
 import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from './permissions.js';
@@ -881,12 +881,26 @@ export class TelegramController extends EventEmitter {
           const sec = String(durSec % 60).padStart(2, '0');
           const durStr = durSec > 0 ? `${min}:${sec}` : 'HD Audio';
           const lyricsSlug = trackTitle.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
+
+          let lyricBlock = '';
+          try {
+            const lyricsRes = await getLyrics(trackTitle, trackArtist).catch(() => null);
+            if (lyricsRes?.lyrics) {
+              const baseMeta = `🎵 <b>${trackTitle}</b> — <i>${trackArtist}</i>\n<blockquote>⏱ Duration: ${durStr} • 🎧 Quality: 320 kbps HD\n✨ Full Audio (100%) via @${botUser} ♡</blockquote>`;
+              const avail = Math.max(0, 950 - baseMeta.length - 40);
+              if (lyricsRes.lyrics.length <= avail) {
+                lyricBlock = `\n<blockquote expandable>📜 <b>Lyrics:</b>\n\n${escapeHtml(lyricsRes.lyrics)}</blockquote>`;
+              }
+            }
+          } catch {}
+
+          const caption = `🎵 <b>${escapeHtml(trackTitle)}</b> — <i>${escapeHtml(trackArtist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>${lyricBlock}`;
           await this.api.editMessageMedia({
             inline_message_id: inlineMessageId,
             media: {
               type: 'audio',
               media: fileId,
-              caption: `🎵 <b>${escapeHtml(trackTitle)}</b> — <i>${escapeHtml(trackArtist)}</i>\n<blockquote>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`,
+              caption,
               parse_mode: 'HTML'
             },
             reply_markup: {
@@ -1692,8 +1706,16 @@ export class TelegramController extends EventEmitter {
         const safeTitle = [...String(item.title || 'Music Track')].slice(0, 60).join('').trim();
         const safeArtist = [...String(item.artist || 'Music')].slice(0, 60).join('').trim();
         const lyricsSlug = safeTitle.replace(/[^a-zA-Z0-9]/g, '_').replace(/_+/g, '_').slice(0, 30);
+        const cachedLyr = getCachedLyrics(safeTitle, safeArtist);
+        let inlineLyricBlock = '';
+        if (cachedLyr?.lyrics) {
+          const avail = Math.max(0, 950 - 160);
+          if (cachedLyr.lyrics.length <= avail) {
+            inlineLyricBlock = `\n<blockquote expandable>📜 <b>Lyrics:</b>\n\n${escapeHtml(cachedLyr.lyrics)}</blockquote>`;
+          }
+        }
 
-        const caption = `🎵 <b>${escapeHtml(safeTitle)}</b> — <i>${escapeHtml(safeArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`;
+        const caption = `🎵 <b>${escapeHtml(safeTitle)}</b> — <i>${escapeHtml(safeArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>${inlineLyricBlock}`;
 
         const keyboard = [
           [

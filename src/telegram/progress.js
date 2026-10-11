@@ -15,7 +15,7 @@ import { isPermissionError, recordChatPermissionRestriction, formatMediaRestrict
 const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests|flood wait dropped|FLOOD_WAIT/i;
 
 export class ProgressTracker {
-  constructor({ api, chatId, messageId = null, heartbeatMs = 2500, action = 'typing', log } = {}) {
+  constructor({ api, chatId, messageId = null, heartbeatMs = 1000, action = 'typing', log } = {}) {
     this.api = api;
     this.chatId = chatId;
     this.messageId = messageId;
@@ -116,7 +116,7 @@ export class ProgressTracker {
         this.log.warn({ err: error }, 'progress edit failed');
       }
     }
-  }, 3000);
+  }, 1000);
 
   #stop() {
     this.closed = true;

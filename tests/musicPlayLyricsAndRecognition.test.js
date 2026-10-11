@@ -972,10 +972,118 @@ test('Group Chat Photo Restriction Fallback: delivers audio with expandable bloc
   assert.ok(sentAudioParams, 'sendAudio must be called for fallback in group chat');
   assert.equal(sentAudioParams.chatId, -100999);
   assert.ok(sentAudioParams.opts.caption, 'Audio must carry rich caption');
+  assert.ok(sentAudioParams.opts.caption.includes('<blockquote>'), 'Caption must contain non-extended metadata blockquote');
   assert.ok(sentAudioParams.opts.caption.includes('<blockquote expandable>'), 'Caption must contain expandable blockquote');
   assert.ok(sentAudioParams.opts.caption.includes('The Weeknd'), 'Caption contains artist metadata');
   assert.ok(sentAudioParams.opts.caption.includes('church shoes'), 'Caption contains lyrics inside the expandable blockquote');
   assert.ok(sentAudioParams.opts.caption.length <= 1024, 'Caption must be within Telegram 1024 character limit');
+
+  db.close();
+});
+
+test('Responsive Native Header: banner and gothicCard omit wide unicode borders', async () => {
+  const { banner, gothicCard } = await import('../src/telegram/ui.js');
+  const bText = banner(['URL DOWNLOADER', 'processing your media']);
+  assert.ok(!bText.includes('୨୧ ━━━'), 'Banner must not contain fixed-width line border');
+  assert.ok(!bText.includes('૮꒰ ˶• ༝ •˶꒱ა'), 'Banner must not contain fixed-width bunny border');
+  assert.ok(bText.includes('𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪'));
+  assert.ok(bText.includes('processing your media'));
+
+  const gText = gothicCard('MUSIC PLAYER', 'playing tracks');
+  assert.ok(!gText.includes('୨୧ ━━━━'), 'Gothic card must not contain fixed-width line border');
+  assert.ok(gText.includes('MUSIC PLAYER'));
+});
+
+test('Long Lyrics Delivery: sends non-extended blockquote first and delivers 100% full lyrics without ellipsis', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  let sentAudioParams = null;
+  let sentMessageParams = null;
+
+  const mockApi = {
+    me: { id: 8859351350 },
+    botUsername: 'Lancy_easy_bot',
+    getChat: async () => ({
+      permissions: {
+        can_send_messages: true,
+        can_send_media_messages: true,
+        can_send_photos: false,
+        can_send_videos: false,
+        can_send_audios: true
+      }
+    }),
+    getChatMember: async () => ({ status: 'member' }),
+    sendRichMessage: async () => ({ message_id: 111 }),
+    editMessageRich: async () => ({ message_id: 111 }),
+    sendChatAction: async () => ({ ok: true }),
+    deleteMessage: async () => ({ ok: true }),
+    sendAudio: async (chatId, buffer, opts) => {
+      sentAudioParams = { chatId, buffer, opts };
+      return { message_id: 999, audio: { file_id: 'aud_lithe_suv' } };
+    },
+    sendMessage: async (chatId, text, opts) => {
+      sentMessageParams = { chatId, text, opts };
+      return { message_id: 1000 };
+    }
+  };
+
+  const longLyrics = 'And now I am jumping out the SUV yeah\n' + 'line of verse repeat\n'.repeat(60) + 'final verse line completely full';
+
+  const fakeDownloader = {
+    download: async () => ({
+      platform: 'spotify',
+      title: 'SUV',
+      artist: 'Lithe',
+      duration: '2:08',
+      mediaItems: [{ type: 'photo', buffer: Buffer.from('album-art') }],
+      audioTrack: {
+        buffer: Buffer.from('fake-mp3-buffer'),
+        title: 'SUV',
+        performer: 'Lithe',
+        duration: 128
+      },
+      lyrics: longLyrics
+    })
+  };
+
+  const downloader = createDownloaderScreen({
+    app: {
+      db,
+      telegram: { api: mockApi },
+      mediaDownloader: fakeDownloader
+    }
+  });
+
+  const { invalidateChatPermissions } = await import('../src/telegram/permissions.js');
+  invalidateChatPermissions(-100888);
+
+  const groupCtx = {
+    isGroup: true,
+    chatId: -100888,
+    tgId: '1001',
+    user: { id: 1001, first_name: 'Pappy' },
+    api: mockApi,
+    botUsername: 'Lancy_easy_bot',
+    db,
+    settings,
+    sm
+  };
+
+  await downloader.executeDownload(groupCtx, 'lithe suv');
+
+  assert.ok(sentAudioParams, 'sendAudio must be called for audio track');
+  assert.ok(sentAudioParams.opts.caption.includes('<blockquote>'), 'Audio caption has standard non-extended blockquote');
+  assert.ok(sentAudioParams.opts.caption.includes('Lithe'), 'Contains artist');
+  assert.ok(!sentAudioParams.opts.caption.includes('…'), 'Audio caption must not contain ellipsis dots');
+  assert.ok(sentAudioParams.opts.caption.length <= 1024, 'Audio caption must fit in Telegram limit');
+
+  // Follow-up message delivers 100% complete lyrics without any dots
+  assert.ok(sentMessageParams, 'sendMessage must be called with full lyrics');
+  assert.equal(sentMessageParams.opts.reply_to_message_id, 999, 'Must reply to sent audio message');
+  assert.ok(sentMessageParams.text.includes('<blockquote expandable>'), 'Must be in expandable blockquote');
+  assert.ok(sentMessageParams.text.includes('final verse line completely full'), 'Must contain entire ending of song');
+  assert.ok(!sentMessageParams.text.includes('…'), 'Must not truncate lyrics with ellipsis');
 
   db.close();
 });

@@ -290,12 +290,40 @@ async function _doSearchSongByLyrics(snippet) {
   return null;
 }
 
+const lyricsMemoryCache = new Map();
+
+/**
+ * Synchronous cache lookup for lyrics
+ */
+export function getCachedLyrics(rawTitle, rawArtist = '') {
+  const { title, artist } = cleanSongMetadata(rawTitle, rawArtist);
+  const key = `${(title || '').toLowerCase().trim()}:::${(artist || '').toLowerCase().trim()}`;
+  return lyricsMemoryCache.get(key) || null;
+}
+
 /**
  * Fetch lyrics from LRCLIB & AZLyrics with intelligent fallback queries and reverse lyrics search
  */
 export async function getLyrics(rawTitle, rawArtist = '') {
   let { title, artist } = cleanSongMetadata(rawTitle, rawArtist);
   log.debug({ rawTitle, rawArtist, title, artist }, 'fetching lyrics');
+
+  const cacheKey = `${(title || '').toLowerCase().trim()}:::${(artist || '').toLowerCase().trim()}`;
+  if (cacheKey !== ':::' && lyricsMemoryCache.has(cacheKey)) {
+    return lyricsMemoryCache.get(cacheKey);
+  }
+
+  // Helper to cache before return
+  const wrapResult = (res) => {
+    if (res?.found && cacheKey !== ':::') {
+      lyricsMemoryCache.set(cacheKey, res);
+      if (lyricsMemoryCache.size > 500) {
+        const first = lyricsMemoryCache.keys().next().value;
+        lyricsMemoryCache.delete(first);
+      }
+    }
+    return res;
+  };
 
   // Guard against generic or empty titles
   if (!rawTitle || (title && title.toLowerCase() === 'song') || (title && title.toLowerCase() === 'unknown')) {
@@ -339,14 +367,14 @@ export async function getLyrics(rawTitle, rawArtist = '') {
         const synced = stripLrcTimestamps(data.syncedLyrics || '').trim();
         const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
         if (text && text.length > 0) {
-          return {
+          return wrapResult({
             found: true,
             title: data.trackName || title,
             artist: data.artistName || artist,
             album: data.albumName,
             lyrics: text,
             source: 'lrclib'
-          };
+          });
         }
       }
     } catch (err) {
@@ -372,14 +400,14 @@ export async function getLyrics(rawTitle, rawArtist = '') {
             const plain = (match.plainLyrics || '').trim();
             const synced = stripLrcTimestamps(match.syncedLyrics || '').trim();
             const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
-            return {
+            return wrapResult({
               found: true,
               title: match.trackName || title,
               artist: match.artistName || artist,
               album: match.albumName,
               lyrics: text,
               source: 'lrclib'
-            };
+            });
           }
         }
       }
@@ -392,13 +420,13 @@ export async function getLyrics(rawTitle, rawArtist = '') {
   if (identifiedAzUrl) {
     const azLyrics = await fetchAzLyrics(identifiedAzUrl);
     if (azLyrics && azLyrics.length > 0) {
-      return {
+      return wrapResult({
         found: true,
         title: title || rawTitle,
         artist: artist || rawArtist,
         lyrics: azLyrics,
         source: 'azlyrics'
-      };
+      });
     }
   }
 
@@ -416,27 +444,27 @@ export async function getLyrics(rawTitle, rawArtist = '') {
           const synced = stripLrcTimestamps(data.syncedLyrics || '').trim();
           const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
           if (text) {
-            return {
+            return wrapResult({
               found: true,
               title: data.trackName || reverse.title,
               artist: data.artistName || reverse.artist,
               album: data.albumName,
               lyrics: text,
               source: 'lrclib'
-            };
+            });
           }
         }
 
         if (reverse.sourceUrl?.includes('azlyrics.com')) {
           const azLyrics = await fetchAzLyrics(reverse.sourceUrl);
           if (azLyrics && azLyrics.length > 0) {
-            return {
+            return wrapResult({
               found: true,
               title: reverse.title,
               artist: reverse.artist,
               lyrics: azLyrics,
               source: 'azlyrics'
-            };
+            });
           }
         }
       }
