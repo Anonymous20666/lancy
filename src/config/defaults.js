@@ -19,6 +19,7 @@ export const DEFAULT_SETTINGS = {
   telegram: {
     // botToken is env-only (never stored in the DB, never hot-reloaded)
     adminIds: [],
+    storageChatId: null,         // optional dedicated channel/chat for media caching
     richMessages: true,          // use Bot API 10.3 rich messages
     paginationSize: 5,
     progressAnimation: true,

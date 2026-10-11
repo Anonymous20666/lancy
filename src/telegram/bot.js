@@ -501,12 +501,15 @@ export class TelegramController extends EventEmitter {
         const res = await this.app.mediaDownloader.download(downloadTarget);
         if (!res?.audioTrack?.buffer) return null;
 
-        const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+        const storageChatId = this.settings?.get('telegram.storageChatId') || this.settings?.get('telegram.storageChannelId');
+        if (!storageChatId) {
+          return null; // Never upload to owner's personal chat
+        }
         const durSec = res.duration ? parseDurationToSeconds(res.duration) : 0;
         if (durSec > 0 && durSec < 45) {
           return null; // Strictly reject preview snippets from being cached
         }
-        const sent = await this.api.sendAudio(ownerId, res.audioTrack.buffer, {
+        const sent = await this.api.sendAudio(storageChatId, res.audioTrack.buffer, {
           title: res.title || clean,
           performer: res.artist || res.author || 'Music',
           ...(durSec > 0 ? { duration: durSec } : {}),
@@ -516,7 +519,7 @@ export class TelegramController extends EventEmitter {
         const fileId = sent?.audio?.file_id;
         if (fileId) {
           if (sent.message_id) {
-            await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+            await this.api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
           }
           const songTitle = res.title || clean;
           const songArtist = res.artist || res.author || null;
@@ -631,9 +634,10 @@ export class TelegramController extends EventEmitter {
           writeFileSync(`/data/video_cache/${cleanKey}.mp4`, vidBuf);
         } catch {}
 
-        const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+        const storageChatId = this.settings?.get('telegram.storageChatId') || this.settings?.get('telegram.storageChannelId');
+        if (!storageChatId) return null;
         const durSec = res.duration ? parseDurationToSeconds(res.duration) : 30;
-        const sent = await this.api.sendVideo(ownerId, vidBuf, {
+        const sent = await this.api.sendVideo(storageChatId, vidBuf, {
           caption: `🎬 ${res.title || title || 'Clip'}`,
           ...(durSec > 0 ? { duration: durSec } : {}),
           supports_streaming: true,
@@ -643,7 +647,7 @@ export class TelegramController extends EventEmitter {
         const fileId = sent?.video?.file_id;
         if (fileId) {
           if (sent.message_id) {
-            await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+            await this.api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
           }
           const vidTitle = res.title || title || 'Clip';
           try {
@@ -715,24 +719,26 @@ export class TelegramController extends EventEmitter {
             try {
               if (videoId) writeFileSync(`/data/video_cache/${videoId}.mp4`, vidBuf);
             } catch {}
-            const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+            const storageChatId = this.settings?.get('telegram.storageChatId') || this.settings?.get('telegram.storageChannelId');
             const durSec = res.duration ? parseDurationToSeconds(res.duration) : 30;
-            const sent = await this.api.sendVideo(ownerId, vidBuf, {
-              caption: `🎬 ${res.title || videoTitle}`,
-              ...(durSec > 0 ? { duration: durSec } : {}),
-              supports_streaming: true,
-              disable_notification: true
-            });
-            const uploadedFileId = sent?.video?.file_id;
-            if (uploadedFileId) {
-              fileId = uploadedFileId;
-              if (sent.message_id) {
-                await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+            if (storageChatId) {
+              const sent = await this.api.sendVideo(storageChatId, vidBuf, {
+                caption: `🎬 ${res.title || videoTitle}`,
+                ...(durSec > 0 ? { duration: durSec } : {}),
+                supports_streaming: true,
+                disable_notification: true
+              });
+              const uploadedFileId = sent?.video?.file_id;
+              if (uploadedFileId) {
+                fileId = uploadedFileId;
+                if (sent.message_id) {
+                  await this.api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
+                }
+                try {
+                  const sql = 'INSERT OR REPLACE INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)';
+                  if (videoId) this.db.prepare(sql).run(videoId, fileId, videoTitle, durSec);
+                } catch {}
               }
-              try {
-                const sql = 'INSERT OR REPLACE INTO cached_video_tracks (query, file_id, title, duration) VALUES (?, ?, ?, ?)';
-                if (videoId) this.db.prepare(sql).run(videoId, fileId, videoTitle, durSec);
-              } catch {}
             }
           }
         } catch (err) {
@@ -740,13 +746,15 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      if (fileId) {
+      const directVideoUrl = `https://pappysonghttps.duckdns.org/video/live/${encodeURIComponent(videoId || 'clip')}.mp4`;
+      const videoMediaTarget = fileId || directVideoUrl;
+      if (videoMediaTarget) {
         try {
           await this.api.editMessageMedia({
             inline_message_id: inlineMessageId,
             media: {
               type: 'video',
-              media: fileId,
+              media: videoMediaTarget,
               caption: `🎬 <b>${escapeHtml(videoTitle)}</b>\n<blockquote expandable>⏱ <b>Duration:</b> ${escapeHtml(videoDuration)}\n✨ <i>TikTok &amp; Shorts HD Clip via @${botUser} ♡</i></blockquote>`,
               parse_mode: 'HTML',
               supports_streaming: true
@@ -843,31 +851,33 @@ export class TelegramController extends EventEmitter {
           const downloadTarget = videoId ? `https://www.youtube.com/watch?v=${videoId}` : searchQuery;
           const res = await this.app.mediaDownloader.download(downloadTarget);
           if (res?.audioTrack?.buffer) {
-            const ownerId = (this.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+            const storageChatId = this.settings?.get('telegram.storageChatId') || this.settings?.get('telegram.storageChannelId');
             const resDur = res.duration ? parseDurationToSeconds(res.duration) : durSec;
             if (res.title) trackTitle = res.title;
             if (res.artist || res.author) trackArtist = res.artist || res.author;
-            const sent = await this.api.sendAudio(ownerId, res.audioTrack.buffer, {
-              title: trackTitle,
-              performer: trackArtist,
-              ...(resDur > 0 ? { duration: resDur } : {}),
-              disable_notification: true
-            });
-            const uploadedFileId = sent?.audio?.file_id;
-            if (uploadedFileId) {
-              fileId = uploadedFileId;
-              durSec = resDur;
-              if (sent.message_id) {
-                await this.api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
-              }
-              try {
-                const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
-                if (videoId) this.db.prepare(sql).run(videoId, fileId, trackTitle, trackArtist, durSec);
-                this.db.prepare(sql).run(searchQuery.toLowerCase().trim(), fileId, trackTitle, trackArtist, durSec);
-                if (trackTitle && trackTitle.toLowerCase().trim() !== searchQuery.toLowerCase().trim()) {
-                  this.db.prepare(sql).run(trackTitle.toLowerCase().trim(), fileId, trackTitle, trackArtist, durSec);
+            if (storageChatId) {
+              const sent = await this.api.sendAudio(storageChatId, res.audioTrack.buffer, {
+                title: trackTitle,
+                performer: trackArtist,
+                ...(resDur > 0 ? { duration: resDur } : {}),
+                disable_notification: true
+              });
+              const uploadedFileId = sent?.audio?.file_id;
+              if (uploadedFileId) {
+                fileId = uploadedFileId;
+                durSec = resDur;
+                if (sent.message_id) {
+                  await this.api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
                 }
-              } catch {}
+                try {
+                  const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                  if (videoId) this.db.prepare(sql).run(videoId, fileId, trackTitle, trackArtist, durSec);
+                  this.db.prepare(sql).run(searchQuery.toLowerCase().trim(), fileId, trackTitle, trackArtist, durSec);
+                  if (trackTitle && trackTitle.toLowerCase().trim() !== searchQuery.toLowerCase().trim()) {
+                    this.db.prepare(sql).run(trackTitle.toLowerCase().trim(), fileId, trackTitle, trackArtist, durSec);
+                  }
+                } catch {}
+              }
             }
           }
         } catch (err) {
@@ -875,7 +885,9 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      if (fileId) {
+      const directStreamUrl = `https://pappysonghttps.duckdns.org/audio/live/${encodeURIComponent(videoId || 'track')}/${encodeURIComponent(trackArtist)}_-_${encodeURIComponent(trackTitle)}.mp3`;
+      const audioMediaTarget = fileId || directStreamUrl;
+      if (audioMediaTarget) {
         try {
           const min = Math.floor(durSec / 60);
           const sec = String(durSec % 60).padStart(2, '0');
@@ -899,7 +911,7 @@ export class TelegramController extends EventEmitter {
             inline_message_id: inlineMessageId,
             media: {
               type: 'audio',
-              media: fileId,
+              media: audioMediaTarget,
               caption,
               parse_mode: 'HTML'
             },
@@ -1803,11 +1815,6 @@ export class TelegramController extends EventEmitter {
             reply_markup: { inline_keyboard: keyboard }
           });
         }
-      }
-
-      // Pre-warm top uncached audio track in background for instant full song delivery
-      if (paged.length > 0 && !paged[0].fileId && paged[0].title) {
-        this.#cacheAudioTrack(`${paged[0].title} ${paged[0].artist}`, 0).catch(() => {});
       }
 
       return { results, nextOffset };
@@ -2959,16 +2966,11 @@ export class TelegramController extends EventEmitter {
             if (total > 1) await sleep(300);
           }
         } else {
-          const errSent = await this.api.sendMessage(
+          await this.api.sendMessage(
             chatId,
             `<blockquote>♡ Could not find lyrics for "<b>${escapeHtml(query)}</b>" ♡\nPlease check the spelling or send a longer lyric snippet!</blockquote>`,
             { parse_mode: 'HTML' }
           );
-          if (errSent?.message_id && typeof this.api.deleteMessage === 'function') {
-            setTimeout(() => {
-              this.api.deleteMessage(chatId, errSent.message_id).catch(() => {});
-            }, 12000)?.unref?.();
-          }
         }
         return;
       }

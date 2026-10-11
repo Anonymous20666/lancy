@@ -1326,31 +1326,21 @@ export function createDownloaderScreen({ app }) {
           }
 
           if (!songTitle || songTitle.toLowerCase() === 'song') {
-            const errSent = await ctx.api.sendMessage(
+            await ctx.api.sendMessage(
               ctx.chatId,
               '<blockquote>♡ Could not find lyrics: song title could not be determined from this card ♡\nTip: You can search lyrics directly with <code>/lyrics &lt;song name&gt;</code> ♡</blockquote>',
               { parse_mode: 'HTML' }
             );
-            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
-              setTimeout(() => {
-                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
-              }, 12000)?.unref?.();
-            }
             return;
           }
 
           const lyricsRes = await getLyrics(songTitle, songArtist);
           if (!lyricsRes.found || !lyricsRes.lyrics) {
-            const errSent = await ctx.api.sendMessage(
+            await ctx.api.sendMessage(
               ctx.chatId,
               `<blockquote>♡ Could not find lyrics for "<b>${escapeHtml(songTitle)}</b>" ♡\nTip: You can search lyrics directly with <code>/lyrics &lt;song&gt;</code> ♡</blockquote>`,
               { parse_mode: 'HTML' }
             );
-            if (errSent?.message_id && typeof ctx.api.deleteMessage === 'function') {
-              setTimeout(() => {
-                ctx.api.deleteMessage(ctx.chatId, errSent.message_id).catch(() => {});
-              }, 12000)?.unref?.();
-            }
             return;
           }
 
@@ -1515,43 +1505,48 @@ export function createDownloaderScreen({ app }) {
           const songArtist = downloadRes.artist || downloadRes.author || 'Music';
           const caption = `🎵 <b>${escapeHtml(songTitle)}</b> — <i>${escapeHtml(songArtist)}</i>\n<blockquote expandable>⏱ <b>Duration:</b> ${durStr} • 🎧 <b>Quality:</b> 320 kbps HD\n✨ <i>Full Audio (100%) via @${botUser} ♡</i></blockquote>`;
 
-          // If triggered from inline message, upload via owner/bot to get file_id then upgrade inline message!
+          // If triggered from inline message, upgrade inline message!
           if (inlineMsgId) {
-            const ownerId = (ctx.settings?.get?.('telegram.ownerIds') || [])[0] || 8380969639;
-            const tempSent = await ctx.api.sendAudio(ownerId, downloadRes.audioTrack.buffer, {
-              title: songTitle,
-              performer: songArtist,
-              ...(durSec > 0 ? { duration: durSec } : {}),
-              disable_notification: true
-            }).catch(() => null);
+            let fileId = null;
+            const storageChatId = ctx.settings?.get?.('telegram.storageChatId') || ctx.settings?.get?.('telegram.storageChannelId');
+            if (storageChatId) {
+              const tempSent = await ctx.api.sendAudio(storageChatId, downloadRes.audioTrack.buffer, {
+                title: songTitle,
+                performer: songArtist,
+                ...(durSec > 0 ? { duration: durSec } : {}),
+                disable_notification: true
+              }).catch(() => null);
 
-            if (tempSent?.audio?.file_id) {
-              const fileId = tempSent.audio.file_id;
-              if (tempSent.message_id) {
-                await ctx.api.call('deleteMessage', { chat_id: ownerId, message_id: tempSent.message_id }).catch(() => {});
-              }
-
-              // Cache in SQLite
-              try {
-                const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
-                if (videoId) db.prepare(sql).run(videoId, fileId, songTitle, songArtist, durSec);
-                db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
-                if (songArtist && songArtist !== 'Music') {
-                  db.prepare(sql).run(`${songTitle.toLowerCase().trim()} ${songArtist.toLowerCase().trim()}`, fileId, songTitle, songArtist, durSec);
+              if (tempSent?.audio?.file_id) {
+                fileId = tempSent.audio.file_id;
+                if (tempSent.message_id) {
+                  await ctx.api.call('deleteMessage', { chat_id: storageChatId, message_id: tempSent.message_id }).catch(() => {});
                 }
-              } catch {}
 
-              try {
-                await ctx.api.call('editMessageMedia', {
-                  inline_message_id: inlineMsgId,
-                  media: {
-                    type: 'audio',
-                    media: fileId,
-                    title: songTitle,
-                    performer: songArtist,
-                    caption,
-                    parse_mode: 'HTML'
-                  },
+                // Cache in SQLite
+                try {
+                  const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                  if (videoId) db.prepare(sql).run(videoId, fileId, songTitle, songArtist, durSec);
+                  db.prepare(sql).run(songTitle.toLowerCase().trim(), fileId, songTitle, songArtist, durSec);
+                  if (songArtist && songArtist !== 'Music') {
+                    db.prepare(sql).run(`${songTitle.toLowerCase().trim()} ${songArtist.toLowerCase().trim()}`, fileId, songTitle, songArtist, durSec);
+                  }
+                } catch {}
+              }
+            }
+
+            const directStreamUrl = `https://pappysonghttps.duckdns.org/audio/live/${encodeURIComponent(videoId || 'track')}/${encodeURIComponent(songArtist)}_-_${encodeURIComponent(songTitle)}.mp3`;
+            try {
+              await ctx.api.call('editMessageMedia', {
+                inline_message_id: inlineMsgId,
+                media: {
+                  type: 'audio',
+                  media: fileId || directStreamUrl,
+                  title: songTitle,
+                  performer: songArtist,
+                  caption,
+                  parse_mode: 'HTML'
+                },
                   reply_markup: {
                     inline_keyboard: [
                       [
@@ -1574,7 +1569,6 @@ export function createDownloaderScreen({ app }) {
                 return;
               } catch {}
             }
-          }
 
           // Deliver directly to target chat
           const destinationChat = targetChatId || ctx.tgId;

@@ -1413,6 +1413,7 @@ test('TelegramController: handleChosenInlineResult upgrades video chosen result 
     }
   };
 
+  await settings.set('telegram.storageChatId', 1001);
   const controller = new TelegramController({
     api: fakeApi,
     db,
@@ -1501,6 +1502,7 @@ test('TelegramController: handleChosenInlineResult upgrades audio chosen result 
     }
   };
 
+  await settings.set('telegram.storageChatId', 1001);
   const controller = new TelegramController({
     api: fakeApi,
     db,

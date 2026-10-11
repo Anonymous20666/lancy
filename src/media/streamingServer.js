@@ -150,15 +150,15 @@ export class VideoStreamingServer {
           const finalBuffer = optimized || videoItem.buffer;
           writeFileSync(targetPath, finalBuffer);
 
-          // Upload to Telegram in background and cache file_id
+          // If a dedicated storage channel is configured, upload and cache file_id (never upload to owner's personal chat)
           const api = this.app?.telegram?.api;
-          const ownerId = (this.app?.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+          const storageChatId = this.app?.settings?.get('telegram.storageChatId') || this.app?.settings?.get('telegram.storageChannelId');
           const durSec = res.duration ? parseDurationToSeconds(res.duration) : 30;
 
-          if (api) {
+          if (api && storageChatId) {
             (async () => {
               try {
-                const sent = await api.sendVideo(ownerId, finalBuffer, {
+                const sent = await api.sendVideo(storageChatId, finalBuffer, {
                   caption: `🎬 ${res.title || 'Clip'}`,
                   duration: durSec > 0 ? durSec : 30,
                   supports_streaming: true,
@@ -167,7 +167,7 @@ export class VideoStreamingServer {
                 const fileId = sent?.video?.file_id;
                 if (fileId) {
                   if (sent.message_id) {
-                    await api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+                    await api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
                   }
                   const db = this.app?.db;
                   if (db) {
@@ -276,12 +276,12 @@ export class VideoStreamingServer {
                 const fullRes = await downloader.download(fullSearchQuery).catch(() => null);
                 if (fullRes?.audioTrack?.buffer && fullRes.audioTrack.buffer.length > 10000) {
                   writeFileSync(targetPath, fullRes.audioTrack.buffer);
-                  // Upload to Telegram to cache permanent file_id
+                  // If a dedicated storage channel is configured, upload to cache permanent file_id (never upload to owner's personal chat)
                   const api = this.app?.telegram?.api;
-                  const ownerId = (this.app?.settings?.get('telegram.ownerIds') || [])[0] || 8380969639;
+                  const storageChatId = this.app?.settings?.get('telegram.storageChatId') || this.app?.settings?.get('telegram.storageChannelId');
                   const durSec = fullRes.duration ? parseDurationToSeconds(fullRes.duration) : 0;
-                  if (api) {
-                    const sent = await api.sendAudio(ownerId, fullRes.audioTrack.buffer, {
+                  if (api && storageChatId) {
+                    const sent = await api.sendAudio(storageChatId, fullRes.audioTrack.buffer, {
                       title: fullRes.title || meta?.title || fullSearchQuery,
                       performer: fullRes.artist || fullRes.author || meta?.artist || 'Music',
                       ...(durSec > 0 ? { duration: durSec } : {}),
@@ -290,7 +290,7 @@ export class VideoStreamingServer {
                     const uploadedFileId = sent?.audio?.file_id;
                     if (uploadedFileId) {
                       if (sent.message_id) {
-                        await api.call('deleteMessage', { chat_id: ownerId, message_id: sent.message_id }).catch(() => {});
+                        await api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
                       }
                       const db = this.app?.db;
                       if (db) {
