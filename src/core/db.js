@@ -60,6 +60,22 @@ export class Database {
           PRIMARY KEY (chat_id, user_id)
         );
         CREATE INDEX IF NOT EXISTS idx_group_members_chat ON group_members(chat_id);
+
+        CREATE TABLE IF NOT EXISTS game_scores (
+          chat_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          first_name TEXT,
+          username TEXT,
+          score INTEGER NOT NULL DEFAULT 0,
+          games_won INTEGER NOT NULL DEFAULT 0,
+          correct_answers INTEGER NOT NULL DEFAULT 0,
+          fastest_ms INTEGER DEFAULT NULL,
+          best_streak INTEGER NOT NULL DEFAULT 0,
+          current_streak INTEGER NOT NULL DEFAULT 0,
+          last_played TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (chat_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_game_scores_chat_score ON game_scores(chat_id, score DESC);
       `);
     } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
@@ -233,6 +249,81 @@ export class Database {
       return row?.count ? Number(row.count) : 0;
     } catch {
       return 0;
+    }
+  }
+
+  recordGameAnswer(chatId, user, points = 100, reactionMs = null) {
+    if (!chatId || !user?.id) return;
+    try {
+      this.run(
+        `INSERT INTO game_scores (chat_id, user_id, first_name, username, score, correct_answers, current_streak, best_streak, fastest_ms, last_played)
+         VALUES (?, ?, ?, ?, ?, 1, 1, 1, ?, datetime('now'))
+         ON CONFLICT(chat_id, user_id) DO UPDATE SET
+           first_name = COALESCE(excluded.first_name, game_scores.first_name),
+           username = COALESCE(excluded.username, game_scores.username),
+           score = game_scores.score + excluded.score,
+           correct_answers = game_scores.correct_answers + 1,
+           current_streak = game_scores.current_streak + 1,
+           best_streak = MAX(game_scores.best_streak, game_scores.current_streak + 1),
+           fastest_ms = CASE 
+             WHEN excluded.fastest_ms IS NULL THEN game_scores.fastest_ms
+             WHEN game_scores.fastest_ms IS NULL THEN excluded.fastest_ms
+             ELSE MIN(game_scores.fastest_ms, excluded.fastest_ms)
+           END,
+           last_played = datetime('now')`,
+        Number(chatId),
+        Number(user.id),
+        user.first_name || 'Player',
+        user.username || null,
+        Number(points),
+        reactionMs ? Number(reactionMs) : null
+      );
+    } catch (err) {
+      logger().warn({ err, chatId, userId: user.id }, 'failed to record game answer');
+    }
+  }
+
+  recordGameWin(chatId, user) {
+    if (!chatId || !user?.id) return;
+    try {
+      this.run(
+        `INSERT INTO game_scores (chat_id, user_id, first_name, username, games_won, last_played)
+         VALUES (?, ?, ?, ?, 1, datetime('now'))
+         ON CONFLICT(chat_id, user_id) DO UPDATE SET
+           games_won = game_scores.games_won + 1,
+           last_played = datetime('now')`,
+        Number(chatId),
+        Number(user.id),
+        user.first_name || 'Player',
+        user.username || null
+      );
+    } catch (err) {
+      logger().warn({ err, chatId, userId: user.id }, 'failed to record game win');
+    }
+  }
+
+  resetPlayerStreak(chatId, userId) {
+    if (!chatId || !userId) return;
+    try {
+      this.run('UPDATE game_scores SET current_streak = 0 WHERE chat_id = ? AND user_id = ?', Number(chatId), Number(userId));
+    } catch {}
+  }
+
+  getGameLeaderboard(chatId, limit = 10) {
+    if (!chatId) return [];
+    try {
+      return this.all(
+        `SELECT user_id, first_name, username, score, games_won, correct_answers, fastest_ms, best_streak
+         FROM game_scores
+         WHERE chat_id = ?
+         ORDER BY score DESC
+         LIMIT ?`,
+        Number(chatId),
+        Number(limit)
+      );
+    } catch (err) {
+      logger().warn({ err, chatId }, 'failed to fetch game leaderboard');
+      return [];
     }
   }
 

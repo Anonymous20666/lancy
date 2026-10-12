@@ -318,6 +318,22 @@ export class TelegramAPI {
     return this.call('pinChatMessage', { chat_id: chatId, message_id: messageId, disable_notification: disableNotification }).catch(() => null);
   }
 
+  sendPoll(chatId, question, options, extra = {}) {
+    const opts = Array.isArray(options)
+      ? options.map((o) => (typeof o === 'string' ? { text: o } : o))
+      : [];
+    return this.call('sendPoll', {
+      chat_id: chatId,
+      question,
+      options: JSON.stringify(opts),
+      ...extra
+    });
+  }
+
+  stopPoll(chatId, messageId, extra = {}) {
+    return this.call('stopPoll', { chat_id: chatId, message_id: messageId, ...extra });
+  }
+
   getUserProfilePhotos(userId, extra = {}) {
     return this.call('getUserProfilePhotos', { user_id: userId, ...extra });
   }
@@ -408,7 +424,9 @@ export class TelegramAPI {
         'chosen_inline_result',
         'chat_member',
         'my_chat_member',
-        'chat_join_request'
+        'chat_join_request',
+        'poll',
+        'poll_answer'
       ]
     };
     const controller = new AbortController();

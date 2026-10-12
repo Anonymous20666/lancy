@@ -15,6 +15,7 @@ import { getLyrics, getCachedLyrics, chunkLyrics, escapeHtml, formatBlockquoteLy
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
 import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from './permissions.js';
+import { GameEngine } from '../games/engine.js';
 
 const execFileAsync = promisify(execFile);
 export const inlineSearchCache = new Map();
@@ -89,6 +90,7 @@ export class TelegramController extends EventEmitter {
     this.pendingAudioCaches = new Set(); // query -> boolean
     this.pendingVideoCaches = new Set(); // videoId -> boolean
     this.audioMetadataMap = new Map(); // trackId -> { id, title, artist, album, cover, previewUrl }
+    this.gameEngine = new GameEngine({ api: this.api, db: this.db, log: this.log });
   }
 
   getInlineAudioMetadata(trackId) {
@@ -227,6 +229,8 @@ export class TelegramController extends EventEmitter {
     const botName = this.botContext?.botName || 'Lancy';
 
     const groupCommands = [
+      { command: 'game', description: '🎮 Play Flags, Cars, Characters & AI Quiz in chat' },
+      { command: 'topleaderboard', description: '🏆 Group trivia & game hall of fame' },
       { command: 'hidetag', description: '📢 Invisibly mention all group members in one message (admins only)' },
       { command: 'tagall', description: '📢 Tag all group members in one clean message' },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
@@ -242,6 +246,8 @@ export class TelegramController extends EventEmitter {
     ];
 
     const privateCommands = [
+      { command: 'game', description: '🎮 Play Flags, Cars, Characters & AI Quiz' },
+      { command: 'topleaderboard', description: '🏆 Trivia & game hall of fame' },
       { command: 'start', description: `✦ Open ${botName} aesthetic dashboard` },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
@@ -2610,6 +2616,10 @@ export class TelegramController extends EventEmitter {
     const data = query.data ?? '';
 
     try {
+      if (data.startsWith('game_')) {
+        await this.handleGameCallback(query);
+        return;
+      }
       if (data === NOOP_CALLBACK || data.startsWith('l1:noop')) {
         await this.api.answerCallbackQuery(query.id);
         return;
@@ -2713,6 +2723,12 @@ export class TelegramController extends EventEmitter {
     const guard = this.isAllowed(message.from?.id, { isGroup });
     if (!guard.ok) return; // silent for strangers in DMs
 
+    // In active game sessions, test incoming group messages for correct trivia answers!
+    if (chatId && this.gameEngine?.hasActiveGame(chatId) && (message.text || message.caption)) {
+      const answered = await this.gameEngine.handleChatMessage(message);
+      if (answered) return;
+    }
+
     // Commands
     const rawText = message.text ?? message.caption ?? '';
     let text = rawText.trim();
@@ -2729,6 +2745,16 @@ export class TelegramController extends EventEmitter {
       const command = parts[0].toLowerCase();
       const targetBot = parts[1]?.toLowerCase();
       if (targetBot && this.botUsername && targetBot !== this.botUsername.toLowerCase()) {
+        return;
+      }
+
+      if (command === '/game' || command === '/quiz' || command === '/guess' || command === '/trivia') {
+        await this.handleGameCommand(message, rest);
+        return;
+      }
+
+      if (command === '/topleaderboard' || command === '/gameleaderboard' || command === '/gtop') {
+        await this.handleGameLeaderboard(message);
         return;
       }
 
@@ -3764,6 +3790,150 @@ export class TelegramController extends EventEmitter {
         }
       })().catch(() => {});
     }
+  }
+
+  async handleGameCommand(message, rest = []) {
+    const chatId = message.chat.id;
+    const subCmd = rest[0]?.toLowerCase();
+
+    if (subCmd === 'stop') {
+      const res = await this.gameEngine.stopGame(chatId, { user: message.from });
+      if (!res.ok) {
+        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    if (subCmd === 'skip') {
+      const res = await this.gameEngine.skipRound(chatId);
+      if (!res.ok) {
+        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    if (subCmd === 'hint') {
+      const res = await this.gameEngine.giveHint(chatId);
+      if (!res.ok) {
+        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    if (subCmd === 'top' || subCmd === 'leaderboard') {
+      await this.handleGameLeaderboard(message);
+      return;
+    }
+
+    if (['flags', 'flag', 'cars', 'car', 'characters', 'character', 'mixed', 'ai', 'poll'].includes(subCmd)) {
+      const modeMap = {
+        flag: 'flags', flags: 'flags',
+        car: 'cars', cars: 'cars',
+        character: 'characters', characters: 'characters',
+        mixed: 'mixed', ai: 'mixed', poll: 'mixed'
+      };
+      const mode = modeMap[subCmd] || 'flags';
+      const rounds = Number(rest[1]) || 5;
+      const difficulty = rest[2] || 'ALL';
+
+      const res = await this.gameEngine.startGame(chatId, {
+        mode,
+        totalRounds: rounds,
+        difficulty,
+        startedBy: message.from
+      });
+
+      if (!res.ok) {
+        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+      }
+      return;
+    }
+
+    // Default: Launcher Menu with interactive buttons
+    const menuHtml = `୨୧ ━━━ 𓆩♡𓆪 <b>LANCY GAME ARENA</b> 𓆩♡𓆪 ━━━ ୨୧
+    ₊˚⊹♡  <i>interactive group trivia & guessing</i>  ♡  ˙ᵕ˙
+
+<blockquote>🎮 <b>Choose your battle mode:</b>
+• <b>🌍 Guess the Flag</b>: Country flags (Easy, Medium & Hard)
+• <b>🚘 Guess the Car</b>: 100+ iconic emblems & exotic badges
+• <b>👀 Guess the Character</b>: Anime legends, celebrities & heroes
+• <b>🧠 Mixed AI Quiz</b>: Fresh trivia generated live by AI
+
+⚡ <b>How it works:</b>
+Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in chat—first correct answer snipes the points! ♡</blockquote>`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: '🌍 Guess the Flag', callback_data: 'game_start:flags' },
+          { text: '🚘 Guess the Car', callback_data: 'game_start:cars' }
+        ],
+        [
+          { text: '👀 Guess the Character', callback_data: 'game_start:characters' },
+          { text: '🧠 Mixed AI Quiz', callback_data: 'game_start:mixed' }
+        ],
+        [
+          { text: '🏆 Group Leaderboard', callback_data: 'game_leaderboard' }
+        ]
+      ]
+    };
+
+    await this.api.sendMessage(chatId, menuHtml, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
+  }
+
+  async handleGameLeaderboard(message) {
+    const chatId = message.chat.id;
+    const top = this.db?.getGameLeaderboard ? this.db.getGameLeaderboard(chatId, 10) : [];
+
+    let text = `୨୧ ━━━ 𓆩♡𓆪 <b>GAME ARENA LEADERBOARD</b> 𓆩♡𓆪 ━━━ ୨୧
+    ₊˚⊹♡  <i>hall of fame • top trivia snipers</i>  ♡  ˙ᵕ˙\n\n<blockquote>`;
+
+    if (!top.length) {
+      text += `No games have been played in this chat yet!\nStart one now with <code>/game</code>! ♡</blockquote>`;
+    } else {
+      const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
+      top.forEach((p, idx) => {
+        const medal = medals[idx] || `#${idx + 1}`;
+        const name = escapeHtml(p.username ? `@${p.username}` : (p.first_name || 'Player'));
+        const speed = p.fastest_ms ? ` • ⚡ ${(p.fastest_ms / 1000).toFixed(1)}s` : '';
+        const streak = p.best_streak >= 2 ? ` • 🔥 x${p.best_streak}` : '';
+        text += `${medal} <b>${name}</b> — <b>${p.score} XP</b> (${p.correct_answers} correct${speed}${streak})\n`;
+      });
+      text += `</blockquote>`;
+    }
+
+    await this.api.sendMessage(chatId, text, { parse_mode: 'HTML' });
+  }
+
+  async handleGameCallback(query) {
+    const chatId = query.message?.chat?.id;
+    const data = query.data;
+    if (!chatId) {
+      await this.api.answerCallbackQuery(query.id);
+      return;
+    }
+
+    if (data === 'game_leaderboard') {
+      await this.api.answerCallbackQuery(query.id);
+      await this.handleGameLeaderboard(query.message);
+      return;
+    }
+
+    if (data.startsWith('game_start:')) {
+      const mode = data.split(':')[1] || 'flags';
+      await this.api.answerCallbackQuery(query.id, { text: `Starting ${mode.toUpperCase()} game! ♡` });
+      await this.gameEngine.startGame(chatId, {
+        mode,
+        totalRounds: 5,
+        startedBy: query.from
+      });
+      return;
+    }
+
+    await this.api.answerCallbackQuery(query.id);
   }
 
   #chatIdFor(tgId, source) {
