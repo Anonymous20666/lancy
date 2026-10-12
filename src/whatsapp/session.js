@@ -28,12 +28,17 @@ import { isWebPBuffer } from '../media/convert.js';
  * never exposed in Telegram.
  */
 export class WASession extends EventEmitter {
-  constructor({ sessionId, name, phone, prefix, credsDir, settings, log } = {}) {
+  constructor({ sessionId, name, phone, prefix, listenedGroups, credsDir, settings, log } = {}) {
     super();
     this.sessionId = sessionId;
     this.name = name;
     this.phone = phone ?? null;
     this.prefix = prefix ?? settings?.get?.('whatsapp.prefix') ?? '.';
+    this.listenedGroups = new Set(
+      Array.isArray(listenedGroups)
+        ? listenedGroups.map((g) => this.normalizeGroupJid(g)).filter(Boolean)
+        : []
+    );
     this.credsDir = credsDir;
     this.settings = settings;
     this.log = log ?? logger().child({ module: 'wa-session', sessionId });
@@ -58,6 +63,73 @@ export class WASession extends EventEmitter {
   setPrefix(prefix) {
     this.prefix = String(prefix).trim() || '.';
     this.emit('prefixChange', this.prefix);
+  }
+
+  normalizeGroupJid(jid) {
+    if (!jid) return null;
+    let clean = String(jid).trim().toLowerCase();
+    const user = clean.split('@')[0].split(':')[0];
+    if (!user) return null;
+    return `${user}@g.us`;
+  }
+
+  isGroupListened(remoteJid) {
+    if (!remoteJid) return false;
+    const clean = this.normalizeGroupJid(remoteJid);
+    return clean ? this.listenedGroups.has(clean) : false;
+  }
+
+  addListenedGroup(jid) {
+    const clean = this.normalizeGroupJid(jid);
+    if (!clean) return false;
+    if (this.listenedGroups.has(clean)) return false;
+    this.listenedGroups.add(clean);
+    this.emit('listenedGroupsChange', this.getListenedGroups());
+    return true;
+  }
+
+  removeListenedGroup(jid) {
+    const clean = this.normalizeGroupJid(jid);
+    if (!clean) return false;
+    const deleted = this.listenedGroups.delete(clean);
+    if (deleted) {
+      this.emit('listenedGroupsChange', this.getListenedGroups());
+    }
+    return deleted;
+  }
+
+  clearListenedGroups() {
+    if (this.listenedGroups.size === 0) return 0;
+    const count = this.listenedGroups.size;
+    this.listenedGroups.clear();
+    this.emit('listenedGroupsChange', []);
+    return count;
+  }
+
+  getListenedGroups() {
+    return Array.from(this.listenedGroups);
+  }
+
+  /**
+   * Check whether message sender is the owner of this WhatsApp session:
+   * fromMe === true (paired phone / companion device) OR participant matches owner credentials.
+   */
+  isOwnerSender(m) {
+    if (!m?.key) return false;
+    if (m.key.fromMe) return true;
+    const participant = m.key.participant || m.participant;
+    if (!participant) return false;
+    const partUser = String(participant).split('@')[0].split(':')[0];
+    const sessionPhone = this.phone ? String(this.phone).replace(/\D/g, '') : null;
+    const sessionUser = this.jid ? this.jid.split('@')[0].split(':')[0] : null;
+    const sockUser = this.sock?.user?.id ? this.sock.user.id.split('@')[0].split(':')[0] : null;
+    const sockLid = (this.lid ?? this.sock?.user?.lid) ? (this.lid ?? this.sock?.user?.lid).split('@')[0].split(':')[0] : null;
+
+    if (sessionUser && partUser === sessionUser) return true;
+    if (sessionPhone && partUser === sessionPhone) return true;
+    if (sockUser && partUser === sockUser) return true;
+    if (sockLid && partUser === sockLid) return true;
+    return false;
   }
 
   /**
@@ -172,13 +244,21 @@ export class WASession extends EventEmitter {
       const remoteJid = m.key.remoteJid;
       if (!remoteJid) return;
 
-      // 1. Strictly restrict to the paired account's DM (self-chat) only!
-      // NEVER process or respond to messages in conversations with external contacts!
-      if (!this.isPairedNumberDm(remoteJid)) {
+      const isGroup = remoteJid.endsWith('@g.us');
+      const isDm = this.isPairedNumberDm(remoteJid);
+
+      // If not a group and not the owner's self-DM, drop immediately (external contacts, newsletters, broadcasts)
+      if (!isGroup && !isDm) {
         return;
       }
 
-      // 2. Strictly require an explicit text command — NEVER auto-convert without command!
+      // Optimization: if it is an unlistened group, ONLY the owner sending a message could possibly be .listen.
+      // If someone else speaks in an unlistened group, drop immediately (zero overhead, zero noise).
+      if (isGroup && !this.isGroupListened(remoteJid) && !this.isOwnerSender(m)) {
+        return;
+      }
+
+      // Strictly require an explicit text command — NEVER auto-convert without command!
       const text = extractMessageText(m.message);
       if (!text || !text.trim()) {
         return;
@@ -206,12 +286,23 @@ export class WASession extends EventEmitter {
       };
       const canonical = aliasMap[matchedCmd] || matchedCmd;
 
-      const validCmds = new Set(['.ping', '.menu', '.cv', '.tg', '.s', '.prefix']);
+      const validCmds = new Set(['.ping', '.menu', '.cv', '.tg', '.s', '.prefix', '.listen']);
       if (!validCmds.has(canonical)) {
         return;
       }
 
-      this.log.info({ fromMe: m.key.fromMe, remoteJid, cmd: canonical }, 'wa dm command matched');
+      // Group Chat Gating:
+      if (isGroup) {
+        const isListened = this.isGroupListened(remoteJid);
+        if (!isListened) {
+          // Unlistened group: ONLY allow owner triggering .listen to enable the group!
+          if (canonical !== '.listen' || !this.isOwnerSender(m)) {
+            return;
+          }
+        }
+      }
+
+      this.log.info({ fromMe: m.key.fromMe, remoteJid, cmd: canonical, isGroup }, 'wa command matched');
       this.emit('command', { session: this, message: m, command: canonical, text });
     };
 
@@ -451,6 +542,24 @@ export class WASession extends EventEmitter {
   async getNewsletterInviteInfo(codeOrUrl) {
     this.#assertOnline();
     return this.sock.newsletterGetInviteInfo(codeOrUrl);
+  }
+
+  /** Fetch group metadata (subject, participants, etc.). */
+  async getGroupMetadata(jid) {
+    this.#assertOnline();
+    return this.sock.groupMetadata(jid);
+  }
+
+  /** Fetch group metadata via invite code. */
+  async getGroupInviteInfo(code) {
+    this.#assertOnline();
+    return this.sock.groupGetInviteInfo(code);
+  }
+
+  /** Fetch all groups this account is participating in. */
+  async listParticipatingGroups() {
+    this.#assertOnline();
+    return this.sock.groupFetchAllParticipating();
   }
 
   async logout() {

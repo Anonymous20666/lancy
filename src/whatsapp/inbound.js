@@ -36,9 +36,18 @@ export class InboundHandler {
   async handle({ session, message: m, command, text }) {
     const remoteJid = m?.key?.remoteJid;
     if (!remoteJid) return;
-    if (remoteJid.endsWith('@g.us') || remoteJid.endsWith('@newsletter') || remoteJid.endsWith('@broadcast')) return;
+    if (remoteJid.endsWith('@newsletter') || remoteJid.endsWith('@broadcast')) return;
 
-    this.log.info({ sessionId: session?.sessionId, remoteJid, command }, 'inbound wa command');
+    const isGroup = remoteJid.endsWith('@g.us');
+    if (isGroup) {
+      const isListened = session?.isGroupListened?.(remoteJid);
+      const isOwner = session?.isOwnerSender?.(m);
+      if (!isListened && (!isOwner || command !== '.listen')) {
+        return;
+      }
+    }
+
+    this.log.info({ sessionId: session?.sessionId, remoteJid, command, isGroup }, 'inbound wa command');
 
     // WhatsApp presence indicator: show composing while processing command
     await session?.sock?.sendPresenceUpdate?.('composing', remoteJid).catch(() => {});
@@ -59,6 +68,8 @@ export class InboundHandler {
         case '.s':
         case '.sticker':
           return await this.#handleImageToWaSticker(session, m);
+        case '.listen':
+          return await this.#handleListen(session, m, text);
         default:
           return;
       }
@@ -75,7 +86,7 @@ export class InboundHandler {
       return await session.sendText(remoteJid, text);
     } catch (err) {
       this.log.warn({ err: err?.message, remoteJid, sessionJid: session?.jid }, 'sendText to remoteJid failed, trying session.jid fallback');
-      if (session?.jid && session.jid !== remoteJid) {
+      if (!remoteJid.endsWith('@g.us') && session?.jid && session.jid !== remoteJid) {
         return await session.sendText(session.jid, text);
       } else {
         throw err;
@@ -96,12 +107,202 @@ export class InboundHandler {
       const res = await session.sendText(remoteJid, text);
       return res?.key || null;
     } catch (err) {
-      if (session?.jid && session.jid !== remoteJid) {
+      if (!remoteJid.endsWith('@g.us') && session?.jid && session.jid !== remoteJid) {
         const fallback = await session.sendText(session.jid, text).catch(() => null);
         return fallback?.key || null;
       }
       return null;
     }
+  }
+
+  async #handleListen(session, m, text) {
+    const remoteJid = m?.key?.remoteJid;
+    if (!remoteJid) return;
+
+    // Secret command: strictly restricted to session owner.
+    // Non-owners are silently ignored to prevent leakage or group noise.
+    if (!session?.isOwnerSender?.(m)) {
+      this.log.warn({ remoteJid, participant: m?.key?.participant }, 'non-owner attempted .listen command');
+      return;
+    }
+
+    const isGroup = remoteJid.endsWith('@g.us');
+    const p = session?.getPrefix?.() || '.';
+    const parts = String(text || '').trim().split(/\s+/);
+    const sub = (parts[1] || '').toLowerCase();
+    const arg = parts.slice(1).join(' ').trim();
+
+    // 1. Invoked inside a WhatsApp Group Chat
+    if (isGroup) {
+      if (['off', 'remove', 'stop', 'disable', 'rm', 'del', 'no', 'mute'].includes(sub)) {
+        session.removeListenedGroup?.(remoteJid);
+        const reply = `𓆩♡𓆪 *GROUP LISTENING DEACTIVATED* 𓆩♡𓆪\n> 🔇 Lancy will no longer respond in this group chat.\n> 🔒 Normal DM-only mode restored for this group ♡`;
+        return await this.#sendReply(session, remoteJid, reply);
+      }
+
+      if (sub === 'status') {
+        const isListened = session.isGroupListened?.(remoteJid);
+        const reply = `𓆩♡𓆪 *GROUP LISTENING STATUS* 𓆩♡𓆪\n> ✨ Listening: *${isListened ? 'ACTIVE (Responding)' : 'INACTIVE (Muted)'}*\n> 🆔 \`${remoteJid}\` ♡`;
+        return await this.#sendReply(session, remoteJid, reply);
+      }
+
+      // Default inside GC: .listen, .listen on, .listen here
+      session.addListenedGroup?.(remoteJid);
+      let subject = '';
+      try {
+        const meta = await session.sock?.groupMetadata?.(remoteJid);
+        if (meta?.subject) subject = ` (${meta.subject})`;
+      } catch {}
+
+      const reply = `𓆩♡𓆪 *GROUP LISTENING ACTIVATED* 𓆩♡𓆪\n> ✨ Lancy is now active and responding in this group${subject}!\n> 🎀 Available commands: *${p}ping*, *${p}s*, *${p}cv*, *${p}tg*\n> 🤫 Secret test mode active ♡`;
+      return await this.#sendReply(session, remoteJid, reply);
+    }
+
+    // 2. Invoked in Owner's Self-DM
+    // 2a. List / Status / No args
+    if (!arg || ['list', 'ls', 'status'].includes(sub)) {
+      const groups = session.getListenedGroups?.() || [];
+      if (groups.length === 0) {
+        const reply = `𓆩♡𓆪 *SECRET GC LISTENING* 𓆩♡𓆪
+> 🔒 Status: *DM-Only Mode* (0 active groups)
+> 🔇 All group chats are currently ignored to avoid noise.
+
+🎀 *How to enable a group chat:*
+• Inside any GC: send *${p}listen* or *${p}listen on*
+• In DM: send *${p}listen <group_jid_or_link_or_name>*
+  (e.g. *${p}listen 120363024849204928@g.us*)
+  (e.g. *${p}listen https://chat.whatsapp.com/ABCxyz*)
+  (e.g. *${p}listen My Group Name*)
+
+🤫 *Management Commands:*
+• *${p}listen list* — View whitelisted groups
+• *${p}listen remove <jid>* — Stop listening to a group
+• *${p}listen clear* — Stop listening to all groups ♡`;
+        return await this.#sendReply(session, remoteJid, reply);
+      }
+
+      let groupLines = [];
+      let idx = 1;
+      for (const gjid of groups) {
+        let name = 'Group Chat';
+        try {
+          const meta = await session.sock?.groupMetadata?.(gjid);
+          if (meta?.subject) name = meta.subject;
+        } catch {}
+        groupLines.push(`${idx++}. 👥 *${name}*\n   ID: \`${gjid}\``);
+      }
+
+      const reply = `𓆩♡𓆪 *LISTENED GROUP CHATS (${groups.length})* 𓆩♡𓆪
+> ✨ Lancy is actively listening and responding in:
+
+${groupLines.join('\n\n')}
+
+🎀 *To stop listening:*
+• Send *${p}listen remove <jid>* (or *${p}listen remove <number>*)
+• Send *${p}listen clear* to disable all groups ♡`;
+      return await this.#sendReply(session, remoteJid, reply);
+    }
+
+    // 2b. Clear / Reset / Off
+    if (['clear', 'reset', 'off'].includes(sub)) {
+      const count = session.clearListenedGroups?.() || 0;
+      const reply = `𓆩♡𓆪 *GROUP LISTENING CLEARED* 𓆩♡𓆪\n> 🔒 Cleared ${count} group(s) from whitelist.\n> 🔇 Strict DM-only mode restored ♡`;
+      return await this.#sendReply(session, remoteJid, reply);
+    }
+
+    // 2c. Remove specific group
+    if (['remove', 'rm', 'del', 'delete'].includes(sub)) {
+      const target = parts[2];
+      if (!target) {
+        return await this.#sendReply(session, remoteJid, `✕ Please specify group JID or index to remove: *${p}listen remove <jid>*`);
+      }
+      const groups = session.getListenedGroups?.() || [];
+      let targetJid = null;
+      if (/^\d+$/.test(target) && Number(target) >= 1 && Number(target) <= groups.length) {
+        targetJid = groups[Number(target) - 1];
+      } else {
+        targetJid = session.normalizeGroupJid ? session.normalizeGroupJid(target) : target;
+      }
+
+      if (!targetJid || !session.isGroupListened?.(targetJid)) {
+        return await this.#sendReply(session, remoteJid, `✕ Group \`${target}\` is not in the listened list.`);
+      }
+
+      session.removeListenedGroup?.(targetJid);
+      return await this.#sendReply(session, remoteJid, `𓆩♡𓆪 *GROUP REMOVED* 𓆩♡𓆪\n> 🔇 Removed \`${targetJid}\` from whitelist.\n> 🔒 Bot will no longer respond there ♡`);
+    }
+
+    // If "on" or "add" was typed with an argument (e.g. .listen on 12036... or .listen add https://...)
+    let targetArg = arg;
+    if ((sub === 'on' || sub === 'add') && parts.length > 2) {
+      targetArg = parts.slice(2).join(' ').trim();
+    } else if (sub === 'on' || sub === 'add') {
+      return await this.#sendReply(session, remoteJid, `💡 To enable a group in DM, please specify its JID, invite link, or name: *${p}listen <jid_or_link>*`);
+    }
+
+    // 2d. Add group by WhatsApp invite link
+    const linkMatch = targetArg.match(/chat\.whatsapp\.com\/([a-zA-Z0-9_-]+)/i);
+    if (linkMatch) {
+      const code = linkMatch[1];
+      try {
+        const info = await session.sock?.groupGetInviteInfo?.(code);
+        if (info?.id) {
+          const gjid = session.normalizeGroupJid ? session.normalizeGroupJid(info.id) : info.id;
+          session.addListenedGroup?.(gjid);
+          return await this.#sendReply(
+            session,
+            remoteJid,
+            `𓆩♡𓆪 *GROUP ADDED* 𓆩♡𓆪\n> ✨ Whitelisted: *${info.subject || 'Group'}*\n> 🆔 \`${gjid}\`\n> 🎀 Bot will now listen and respond in this group! ♡`
+          );
+        }
+      } catch (err) {
+        return await this.#sendReply(session, remoteJid, `✕ Failed to resolve invite link: ${err.message}`);
+      }
+    }
+
+    // 2e. Add group by direct JID or numeric ID
+    const jidPattern = /^[0-9]+(@g\.us)?$/;
+    if (jidPattern.test(targetArg)) {
+      const gjid = session.normalizeGroupJid ? session.normalizeGroupJid(targetArg) : targetArg;
+      let subject = 'Group';
+      try {
+        const meta = await session.sock?.groupMetadata?.(gjid);
+        if (meta?.subject) subject = meta.subject;
+      } catch {}
+      session.addListenedGroup?.(gjid);
+      return await this.#sendReply(
+        session,
+        remoteJid,
+        `𓆩♡𓆪 *GROUP ADDED* 𓆩♡𓆪\n> ✨ Whitelisted: *${subject}*\n> 🆔 \`${gjid}\`\n> 🎀 Bot will now listen and respond in this group! ♡`
+      );
+    }
+
+    // 2f. Add group by subject search in participating groups
+    try {
+      const allGroups = await session.sock?.groupFetchAllParticipating?.();
+      if (allGroups && typeof allGroups === 'object') {
+        const list = Object.values(allGroups);
+        const searchLower = targetArg.toLowerCase();
+        const match = list.find((g) => (g.subject || '').toLowerCase() === searchLower)
+          || list.find((g) => (g.subject || '').toLowerCase().includes(searchLower));
+        if (match?.id) {
+          const gjid = session.normalizeGroupJid ? session.normalizeGroupJid(match.id) : match.id;
+          session.addListenedGroup?.(gjid);
+          return await this.#sendReply(
+            session,
+            remoteJid,
+            `𓆩♡𓆪 *GROUP ADDED* 𓆩♡𓆪\n> ✨ Whitelisted: *${match.subject}*\n> 🆔 \`${gjid}\`\n> 🎀 Bot will now listen and respond in this group! ♡`
+          );
+        }
+      }
+    } catch {}
+
+    // Fallback: If nothing matched
+    return await this.#sendReply(
+      session,
+      remoteJid,
+      `𓆩♡𓆪 *GROUP NOT FOUND* 𓆩♡𓆪\n> ✕ Could not find group "${targetArg}".\n> 💡 Tip: Provide the group JID (e.g. \`120363024849204928@g.us\`) or invite link (*https://chat.whatsapp.com/...*), or run *${p}listen* inside the group chat! ♡`
+    );
   }
 
   async #handlePing(session, m) {
@@ -144,6 +345,9 @@ export class InboundHandler {
 
   async #handlePrefix(session, m, text) {
     const remoteJid = m.key.remoteJid;
+    if (remoteJid.endsWith('@g.us') && !session?.isOwnerSender?.(m)) {
+      return await this.#sendReply(session, remoteJid, '✕ Only the bot owner can change the command prefix ♡');
+    }
     const currentPrefix = session?.getPrefix?.() || '.';
     const parts = String(text || '').trim().split(/\s+/);
     const newPrefix = parts[1];

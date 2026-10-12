@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS wa_sessions (
   reconnect_state TEXT NOT NULL DEFAULT 'idle',
   creds_path TEXT NOT NULL,
   stats_json TEXT NOT NULL DEFAULT '{}',
+  listened_groups_json TEXT DEFAULT '[]',
   last_connected TEXT,
   last_disconnect TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),

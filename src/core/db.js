@@ -28,6 +28,9 @@ export class Database {
       this.db.exec("ALTER TABLE wa_sessions ADD COLUMN prefix TEXT DEFAULT '.';");
     } catch {}
     try {
+      this.db.exec("ALTER TABLE wa_sessions ADD COLUMN listened_groups_json TEXT DEFAULT '[]';");
+    } catch {}
+    try {
       this.db.exec("ALTER TABLE scheduled_drops ADD COLUMN platform TEXT DEFAULT 'telegram';");
     } catch {}
     try {

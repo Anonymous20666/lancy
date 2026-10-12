@@ -47,11 +47,16 @@ export class WhatsAppManager extends EventEmitter {
   }
 
   #hydrate(row) {
+    let listenedGroups = [];
+    try {
+      listenedGroups = JSON.parse(row.listened_groups_json || '[]');
+    } catch {}
     const session = new WASession({
       sessionId: row.session_id,
       name: row.name,
       phone: row.phone,
       prefix: row.prefix ?? '.',
+      listenedGroups,
       credsDir: this.credsRoot,
       settings: this.settings
     });
@@ -94,6 +99,13 @@ export class WhatsAppManager extends EventEmitter {
     session.on('prefixChange', (prefix) => {
       this.db.run('UPDATE wa_sessions SET prefix = ? WHERE session_id = ?', prefix, session.sessionId);
     });
+    session.on('listenedGroupsChange', (groups) => {
+      this.db.run(
+        'UPDATE wa_sessions SET listened_groups_json = ? WHERE session_id = ?',
+        JSON.stringify(groups),
+        session.sessionId
+      );
+    });
   }
 
   #persistSession(session, patch = {}) {
@@ -120,13 +132,14 @@ export class WhatsAppManager extends EventEmitter {
     const sessionId = `wa_${randomToken(8)}`;
     ensureSessionDir(this.credsRoot, sessionId);
     this.db.run(
-      `INSERT INTO wa_sessions (user_id, session_id, name, phone, jid, status, reconnect_state, creds_path, prefix)
-       VALUES (?, ?, ?, ?, NULL, 'offline', 'idle', ?, '.')`,
+      `INSERT INTO wa_sessions (user_id, session_id, name, phone, jid, status, reconnect_state, creds_path, prefix, listened_groups_json)
+       VALUES (?, ?, ?, ?, NULL, 'offline', 'idle', ?, '.', '[]')`,
       userId, sessionId, name, phone, `${this.credsRoot}/sessions/${sessionId}`
     );
     const session = new WASession({
       sessionId, name, phone,
       prefix: '.',
+      listenedGroups: [],
       credsDir: this.credsRoot,
       settings: this.settings
     });
@@ -159,6 +172,7 @@ export class WhatsAppManager extends EventEmitter {
         phone: null,
         jid: null,
         prefix: '.',
+        listenedGroups: [],
         status: 'offline',
         reconnectState: 'idle',
         pairingCode: null,
@@ -174,6 +188,7 @@ export class WhatsAppManager extends EventEmitter {
       phone: session.phone,
       jid: session.jid,
       prefix: session.prefix ?? '.',
+      listenedGroups: session.getListenedGroups?.() ?? [],
       status: session.status,
       reconnectState: session.reconnectState,
       pairingCode: session.pairingCode,
