@@ -41,7 +41,9 @@ export class TelegramStickerService {
     }
     return toTelegramStaticSticker(descriptor.buffer, {
       maxBytes: resolveLimits(this.settings, 'static').maxBytes,
-      quality: this.settings?.get('stickers.imageProcessingQuality') ?? 92
+      quality: this.settings?.get('stickers.imageProcessingQuality') ?? 92,
+      configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? '',
+      isVideo: descriptor.type === 'video'
     });
   }
 

@@ -227,14 +227,13 @@ export function createStickersScreen({ app }) {
         return;
       }
 
-      // Check whether this search was for video stickers or image stickers
+      // Check whether this search was explicitly for video stickers
       const isVideoSearch = searchRow.mode === 'videos' || allMediaRows.every((r) => r.type === 'video');
       const stickerType = isVideoSearch ? 'video' : 'static';
-      const mediaRows = isVideoSearch
-        ? allMediaRows.filter((r) => r.type === 'video')
-        : allMediaRows.filter((r) => r.type !== 'video');
-
-      const usableRows = mediaRows.length > 0 ? mediaRows : allMediaRows;
+      // Include ALL media from search! Never omit videos from mixed results.
+      // If creating a static pack, videos are converted to static stickers via crisp frame extraction.
+      // If creating a video pack, static images are converted to video stickers.
+      const usableRows = allMediaRows;
 
       // Check which sent preview photos are still on the user's screen!
       // If the user deleted specific photos from their chat, exclude them!

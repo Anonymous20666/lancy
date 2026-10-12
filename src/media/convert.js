@@ -169,23 +169,22 @@ export async function perceptualHash(buffer) {
  * lossless-ish WebP at the configured quality, only recompressing when the
  * size limit demands it.
  */
-export async function toTelegramStaticSticker(buffer, { maxBytes = 512 * 1024, quality = 92, configuredFfmpeg = '' } = {}) {
+export async function toTelegramStaticSticker(buffer, { maxBytes = 512 * 1024, quality = 92, configuredFfmpeg = '', isVideo = false } = {}) {
   let imgBuffer = buffer;
 
-  // If video buffer (WebM, MP4, etc.), extract first frame cleanly using FFmpeg
-  if (isVideoBuffer(buffer)) {
+  // If video buffer (WebM, MP4, etc.) or explicitly marked as video, extract first frame cleanly using FFmpeg
+  if (isVideo || isVideoBuffer(buffer)) {
     const ffmpegPath = resolveFfmpegPath(configuredFfmpeg);
     if (ffmpegPath) {
       const dir = mkdtempSync(join(tmpdir(), 'lancy-frame-'));
       try {
         const inPath = join(dir, 'in.bin');
-        const outPath = join(dir, 'out.jpg');
+        const outPath = join(dir, 'out.png');
         writeFileSync(inPath, buffer);
         execFileSync(ffmpegPath, [
           '-y', '-i', inPath,
           '-frames:v', '1',
-          '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=white',
-          '-q:v', '2',
+          '-vf', 'scale=512:512:force_original_aspect_ratio=decrease',
           outPath
         ], { stdio: 'ignore' });
         if (existsSync(outPath)) {
@@ -209,13 +208,12 @@ export async function toTelegramStaticSticker(buffer, { maxBytes = 512 * 1024, q
       const dir = mkdtempSync(join(tmpdir(), 'lancy-frame2-'));
       try {
         const inPath = join(dir, 'in.bin');
-        const outPath = join(dir, 'out.jpg');
+        const outPath = join(dir, 'out.png');
         writeFileSync(inPath, buffer);
         execFileSync(ffmpegPath, [
           '-y', '-i', inPath,
           '-frames:v', '1',
-          '-vf', 'scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=white',
-          '-q:v', '2',
+          '-vf', 'scale=512:512:force_original_aspect_ratio=decrease',
           outPath
         ], { stdio: 'ignore' });
         if (existsSync(outPath)) {

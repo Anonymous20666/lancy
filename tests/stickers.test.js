@@ -213,3 +213,73 @@ test('prepareStickerItems converts and assigns emojis', async () => {
   }
   db.close();
 });
+
+test('static sticker conversion: converts video buffer to static 512px webp sticker', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const dir = mkdtempSync(join(tmpdir(), 'test-vid-sticker-'));
+  try {
+    const vidPath = join(dir, 'test.mp4');
+    execFileSync('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=640x360:rate=10',
+      '-pix_fmt', 'yuv420p',
+      vidPath
+    ]);
+    const vidBuf = readFileSync(vidPath);
+    const sticker = await toTelegramStaticSticker(vidBuf, { isVideo: true });
+    assert.ok(sticker.buffer.length > 0);
+    assert.ok(sticker.buffer.length <= 512 * 1024);
+    const meta = await sharp(sticker.buffer).metadata();
+    assert.equal(meta.format, 'webp');
+    assert.equal(Math.max(meta.width, meta.height), 512);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('prepareStickerItems handles mixed image and video descriptors without omitting videos', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+
+  const db = new Database(':memory:');
+  const settings = fakeSettings();
+  const { api } = makeApiMock();
+  const stickerService = new TelegramStickerService({ api, db, settings });
+
+  const dir = mkdtempSync(join(tmpdir(), 'test-mixed-sticker-'));
+  try {
+    const vidPath = join(dir, 'test.mp4');
+    execFileSync('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=480x640:rate=10',
+      '-pix_fmt', 'yuv420p',
+      vidPath
+    ]);
+    const vidBuf = readFileSync(vidPath);
+    const imgBuf = await makeImage(600, 600, '#88aaff');
+
+    const descriptors = [
+      { pinId: 'p1', mediaUrl: 'http://x/1.jpg', type: 'image', buffer: imgBuf, sha256: 's1', phash: null },
+      { pinId: 'p2', mediaUrl: 'http://x/2.mp4', type: 'video', buffer: vidBuf, sha256: 's2', phash: null },
+      { pinId: 'p3', mediaUrl: 'http://x/3.jpg', type: 'image', buffer: imgBuf, sha256: 's3', phash: null }
+    ];
+
+    const items = await prepareStickerItems(descriptors, { stickerService, query: 'mixed', stickerType: 'static' });
+    assert.equal(items.length, 3, 'all 3 items must be converted without omitting the video');
+    for (const item of items) {
+      assert.ok(item.buffer.length > 0);
+      const meta = await sharp(item.buffer).metadata();
+      assert.equal(meta.format, 'webp');
+      assert.equal(Math.max(meta.width, meta.height), 512);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    db.close();
+  }
+});
