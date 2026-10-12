@@ -5,6 +5,7 @@ import { ProgressTracker } from '../progress.js';
 import { SEARCH_MODES } from '../../pinterest/search.js';
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
+import { optimizePreviewImage } from '../../media/convert.js';
 
 /**
  * Pinterest screen + deep search flow.
@@ -579,21 +580,28 @@ export function createPinterestScreen({ app }) {
     const mediaFiles = {};
     let idx = 0;
 
-    for (const p of mediaRows.slice(0, 10)) {
-      if (!p.sha256) continue;
-      const buffer = app.media.cache.read(p.sha256);
-      if (buffer) {
-        if (p.type === 'video') {
-          const field = `video_${idx}`;
-          mediaFiles[field] = { buffer, filename: `${field}.mp4`, contentType: p.mime ?? 'video/mp4' };
-          previewBlocks.push({ type: 'video', ref: `attach://${field}` });
-        } else {
-          const field = `photo_${idx}`;
-          mediaFiles[field] = { buffer, filename: `${field}.jpg`, contentType: p.mime ?? 'image/jpeg' };
-          previewBlocks.push({ type: 'photo', ref: `attach://${field}` });
-        }
-        idx++;
+    const mediaSlice = mediaRows.slice(0, 10);
+    const mediaPromises = mediaSlice.map(async (p) => {
+      if (!p.sha256) return null;
+      const rawBuf = app.media.cache.read(p.sha256);
+      if (!rawBuf) return null;
+      if (p.type === 'video') {
+        return { type: 'video', buffer: rawBuf, mime: p.mime ?? 'video/mp4' };
       }
+      const optBuf = await optimizePreviewImage(rawBuf);
+      return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+    });
+    const loadedMedia = await Promise.all(mediaPromises);
+    for (const item of loadedMedia) {
+      if (!item) continue;
+      const field = `${item.type}_${idx}`;
+      mediaFiles[field] = {
+        buffer: item.buffer,
+        filename: `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
+        contentType: item.mime
+      };
+      previewBlocks.push({ type: item.type, ref: `attach://${field}` });
+      idx++;
     }
 
     const resultStub = {
@@ -659,21 +667,27 @@ export function createPinterestScreen({ app }) {
     const mediaFiles = {};
     const previewBlocks = [];
     let idx = 0;
-    for (const p of nextMedia) {
-      if (!p.sha256) continue;
-      const buffer = app.media.cache.read(p.sha256);
-      if (buffer) {
-        if (p.type === 'video') {
-          const field = `video_${idx}`;
-          mediaFiles[field] = { buffer, filename: `${field}.mp4`, contentType: p.mime ?? 'video/mp4' };
-          previewBlocks.push({ type: 'video', ref: `attach://${field}` });
-        } else {
-          const field = `photo_${idx}`;
-          mediaFiles[field] = { buffer, filename: `${field}.jpg`, contentType: p.mime ?? 'image/jpeg' };
-          previewBlocks.push({ type: 'photo', ref: `attach://${field}` });
-        }
-        idx++;
+    const mediaPromises = nextMedia.map(async (p) => {
+      if (!p.sha256) return null;
+      const rawBuf = app.media.cache.read(p.sha256);
+      if (!rawBuf) return null;
+      if (p.type === 'video') {
+        return { type: 'video', buffer: rawBuf, mime: p.mime ?? 'video/mp4' };
       }
+      const optBuf = await optimizePreviewImage(rawBuf);
+      return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+    });
+    const loadedMedia = await Promise.all(mediaPromises);
+    for (const item of loadedMedia) {
+      if (!item) continue;
+      const field = `${item.type}_${idx}`;
+      mediaFiles[field] = {
+        buffer: item.buffer,
+        filename: `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
+        contentType: item.mime
+      };
+      previewBlocks.push({ type: item.type, ref: `attach://${field}` });
+      idx++;
     }
 
     const nextOffset = numOffset + nextMedia.length;

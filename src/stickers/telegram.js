@@ -134,7 +134,7 @@ export class TelegramStickerService {
       }
       if (added) done++;
       onProgress?.({ stage: 'adding', done, total: items.length });
-      const delay = this.settings?.get('telegram.stickerAddDelayMs') ?? 250;
+      const delay = this.settings?.get('telegram.stickerAddDelayMs') ?? 40;
       if (delay > 0) await sleep(delay);
     }
 
@@ -193,7 +193,7 @@ export class TelegramStickerService {
       }
       done++;
       onProgress?.({ stage: 'adding', done, total: usable.length });
-      const delay = this.settings?.get('telegram.stickerAddDelayMs') ?? 250;
+      const delay = this.settings?.get('telegram.stickerAddDelayMs') ?? 40;
       if (delay > 0) await sleep(delay);
     }
     return { name, added: done, count: currentCount + done, capacity };
@@ -250,26 +250,36 @@ export async function prepareStickerItems(descriptors, { stickerService, query =
   const assignment = stickerService.settings?.get('stickers.emojiAssignment') ?? 'auto';
   const rawPackEmoji = stickerService.settings?.get('stickers.packEmoji') ?? '🤍';
   const packEmoji = rawPackEmoji === '♡' ? '🤍' : rawPackEmoji;
-  const items = [];
+  const items = new Array(descriptors.length);
   let done = 0;
-  for (const descriptor of descriptors) {
-    const converted = await stickerService.convertForTelegram(descriptor, { type: stickerType });
-    const rawEmoji = (Array.isArray(descriptor.emoji) && descriptor.emoji.length)
-      ? descriptor.emoji
-      : (descriptor.emoji ? [descriptor.emoji] : emojisForSticker({ query, packEmoji, index: done, assignment }));
-    const emoji = rawEmoji.map((e) => (e === '♡' ? '🤍' : e)).filter(Boolean);
-    items.push({
-      buffer: converted.buffer,
-      emoji,
-      type: stickerType,
-      sha256: descriptor.sha256,
-      phash: descriptor.phash,
-      sourcePinId: descriptor.pinId ?? null,
-      width: converted.width ?? 512,
-      height: converted.height ?? 512
-    });
-    done++;
-    onProgress?.({ stage: 'converting', done, total: descriptors.length });
+  const concurrency = Math.min(6, descriptors.length || 1);
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < descriptors.length) {
+      const index = cursor++;
+      const descriptor = descriptors[index];
+      const converted = await stickerService.convertForTelegram(descriptor, { type: stickerType });
+      const rawEmoji = (Array.isArray(descriptor.emoji) && descriptor.emoji.length)
+        ? descriptor.emoji
+        : (descriptor.emoji ? [descriptor.emoji] : emojisForSticker({ query, packEmoji, index, assignment }));
+      const emoji = rawEmoji.map((e) => (e === '♡' ? '🤍' : e)).filter(Boolean);
+      items[index] = {
+        buffer: converted.buffer,
+        emoji,
+        type: stickerType,
+        sha256: descriptor.sha256,
+        phash: descriptor.phash,
+        sourcePinId: descriptor.pinId ?? null,
+        width: converted.width ?? 512,
+        height: converted.height ?? 512
+      };
+      done++;
+      onProgress?.({ stage: 'converting', done, total: descriptors.length });
+    }
   }
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
   return items;
 }
+

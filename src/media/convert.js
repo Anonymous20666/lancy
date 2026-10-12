@@ -243,11 +243,11 @@ export async function toTelegramStaticSticker(buffer, { maxBytes = 512 * 1024, q
     withoutEnlargement: false
   });
 
-  let webp = await pipeline.webp({ quality, effort: 4 }).toBuffer();
+  let webp = await pipeline.webp({ quality, effort: 1 }).toBuffer();
   if (webp.length > maxBytes) {
     // Progressive quality reduction — the honest way to fit the limit.
     for (const q of [80, 70, 60, 50]) {
-      webp = await pipeline.webp({ quality: q, effort: 4 }).toBuffer();
+      webp = await pipeline.webp({ quality: q, effort: 1 }).toBuffer();
       if (webp.length <= maxBytes) break;
     }
   }
@@ -377,14 +377,14 @@ export async function toWhatsAppSticker(buffer, { configuredFfmpeg = '', quality
         fit: 'contain',
         background: { r: 0, g: 0, b: 0, alpha: 0 }
       })
-      .webp({ quality, effort: 4 });
+      .webp({ quality, effort: 1 });
 
     let webp = await pipeline.toBuffer();
     if (webp.length > maxBytes) {
       for (const q of [75, 60, 45]) {
         webp = await sharp(buffer, { failOn: 'none', page: 0 })
           .resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
-          .webp({ quality: q, effort: 4 })
+          .webp({ quality: q, effort: 1 })
           .toBuffer();
         if (webp.length <= maxBytes) break;
       }
@@ -403,7 +403,7 @@ export async function toWhatsAppSticker(buffer, { configuredFfmpeg = '', quality
 export async function toWhatsAppStickerImage(buffer, { quality = 85 } = {}) {
   const webp = await sharp(buffer, { failOn: 'none', animated: false })
     .resize(512, 512, { fit: 'inside', withoutEnlargement: true })
-    .webp({ quality, effort: 4 })
+    .webp({ quality, effort: 1 })
     .toBuffer();
   return { buffer: webp, bytes: webp.length };
 }
@@ -415,6 +415,24 @@ export async function toThumbnail(buffer, { size = 100 } = {}) {
     .webp({ quality: 80 })
     .toBuffer();
   return { buffer: webp, bytes: webp.length };
+}
+
+/**
+ * Fast slideshow/preview image optimizer.
+ * If image is > 250KB, downsizes to max 1080px JPEG (~80-150KB) in milliseconds.
+ * This avoids uploading 20-40MB payloads to Telegram during pagination / slide browsing.
+ */
+export async function optimizePreviewImage(buffer, { maxDimension = 1080, quality = 82, thresholdBytes = 250 * 1024 } = {}) {
+  if (!buffer || buffer.length <= thresholdBytes) return buffer;
+  try {
+    return await sharp(buffer, { failOn: 'none', animated: false })
+      .rotate()
+      .resize(maxDimension, maxDimension, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality, mozjpeg: false })
+      .toBuffer();
+  } catch {
+    return buffer;
+  }
 }
 
 // ── Video conversion ──────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import { truncate } from '../../utils/text.js';
 import { getLyrics, formatBlockquoteLyrics, chunkLyrics, escapeHtml } from '../../media/lyrics.js';
 import { extractMediaForMusicRecognition, recognizeAudio } from '../../media/recognizer.js';
 import { sleep, parseDurationToSeconds } from '../../utils/time.js';
-import { toTelegramStaticSticker } from '../../media/convert.js';
+import { toTelegramStaticSticker, optimizePreviewImage } from '../../media/convert.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 import { PinterestWebProvider } from '../../pinterest/web.js';
 
@@ -513,7 +513,7 @@ export function createDownloaderScreen({ app }) {
 
   const SLIDESHOW_PAGE_SIZE = 10;
 
-  function buildDeliveryRichMessage({
+  async function buildDeliveryRichMessage({
     mediaItems = [],
     audioTrack = null,
     platform = 'Media',
@@ -566,7 +566,16 @@ export function createDownloaderScreen({ app }) {
       // Telegram Bot API allows AT MOST ONE slideshow / media group block per message (max 10 items).
       // We slice exactly one page (up to 10 items) for this message to prevent client button detachment:
       const pageSlice = mediaItems.slice(offset, offset + SLIDESHOW_PAGE_SIZE);
-      const chunkBlocks = pageSlice.map((item, idx) => {
+      const optimizedSlice = await Promise.all(
+        pageSlice.map(async (item) => {
+          if (item.type === 'photo' && item.buffer) {
+            const optBuf = await optimizePreviewImage(item.buffer);
+            return { ...item, buffer: optBuf };
+          }
+          return item;
+        })
+      );
+      const chunkBlocks = optimizedSlice.map((item, idx) => {
         const globalIdx = offset + idx;
         const field = `${item.type}_${globalIdx}`;
         files[field] = {
@@ -907,7 +916,7 @@ export function createDownloaderScreen({ app }) {
         } catch {}
       }
 
-      const { rich, files } = buildDeliveryRichMessage({
+      const { rich, files } = await buildDeliveryRichMessage({
         mediaItems,
         audioTrack,
         platform,
@@ -1324,7 +1333,7 @@ export function createDownloaderScreen({ app }) {
       let albumKey = Math.random().toString(36).slice(2, 8);
       saveAlbum(albumKey, { mediaItems: mediaBuffers, platform: 'pinterest', title: `${q} Matching PFP`, isMatchingPfp: true, imageKey });
 
-      const { rich, files } = buildDeliveryRichMessage({
+      const { rich, files } = await buildDeliveryRichMessage({
         mediaItems: mediaBuffers,
         platform: 'pinterest',
         title: `${q} Matching PFP`,
@@ -1560,7 +1569,7 @@ export function createDownloaderScreen({ app }) {
             return;
           }
 
-          const { rich, files } = buildDeliveryRichMessage({
+          const { rich, files } = await buildDeliveryRichMessage({
             ...album,
             ctx,
             offset,
@@ -2220,15 +2229,25 @@ export function createDownloaderScreen({ app }) {
           const STICKER_BATCH = 10;
           const currentBatch = images.slice(offset, offset + STICKER_BATCH);
           let successCount = 0;
-          for (let i = 0; i < currentBatch.length; i++) {
-            try {
-              const stickerRes = await toTelegramStaticSticker(currentBatch[i].buffer);
-              if (stickerRes?.buffer) {
+          const convertedStickers = await Promise.all(
+            currentBatch.map(async (item) => {
+              if (!item?.buffer) return null;
+              try {
+                return await toTelegramStaticSticker(item.buffer);
+              } catch (err) {
+                log.debug({ err: err?.message }, 'failed to convert image to sticker');
+                return null;
+              }
+            })
+          );
+          for (const stickerRes of convertedStickers) {
+            if (stickerRes?.buffer) {
+              try {
                 await ctx.api.sendSticker(ctx.chatId, stickerRes.buffer, { emoji: '✨' });
                 successCount++;
+              } catch (err) {
+                log.debug({ err: err?.message }, 'failed to send sticker');
               }
-            } catch (err) {
-              log.debug({ err: err?.message, idx: offset + i }, 'failed to convert image to sticker');
             }
           }
 
