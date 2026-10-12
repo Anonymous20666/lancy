@@ -19,6 +19,7 @@ import {
 
 import { searchSongByLyrics, cleanSongMetadata } from './lyrics.js';
 import { searchYouTubeFast } from './youtubeSearch.js';
+import { parseDurationToSeconds } from '../utils/time.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -47,6 +48,53 @@ export async function getAudioDurationSeconds(filePath) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Rank YouTube audio candidates with smart duration scoring:
+ * - Prioritizes standard commercial song length (1:30 - 7:00)
+ * - Penalizes long 1-3 hour mixes, continuous loops, and sub-45s snippets unless explicitly requested
+ */
+export function rankYouTubeAudioCandidates(items, queryTerms, { clean = '', wantsLongMix = false } = {}) {
+  if (!Array.isArray(items) || items.length === 0) return null;
+  const cleanLower = clean.toLowerCase();
+  const scored = items.map((item) => {
+    const combined = `${item.title} ${item.author}`.toLowerCase();
+    let score = 0;
+    for (const term of queryTerms) {
+      if (combined.includes(term)) score += 10;
+    }
+    if (clean && combined.includes(cleanLower)) score += 15;
+
+    const durSec = parseDurationToSeconds(item.duration);
+
+    if (!wantsLongMix) {
+      if (durSec >= 90 && durSec <= 420) {
+        score += 30; // Sweet spot for songs (1.5 to 7 mins)
+      } else if (durSec > 420 && durSec <= 600) {
+        score += 15; // 7 to 10 mins
+      } else if (durSec > 600 && durSec <= 900) {
+        score -= 15; // 10 to 15 mins
+      } else if (durSec > 900 && durSec <= 1800) {
+        score -= 60; // 15 to 30 mins
+      } else if (durSec > 1800) {
+        score -= 200; // > 30 mins (1-3 hour mixes)
+      } else if (durSec < 45 || /^short$/i.test(item.duration)) {
+        score -= 40; // Too short / Shorts clip
+      }
+    } else {
+      if (durSec >= 600) score += 25;
+    }
+
+    if (/\b(official\s*(?:audio|music\s*video|video)|topic)\b/i.test(combined)) {
+      score += 15;
+    }
+
+    return { item, score, durSec };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored[0]?.item || null;
 }
 
 /**
@@ -820,19 +868,27 @@ export class MediaDownloader {
   }
 
   /**
-   * Fast CBR 192k MP3 re-encoding with clean ID3v2.3 tags
-   * Strips all bloated YouTube descriptions and ensures instant 0ms playback in mobile ExoPlayer / Telegram
+   * Fast CBR 192k MP3 re-encoding / stream copy with clean ID3v2.3 tags
+   * Strips bloated descriptions and ensures instant 0ms playback in mobile ExoPlayer / Telegram
    */
   async #optimizeAudioToCbrMp3(input, { title = '', artist = '', album = '', year = '' } = {}) {
     const tempDir = join(tmpdir(), `lancy_cbr_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
     mkdirSync(tempDir, { recursive: true });
 
     let inPath;
+    let isAlreadyMp3 = false;
     if (typeof input === 'string') {
       inPath = input;
+      isAlreadyMp3 = inPath.toLowerCase().endsWith('.mp3');
     } else if (Buffer.isBuffer(input)) {
       inPath = join(tempDir, 'input_raw');
       writeFileSync(inPath, input);
+      if (input.length >= 3 && (
+        (input[0] === 0x49 && input[1] === 0x44 && input[2] === 0x33) ||
+        (input[0] === 0xFF && (input[1] & 0xE0) === 0xE0)
+      )) {
+        isAlreadyMp3 = true;
+      }
     } else {
       return input;
     }
@@ -846,13 +902,15 @@ export class MediaDownloader {
       }
       const optArtist = cleaned.artist || artist || 'Spotify';
 
+      const audioCodecArgs = isAlreadyMp3
+        ? ['-c:a', 'copy']
+        : ['-c:a', 'libmp3lame', '-b:a', '192k', '-compression_level', '7', '-ar', '44100'];
+
       await execFileAsync('ffmpeg', [
         '-y',
         '-i', inPath,
         '-map_metadata', '-1',
-        '-c:a', 'libmp3lame',
-        '-b:a', '192k',
-        '-ar', '44100',
+        ...audioCodecArgs,
         '-id3v2_version', '3',
         '-metadata', `title=${optTitle}`,
         '-metadata', `artist=${optArtist}`,
@@ -1024,18 +1082,22 @@ export class MediaDownloader {
         // Try fast search for exact YouTube video
         try {
           const fastVids = await searchYouTubeFast(query);
-          if (fastVids.length > 0 && fastVids[0].videoId) {
+          const bestCandidate = rankYouTubeAudioCandidates(fastVids, query.toLowerCase().split(/\s+/).filter(Boolean), { clean: query });
+          if (bestCandidate && bestCandidate.videoId) {
             await execFileAsync('yt-dlp', [
               '--no-warnings',
+              '--no-playlist',
               ...cookieArgs,
+              '-N', '4',
+              '--max-filesize', '48M',
               '--js-runtimes', 'node:/usr/bin/node',
               '-f', 'ba/b',
               '-x',
               '--audio-format', 'mp3',
               '--audio-quality', '2',
               '-o', join(tempDir, '%(title).60s.%(ext)s'),
-              `https://www.youtube.com/watch?v=${fastVids[0].videoId}`
-            ], { timeout: 60000 });
+              `https://www.youtube.com/watch?v=${bestCandidate.videoId}`
+            ], { timeout: 45000 });
             const files = readdirSync(tempDir);
             const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
             if (foundAudio) {
@@ -1049,7 +1111,10 @@ export class MediaDownloader {
           try {
             await execFileAsync('yt-dlp', [
               '--no-warnings',
+              '--no-playlist',
               ...cookieArgs,
+              '-N', '4',
+              '--max-filesize', '48M',
               '--js-runtimes', 'node:/usr/bin/node',
               '-f', 'ba/b',
               '-x',
@@ -1057,7 +1122,7 @@ export class MediaDownloader {
               '--audio-quality', '2',
               '-o', join(tempDir, '%(title).60s.%(ext)s'),
               `ytsearch1:${query}`
-            ], { timeout: 60000 });
+            ], { timeout: 45000 });
             const files = readdirSync(tempDir);
             const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
             if (foundAudio) {
@@ -1071,12 +1136,15 @@ export class MediaDownloader {
           try {
             await execFileAsync('yt-dlp', [
               '--no-warnings',
+              '--no-playlist',
+              '-N', '4',
+              '--max-filesize', '48M',
               '-x',
               '--audio-format', 'mp3',
               '--audio-quality', '2',
               '-o', join(tempDir, '%(title).60s.%(ext)s'),
               `scsearch1:${query}`
-            ], { timeout: 60000 });
+            ], { timeout: 45000 });
             const files = readdirSync(tempDir);
             const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
             if (foundAudio) {
@@ -1149,12 +1217,13 @@ export class MediaDownloader {
     mkdirSync(tempDir, { recursive: true });
 
     try {
-      // Check if query looks like lyrics or a verse snippet
-      let isLyricQuery = clean.includes('\n') || (clean.split(/\s+/).length >= 4 && !/[-–—]/.test(clean));
-      if (!isLyricQuery && clean.split(/\s+/).length >= 3) {
-        if (/\b(love|feel|heart|baby|wished|star|shoot|shot|bulletproof|eyes|night|hold|dance|wanna|gonna|overtime|tears|fly|die|kiss|look|know|tell|say|fall|time|girl|boy|never|always)\b/i.test(clean)) {
-          isLyricQuery = true;
-        }
+      // Check if query is explicitly multi-line lyrics or starts with lyrics:
+      let isLyricQuery = false;
+      const lines = clean.split('\n').map((l) => l.trim()).filter(Boolean);
+      if (lines.length >= 2) {
+        isLyricQuery = true;
+      } else if (/^lyrics?\s*[:\-]/i.test(query)) {
+        isLyricQuery = true;
       }
 
       let trackTitle = clean;
@@ -1177,56 +1246,61 @@ export class MediaDownloader {
       let trackYear = null;
       let videoId = null;
 
-      // 1. YouTube Fast Search (<100ms InnerTube endpoint)
       const queryTerms = clean.toLowerCase().split(/\s+/).filter(Boolean);
-      try {
-        const fastItems = await searchYouTubeFast(clean);
-        if (Array.isArray(fastItems) && fastItems.length > 0) {
-          const scored = fastItems.map((item) => {
-            const combined = `${item.title} ${item.author}`.toLowerCase();
-            const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
-            return { item, score };
-          });
-          scored.sort((a, b) => b.score - a.score);
-          const best = scored[0].item;
-          videoId = best.videoId;
-          trackTitle = best.title || trackTitle;
-          trackAuthor = best.author || trackAuthor;
-          trackDuration = best.duration || trackDuration;
-          trackThumbnailUrl = best.thumb || trackThumbnailUrl;
-        }
-      } catch (err) {
-        this.log.warn({ err: err?.message, clean }, 'searchYouTubeFast failed, trying Deezer metadata');
+      const wantsLongMix = /\b(mix|compilation|full\s*album|album|1\s*hour|2\s*hour|3\s*hour|10\s*hour|1hr|2hr|3hr|10hr|hours|extended|continuous|medley|playlist|podcast|lofi|lo-fi)\b/i.test(clean);
+
+      // Fast concurrent search via InnerTube (<100ms) + Deezer (<300ms)
+      const [fastItemsResult, deezerResult] = await Promise.allSettled([
+        searchYouTubeFast(clean),
+        fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=3`, {
+          signal: AbortSignal.timeout(3500)
+        }).then((r) => r.ok ? r.json() : null)
+      ]);
+
+      const fastItems = fastItemsResult.status === 'fulfilled' && Array.isArray(fastItemsResult.value) ? fastItemsResult.value : [];
+      let bestSp = null;
+      if (deezerResult.status === 'fulfilled' && deezerResult.value?.data?.length > 0) {
+        const spCandidates = deezerResult.value.data.map((item) => {
+          const combined = `${item.title} ${item.artist?.name || ''}`.toLowerCase();
+          const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
+          return { item, score };
+        });
+        spCandidates.sort((a, b) => b.score - a.score);
+        bestSp = spCandidates[0].item;
       }
 
-      // 2. High-res metadata and artwork enrichment via Deezer (Zero audio previews used!)
-      try {
-        const spRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&limit=3`, {
-          signal: AbortSignal.timeout(5000)
-        });
-        if (spRes.ok) {
-          const spData = await spRes.json();
-          if (Array.isArray(spData.data) && spData.data.length > 0) {
-            const spCandidates = spData.data.map((item) => {
-              const combined = `${item.title} ${item.artist?.name || ''}`.toLowerCase();
-              const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
-              return { item, score };
-            });
-            spCandidates.sort((a, b) => b.score - a.score);
-            const bestSp = spCandidates[0].item;
-            if (!videoId) {
-              trackTitle = bestSp.title || trackTitle;
-              trackAuthor = bestSp.artist?.name || trackAuthor;
-            }
-            if (bestSp.duration && !trackDuration) {
-              const min = Math.floor(bestSp.duration / 60);
-              const sec = String(bestSp.duration % 60).padStart(2, '0');
-              trackDuration = `${min}:${sec}`;
-            }
-            trackThumbnailUrl = bestSp.album?.cover_big || bestSp.album?.cover_medium || trackThumbnailUrl;
-          }
+      let bestYt = rankYouTubeAudioCandidates(fastItems, queryTerms, { clean, wantsLongMix });
+
+      // If YouTube's best candidate is a long compilation (> 15m) and Deezer found a standard commercial track, search for the artist + title
+      const bestYtDur = parseDurationToSeconds(bestYt?.duration);
+      if ((!bestYt || (bestYtDur > 900 && !wantsLongMix)) && bestSp && bestSp.artist?.name && bestSp.title) {
+        try {
+          const refinedItems = await searchYouTubeFast(`${bestSp.artist.name} ${bestSp.title}`);
+          const refinedBest = rankYouTubeAudioCandidates(refinedItems, queryTerms, { clean, wantsLongMix });
+          if (refinedBest) bestYt = refinedBest;
+        } catch {}
+      }
+
+      if (bestYt) {
+        videoId = bestYt.videoId;
+        trackTitle = bestYt.title || trackTitle;
+        trackAuthor = bestYt.author || trackAuthor;
+        trackDuration = bestYt.duration || trackDuration;
+        trackThumbnailUrl = bestYt.thumb || trackThumbnailUrl;
+      }
+
+      if (bestSp) {
+        if (!videoId) {
+          trackTitle = bestSp.title || trackTitle;
+          trackAuthor = bestSp.artist?.name || trackAuthor;
         }
-      } catch {}
+        if (bestSp.duration && !trackDuration) {
+          const min = Math.floor(bestSp.duration / 60);
+          const sec = String(bestSp.duration % 60).padStart(2, '0');
+          trackDuration = `${min}:${sec}`;
+        }
+        trackThumbnailUrl = bestSp.album?.cover_big || bestSp.album?.cover_medium || trackThumbnailUrl;
+      }
 
       // Clean track title & author from search if needed
       const initialClean = cleanSongMetadata(trackTitle, trackAuthor);
@@ -1236,6 +1310,29 @@ export class MediaDownloader {
       }
 
       onProgress?.(`Downloading full audio track for "${trackTitle}"… ♡`);
+
+      // Pre-fetch thumbnail in background while audio downloads
+      const coverPromise = (async () => {
+        if (trackThumbnailUrl) {
+          try {
+            const imgRes = await fetch(trackThumbnailUrl, { signal: AbortSignal.timeout(8000) });
+            if (imgRes.ok) {
+              const rawThumb = Buffer.from(await imgRes.arrayBuffer());
+              return await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer().catch(() => rawThumb);
+            }
+          } catch {}
+        }
+        if (videoId) {
+          try {
+            const imgRes = await fetch(`https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, { signal: AbortSignal.timeout(5000) });
+            if (imgRes.ok) {
+              const rawThumb = Buffer.from(await imgRes.arrayBuffer());
+              return await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer().catch(() => rawThumb);
+            }
+          } catch {}
+        }
+        return null;
+      })();
 
       let downloaded = false;
       const cookieArgs = getCookieArgs();
@@ -1263,17 +1360,19 @@ export class MediaDownloader {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
+            '--no-playlist',
             ...cookieArgs,
+            '-N', '4',
+            '--max-filesize', '48M',
             '--js-runtimes', 'node:/usr/bin/node',
             '-f', 'ba/b',
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
             `https://www.youtube.com/watch?v=${videoId}`
-          ], { timeout: 60000 });
+          ], { timeout: 45000 });
           if (await getValidAudioFile()) downloaded = true;
         } catch (ytDlErr) {
           this.log.warn({ err: ytDlErr.message, videoId }, 'Direct YouTube video download failed, trying search fallback');
@@ -1285,17 +1384,19 @@ export class MediaDownloader {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
+            '--no-playlist',
             ...cookieArgs,
+            '-N', '4',
+            '--max-filesize', '48M',
             '--js-runtimes', 'node:/usr/bin/node',
             '-f', 'ba/b',
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
             `ytsearch1:${clean}`
-          ], { timeout: 60000 });
+          ], { timeout: 45000 });
           if (await getValidAudioFile()) downloaded = true;
         } catch (ytSearchErr) {
           this.log.warn({ err: ytSearchErr.message }, 'YouTube query search failed, trying proxy fallback');
@@ -1307,18 +1408,20 @@ export class MediaDownloader {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
+            '--no-playlist',
             '--proxy', 'socks5h://127.0.0.1:9000',
             ...cookieArgs,
+            '-N', '4',
+            '--max-filesize', '48M',
             '--js-runtimes', 'node:/usr/bin/node',
             '-f', 'ba/b',
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
             `ytsearch1:${clean}`
-          ], { timeout: 60000 });
+          ], { timeout: 45000 });
           if (await getValidAudioFile()) downloaded = true;
         } catch (proxyErr) {
           this.log.warn({ err: proxyErr.message }, 'YouTube proxy download failed, trying SoundCloud fallback');
@@ -1331,14 +1434,16 @@ export class MediaDownloader {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
+            '--no-playlist',
+            '-N', '4',
+            '--max-filesize', '48M',
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
-            '--write-thumbnail',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
             `scsearch1:${clean}`
-          ], { timeout: 60000 });
+          ], { timeout: 45000 });
           if (await getValidAudioFile()) downloaded = true;
         } catch (scErr) {
           this.log.warn({ err: scErr.message }, 'SoundCloud search download also failed');
@@ -1360,31 +1465,27 @@ export class MediaDownloader {
       if (finalClean.title) trackTitle = finalClean.title;
       if (finalClean.artist) trackAuthor = finalClean.artist;
 
-      const audioBuf = await this.#optimizeAudioToCbrMp3(join(tempDir, audioFile), {
-        title: trackTitle,
-        artist: trackAuthor,
-        year: trackYear
-      });
-
-      let coverBuf = null;
-      const files = readdirSync(tempDir);
-      const thumbFile = files.find((f) => /\.(webp|jpg|jpeg|png)$/i.test(f));
-      if (thumbFile) {
-        try {
-          const rawThumb = readFileSync(join(tempDir, thumbFile));
-          coverBuf = await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer();
-        } catch {
-          coverBuf = readFileSync(join(tempDir, thumbFile));
-        }
-      } else if (trackThumbnailUrl) {
-        try {
-          const imgRes = await fetch(trackThumbnailUrl, { signal: AbortSignal.timeout(10000) });
-          if (imgRes.ok) {
-            const rawThumb = Buffer.from(await imgRes.arrayBuffer());
-            coverBuf = await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer();
+      const [coverBuf, audioBuf] = await Promise.all([
+        coverPromise.then(async (buf) => {
+          if (buf) return buf;
+          const files = readdirSync(tempDir);
+          const thumbFile = files.find((f) => /\.(webp|jpg|jpeg|png)$/i.test(f));
+          if (thumbFile) {
+            try {
+              const rawThumb = readFileSync(join(tempDir, thumbFile));
+              return await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer();
+            } catch {
+              return readFileSync(join(tempDir, thumbFile));
+            }
           }
-        } catch {}
-      }
+          return null;
+        }).catch(() => null),
+        this.#optimizeAudioToCbrMp3(join(tempDir, audioFile), {
+          title: trackTitle,
+          artist: trackAuthor,
+          year: trackYear
+        })
+      ]);
 
       const safeFilename = `${trackTitle.replace(/[^\w\s-]/g, '').trim() || 'track'}.mp3`;
       const mediaItems = coverBuf ? [{
