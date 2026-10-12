@@ -211,8 +211,10 @@ export class TelegramAPI {
 
   sendPhoto(chatId, photo, extra = {}, files = null) {
     if (Buffer.isBuffer(photo)) {
+      const filename = extra.filename ?? 'photo.jpg';
+      const contentType = extra.contentType ?? (filename.endsWith('.png') ? 'image/png' : 'image/jpeg');
       return this.call('sendPhoto', { chat_id: chatId, photo: 'attach://photo', ...extra }, {
-        files: { photo: { buffer: photo, filename: extra.filename ?? 'photo.jpg', contentType: 'image/jpeg' } }
+        files: { photo: { buffer: photo, filename, contentType } }
       });
     }
     const params = { chat_id: chatId, ...extra };

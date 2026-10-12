@@ -5,7 +5,7 @@
 import { generateAuraCaption } from '../captions/engine.js';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
-import { renderChannelBanner } from '../telegram/screens/channelPost.js';
+import { renderChannelBanner, prepareStickerPhotoBuffer } from '../telegram/screens/channelPost.js';
 
 /**
  * Calculates the next run timestamp based on scheduled "HH:MM" slots or fallback interval.
@@ -260,13 +260,14 @@ export class AutonomousScheduler {
     let caption = drop.custom_caption;
 
     if (!caption) {
-      caption = await generateAuraCaption({
+      const aura = await generateAuraCaption({
         character: drop.topic,
         query: drop.topic,
         count: stickerCount,
         packs: 1,
         aiService: this.app.ai
-      }).catch(() => `✦ <b>${String(packTitle).toUpperCase()}</b> ✦\n📦 <b>${stickerCount} Stickers</b>\n🌸 Created with @${this.app.telegram?.botUsername || 'Lancy_easy_bot'} ♡`);
+      }).catch(() => null);
+      caption = (typeof aura === 'object' && aura !== null ? aura.caption : aura) || `✦ <b>${String(packTitle).toUpperCase()}</b> ✦\n📦 <b>${stickerCount} Stickers</b>\n🌸 Created with @${this.app.telegram?.botUsername || 'Lancy_easy_bot'} ♡`;
     }
 
     // 3. Publish to Telegram Channel if requested
@@ -299,19 +300,44 @@ export class AutonomousScheduler {
             }
           } catch {}
 
-          // A) Banner photo with caption
-          const bannerBuf = await renderChannelBanner({
-            title: packTitle,
-            count: stickerCount,
-            stickerType: targetPack.sticker_type || 'static',
-            sampleBuffer: sampleBuf,
-            creator: botUser
-          });
+          // A) Sticker drop photo with lean blockquote caption
+          let photoBuf = null;
+          if (sampleBuf) {
+            photoBuf = await prepareStickerPhotoBuffer(sampleBuf).catch(() => null);
+          }
+          if (!photoBuf) {
+            photoBuf = await renderChannelBanner({
+              title: packTitle,
+              count: stickerCount,
+              stickerType: targetPack.sticker_type || 'static',
+              sampleBuffer: sampleBuf,
+              creator: botUser
+            }).catch(() => null);
+          }
 
-          await this.app.telegram.api.sendPhoto(tgChannelId, bannerBuf, {
-            caption: `<blockquote>${caption}</blockquote>`,
-            parse_mode: 'HTML'
-          });
+          const captionStr = typeof caption === 'object' && caption !== null ? (caption.caption || caption.description || '') : String(caption || '');
+          const photoPayload = {
+            caption: captionStr.startsWith('<blockquote>') ? captionStr : `<blockquote>${captionStr}</blockquote>`,
+            parse_mode: 'HTML',
+            filename: 'sticker.png',
+            contentType: 'image/png'
+          };
+          if (pLink) {
+            photoPayload.reply_markup = {
+              inline_keyboard: [
+                [{ text: '➕ Add Sticker Pack 🌸', url: pLink, style: 'success' }]
+              ]
+            };
+          }
+
+          if (photoBuf) {
+            await this.app.telegram.api.sendPhoto(tgChannelId, photoBuf, photoPayload);
+          } else {
+            await this.app.telegram.api.sendMessage(tgChannelId, photoPayload.caption, {
+              parse_mode: 'HTML',
+              reply_markup: photoPayload.reply_markup
+            });
+          }
           await sleep(750);
 
           // B) First 3 to 5 sample stickers
@@ -322,7 +348,7 @@ export class AutonomousScheduler {
             }
           }
 
-          // C) Pack card with inline button
+          // C) Pack card with green success button
           await this.app.telegram.api.sendMessage(
             tgChannelId,
             `<blockquote>✨ <b>Click below to add the complete sticker pack to Telegram!</b>\n👉 <a href="${pLink}">${packTitle}</a>\n\n🌸 Created with @${botUser} ♡</blockquote>`,
@@ -330,7 +356,7 @@ export class AutonomousScheduler {
               parse_mode: 'HTML',
               reply_markup: {
                 inline_keyboard: [
-                  [{ text: '➕ Add Sticker Pack 🌸', url: pLink }]
+                  [{ text: '➕ Add Sticker Pack 🌸', url: pLink, style: 'success' }]
                 ]
               }
             }

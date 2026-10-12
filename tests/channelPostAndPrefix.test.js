@@ -304,6 +304,9 @@ test('ChannelPost screen: wizard flow and full publishing execution (pic, sample
   assert.equal(sentPhotos.length, 1);
   assert.equal(sentPhotos[0].cid, channelId);
   assert.ok(sentPhotos[0].opts.caption.includes('Cute Cats Collection'));
+  assert.ok(sentPhotos[0].opts.caption.startsWith('<blockquote>'));
+  assert.ok(sentPhotos[0].opts.caption.endsWith('</blockquote>'));
+  assert.equal(sentPhotos[0].opts.reply_markup.inline_keyboard[0][0].style, 'success');
 
   // Verify Phase 2: First 3 to 5 sample stickers sent
   assert.ok(sentStickers.length >= 3);
@@ -316,7 +319,9 @@ test('ChannelPost screen: wizard flow and full publishing execution (pic, sample
   const channelFinalMsg = sentMessages.find((m) => m.cid === channelId);
   assert.ok(channelFinalMsg);
   assert.ok(channelFinalMsg.text.toLowerCase().includes('add the complete sticker pack'));
+  assert.ok(!channelFinalMsg.text.includes('👉 undefined'), 'must not contain 👉 undefined');
   assert.ok(channelFinalMsg.opts.reply_markup.inline_keyboard[0][0].url.includes('cute_cats_by_lancy'));
+  assert.equal(channelFinalMsg.opts.reply_markup.inline_keyboard[0][0].style, 'success');
 
   db.close();
 });
@@ -448,6 +453,117 @@ test('ChannelPost: add_channel renders true blockquote without raw HTML tags', a
   assert.ok(!str.includes('<b>'), 'does not contain raw <b> tags');
   assert.ok(!str.includes('<code>'), 'does not contain raw <code> tags');
   assert.ok(!str.includes('<i>'), 'does not contain raw <i> tags');
+
+  db.close();
+});
+
+test('ChannelPost: normalizePack and prepareStickerPhotoBuffer', async () => {
+  const { normalizePack, prepareStickerPhotoBuffer, extractCharacterName, getFallbackCharacterDescription } = await import('../src/telegram/screens/channelPost.js');
+
+  // 1. Raw DB row normalization
+  const dbRow = {
+    id: 12,
+    tg_short_name: 'toji_pack_by_lancy',
+    tg_title: 'LANCY - Toji stickers',
+    query: 'Toji',
+    count: 120,
+    sticker_type: 'static',
+    link: 'https://t.me/addstickers/toji_pack_by_lancy'
+  };
+  const normFromDb = normalizePack(dbRow);
+  assert.equal(normFromDb.title, 'LANCY - Toji stickers');
+  assert.equal(normFromDb.tg_title, 'LANCY - Toji stickers');
+  assert.equal(normFromDb.shortName, 'toji_pack_by_lancy');
+  assert.equal(normFromDb.link, 'https://t.me/addstickers/toji_pack_by_lancy');
+  assert.equal(normFromDb.count, 120);
+
+  // 2. Decorated PackService object normalization
+  const decorated = {
+    id: 12,
+    shortName: 'toji_pack_by_lancy',
+    title: 'LANCY - Toji stickers',
+    query: 'Toji',
+    count: 120,
+    stickerType: 'static',
+    link: 'https://t.me/addstickers/toji_pack_by_lancy'
+  };
+  const normFromDec = normalizePack(decorated);
+  assert.equal(normFromDec.tg_title, 'LANCY - Toji stickers');
+  assert.equal(normFromDec.tg_short_name, 'toji_pack_by_lancy');
+  assert.equal(normFromDec.sticker_type, 'static');
+
+  // 3. Character extraction & description fallback
+  const charName = extractCharacterName('ᥫ᭡ʟᴀɴᴄʏ - Escanor stickers');
+  assert.equal(charName, 'Escanor');
+  const desc = getFallbackCharacterDescription(charName);
+  assert.ok(desc.includes('Lion Sin of Pride'));
+
+  const tojiChar = extractCharacterName('LANCY - Toji stickers');
+  assert.equal(tojiChar, 'Toji');
+  const tojiDesc = getFallbackCharacterDescription(tojiChar);
+  assert.ok(tojiDesc.includes('sorcerer killer'));
+
+  // 4. prepareStickerPhotoBuffer produces clean PNG
+  const sample = await sharp({
+    create: { width: 100, height: 100, channels: 4, background: { r: 255, g: 0, b: 0, alpha: 1 } }
+  }).webp().toBuffer();
+  const photoBuf = await prepareStickerPhotoBuffer(sample);
+  assert.ok(Buffer.isBuffer(photoBuf));
+  const meta = await sharp(photoBuf).metadata();
+  assert.equal(meta.format, 'png');
+  assert.equal(meta.width, 800);
+  assert.equal(meta.height, 800);
+});
+
+test('AutoPost: AUTOPOST_AI_CHAT handles message with contextual clone api without throwing chat not found', async () => {
+  const { createAutoPostScreen } = await import('../src/telegram/screens/autoPost.js');
+  const db = new Database(':memory:');
+  const sm = new StateMachine();
+  const sentCloneMessages = [];
+
+  const fakeCloneApi = {
+    sendMessage: async (chatId, text, opts) => {
+      sentCloneMessages.push({ chatId, text, opts });
+      return { message_id: 888 };
+    },
+    sendRichMessage: async () => ({ message_id: 889 })
+  };
+
+  const app = {
+    telegram: {
+      api: {
+        sendMessage: async () => { throw new Error('Telegram sendMessage: Bad Request: chat not found'); }
+      },
+      botUsername: 'lancy_main_bot'
+    },
+    db,
+    sm,
+    packs: { listPacks: () => ({ packs: [], total: 0 }), getPack: () => null }
+  };
+
+  const screen = createAutoPostScreen({ app });
+  const tgId = 8380969639;
+  const cloneChatId = 8380969639;
+
+  // Transition to AUTOPOST_AI_CHAT
+  await sm.transition(tgId, States.AUTOPOST_AI_CHAT, {
+    chatId: cloneChatId,
+    screenMessageId: 10
+  });
+
+  // Handle message through StateMachine with clone bot context
+  const sctx = {
+    tgId,
+    chatId: cloneChatId,
+    api: fakeCloneApi,
+    screens: new Map([['auto_post', screen]])
+  };
+
+  const handled = await sm.handleMessage(tgId, { text: 'I want random popular animes', chat: { id: cloneChatId } }, sctx);
+  assert.equal(handled, true);
+  assert.equal(sentCloneMessages.length, 1);
+  assert.equal(sentCloneMessages[0].chatId, cloneChatId);
+  assert.ok(sentCloneMessages[0].text.includes('Theme locked in: "I want random popular animes"!'));
 
   db.close();
 });

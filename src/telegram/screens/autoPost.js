@@ -79,20 +79,21 @@ export function createAutoPostScreen({ app }) {
     if (typeof ctx?.editScreen === 'function') {
       return ctx.editScreen(rich, {}, files);
     }
+    const api = ctx?.api || ctx?.bot?.api || app.telegram?.api;
     const chatId = ctx?.chat?.id ?? ctx?.chatId ?? ctx?.from?.id ?? ctx?.tgId;
     const messageId = ctx?.message?.message_id ?? ctx?.messageId ?? ctx?.sm?.context?.(ctx?.tgId)?.screenMessageId;
     if (messageId && chatId) {
       try {
-        return await app.telegram.api.editMessageRich(chatId, messageId, rich, {}, files);
+        return await api.editMessageRich(chatId, messageId, rich, {}, files);
       } catch (err) {
         if (!/message is not modified/i.test(err?.message)) {
-          return await app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+          return await api.sendRichMessage(chatId, rich, {}, files);
         }
         return;
       }
     }
     if (chatId) {
-      return await app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+      return await api.sendRichMessage(chatId, rich, {}, files);
     }
   }
 
@@ -450,8 +451,9 @@ export function createAutoPostScreen({ app }) {
       for (const p of userPacks.slice(0, 5)) {
         const isSelected = sel.selectedPackIds.includes(p.id);
         const radio = isSelected ? '🔘' : '⚪';
+        const pTitle = p.title || p.tg_title || p.query || 'Pack';
         b.buttons([
-          richButton.callback(`${radio} ${p.tg_title} (${p.count})`, encodeCallback(id, 'toggle_pack', p.id), {
+          richButton.callback(`${radio} ${pTitle} (${p.count ?? 0})`, encodeCallback(id, 'toggle_pack', p.id), {
             style: isSelected ? 'success' : 'primary'
           })
         ]);
@@ -616,16 +618,18 @@ export function createAutoPostScreen({ app }) {
     // Custom days number input handler
     app.sm.register(States.AUTOPOST_CUSTOM_DAYS, {
       onMessage: async (sctx, message) => {
+        const api = sctx?.api || app.telegram?.api;
+        const targetChatId = message.chat?.id || sctx.chatId || sctx.tgId;
         const text = (message.text ?? '').trim();
         const num = parseInt(text, 10);
         if (isNaN(num) || num < 1 || num > 365) {
-          await app.telegram.api.sendMessage(sctx.chatId, '<blockquote>✕ Please send a valid number of days between 1 and 365 ♡</blockquote>', { parse_mode: 'HTML' });
+          await api.sendMessage(targetChatId, '<blockquote>✕ Please send a valid number of days between 1 and 365 ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
           return true;
         }
         const sel = getSelection(sctx.tgId);
         sel.days = num;
         await app.sm.reset(sctx.tgId, { reason: 'custom-days-set' });
-        await renderDaysPicker({ ...sctx, tgId: sctx.tgId });
+        await renderDaysPicker({ ...sctx, tgId: sctx.tgId, api, chatId: targetChatId });
         return true;
       }
     });
@@ -633,6 +637,8 @@ export function createAutoPostScreen({ app }) {
     // AI Chat Theme input handler
     app.sm.register(States.AUTOPOST_AI_CHAT, {
       onMessage: async (sctx, message) => {
+        const api = sctx?.api || app.telegram?.api;
+        const targetChatId = message.chat?.id || sctx.chatId || sctx.tgId;
         const text = (message.text ?? '').trim();
         if (!text) return false;
         const sel = getSelection(sctx.tgId);
@@ -640,12 +646,12 @@ export function createAutoPostScreen({ app }) {
         sel.aiPrompt = text;
         await app.sm.reset(sctx.tgId, { reason: 'ai-theme-set' });
 
-        await app.telegram.api.sendMessage(
-          sctx.chatId,
+        await api.sendMessage(
+          targetChatId,
           `<blockquote>✨ <b>Theme locked in: "${text}"!</b>\n\nI'll curate this aesthetic for the scheduled campaign! Returning to preview... ♡</blockquote>`,
           { parse_mode: 'HTML' }
-        );
-        await renderContentPicker({ ...sctx, tgId: sctx.tgId });
+        ).catch(() => {});
+        await renderContentPicker({ ...sctx, tgId: sctx.tgId, api, chatId: targetChatId });
         return true;
       }
     });

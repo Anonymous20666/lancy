@@ -136,6 +136,93 @@ export async function renderChannelBanner({
 }
 
 /**
+ * Normalizes pack fields whether from raw DB row or decorated PackService object.
+ */
+export function normalizePack(p) {
+  if (!p || typeof p !== 'object') return null;
+  const shortName = p.shortName || p.tg_short_name || p.name || '';
+  const title = p.title || p.tg_title || p.query || 'Sticker Pack';
+  const link = p.link || (shortName ? `https://t.me/addstickers/${shortName}` : '');
+  const count = Number(p.count ?? p.stickerCount ?? 0);
+  const stickerType = p.stickerType || p.sticker_type || 'static';
+  const query = p.query || title;
+  return {
+    ...p,
+    id: p.id,
+    shortName,
+    tg_short_name: shortName,
+    name: shortName,
+    title,
+    tg_title: title,
+    link,
+    count,
+    stickerType,
+    sticker_type: stickerType,
+    query
+  };
+}
+
+/**
+ * Extracts a clean character name from title or query.
+ */
+export function extractCharacterName(raw = '') {
+  return String(raw || '')
+    .replace(/^ᥫ᭡[^\s-]+\s*-\s*/, '')
+    .replace(/^(?:lancy\s*-\s*)/i, '')
+    .replace(/\s*(?:stickers?|collection|wa\s*import|part\s*\d+|pack)/gi, '')
+    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+    .trim() || 'Stickers';
+}
+
+/**
+ * Aesthetic character-tailored fallback descriptions.
+ */
+export function getFallbackCharacterDescription(characterName = '') {
+  const lower = String(characterName || '').toLowerCase();
+  if (lower.includes('toji')) {
+    return 'Cold-blooded sorcerer killer aura, swagger smirks, and unhinged combat energy. 🗡️⚡';
+  }
+  if (lower.includes('escanor')) {
+    return 'Peak Lion Sin of Pride majesty, unyielding solar arrogance, and untouchable strength. ☀️🦁';
+  }
+  if (lower.includes('gojo')) {
+    return 'The limitless honored one, smug blindfolded smirks, and peak domain swagger. 🤞🏼✨';
+  }
+  if (lower.includes('sukuna')) {
+    return 'Cursed king malevolence, four-eyed smirks, and demonic slaughter moods. 🩸🔥';
+  }
+  if (lower.includes('anime') || lower.includes('manga')) {
+    return 'Peak anime aura featuring iconic reactions, cocky smirks, and expressive moods. 🫶🏼💫';
+  }
+  if (lower.includes('cat') || lower.includes('kitty') || lower.includes('cute')) {
+    return 'Soft pastel aesthetics, heartwarming reactions, and darling cozy moments. 🐾🌸';
+  }
+  return 'Curated aesthetic collection featuring expressive moods, iconic reactions, and chat vibes. 🤍✨';
+}
+
+/**
+ * Converts a sticker WebP/image buffer into a crisp 800x800 PNG photo buffer for Telegram.
+ */
+export async function prepareStickerPhotoBuffer(sampleBuf) {
+  if (!sampleBuf || !Buffer.isBuffer(sampleBuf)) return null;
+  try {
+    return await sharp(sampleBuf, { failOn: 'none', page: 0 })
+      .resize(800, 800, {
+        fit: 'contain',
+        background: { r: 0, g: 0, b: 0, alpha: 0 }
+      })
+      .png({ quality: 100 })
+      .toBuffer();
+  } catch {
+    try {
+      return await sharp(sampleBuf, { failOn: 'none', page: 0 }).png().toBuffer();
+    } catch {
+      return null;
+    }
+  }
+}
+
+/**
  * Telegram Channel Post Screen — wizard to select packs and publish to Telegram channels.
  */
 export function createChannelPostScreen({ app }) {
@@ -170,20 +257,21 @@ export function createChannelPostScreen({ app }) {
     if (typeof ctx?.editScreen === 'function') {
       return ctx.editScreen(rich, {}, files);
     }
+    const api = ctx?.api || ctx?.bot?.api || app.telegram?.api;
     const chatId = ctx?.chat?.id ?? ctx?.chatId ?? ctx?.from?.id ?? ctx?.tgId;
     const messageId = ctx?.message?.message_id ?? ctx?.messageId ?? ctx?.sm?.context?.(ctx?.tgId)?.screenMessageId;
     if (messageId && chatId) {
       try {
-        return await app.telegram.api.editMessageRich(chatId, messageId, rich, {}, files);
+        return await api.editMessageRich(chatId, messageId, rich, {}, files);
       } catch (err) {
         if (!/message is not modified/i.test(err?.message)) {
-          return await app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+          return await api.sendRichMessage(chatId, rich, {}, files);
         }
         return;
       }
     }
     if (chatId) {
-      return await app.telegram.api.sendRichMessage(chatId, rich, {}, files);
+      return await api.sendRichMessage(chatId, rich, {}, files);
     }
   }
 
@@ -226,10 +314,11 @@ export function createChannelPostScreen({ app }) {
 
     b.paragraph(rt.italic('choose the sticker pack you want to post to your channel:'));
 
-    for (const p of packs) {
+    for (const rawP of packs) {
+      const p = normalizePack(rawP);
       const isSelected = sel.packId === p.id;
       const radio = isSelected ? '🔘' : '⚪';
-      const label = `${radio} ${p.tg_title || p.query || 'Pack'} (${p.count ?? 0})`;
+      const label = `${radio} ${p.title} (${p.count ?? 0})`;
       b.buttons([
         richButton.callback(label, encodeCallback(id, 'select_pack', p.id), {
           style: isSelected ? 'success' : 'primary'
@@ -333,7 +422,7 @@ export function createChannelPostScreen({ app }) {
   async function renderPreview(ctx) {
     const tgId = String(ctx.tgId);
     const sel = getSelection(tgId);
-    const botUser = app.telegram?.botUsername || 'Lancy_easy_bot';
+    const botUser = ctx?.bot?.botUsername || ctx?.bot?.username || app.telegram?.botUsername || 'Lancy_easy_bot';
 
     const b = new RichMessageBuilder();
     b.paragraph(rt.bold(banner([
@@ -342,12 +431,12 @@ export function createChannelPostScreen({ app }) {
     ])));
     b.divider();
 
-    const p = sel.pack;
+    const p = normalizePack(sel.pack);
     const ch = sel.channel;
 
     b.heading('📦 STICKER PACK', 3);
-    b.paragraph(rt.concat(rt.bold('Title: '), rt.text(p?.tg_title ?? 'Sticker Pack')));
-    b.paragraph(rt.concat(rt.bold('Total Stickers: '), rt.text(`${p?.count ?? 0} (${(p?.sticker_type ?? 'static').toUpperCase()})`)));
+    b.paragraph(rt.concat(rt.bold('Title: '), rt.text(p?.title ?? 'Sticker Pack')));
+    b.paragraph(rt.concat(rt.bold('Total Stickers: '), rt.text(`${p?.count ?? 0} (${(p?.stickerType ?? 'static').toUpperCase()})`)));
     if (p?.link) {
       b.paragraph(rt.concat(rt.bold('Install Link: '), rt.text(p.link)));
     }
@@ -358,16 +447,32 @@ export function createChannelPostScreen({ app }) {
 
     b.divider();
     b.heading('✨ PUBLISH SEQUENCE', 3);
-    b.paragraph(rt.text('1️⃣ 🖼 High-res Banner Photo with aesthetic caption\n2️⃣ 🎨 First 3 to 5 sample stickers from the pack\n3️⃣ 🎁 Official pack card with 1-tap "➕ Add Sticker Pack" button'));
+    b.paragraph(rt.text('1️⃣ 🖼 Sticker Drop Photo with AI character blockquote caption\n2️⃣ 🎨 First 3 to 5 sample stickers from the pack\n3️⃣ 🎁 Official pack card with green "➕ Add Sticker Pack 🌸" button'));
 
-    // Default caption if not custom
-    if (!sel.caption) {
-      sel.caption = `✦ <b>${p?.tg_title ?? 'Sticker Pack'}</b> ✦\n📦 <b>${p?.count ?? 0} Stickers</b> • ${(p?.sticker_type ?? 'static').toUpperCase()}\n🔗 <a href="${p?.link}">Add to Telegram</a>\n🌸 Created with @${botUser} ♡`;
+    // Default caption if not custom: generate lean character-aware AI description
+    if (!sel.caption && p) {
+      const characterName = extractCharacterName(p.query || p.title);
+      let aiDesc = '';
+      try {
+        aiDesc = await app.captions?.generateAbout?.(characterName, { aiService: app.ai });
+      } catch {}
+      if (!aiDesc || aiDesc.includes('A fresh pack filled with')) {
+        aiDesc = getFallbackCharacterDescription(characterName);
+      }
+      sel.caption = [
+        `✦ <b>${p.title}</b> ✦`,
+        '',
+        aiDesc,
+        '',
+        `📦 <b>${p.count} Stickers</b> • ${(p.stickerType || 'static').toUpperCase()}`,
+        `🔗 <a href="${p.link}">Add to Telegram</a>`,
+        `🌸 Created with @${botUser} ♡`
+      ].join('\n');
     }
 
     b.divider();
     b.heading('💬 CAPTION PREVIEW', 3);
-    b.blockquote(sel.caption);
+    b.blockquote(sel.caption || 'No caption set');
 
     b.divider();
     b.buttons([
@@ -392,12 +497,13 @@ export function createChannelPostScreen({ app }) {
   async function executeChannelPublish(ctx) {
     const tgId = String(ctx.tgId);
     const sel = getSelection(tgId);
-    const chatId = ctx.chatId;
-    const p = sel.pack;
+    const api = ctx?.api || app.telegram?.api;
+    const chatId = ctx.chatId || ctx.tgId;
+    const p = normalizePack(sel.pack);
     const ch = sel.channel;
 
     if (!p || !ch) {
-      await app.telegram.api.sendMessage(chatId, '<blockquote>✕ Please select both a sticker pack and target channel first ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
+      await api.sendMessage(chatId, '<blockquote>✕ Please select both a sticker pack and target channel first ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
       return;
     }
 
@@ -408,28 +514,41 @@ export function createChannelPostScreen({ app }) {
       `sending to ${ch.title}... ♡`
     ])));
     bProg.divider();
-    bProg.paragraph(rt.italic('⏳ Generating visual banner card and uploading sample stickers... please wait ♡'));
+    bProg.paragraph(rt.italic('⏳ Preparing sticker drop photo and uploading sample stickers... please wait ♡'));
     bProg.validate();
     await editOrSend(ctx, bProg.toJSON());
 
-    const botUser = app.telegram?.botUsername || 'Lancy_easy_bot';
+    const botUser = ctx?.bot?.botUsername || ctx?.bot?.username || (await api.getMe().catch(() => null))?.username || app.telegram?.botUsername || 'Lancy_easy_bot';
 
     try {
       // 1. Fetch sticker set to retrieve stickers & sample
-      const setName = p.tg_short_name || p.name;
+      const setName = p.shortName || p.tg_short_name || p.name;
       let set = null;
       let sampleStickers = [];
       let sampleBuf = null;
 
       try {
-        set = await app.telegram.api.getStickerSet(setName);
+        if (setName) {
+          set = await api.getStickerSet(setName);
+        }
         if (set?.stickers?.length) {
+          if (!p.count || p.count === 0) {
+            p.count = set.stickers.length;
+            try {
+              app.db.run('UPDATE sticker_packs SET count = ? WHERE id = ?', set.stickers.length, p.id);
+            } catch {}
+          }
           sampleStickers = set.stickers.slice(0, Math.min(5, Math.max(3, set.stickers.length)));
-          // Download the first sticker to composite on banner
-          if (sampleStickers[0]?.file_id) {
-            const fInfo = await app.telegram.api.getFile(sampleStickers[0].file_id);
+          // Download the first sticker to send as the photo for the drop
+          const firstSticker = sampleStickers[0];
+          const targetFileId = firstSticker?.is_animated && (firstSticker.thumbnail || firstSticker.thumb)
+            ? (firstSticker.thumbnail || firstSticker.thumb).file_id
+            : firstSticker?.file_id;
+
+          if (targetFileId) {
+            const fInfo = await api.getFile(targetFileId);
             if (fInfo?.file_path) {
-              sampleBuf = await app.telegram.api.downloadFile(fInfo.file_path).catch(() => null);
+              sampleBuf = await api.downloadFile(fInfo.file_path).catch(() => null);
             }
           }
         }
@@ -437,46 +556,99 @@ export function createChannelPostScreen({ app }) {
         log.warn({ err: setErr?.message, setName }, 'could not fetch full sticker set info');
       }
 
-      // 2. Render 1000x560 Banner Photo
-      const bannerBuffer = await renderChannelBanner({
-        title: p.tg_title,
-        count: p.count,
-        stickerType: p.sticker_type || 'static',
-        sampleBuffer: sampleBuf,
-        creator: botUser
-      });
+      // Fallback if sampleBuf not found via API download:
+      if (!sampleBuf && app.packs?.getStickerBytes) {
+        sampleBuf = await app.packs.getStickerBytes(p, 0, {
+          download: (fileId) => api.getFile(fileId).then((f) => api.downloadFile(f.file_path)).catch(() => null)
+        }).catch(() => null);
+      }
 
-      // 3. Post Phase 1: Banner Photo with Caption
-      const bannerCaption = sel.caption || `✦ <b>${p.tg_title}</b> ✦\n📦 <b>${p.count} Stickers</b> • ${(p.sticker_type || 'static').toUpperCase()}\n🔗 <a href="${p.link}">Add to Telegram</a>\n🌸 Created with @${botUser} ♡`;
-      await app.telegram.api.sendPhoto(ch.channel_id, bannerBuffer, {
-        caption: `<blockquote>${bannerCaption}</blockquote>`,
-        parse_mode: 'HTML'
-      });
+      // 2. Prepare Sticker Drop Photo buffer from the actual sticker
+      let stickerPhotoBuf = null;
+      if (sampleBuf) {
+        stickerPhotoBuf = await prepareStickerPhotoBuffer(sampleBuf).catch(() => null);
+      }
+      if (!stickerPhotoBuf) {
+        // Fallback to banner only if sticker extraction failed completely
+        stickerPhotoBuf = await renderChannelBanner({
+          title: p.title,
+          count: p.count,
+          stickerType: p.stickerType,
+          sampleBuffer: sampleBuf,
+          creator: botUser
+        }).catch(() => null);
+      }
+
+      // 3. Prepare AI Character Description and Lean Caption
+      const characterName = extractCharacterName(p.query || p.title);
+      let aiDesc = '';
+      if (!sel.caption) {
+        try {
+          aiDesc = await app.captions?.generateAbout?.(characterName, { aiService: app.ai });
+        } catch {}
+        if (!aiDesc || aiDesc.includes('A fresh pack filled with')) {
+          aiDesc = getFallbackCharacterDescription(characterName);
+        }
+      }
+
+      const dropCaption = sel.caption || [
+        `✦ <b>${p.title}</b> ✦`,
+        '',
+        aiDesc,
+        '',
+        `📦 <b>${p.count} Stickers</b> • ${(p.stickerType || 'static').toUpperCase()}`,
+        `🔗 <a href="${p.link}">Add to Telegram</a>`,
+        `🌸 Created with @${botUser} ♡`
+      ].join('\n');
+
+      // 4. Post Phase 1: Sticker Photo with Lean Blockquote Caption + Green Success Button
+      const photoPayload = {
+        caption: `<blockquote>${dropCaption}</blockquote>`,
+        parse_mode: 'HTML',
+        filename: 'sticker.png',
+        contentType: 'image/png'
+      };
+      if (p.link) {
+        photoPayload.reply_markup = {
+          inline_keyboard: [
+            [{ text: '➕ Add Sticker Pack 🌸', url: p.link, style: 'success' }]
+          ]
+        };
+      }
+
+      if (stickerPhotoBuf) {
+        await api.sendPhoto(ch.channel_id, stickerPhotoBuf, photoPayload);
+      } else {
+        await api.sendMessage(ch.channel_id, `<blockquote>${dropCaption}</blockquote>`, {
+          parse_mode: 'HTML',
+          reply_markup: photoPayload.reply_markup
+        });
+      }
       await sleep(750);
 
-      // 4. Post Phase 2: First 3 to 5 Sample Stickers
+      // 5. Post Phase 2: First 3 to 5 Sample Stickers
       let sentSampleCount = 0;
       for (const st of sampleStickers) {
         if (!st?.file_id) continue;
-        await app.telegram.api.sendSticker(ch.channel_id, st.file_id).catch((err) => {
+        await api.sendSticker(ch.channel_id, st.file_id).catch((err) => {
           log.warn({ err: err?.message, channelId: ch.channel_id }, 'sample sticker send skipped');
         });
         sentSampleCount += 1;
         await sleep(600);
       }
 
-      // 5. Post Phase 3: Official Pack Card with direct button
-      const finalMsg = `<blockquote>✨ <b>Click below to add the complete sticker pack to Telegram!</b>\n👉 <a href="${p.link}">${p.tg_title}</a>\n\n🌸 Created with @${botUser} ♡</blockquote>`;
-      await app.telegram.api.sendMessage(ch.channel_id, finalMsg, {
+      // 6. Post Phase 3: Official Pack Card with Green Success Button
+      const finalMsg = `<blockquote>✨ <b>Click below to add the complete sticker pack to Telegram!</b>\n👉 <a href="${p.link}">${p.title}</a>\n\n🌸 Created with @${botUser} ♡</blockquote>`;
+      await api.sendMessage(ch.channel_id, finalMsg, {
         parse_mode: 'HTML',
         reply_markup: {
           inline_keyboard: [
-            [{ text: '➕ Add Sticker Pack 🌸', url: p.link }]
+            [{ text: '➕ Add Sticker Pack 🌸', url: p.link, style: 'success' }]
           ]
         }
       });
 
-      // 6. Victory Card for User
+      // 7. Victory Card for User
       const bDone = new RichMessageBuilder();
       bDone.paragraph(rt.bold(banner([
         '🎉 SUCCESSFULLY POSTED! 🎉',
@@ -484,9 +656,9 @@ export function createChannelPostScreen({ app }) {
       ])));
       bDone.divider();
       bDone.paragraph(rt.concat(
-        rt.bold('Pack: '), rt.text(`${p.tg_title}\n`),
+        rt.bold('Pack: '), rt.text(`${p.title}\n`),
         rt.bold('Channel: '), rt.text(`${ch.title} (${ch.username ? '@' + ch.username : ch.channel_id})\n`),
-        rt.bold('Delivered: '), rt.text(`1 Banner card, ${sentSampleCount} sample stickers, and 1 pack card ♡`)
+        rt.bold('Delivered: '), rt.text(`1 Sticker drop photo, ${sentSampleCount} sample stickers, and 1 pack card ♡`)
       ));
       bDone.divider();
 
@@ -539,21 +711,23 @@ export function createChannelPostScreen({ app }) {
 
         const tgId = String(sctx.tgId);
         const sel = getSelection(tgId);
+        const api = sctx?.api || app.telegram?.api;
+        const targetChatId = message.chat?.id || sctx.chatId || sctx.tgId;
 
         try {
-          const chat = await app.telegram.api.getChat(input);
+          const chat = await api.getChat(input);
           if (!chat?.id) throw new Error('Channel not found');
 
-          const me = await app.telegram.api.getMe();
-          const member = await app.telegram.api.getChatMember(chat.id, me.id);
+          const me = await api.getMe();
+          const member = await api.getChatMember(chat.id, me.id);
 
           const isAdmin = member.status === 'administrator' || member.status === 'creator';
           if (!isAdmin) {
-            await app.telegram.api.sendMessage(
-              sctx.chatId,
+            await api.sendMessage(
+              targetChatId,
               `<blockquote>✕ The bot is not an administrator in <b>${escapeXml(chat.title || input)}</b>!\nPlease make the bot an admin with "Post Messages" permission, then send the @username again ♡</blockquote>`,
               { parse_mode: 'HTML' }
-            );
+            ).catch(() => {});
             return true;
           }
 
@@ -569,19 +743,20 @@ export function createChannelPostScreen({ app }) {
           sel.channel = app.db.getTelegramChannel(chat.id);
 
           await app.sm.reset(tgId, { reason: 'channel-connected' });
-          await renderChannelPicker({ ...sctx, tgId });
+          await renderChannelPicker({ ...sctx, tgId, api, chatId: targetChatId });
           return true;
         } catch (err) {
-          await app.telegram.api.sendMessage(
-            sctx.chatId,
+          await api.sendMessage(
+            targetChatId,
             `<blockquote>✕ Could not connect channel: <i>${escapeXml(err.message || 'Invalid channel')}</i>\nPlease check the username or channel ID and try again ♡</blockquote>`,
             { parse_mode: 'HTML' }
-          );
+          ).catch(() => {});
           return true;
         }
       },
       onTimeout: async (sctx) => {
-        await app.telegram.api.sendMessage(sctx.chatId, '<blockquote>♡ Channel input timed out ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
+        const api = sctx?.api || app.telegram?.api;
+        await api.sendMessage(sctx.chatId, '<blockquote>♡ Channel input timed out ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
       }
     });
 
@@ -592,13 +767,16 @@ export function createChannelPostScreen({ app }) {
         if (!text) return false;
         const tgId = String(sctx.tgId);
         const sel = getSelection(tgId);
+        const api = sctx?.api || app.telegram?.api;
+        const targetChatId = message.chat?.id || sctx.chatId || sctx.tgId;
         sel.caption = text;
         await app.sm.reset(tgId, { reason: 'caption-saved' });
-        await renderPreview({ ...sctx, tgId });
+        await renderPreview({ ...sctx, tgId, api, chatId: targetChatId });
         return true;
       },
       onTimeout: async (sctx) => {
-        await app.telegram.api.sendMessage(sctx.chatId, '<blockquote>♡ Caption input timed out ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
+        const api = sctx?.api || app.telegram?.api;
+        await api.sendMessage(sctx.chatId, '<blockquote>♡ Caption input timed out ♡</blockquote>', { parse_mode: 'HTML' }).catch(() => {});
       }
     });
   }
@@ -632,7 +810,8 @@ export function createChannelPostScreen({ app }) {
         case 'select_pack': {
           const packId = Number(args[0]);
           sel.packId = packId;
-          sel.pack = app.packs.getPack(Number(tgId), packId) || app.db.get('SELECT * FROM sticker_packs WHERE id = ?', packId);
+          const rawPack = app.packs.getPack(Number(tgId), packId) || app.db.get('SELECT * FROM sticker_packs WHERE id = ?', packId);
+          sel.pack = normalizePack(rawPack);
           return renderPackPicker(ctx);
         }
 
