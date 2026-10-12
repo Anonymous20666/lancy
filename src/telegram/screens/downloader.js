@@ -465,11 +465,17 @@ export function createDownloaderScreen({ app }) {
       richButton.callback('🌸 Pastel / Aesthetic', encodeCallback(id, 'pfp_search', 'cute aesthetic matching pfp'), { style: 'primary' }),
       richButton.callback('🔍 Custom Topic…', encodeCallback(id, 'pfp_custom'), { style: 'primary' })
     ]);
+    b.divider();
+    b.heading('📦 PICK NUMBER OF MATCHING PICS', 3);
+    b.buttons([
+      richButton.callback('🎯 10 Picks (Full Albums)', encodeCallback(id, 'pfp_count', '10'), { style: 'primary' }),
+      richButton.callback('🎯 20 Picks (Full Albums)', encodeCallback(id, 'pfp_count', '20'), { style: 'primary' })
+    ]);
     b.buttons([
       richButton.callback('🔗 Paste Pinterest Album Link', encodeCallback(id, 'input', 'from_media'), { style: 'primary' }),
       richButton.callback('« Downloader', encodeCallback(id, 'open'))
     ]);
-    b.footer(rt.italic('Tip: You can also type /pfp <character> anytime ♡'));
+    b.footer(rt.italic('Tip: You can also type /pfp <character> [count] anytime ♡'));
     b.validate();
     return b.toJSON();
   }
@@ -483,14 +489,15 @@ export function createDownloaderScreen({ app }) {
     b.heading('୨୧ search matching profile pictures', 3);
     if (isGroup) {
       b.paragraph(rt.text(
-        '• 👥 Type /pfp <character or theme> directly in this chat\n' +
-        '• 🖼️ Or reply to this card with any character name (e.g. Tanjiro Nezuko, Gojo Geto, Cat couple)!\n' +
+        '• 👥 Type /pfp <character or theme> [count] directly in this chat (e.g. /pfp anime 10)\n' +
+        '• 🖼️ Or reply to this card with any character name (e.g. Tanjiro Nezuko 10, Gojo Geto, Cat couple)!\n' +
         '• 🔗 Or paste any Pinterest matching album link'
       ));
     } else {
       b.paragraph(rt.text(
-        '• 👥 Send character name or theme (e.g. Tanjiro Nezuko, Loid Yor, Cat couple, Vintage anime)\n' +
-        '• 🔗 Or paste a Pinterest album link directly!'
+        '• 👥 Send character name or theme (e.g. Tanjiro Nezuko 10, Loid Yor, 10 pit, Vintage anime)\n' +
+        '• 🔗 Or paste a Pinterest album link directly!\n' +
+        '• 💡 Tip: Full albums are never truncated — extra pictures are added as bonus (e.g. 10 - 5extra) ♡'
       ));
     }
     b.divider();
@@ -542,7 +549,9 @@ export function createDownloaderScreen({ app }) {
     lyrics = null,
     pfpSessionKey = null,
     pfpCurrentIndex = 0,
-    pfpTotalCount = 0
+    pfpTotalCount = 0,
+    targetGoal = null,
+    extraCount = 0
   }) {
     const files = {};
     const b = new RichMessageBuilder();
@@ -634,19 +643,28 @@ export function createDownloaderScreen({ app }) {
     b.divider();
 
     if (isMatchingPfp) {
-      const pairLabel = photoCount === 2 ? '𝟐 𝑷𝑨𝑰𝑹' : (photoCount === 3 ? '𝟑 𝑻𝑹𝑰𝑶 𝑺𝑬𝑻' : `𝟎${photoCount} 𝑺𝑬𝑻`);
+      const pairLabel = (targetGoal && extraCount > 0)
+        ? `${photoCount} 𝑺𝑬𝑻 (${targetGoal} - ${extraCount}extra)`
+        : (photoCount === 2 ? '𝟐 𝑷𝑨𝑰𝑹' : (photoCount === 3 ? '𝟑 𝑻𝑹𝑰𝑶 𝑺𝑬𝑻' : `${String(photoCount).padStart(2, '0')} 𝑺𝑬𝑻`));
+
+      const middleBoxLines = (targetGoal && extraCount > 0) ? [
+        `│ 🎯 𝐓𝐀𝐑𝐆𝐄𝐓      •  ${String(targetGoal).padStart(2, '0')} 𝐏𝐈𝐂𝐊𝐒          │`,
+        `│ 🎁 𝐄𝐗𝐓𝐑𝐀       •  +${String(extraCount).padStart(2, '0')} 𝐅𝐔𝐋𝐋 𝐀𝐋𝐁𝐔𝐌    │`,
+        `│ 👥 𝐓𝐎𝐓𝐀𝐋 𝐏𝐅𝐏𝐒  •  ${String(photoCount).padStart(2, '0')} (${targetGoal} - ${extraCount}extra) │`
+      ] : (photoCount === 2 ? [
+        '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏  │',
+        '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐  │'
+      ] : [
+        `│ 👥 𝐏𝐅𝐏 𝟎𝟏–${String(photoCount).padStart(2, '0')}  •  𝐒𝐐𝐔𝐀𝐃 𝐌𝐀𝐓𝐂𝐇       │`
+      ]);
+
       const pfpCard = [
         '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
         `💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • ${pairLabel}`,
         '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
         '',
         '╭───────────────────────────╮',
-        ...(photoCount === 2 ? [
-          '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏  │',
-          '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐  │'
-        ] : [
-          `│ 👥 𝐏𝐅𝐏 𝟎𝟏–𝟎${photoCount}  •  𝐒𝐐𝐔𝐀𝐃 𝐌𝐀𝐓𝐂𝐇       │`
-        ]),
+        ...middleBoxLines,
         '╰───────────────────────────╯',
         '',
         '✨ 𝐇𝐃 𝐐𝐔𝐀𝐋𝐈𝐓𝐘 • 𝟏:𝟏 𝐀𝐕𝐀𝐓𝐀𝐑 𝐑𝐄𝐀𝐃𝐘 ✨',
@@ -659,15 +677,21 @@ export function createDownloaderScreen({ app }) {
         '╰───────────────╯',
         '',
         '    𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘',
-        '          ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬'
+        '          ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝑰𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥s⃟❥🌸⃟╬'
       ].join('\n');
       b.blockquote(pfpCard);
 
+      const matchingIconsLabel = (targetGoal && extraCount > 0)
+        ? `${photoCount} Profile Pictures (${targetGoal} - ${extraCount}extra)`
+        : `${photoCount} Profile Pictures (HD 1:1)`;
       const pfpRows = [
-        ['📱 Platform', 'PINTEREST ALBUM ♡'],
+        ['📱 Platform', 'PINTEREST ALBUMS ♡'],
         ['🏷 Set Title', truncate(title, 36)],
-        ['👥 Matching Icons', `${photoCount} Profile Pictures (HD 1:1)`]
+        ['👥 Matching Icons', matchingIconsLabel]
       ];
+      if (targetGoal && extraCount > 0) {
+        pfpRows.push(['🎁 Extra Bonus', `+${extraCount} from complete albums ♡`]);
+      }
       if (ctx?.isGroup) {
         pfpRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
       }
@@ -796,13 +820,19 @@ export function createDownloaderScreen({ app }) {
       if (pfpSessionKey && pfpTotalCount > 1) {
         const navRow = [];
         if (pfpCurrentIndex > 0) {
+          const prevLabel = targetGoal
+            ? `← Prev Batch (${pfpCurrentIndex}/${pfpTotalCount})`
+            : `← Prev Set (${pfpCurrentIndex}/${pfpTotalCount})`;
           navRow.push(
-            richButton.callback(`← Prev Set (${pfpCurrentIndex}/${pfpTotalCount})`, encodeCallback(id, 'pfp_nav', pfpSessionKey, String(pfpCurrentIndex - 1)), { style: 'primary' })
+            richButton.callback(prevLabel, encodeCallback(id, 'pfp_nav', pfpSessionKey, String(pfpCurrentIndex - 1)), { style: 'primary' })
           );
         }
         if (pfpCurrentIndex + 1 < pfpTotalCount) {
+          const nextLabel = targetGoal
+            ? `🔄 Next Batch (${pfpCurrentIndex + 2}/${pfpTotalCount}) →`
+            : `🔄 Next Set (${pfpCurrentIndex + 2}/${pfpTotalCount}) →`;
           navRow.push(
-            richButton.callback(`🔄 Next Set (${pfpCurrentIndex + 2}/${pfpTotalCount}) →`, encodeCallback(id, 'pfp_nav', pfpSessionKey, String(pfpCurrentIndex + 1)), { style: 'primary' })
+            richButton.callback(nextLabel, encodeCallback(id, 'pfp_nav', pfpSessionKey, String(pfpCurrentIndex + 1)), { style: 'primary' })
           );
         }
         if (navRow.length > 0) b.buttons(navRow);
@@ -1244,9 +1274,38 @@ export function createDownloaderScreen({ app }) {
     }
   }
 
-  async function executePfpSearch(ctx, query, { sessionKey = null, targetIndex = 0 } = {}) {
+  async function executePfpSearch(ctx, query, optsOrIndex = {}, maybeSessionKey = null, maybeGoal = null) {
+    let sessionKey = null;
+    let targetIndex = 0;
+    let requestedGoal = null;
+
+    if (typeof optsOrIndex === 'object' && optsOrIndex !== null) {
+      sessionKey = optsOrIndex.sessionKey || null;
+      targetIndex = Number(optsOrIndex.targetIndex) || 0;
+      requestedGoal = optsOrIndex.goal ?? optsOrIndex.requestedGoal ?? null;
+    } else {
+      targetIndex = Number(optsOrIndex) || 0;
+      sessionKey = maybeSessionKey;
+      requestedGoal = maybeGoal;
+    }
+
     let session = sessionKey ? getPfpSession(sessionKey) : null;
-    const q = session?.query || String(query || '').trim() || 'anime couple';
+    let q = session?.query || String(query || '').trim() || 'anime couple';
+    let targetGoal = requestedGoal ? Number(requestedGoal) : (session?.targetGoal ? Number(session.targetGoal) : null);
+
+    // Extract target picture count if user typed e.g. "anime 10", "10 pit", "couple 10", "10"
+    if (!session && !targetGoal) {
+      const countMatch = q.match(/\b(\d+)\s*(?:pit|pins?|pics?|photos?|images?|pfps?|sets?)?\b/i) || q.match(/(?:^|\s)(\d+)$/);
+      if (countMatch) {
+        const parsedCount = parseInt(countMatch[1], 10);
+        if (parsedCount >= 2 && parsedCount <= 100) {
+          targetGoal = parsedCount;
+          q = q.replace(countMatch[0], '').replace(/\b(?:pit|pins?|pics?|photos?|images?|pfps?|sets?)\b/gi, '').trim();
+          if (!q) q = 'aesthetic matching';
+        }
+      }
+    }
+
     const isGroup = Boolean(ctx.isGroup);
     const forceNew = Boolean(ctx.forceNew);
     const api = ctx.api || app.telegram?.api;
@@ -1324,7 +1383,7 @@ export function createDownloaderScreen({ app }) {
 
         candidates = Array.from(candidateMap.values());
         activeSessionKey = Math.random().toString(36).slice(2, 8);
-        savePfpSession(activeSessionKey, { query: q, candidates, currentIndex: 0 });
+        savePfpSession(activeSessionKey, { query: q, candidates, currentIndex: 0, targetGoal });
       }
 
       if (candidates.length === 0) {
@@ -1343,10 +1402,11 @@ export function createDownloaderScreen({ app }) {
         return await api.sendRichMessage(ctx.chatId, b.toJSON());
       }
 
-      tracker.set({ stage: 'Extracting matching avatar images… ♡' });
+      tracker.set({ stage: targetGoal ? `Extracting ${targetGoal} matching avatar pictures… ♡` : 'Extracting matching avatar images… ♡' });
 
       let mediaBuffers = [];
       let chosenIdx = Math.max(0, Math.min(targetIndex, candidates.length - 1));
+      let lastProcessedIdx = chosenIdx;
 
       // Try candidates starting from targetIndex until we get >= 2 matching photos from the SAME post
       for (let i = chosenIdx; i < candidates.length; i++) {
@@ -1354,7 +1414,7 @@ export function createDownloaderScreen({ app }) {
         let fetchedBuffers = [];
 
         if (cand.albumImages?.length >= 2) {
-          const targetUrls = cand.albumImages.slice(0, 10);
+          const targetUrls = cand.albumImages.slice(0, 20);
           const fetched = await Promise.all(
             targetUrls.map(async (u, idx) => {
               try {
@@ -1363,7 +1423,7 @@ export function createDownloaderScreen({ app }) {
                   return {
                     type: 'photo',
                     buffer: Buffer.from(await res.arrayBuffer()),
-                    filename: `pfp_${idx + 1}.jpg`,
+                    filename: `pfp_${mediaBuffers.length + idx + 1}.jpg`,
                     mimeType: 'image/jpeg'
                   };
                 }
@@ -1390,7 +1450,7 @@ export function createDownloaderScreen({ app }) {
               fetchedBuffers = [{
                 type: 'photo',
                 buffer: buf,
-                filename: 'pfp_1.jpg',
+                filename: `pfp_${mediaBuffers.length + 1}.jpg`,
                 mimeType: 'image/jpeg'
               }];
             }
@@ -1404,7 +1464,7 @@ export function createDownloaderScreen({ app }) {
             fetchedBuffers = parts.map((buf, pIdx) => ({
               type: 'photo',
               buffer: buf,
-              filename: `pfp_${pIdx + 1}.jpg`,
+              filename: `pfp_${mediaBuffers.length + pIdx + 1}.jpg`,
               mimeType: 'image/jpeg'
             }));
           }
@@ -1412,14 +1472,20 @@ export function createDownloaderScreen({ app }) {
 
         // Strictly verify that we have 2 or more photos!
         if (fetchedBuffers.length >= 2) {
-          mediaBuffers = fetchedBuffers;
-          chosenIdx = i;
-          const sess = getPfpSession(activeSessionKey);
-          if (sess) {
-            sess.currentIndex = i;
-            savePfpSession(activeSessionKey, sess);
+          mediaBuffers.push(...fetchedBuffers);
+          lastProcessedIdx = i;
+
+          if (targetGoal && targetGoal > 1) {
+            if (mediaBuffers.length >= targetGoal) {
+              // Target count reached or exceeded!
+              // CRITICAL: NEVER truncate or drop remaining photos of this album!
+              // All photos in fetchedBuffers remain intact in mediaBuffers.
+              break;
+            }
+          } else {
+            // Default: single matching set
+            break;
           }
-          break;
         }
       }
 
@@ -1428,7 +1494,7 @@ export function createDownloaderScreen({ app }) {
         for (let i = chosenIdx - 1; i >= 0; i--) {
           const cand = candidates[i];
           if (cand.albumImages?.length >= 2) {
-            const targetUrls = cand.albumImages.slice(0, 10);
+            const targetUrls = cand.albumImages.slice(0, 20);
             const fetched = await Promise.all(
               targetUrls.map(async (u, idx) => {
                 try {
@@ -1437,7 +1503,7 @@ export function createDownloaderScreen({ app }) {
                     return {
                       type: 'photo',
                       buffer: Buffer.from(await res.arrayBuffer()),
-                      filename: `pfp_${idx + 1}.jpg`,
+                      filename: `pfp_${mediaBuffers.length + idx + 1}.jpg`,
                       mimeType: 'image/jpeg'
                     };
                   }
@@ -1447,14 +1513,13 @@ export function createDownloaderScreen({ app }) {
             );
             const fb = fetched.filter(Boolean);
             if (fb.length >= 2) {
-              mediaBuffers = fb;
-              chosenIdx = i;
-              const sess = getPfpSession(activeSessionKey);
-              if (sess) {
-                sess.currentIndex = i;
-                savePfpSession(activeSessionKey, sess);
+              mediaBuffers.push(...fb);
+              lastProcessedIdx = i;
+              if (targetGoal && targetGoal > 1) {
+                if (mediaBuffers.length >= targetGoal) break;
+              } else {
+                break;
               }
-              break;
             }
           }
         }
@@ -1476,10 +1541,18 @@ export function createDownloaderScreen({ app }) {
         return await api.sendRichMessage(ctx.chatId, b.toJSON());
       }
 
+      const extraCount = targetGoal ? Math.max(0, mediaBuffers.length - targetGoal) : 0;
+      const sess = getPfpSession(activeSessionKey);
+      if (sess) {
+        sess.currentIndex = lastProcessedIdx;
+        sess.targetGoal = targetGoal;
+        savePfpSession(activeSessionKey, sess);
+      }
+
       let imageKey = Math.random().toString(36).slice(2, 8);
       saveMediaImages(imageKey, mediaBuffers);
       let albumKey = Math.random().toString(36).slice(2, 8);
-      saveAlbum(albumKey, { mediaItems: mediaBuffers, platform: 'pinterest', title: `${q} Matching PFP`, isMatchingPfp: true, imageKey });
+      saveAlbum(albumKey, { mediaItems: mediaBuffers, platform: 'pinterest', title: `${q} Matching PFP`, isMatchingPfp: true, imageKey, targetGoal, extraCount });
 
       const { rich, files } = await buildDeliveryRichMessage({
         mediaItems: mediaBuffers,
@@ -1491,8 +1564,10 @@ export function createDownloaderScreen({ app }) {
         albumKey,
         imageKey,
         pfpSessionKey: activeSessionKey,
-        pfpCurrentIndex: chosenIdx,
-        pfpTotalCount: candidates.length
+        pfpCurrentIndex: lastProcessedIdx,
+        pfpTotalCount: candidates.length,
+        targetGoal,
+        extraCount
       });
 
       const sent = await tracker.finish(rich, files);
@@ -2465,10 +2540,51 @@ export function createDownloaderScreen({ app }) {
         case 'pfp_nav': {
           const sessionKey = args[0];
           const targetIndex = parseInt(args[1], 10) || 0;
+          const session = getPfpSession(sessionKey);
           if (ctx.query?.id) {
             await ctx.api.answerCallbackQuery(ctx.query.id, { text: `🌸 Loading matching set ${targetIndex + 1}… ♡` }).catch(() => {});
           }
-          return executePfpSearch(ctx, null, { sessionKey, targetIndex });
+          return executePfpSearch(ctx, null, { sessionKey, targetIndex, goal: session?.targetGoal });
+        }
+        case 'pfp_count': {
+          const count = Number(args[0]) || 10;
+          await ctx.sm?.transition(ctx.tgId, States.PFP_SEARCH_INPUT, { context: { mode: 'pfp', requestedGoal: count } });
+          const b = new RichMessageBuilder();
+          b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+          b.paragraph(rt.italic(`₊˚⊹♡ target: ${count} picks • full albums preserved ˙ᵕ˙`));
+          b.divider();
+          b.paragraph(rt.italic(`What character or aesthetic theme would you like for ${count} picks? ♡`));
+          b.paragraph(rt.concat(rt.text('Example: '), rt.code('anime couple'), rt.text(' or '), rt.code('naruto sasuke')));
+          b.divider();
+          b.buttons([
+            richButton.callback('👩‍❤️‍👨 Couple / Duo', encodeCallback(id, 'pfp_search_with_goal', 'couple matching pfp', String(count)), { style: 'primary' }),
+            richButton.callback('⚔️ Anime Matching', encodeCallback(id, 'pfp_search_with_goal', 'anime matching pfp', String(count)), { style: 'primary' })
+          ]);
+          b.buttons([
+            richButton.callback('🐱 Cute Cats', encodeCallback(id, 'pfp_search_with_goal', 'cat matching pfp', String(count)), { style: 'primary' }),
+            richButton.callback('🖤 Dark Gothic', encodeCallback(id, 'pfp_search_with_goal', 'dark anime matching pfp', String(count)), { style: 'primary' })
+          ]);
+          b.buttons([
+            richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu')),
+            richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+          ]);
+          b.validate();
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(b.toJSON());
+            } catch {
+              return await ctx.reply(`👥 Send any character or theme to find ${count} matching PFPs! ♡`);
+            }
+          }
+          return ctx.editScreen(b.toJSON());
+        }
+        case 'pfp_search_with_goal': {
+          const query = args[0] || 'matching pfp';
+          const goal = Number(args[1]) || 10;
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: `🔍 Searching ${goal} matching picks… ♡` }).catch(() => {});
+          }
+          return executePfpSearch(ctx, query, { goal });
         }
         case 'pfp_search':
         case 'pfp_more': {
@@ -2848,11 +2964,12 @@ export function createDownloaderScreen({ app }) {
             tgId: sctx.tgId || String(message.from?.id),
             message
           };
+          const requestedGoal = sctx.context?.requestedGoal || null;
           await sctx.reset?.({ reason: 'pfp_search_started' });
           if (match) {
             await executeDownload(dlCtx, match[0]);
           } else {
-            await executePfpSearch(dlCtx, text);
+            await executePfpSearch(dlCtx, text, { goal: requestedGoal });
           }
           return true;
         },

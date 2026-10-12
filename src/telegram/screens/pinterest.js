@@ -336,6 +336,7 @@ export function createPinterestScreen({ app }) {
       }
 
       result.mode = mode;
+      result.requestedGoal = goal;
       const rich = resultsRich(result, previewBlocks.length, totalMedia, previewBlocks, 0);
       const files = previewBlocks.length > 0 ? mediaFiles : null;
       try {
@@ -975,10 +976,16 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
   const b = new RichMessageBuilder();
   const count = Array.isArray(result.results) ? result.results.length : (result.results?.length ?? totalImages);
   const total = Math.max(Number(totalImages) || 0, Number(count) || 0);
-  b.paragraph(rt.bold(banner([
-    '𓆩♡𓆪 SEARCH COMPLETED 𓆩♡𓆪',
-    `found: ${count} aesthetic picks`
-  ])));
+  const requestedGoal = result.requestedGoal || result.stats?.requestedGoal || null;
+  const extraCount = (requestedGoal && total > requestedGoal) ? (total - requestedGoal) : (result.stats?.extraCount || 0);
+
+  const bannerLines = ['𓆩♡𓆪 SEARCH COMPLETED 𓆩♡𓆪'];
+  if (extraCount > 0) {
+    bannerLines.push(`found: ${total} aesthetic picks (${requestedGoal} - ${extraCount}extra)`);
+  } else {
+    bannerLines.push(`found: ${count} aesthetic picks`);
+  }
+  b.paragraph(rt.bold(banner(bannerLines)));
   b.divider();
 
   // If preview attachments provided, embed the scrollable slideshow directly into this message!
@@ -998,7 +1005,7 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
     ],
     [
       { text: '˙ᵕ˙ Unique results', align: 'left', valign: 'middle' },
-      { text: rt.bold(String(count)), align: 'right', valign: 'middle' }
+      { text: rt.bold(extraCount > 0 ? `${total} (${requestedGoal} + ${extraCount} extra)` : String(count)), align: 'right', valign: 'middle' }
     ],
     [
       { text: '୨୧ Twins removed', align: 'left', valign: 'middle' },
@@ -1014,9 +1021,10 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
   const end = Math.min(total, start + (previewCount || Math.min(10, total - start)));
 
   if (total > 0 && end > 0) {
+    const extraPicksNote = extraCount > 0 ? ` (${requestedGoal} requested + ${extraCount} extra from full albums)` : '';
     b.paragraph(rt.concat(
       rt.bold('₊˚⊹♡ scroll slideshow above to browse aesthetic picks!'),
-      rt.text(`\nʕ•ᴥ•ʔ showing ${start + 1}–${end} of ${total} picks ♡`)
+      rt.text(`\nʕ•ᴥ•ʔ showing ${start + 1}–${end} of ${total} picks${extraPicksNote} ♡`)
     ));
   } else {
     b.paragraph(rt.concat(

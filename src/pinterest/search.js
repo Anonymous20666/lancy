@@ -190,29 +190,42 @@ export class DeepSearchPipeline extends EventEmitter {
       while (queue.length > 0 && valid.length < goal) {
         if (signal?.aborted) return;
         const candidate = queue.shift();
-        try {
-          const descriptor = await this.media.process(candidate, {
-            userId,
-            expectedType: mode === 'images' ? 'image' : mode === 'videos' ? 'video' : null,
-            signal
-          });
-          if (descriptor.duplicate) {
-            duplicatesFound++;
-            this.db.run(
-              'UPDATE pinterest_media SET is_duplicate = 1, status = ? WHERE id = ?',
-              'duplicate', descriptor.id ?? -1
-            );
-            continue;
+        const isAlbum = Boolean(candidate.isAlbum && Array.isArray(candidate.albumImages) && candidate.albumImages.length > 1);
+        const subCandidates = isAlbum
+          ? candidate.albumImages.map((imgUrl, idx) => ({
+              ...candidate,
+              mediaUrl: imgUrl,
+              albumIndex: idx,
+              isAlbumItem: true,
+              pinId: candidate.pinId ? `${candidate.pinId}_slide_${idx}` : null
+            }))
+          : [candidate];
+
+        for (const item of subCandidates) {
+          try {
+            const descriptor = await this.media.process(item, {
+              userId,
+              expectedType: mode === 'images' ? 'image' : mode === 'videos' ? 'video' : null,
+              signal
+            });
+            if (descriptor.duplicate) {
+              duplicatesFound++;
+              this.db.run(
+                'UPDATE pinterest_media SET is_duplicate = 1, status = ? WHERE id = ?',
+                'duplicate', descriptor.id ?? -1
+              );
+              continue;
+            }
+            descriptor.searchId = searchId;
+            descriptor.id = this.#persistMedia(userId, searchId, descriptor);
+            this.media.dedup.registerCandidate(userId, descriptor);
+            valid.push(descriptor);
+          } catch (error) {
+            rejected.push({ candidate: item, error: error.message });
           }
-          descriptor.searchId = searchId;
-          descriptor.id = this.#persistMedia(userId, searchId, descriptor);
-          this.media.dedup.registerCandidate(userId, descriptor);
-          valid.push(descriptor);
-        } catch (error) {
-          rejected.push({ candidate, error: error.message });
+          processed++;
+          onProgress?.({ stage: 'validating', processed, total: ordered.length, valid: valid.length, rejected: rejected.length });
         }
-        processed++;
-        onProgress?.({ stage: 'validating', processed, total: ordered.length, valid: valid.length, rejected: rejected.length });
       }
     });
     await Promise.all(workers);
@@ -226,7 +239,7 @@ export class DeepSearchPipeline extends EventEmitter {
       const unique = [];
       for (const descriptor of valid) {
         let dupReason = null;
-        if (descriptor.pinId && seenPins.has(descriptor.pinId)) dupReason = 'pin_id';
+        if (descriptor.pinId && !descriptor.isAlbumItem && seenPins.has(descriptor.pinId)) dupReason = 'pin_id';
         else if (descriptor.mediaUrl && seenUrls.has(descriptor.mediaUrl)) dupReason = 'media_url';
         else if (descriptor.sha256 && seenShas.has(descriptor.sha256)) dupReason = 'sha256';
         else if (descriptor.phash && seenPhashes.some((h) => isPerceptualDuplicate(descriptor.phash, h))) dupReason = 'perceptual_hash';
@@ -262,19 +275,24 @@ export class DeepSearchPipeline extends EventEmitter {
     this.emit('done', { searchId, results: ranked });
     onProgress?.({ stage: 'done', results: ranked.length });
 
+    const extraCount = Math.max(0, ranked.length - goal);
+
     return {
       searchId,
       query,
       normalizedQuery: normalized,
       mode,
       depth,
+      requestedGoal: goal,
       results: ranked,
       stats: {
         pagesFetched,
         collected: collected.length,
         duplicatesFound,
         rejected: rejected.length,
-        valid: ranked.length
+        valid: ranked.length,
+        requestedGoal: goal,
+        extraCount
       }
     };
   }

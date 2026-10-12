@@ -468,3 +468,282 @@ test('executePfpSearch: deep searches multi-slide pins and pages with pfp_nav', 
     db.close();
   }
 });
+
+test('Matching PFP preserves complete albums without dropping slides (10 requested with 4+5+6 albums yields 15 total, 10 - 5extra)', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine({ db });
+
+  const origFetch = globalThis.fetch;
+  const fetchedUrls = [];
+  globalThis.fetch = async (url) => {
+    fetchedUrls.push(String(url));
+    const imgBuf = await sharp({
+      create: { width: 300, height: 300, channels: 3, background: { r: 120, g: 150, b: 180 } }
+    }).jpeg().toBuffer();
+    return new Response(imgBuf, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+  };
+
+  const sentRichMessages = [];
+  const editedRichMessages = [];
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      const msg = { message_id: 2001, rich, extra, files };
+      sentRichMessages.push(msg);
+      return msg;
+    },
+    editMessageRich: async (chatId, msgId, rich, extra, files) => {
+      const msg = { message_id: msgId, rich, extra, files };
+      editedRichMessages.push(msg);
+      return msg;
+    },
+    sendChatAction: async () => {},
+    answerCallbackQuery: async () => {}
+  };
+
+  // Mock Pinterest Provider with 3 candidate albums:
+  // Album 1 has 4 photos
+  // Album 2 has 5 photos
+  // Album 3 has 6 photos
+  // Total across all 3 = 15 photos!
+  const mockProvider = {
+    search: async () => ({
+      items: [
+        {
+          pinId: 'pin_album_4',
+          isAlbum: true,
+          albumImages: [
+            'https://example.com/alb1_1.jpg',
+            'https://example.com/alb1_2.jpg',
+            'https://example.com/alb1_3.jpg',
+            'https://example.com/alb1_4.jpg'
+          ],
+          albumCount: 4
+        },
+        {
+          pinId: 'pin_album_5',
+          isAlbum: true,
+          albumImages: [
+            'https://example.com/alb2_1.jpg',
+            'https://example.com/alb2_2.jpg',
+            'https://example.com/alb2_3.jpg',
+            'https://example.com/alb2_4.jpg',
+            'https://example.com/alb2_5.jpg'
+          ],
+          albumCount: 5
+        },
+        {
+          pinId: 'pin_album_6',
+          isAlbum: true,
+          albumImages: [
+            'https://example.com/alb3_1.jpg',
+            'https://example.com/alb3_2.jpg',
+            'https://example.com/alb3_3.jpg',
+            'https://example.com/alb3_4.jpg',
+            'https://example.com/alb3_5.jpg',
+            'https://example.com/alb3_6.jpg'
+          ],
+          albumCount: 6
+        }
+      ],
+      bookmark: null
+    })
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: mockApi },
+    pinterest: { provider: mockProvider }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  downloader.registerStates(sm);
+
+  const ctx = {
+    tgId: 4002,
+    chatId: 4002,
+    api: mockApi,
+    db,
+    settings,
+    sm,
+    user: { first_name: 'TestUser' }
+  };
+
+  try {
+    // User requests "10 pit" (10 matching pictures)
+    await downloader.executePfpSearch(ctx, 'Tanjiro Nezuko 10 pit');
+
+    const delivery = editedRichMessages[editedRichMessages.length - 1] || sentRichMessages[sentRichMessages.length - 1];
+    assert.ok(delivery, 'should have delivered matching pfp message');
+    const text = JSON.stringify(delivery.rich);
+
+    // Verify all 15 pictures from the 3 albums were downloaded (none were dropped!)
+    assert.ok(text.includes('10 - 5extra'), `Expected '10 - 5extra' in delivery, got: ${text}`);
+    assert.ok(text.includes('15') || text.includes('05 FULL ALBUM'), 'Expected 15 total items or extra count');
+
+    // Verify files map contains all 10 slideshow items for page 1
+    assert.ok(delivery.files, 'files should be attached');
+    assert.ok(delivery.files.photo_0, 'photo_0 should exist');
+    assert.ok(delivery.files.photo_9, 'photo_9 should exist');
+
+    // Verify pagination button for remaining slides 11-15 exists
+    assert.ok(text.includes('Next 5 Slides (11–15) →'), `Expected Next 5 Slides button, got: ${text}`);
+  } finally {
+    globalThis.fetch = origFetch;
+    db.close();
+  }
+});
+
+test('Pinterest DeepSearchPipeline preserves full carousel slides beyond goal and records extraCount', async () => {
+  const { DeepSearchPipeline } = await import('../src/pinterest/search.js');
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+
+  // Setup minimal pinterest schema
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pinterest_searches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      query TEXT NOT NULL,
+      normalized_query TEXT,
+      mode TEXT DEFAULT 'normal',
+      depth TEXT DEFAULT 'deep',
+      result_count INTEGER DEFAULT 0,
+      duplicates_found INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pinterest_media (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      search_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      pin_id TEXT,
+      source_url TEXT,
+      media_url TEXT NOT NULL,
+      type TEXT NOT NULL,
+      width INTEGER,
+      height INTEGER,
+      duration REAL,
+      size INTEGER,
+      mime TEXT,
+      sha256 TEXT,
+      phash TEXT,
+      quality_score REAL DEFAULT 0,
+      is_duplicate INTEGER DEFAULT 0,
+      status TEXT DEFAULT 'valid'
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS user_media_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      sha256 TEXT,
+      phash TEXT,
+      pin_id TEXT,
+      media_url TEXT
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS media_hashes (
+      sha256 TEXT PRIMARY KEY,
+      hits INTEGER DEFAULT 1,
+      last_seen TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  const mockProvider = {
+    search: async () => ({
+      items: [
+        {
+          pinId: 'cand_1',
+          isAlbum: true,
+          type: 'image',
+          mediaUrl: 'https://example.com/p1_1.jpg',
+          albumImages: [
+            'https://example.com/p1_1.jpg',
+            'https://example.com/p1_2.jpg',
+            'https://example.com/p1_3.jpg',
+            'https://example.com/p1_4.jpg'
+          ],
+          albumCount: 4
+        },
+        {
+          pinId: 'cand_2',
+          isAlbum: true,
+          type: 'image',
+          mediaUrl: 'https://example.com/p2_1.jpg',
+          albumImages: [
+            'https://example.com/p2_1.jpg',
+            'https://example.com/p2_2.jpg',
+            'https://example.com/p2_3.jpg',
+            'https://example.com/p2_4.jpg',
+            'https://example.com/p2_5.jpg'
+          ],
+          albumCount: 5
+        },
+        {
+          pinId: 'cand_3',
+          isAlbum: true,
+          type: 'image',
+          mediaUrl: 'https://example.com/p3_1.jpg',
+          albumImages: [
+            'https://example.com/p3_1.jpg',
+            'https://example.com/p3_2.jpg',
+            'https://example.com/p3_3.jpg',
+            'https://example.com/p3_4.jpg',
+            'https://example.com/p3_5.jpg',
+            'https://example.com/p3_6.jpg'
+          ],
+          albumCount: 6
+        }
+      ],
+      bookmark: null
+    })
+  };
+
+  let mockCount = 0;
+  const mockMedia = {
+    process: async (cand) => {
+      mockCount++;
+      return {
+        ...cand,
+        sha256: `sha_${cand.mediaUrl}`,
+        phash: `phash_${mockCount}`,
+        mime: 'image/jpeg',
+        type: 'image',
+        width: 800,
+        height: 800,
+        size: 50000,
+        duplicate: false
+      };
+    },
+    dedup: {
+      check: () => ({ duplicate: false }),
+      registerCandidate: () => {}
+    }
+  };
+
+  const pipeline = new DeepSearchPipeline({
+    provider: mockProvider,
+    media: mockMedia,
+    db,
+    settings
+  });
+
+  const res = await pipeline.search({
+    userId: 9001,
+    query: 'anime matching',
+    goal: 10
+  });
+
+  assert.equal(res.requestedGoal, 10);
+  // 4 + 5 + 6 = 15 total, no slides from album 3 were dropped!
+  assert.equal(res.results.length, 15);
+  assert.equal(res.stats.extraCount, 5);
+  assert.equal(res.stats.valid, 15);
+
+  db.close();
+});
+
