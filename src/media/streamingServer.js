@@ -1,10 +1,10 @@
 import http from 'node:http';
-import { existsSync, statSync, createReadStream, writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { existsSync, statSync, createReadStream, writeFileSync, unlinkSync, mkdirSync, renameSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseDurationToSeconds } from '../utils/time.js';
-import { optimizeVideoForTelegram } from './downloader.js';
+import { optimizeVideoForTelegram, getCookieArgs, getAudioDurationSeconds } from './downloader.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -201,109 +201,117 @@ export class VideoStreamingServer {
     const downloadPromise = (async () => {
       try {
         const targetPath = join(this.audioCacheDir, `${trackId}.mp3`);
-        if (existsSync(targetPath) && statSync(targetPath).size > 1000) return targetPath;
+        if (existsSync(targetPath)) {
+          const sz = statSync(targetPath).size;
+          if (sz > 50000) {
+            // Verify file has full duration (not an old 30-second preview)
+            const dur = await getAudioDurationSeconds(targetPath);
+            if (dur === null || dur >= 45) {
+              return targetPath;
+            }
+            // Remove old truncated preview so full track is downloaded
+            try { unlinkSync(targetPath); } catch {}
+          }
+        }
 
         // Retrieve metadata from telegram bot controller
         let meta = this.app?.telegram?.controller?.getInlineAudioMetadata?.(trackId)
-          || this.app?.telegram?.getInlineAudioMetadata?.(trackId);
+          || this.app?.telegram?.getInlineAudioMetadata?.(trackId)
+          || this.app?.telegram?.audioMetadataMap?.get?.(String(trackId));
 
-        // Fallback: search Deezer by filename if meta is not in memory
-        if (!meta && filename) {
-          const queryFromFilename = filename.replace(/\.mp3$/i, '').replace(/_/g, ' ').trim();
-          if (queryFromFilename) {
-            try {
-              const dzRes = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(queryFromFilename)}&limit=1`, { signal: AbortSignal.timeout(3500) }).then((r) => r.json()).catch(() => null);
-              const dzItem = dzRes?.data?.[0];
-              if (dzItem) {
-                meta = {
-                  id: dzItem.id,
-                  title: dzItem.title,
-                  artist: dzItem.artist?.name || 'Music',
-                  album: dzItem.album?.title,
-                  previewUrl: dzItem.preview
-                };
-              }
-            } catch {}
+        const isYouTubeId = /^[a-zA-Z0-9_-]{11}$/.test(trackId);
+        const searchQuery = meta
+          ? `${meta.title} ${meta.artist}`.trim()
+          : (filename ? filename.replace(/\.mp3$/i, '').replace(/_/g, ' ').trim() : trackId);
+
+        const cookieArgs = getCookieArgs();
+        const tempPath = join(this.audioCacheDir, `temp_full_${trackId}_${Date.now()}.mp3`);
+
+        let downloaded = false;
+        try {
+          await execFileAsync('yt-dlp', [
+            '--no-warnings',
+            '--no-playlist',
+            ...cookieArgs,
+            '-N', '4',
+            '--max-filesize', '50M',
+            '--js-runtimes', 'node:/usr/bin/node',
+            '-f', 'ba/b',
+            '-x',
+            '--audio-format', 'mp3',
+            '--audio-quality', '2',
+            '-o', tempPath,
+            isYouTubeId ? `https://www.youtube.com/watch?v=${trackId}` : `ytsearch1:${searchQuery}`
+          ], { timeout: 45000 });
+
+          if (existsSync(tempPath) && statSync(tempPath).size > 10000) {
+            downloaded = true;
           }
+        } catch (dlErr) {
+          this.log?.warn?.({ err: dlErr?.message, trackId }, 'yt-dlp direct audio download failed, attempting mediaDownloader fallback');
         }
 
-        let tagged = false;
-
-        // Step 1: If previewUrl is available, fetch and embed clean ID3v2 tags via ffmpeg (<80ms)
-        if (meta?.previewUrl) {
+        if (!downloaded && this.app?.mediaDownloader) {
           try {
-            const res = await fetch(meta.previewUrl, { signal: AbortSignal.timeout(6000) });
-            if (res.ok) {
-              const buf = Buffer.from(await res.arrayBuffer());
-              if (buf.length > 1024) {
-                const tempRaw = join(this.audioCacheDir, `temp_raw_${trackId}_${Date.now()}.mp3`);
-                writeFileSync(tempRaw, buf);
-                try {
-                  const titleStr = meta.title || 'Music Track';
-                  const artistStr = meta.artist || 'Music';
-                  await execFileAsync('ffmpeg', [
-                    '-y',
-                    '-i', tempRaw,
-                    '-metadata', `title=${titleStr}`,
-                    '-metadata', `artist=${artistStr}`,
-                    ...(meta.album ? ['-metadata', `album=${meta.album}`] : []),
-                    '-id3v2_version', '3',
-                    '-c', 'copy',
-                    targetPath
-                  ]);
-                  tagged = true;
-                } catch (tagErr) {
-                  this.log?.debug?.({ err: tagErr?.message, trackId }, 'ffmpeg preview tag failed, using raw');
-                  writeFileSync(targetPath, buf);
-                  tagged = true;
-                } finally {
-                  try { unlinkSync(tempRaw); } catch {}
-                }
-              }
+            const dlTarget = isYouTubeId ? `https://www.youtube.com/watch?v=${trackId}` : searchQuery;
+            const res = await this.app.mediaDownloader.download(dlTarget);
+            if (res?.audioTrack?.buffer && res.audioTrack.buffer.length > 10000) {
+              writeFileSync(tempPath, res.audioTrack.buffer);
+              downloaded = true;
             }
-          } catch (fetchErr) {
-            this.log?.debug?.({ err: fetchErr?.message, trackId }, 'audio preview fetch failed');
+          } catch (mErr) {
+            this.log?.debug?.({ err: mErr?.message, trackId }, 'mediaDownloader audio fallback failed');
           }
         }
 
-        // Step 2: Trigger full audio track download in the background to ensure user gets full 100% song
-        const fullSearchQuery = meta ? `${meta.title} ${meta.artist}`.trim() : (filename ? filename.replace(/\.mp3$/i, '').replace(/_/g, ' ') : '');
-        if (fullSearchQuery && fullSearchQuery.length >= 2) {
+        if (downloaded && existsSync(tempPath)) {
+          // Tag with ID3v2 if metadata available
+          const titleStr = meta?.title || searchQuery;
+          const artistStr = meta?.artist || 'Music';
+          try {
+            await execFileAsync('ffmpeg', [
+              '-y',
+              '-i', tempPath,
+              '-metadata', `title=${titleStr}`,
+              '-metadata', `artist=${artistStr}`,
+              '-id3v2_version', '3',
+              '-c', 'copy',
+              targetPath
+            ]);
+            try { unlinkSync(tempPath); } catch {}
+          } catch {
+            renameSync(tempPath, targetPath);
+          }
+
+          // If a storage channel is configured, cache to Telegram in background
           (async () => {
             try {
-              const downloader = this.app?.mediaDownloader;
-              if (downloader) {
-                const fullRes = await downloader.download(fullSearchQuery).catch(() => null);
-                if (fullRes?.audioTrack?.buffer && fullRes.audioTrack.buffer.length > 10000) {
-                  writeFileSync(targetPath, fullRes.audioTrack.buffer);
-                  // If a dedicated storage channel is configured, upload to cache permanent file_id (never upload to owner's personal chat)
-                  const api = this.app?.telegram?.api;
-                  const storageChatId = this.app?.settings?.get('telegram.storageChatId') || this.app?.settings?.get('telegram.storageChannelId');
-                  const durSec = fullRes.duration ? parseDurationToSeconds(fullRes.duration) : 0;
-                  if (api && storageChatId) {
-                    const sent = await api.sendAudio(storageChatId, fullRes.audioTrack.buffer, {
-                      title: fullRes.title || meta?.title || fullSearchQuery,
-                      performer: fullRes.artist || fullRes.author || meta?.artist || 'Music',
-                      ...(durSec > 0 ? { duration: durSec } : {}),
-                      disable_notification: true
-                    }).catch(() => null);
-                    const uploadedFileId = sent?.audio?.file_id;
-                    if (uploadedFileId) {
-                      if (sent.message_id) {
-                        await api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
-                      }
-                      const db = this.app?.db;
-                      if (db) {
-                        const songTitle = fullRes.title || meta?.title || fullSearchQuery;
-                        const songArtist = fullRes.artist || fullRes.author || meta?.artist || 'Music';
-                        const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
-                        const cleanQ = fullSearchQuery.toLowerCase().trim();
-                        db.run(sql, cleanQ, uploadedFileId, songTitle, songArtist, durSec);
-                        if (trackId) db.run(sql, String(trackId), uploadedFileId, songTitle, songArtist, durSec);
-                        const cleanT = (songTitle || '').toLowerCase().trim();
-                        if (cleanT && cleanT !== cleanQ) {
-                          db.run(sql, cleanT, uploadedFileId, songTitle, songArtist, durSec);
-                        }
+              const api = this.app?.telegram?.api;
+              const storageChatId = this.app?.settings?.get('telegram.storageChatId') || this.app?.settings?.get('telegram.storageChannelId');
+              if (api && storageChatId && existsSync(targetPath)) {
+                const fullBuf = statSync(targetPath).size > 10000 ? readFileSync(targetPath) : null;
+                if (fullBuf) {
+                  const fileDur = await getAudioDurationSeconds(targetPath);
+                  const durSec = fileDur ? Math.round(fileDur) : (meta?.duration || 0);
+                  const sent = await api.sendAudio(storageChatId, fullBuf, {
+                    title: titleStr,
+                    performer: artistStr,
+                    ...(durSec > 0 ? { duration: durSec } : {}),
+                    disable_notification: true
+                  }).catch(() => null);
+                  const uploadedFileId = sent?.audio?.file_id;
+                  if (uploadedFileId) {
+                    if (sent.message_id) {
+                      await api.call('deleteMessage', { chat_id: storageChatId, message_id: sent.message_id }).catch(() => {});
+                    }
+                    const db = this.app?.db;
+                    if (db) {
+                      const sql = 'INSERT OR REPLACE INTO cached_audio_tracks (query, file_id, title, artist, duration) VALUES (?, ?, ?, ?, ?)';
+                      if (isYouTubeId) db.run(sql, trackId, uploadedFileId, titleStr, artistStr, durSec);
+                      db.run(sql, searchQuery.toLowerCase().trim(), uploadedFileId, titleStr, artistStr, durSec);
+                      const cleanT = (titleStr || '').toLowerCase().trim();
+                      if (cleanT && cleanT !== searchQuery.toLowerCase().trim()) {
+                        db.run(sql, cleanT, uploadedFileId, titleStr, artistStr, durSec);
                       }
                     }
                   }
@@ -311,13 +319,11 @@ export class VideoStreamingServer {
               }
             } catch {}
           })();
-        }
 
-        if (tagged && existsSync(targetPath)) {
           return targetPath;
         }
 
-        return existsSync(targetPath) ? targetPath : null;
+        return null;
       } catch (err) {
         this.log?.debug?.({ err: err?.message, trackId }, 'ensureAudioCached failed');
       } finally {

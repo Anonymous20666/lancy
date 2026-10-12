@@ -44,11 +44,12 @@ test('TelegramController: live inline search returns entrypoint cards on empty q
 
   assert.ok(inlineAnswer, 'answerInlineQuery should be called');
   assert.equal(inlineAnswer.inline_query_id, 'query_123');
-  assert.equal(inlineAnswer.results.length, 4);
+  assert.equal(inlineAnswer.results.length, 5);
   assert.match(inlineAnswer.results[0].title, /Music Search/);
   assert.match(inlineAnswer.results[1].title, /Universal Downloader/);
   assert.match(inlineAnswer.results[2].title, /Pinterest Search/);
-  assert.match(inlineAnswer.results[3].title, /TikTok Search/);
+  assert.match(inlineAnswer.results[3].title, /Matching PFP/);
+  assert.match(inlineAnswer.results[4].title, /TikTok Search/);
   assert.ok(inlineAnswer.results[0].thumbnail_url, 'should include thumbnail_url');
   assert.ok(inlineAnswer.results[0].thumb_url, 'should include thumb_url');
   for (const res of inlineAnswer.results) {

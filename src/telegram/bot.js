@@ -1,5 +1,5 @@
 import { extname } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -925,17 +925,28 @@ export class TelegramController extends EventEmitter {
         }
       } catch {}
 
-      if (!fileId && this.app?.mediaDownloader) {
+      if (!fileId) {
         try {
-          const downloadTarget = videoId ? `https://www.youtube.com/watch?v=${videoId}` : searchQuery;
-          const res = await this.app.mediaDownloader.download(downloadTarget);
-          if (res?.audioTrack?.buffer) {
+          const cachedAudioPath = videoId ? `/data/audio_cache/${videoId}.mp3` : null;
+          let audioBuffer = null;
+          let resDur = durSec;
+          if (cachedAudioPath && existsSync(cachedAudioPath) && statSync(cachedAudioPath).size > 10000) {
+            audioBuffer = readFileSync(cachedAudioPath);
+          } else if (this.app?.mediaDownloader) {
+            const downloadTarget = videoId ? `https://www.youtube.com/watch?v=${videoId}` : searchQuery;
+            const res = await this.app.mediaDownloader.download(downloadTarget);
+            if (res?.audioTrack?.buffer) {
+              audioBuffer = res.audioTrack.buffer;
+              if (res.duration) resDur = parseDurationToSeconds(res.duration);
+              if (res.title) trackTitle = res.title;
+              if (res.artist || res.author) trackArtist = res.artist || res.author;
+            }
+          }
+
+          if (audioBuffer) {
             const storageChatId = this.settings?.get('telegram.storageChatId') || this.settings?.get('telegram.storageChannelId');
-            const resDur = res.duration ? parseDurationToSeconds(res.duration) : durSec;
-            if (res.title) trackTitle = res.title;
-            if (res.artist || res.author) trackArtist = res.artist || res.author;
             if (storageChatId) {
-              const sent = await this.api.sendAudio(storageChatId, res.audioTrack.buffer, {
+              const sent = await this.api.sendAudio(storageChatId, audioBuffer, {
                 title: trackTitle,
                 performer: trackArtist,
                 ...(resDur > 0 ? { duration: resDur } : {}),
@@ -964,7 +975,9 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      const directStreamUrl = `https://pappysonghttps.duckdns.org/audio/live/${encodeURIComponent(videoId || 'track')}/${encodeURIComponent(trackArtist)}_-_${encodeURIComponent(trackTitle)}.mp3`;
+      const safeArtChosen = trackArtist.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
+      const safeTitChosen = trackTitle.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
+      const directStreamUrl = `https://pappysonghttps.duckdns.org/audio/live/${encodeURIComponent(videoId || 'track')}/${safeArtChosen}_-_${safeTitChosen}.mp3`;
       const audioMediaTarget = fileId || directStreamUrl;
       if (audioMediaTarget) {
         try {
@@ -1668,119 +1681,73 @@ export class TelegramController extends EventEmitter {
         } catch {}
       }
 
-      // 2. Fast Parallel Live Search (Deezer API + YouTube fast InnerTube in parallel <300ms)
+      // 2. Fast YouTube InnerTube Live Search (<100ms) - Primary Source for 100% Full Audio
       if (!cached.externalFetched && cached.items.length < (offset + 15)) {
         cached.externalFetched = true;
         try {
-          const [dzRes, ytRes] = await Promise.allSettled([
-            fetch(`https://api.deezer.com/search?q=${encodeURIComponent(cleanTopic)}&limit=30`, {
-              signal: AbortSignal.timeout(1800)
-            }).then((r) => r.json()).catch(() => null),
-            searchYouTubeFast(cleanTopic).catch(() => [])
-          ]);
+          const ytItems = await searchYouTubeFast(cleanTopic).catch(() => []);
 
-          const dzData = dzRes.status === 'fulfilled' ? dzRes.value : null;
-          const ytItems = ytRes.status === 'fulfilled' && Array.isArray(ytRes.value) ? ytRes.value : [];
+          if (Array.isArray(ytItems) && ytItems.length > 0) {
+            for (const yt of ytItems) {
+              if (!yt?.videoId || !yt?.title) continue;
+              const normTitle = (yt.title || '').toLowerCase().trim();
+              const normAuthor = (yt.author || '').toLowerCase().trim();
+              const normKey = `${normTitle} ${normAuthor}`.trim();
 
-          if (Array.isArray(dzData?.data) && dzData.data.length > 0) {
-            for (const item of dzData.data) {
-              if (!item?.title) continue;
-              const normTitle = (item.title || '').toLowerCase().trim();
-              const normArtist = (item.artist?.name || '').toLowerCase().trim();
-              const normKey = `${normTitle} ${normArtist}`.trim();
-
-              if (!cached.seenKeys.has(item.id) && !cached.seenKeys.has(normKey) && !cached.seenKeys.has(normTitle)) {
+              if (!cached.seenKeys.has(yt.videoId) && !cached.seenKeys.has(normKey) && !cached.seenKeys.has(normTitle)) {
                 // Check if already in SQLite cached_audio_tracks
                 let matchingFileId = null;
+                let cachedDur = null;
                 try {
                   const matchRow = this.db?.prepare?.(
-                    'SELECT file_id, duration, title, artist FROM cached_audio_tracks WHERE query = ? OR title = ? OR LOWER(title) = ? OR LOWER(query) = ? LIMIT 1'
-                  )?.get?.(normKey, item.title, normTitle, normTitle);
-                  if (matchRow?.file_id) matchingFileId = matchRow.file_id;
+                    'SELECT file_id, duration, title, artist FROM cached_audio_tracks WHERE query = ? OR title = ? OR LOWER(title) = ? OR query = ? LIMIT 1'
+                  )?.get?.(yt.videoId, yt.title, normTitle, normKey);
+                  if (matchRow?.file_id) {
+                    matchingFileId = matchRow.file_id;
+                    if (matchRow.duration) cachedDur = matchRow.duration;
+                  }
                 } catch {}
 
                 if (matchingFileId && cached.seenKeys.has(matchingFileId)) continue;
 
-                cached.seenKeys.add(item.id);
+                cached.seenKeys.add(yt.videoId);
                 if (normKey) cached.seenKeys.add(normKey);
                 if (normTitle) cached.seenKeys.add(normTitle);
                 if (matchingFileId) cached.seenKeys.add(matchingFileId);
 
-                const safeArt = (item.artist?.name || 'Music').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
-                const safeTit = (item.title || 'Track').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
+                const ytDurSec = cachedDur || parseDurationToSeconds(yt.duration) || 180;
+                const safeArt = (yt.author || 'Music').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
+                const safeTit = (yt.title || 'Track').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
                 const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
-                const streamUrl = existsSync(`/data/audio_cache/${item.id}.mp3`)
-                  ? `https://pappysonghttps.duckdns.org/audio/${item.id}.mp3`
-                  : `https://pappysonghttps.duckdns.org/audio/live/${item.id}/${cleanSlug}`;
+                const streamUrl = existsSync(`/data/audio_cache/${yt.videoId}.mp3`)
+                  ? `https://pappysonghttps.duckdns.org/audio/${yt.videoId}.mp3`
+                  : `https://pappysonghttps.duckdns.org/audio/live/${yt.videoId}/${cleanSlug}`;
 
-                this.audioMetadataMap?.set(String(item.id), {
-                  id: item.id,
-                  title: item.title,
-                  artist: item.artist?.name || 'Music',
-                  album: item.album?.title,
-                  cover: item.album?.cover_medium || item.album?.cover_big,
-                  previewUrl: item.preview
+                this.audioMetadataMap?.set(String(yt.videoId), {
+                  id: yt.videoId,
+                  videoId: yt.videoId,
+                  title: yt.title,
+                  artist: yt.author || 'Music',
+                  duration: ytDurSec,
+                  thumb: yt.thumb
                 });
 
                 cached.items.push({
-                  source: matchingFileId ? 'cached' : 'deezer',
-                  id: item.id,
+                  source: matchingFileId ? 'cached' : 'youtube_audio',
+                  id: yt.videoId,
+                  videoId: yt.videoId,
                   fileId: matchingFileId,
                   audioUrl: streamUrl,
-                  preview: item.preview,
-                  album: item.album,
-                  title: item.title,
-                  artist: item.artist?.name || 'Music',
-                  duration: item.duration || 180
+                  title: yt.title,
+                  artist: yt.author || 'Music',
+                  duration: ytDurSec,
+                  thumb: yt.thumb
                 });
-              }
-            }
-          }
-
-          // Merge YouTube results if pool is small
-          if (cached.items.length < (offset + 10) && ytItems.length > 0) {
-            for (const yt of ytItems) {
-              if (!yt?.videoId || !yt?.title) continue;
-              const normTitle = (yt.title || '').toLowerCase().trim();
-              if (!cached.seenKeys.has(yt.videoId) && !cached.seenKeys.has(normTitle)) {
-                let ytFileId = null;
-                try {
-                  const row = this.db?.prepare?.(
-                    'SELECT file_id, duration FROM cached_audio_tracks WHERE query = ? OR title = ? OR LOWER(title) = ? LIMIT 1'
-                  )?.get?.(yt.videoId, yt.title, normTitle);
-                  if (row?.file_id) ytFileId = row.file_id;
-                } catch {}
-
-                if (ytFileId && cached.seenKeys.has(ytFileId)) continue;
-
-                cached.seenKeys.add(yt.videoId);
-                cached.seenKeys.add(normTitle);
-                if (ytFileId) cached.seenKeys.add(ytFileId);
-
-                if (ytFileId) {
-                  cached.items.push({
-                    source: 'cached',
-                    videoId: yt.videoId,
-                    fileId: ytFileId,
-                    title: yt.title,
-                    artist: yt.author || 'Music',
-                    duration: yt.duration || 0
-                  });
-                } else if (cached.items.length === 0) {
-                  cached.items.push({
-                    source: 'youtube_video',
-                    videoId: yt.videoId,
-                    title: yt.title,
-                    artist: yt.author || 'Music',
-                    duration: yt.duration || 'HD Clip',
-                    thumb: yt.thumb
-                  });
-                }
               }
             }
           }
         } catch (searchErr) {
-          this.log?.debug?.({ err: searchErr?.message, cleanTopic }, 'fast live music search error');
+          this.log?.debug?.({ err: searchErr?.message, cleanTopic }, 'fast youtube music search error');
         }
       }
 
@@ -1861,25 +1828,29 @@ export class TelegramController extends EventEmitter {
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: keyboard }
           });
-        } else if (item.audioUrl || item.preview) {
+        } else if (item.audioUrl || item.videoId || item.id) {
+          const videoId = item.videoId || item.id || idx;
           const safeArt = safeArtist.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
           const safeTit = safeTitle.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
           const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
-          const streamUrl = item.audioUrl || `https://pappysonghttps.duckdns.org/audio/live/${item.id || idx}/${cleanSlug}`;
-          const resId = `live_aud_${item.id || idx}_${offset}_${idx}`;
+          const streamUrl = item.audioUrl || (existsSync(`/data/audio_cache/${videoId}.mp3`)
+            ? `https://pappysonghttps.duckdns.org/audio/${videoId}.mp3`
+            : `https://pappysonghttps.duckdns.org/audio/live/${videoId}/${cleanSlug}`);
+          const resId = `yt_aud_${videoId}_${offset}_${idx}`;
 
-          this.audioMetadataMap?.set(String(item.id || idx), {
-            id: item.id || idx,
+          this.audioMetadataMap?.set(String(videoId), {
+            id: videoId,
+            videoId,
             title: safeTitle,
             artist: safeArtist,
-            album: item.album?.title,
-            cover: item.album?.cover_medium,
-            previewUrl: item.preview
+            duration: durSec,
+            thumb: item.thumb
           });
 
           recentInlineSearchResults.set(resId, {
             type: 'audio',
-            id: item.id,
+            id: videoId,
+            videoId,
             title: safeTitle,
             artist: safeArtist,
             duration: durSec,
