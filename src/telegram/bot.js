@@ -240,6 +240,8 @@ export class TelegramController extends EventEmitter {
       { command: 'music', description: '🎧 Fast music & Spotify track search' },
       { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
       { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
+      { command: 'pfp', description: '👥 Grab aesthetic matching PFP albums from Pinterest' },
+      { command: 'matching', description: '👥 Grab 2-piece & multi-slide matching avatars' },
       { command: 'start', description: `✦ Open ${botName} group companion menu` },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       { command: 'help', description: '୨୧ Bot commands & feature guide' },
@@ -257,6 +259,8 @@ export class TelegramController extends EventEmitter {
       { command: 'music', description: '🎧 Fast music & Spotify track search' },
       { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
       { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
+      { command: 'pfp', description: '👥 Grab aesthetic matching PFP albums from Pinterest' },
+      { command: 'matching', description: '👥 Grab 2-piece & multi-slide matching avatars' },
       { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
       { command: 'postchannel', description: '📢 Post sticker pack to Telegram channel' },
       { command: 'autopost', description: '📅 Schedule automated sticker drops' },
@@ -1102,18 +1106,26 @@ export class TelegramController extends EventEmitter {
                 if (!videoUrl && Array.isArray(pin.videos?.videoUrls)) {
                   videoUrl = pin.videos.videoUrls.find((u) => /\.mp4(?:[?&]|$)/i.test(u)) || null;
                 }
-                if (pin.carouselData?.carouselSlots?.length) {
-                  for (const slot of pin.carouselData.carouselSlots) {
+                const carouselSlots = pin.carouselData?.carouselSlots || pin.carousel_data?.carousel_slots;
+                if (Array.isArray(carouselSlots) && carouselSlots.length > 0) {
+                  for (const slot of carouselSlots) {
                     const img = slot.images_orig?.url
+                      || slot.images?.orig?.url
                       || (slot.imageSignature ? `https://i.pinimg.com/originals/${slot.imageSignature.slice(0, 2)}/${slot.imageSignature.slice(2, 4)}/${slot.imageSignature.slice(4, 6)}/${slot.imageSignature}.jpg` : null)
+                      || (slot.image_signature ? `https://i.pinimg.com/originals/${slot.image_signature.slice(0, 2)}/${slot.image_signature.slice(2, 4)}/${slot.image_signature.slice(4, 6)}/${slot.image_signature}.jpg` : null)
                       || slot.images_1200x?.url
-                      || slot.images_736x?.url;
+                      || slot.images?.['1200x']?.url
+                      || slot.images_736x?.url
+                      || slot.images?.['736x']?.url;
                     if (img && !imageUrls.includes(img)) imageUrls.push(img);
                   }
                 }
-                if (pin.storyPinData?.pages?.length) {
-                  for (const page of pin.storyPinData.pages) {
-                    const img = page.image?.images?.originals?.url || page.image?.images?.['736x']?.url;
+                const storyPages = pin.storyPinData?.pages || pin.story_pin_data?.pages;
+                if (Array.isArray(storyPages) && storyPages.length > 0) {
+                  for (const page of storyPages) {
+                    const img = page.image?.images?.originals?.url
+                      || page.image?.images?.orig?.url
+                      || page.image?.images?.['736x']?.url;
                     if (img && !imageUrls.includes(img)) imageUrls.push(img);
                     const vid = page.video?.video_list?.V_720P?.url || page.video?.video_list?.V_EXP3?.url;
                     if (vid && !videoUrl) videoUrl = vid;
@@ -2242,6 +2254,17 @@ export class TelegramController extends EventEmitter {
       },
       {
         type: 'article',
+        id: `cmd_pfp_${prefix}`,
+        title: `👥 ${prefix}pfp <theme>`,
+        description: 'Grab 2-piece & multi-slide matching PFP albums from Pinterest ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+        input_message_content: {
+          message_text: `${prefix}pfp `
+        }
+      },
+      {
+        type: 'article',
         id: `cmd_stickers_${prefix}`,
         title: `🎀 ${prefix}stickers`,
         description: 'Create, convert & manage Telegram sticker packs ♡',
@@ -2375,6 +2398,29 @@ export class TelegramController extends EventEmitter {
                   {
                     text: '🔍 Search HD Pictures',
                     switch_inline_query_current_chat: 'pint ',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          },
+          {
+            type: 'article',
+            id: 'hint_pfp',
+            title: '👥 Matching PFP Studio 👥',
+            description: 'Type "pfp <character>" to find 2-piece & duo matching avatars ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+            input_message_content: {
+              message_text: `<blockquote>👥 <b>Matching PFP Studio</b>\nType <code>@${this.botUsername || 'bot'} pfp anime couple</code> to grab matching avatars! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '👥 Search Matching PFPs',
+                    switch_inline_query_current_chat: 'pfp ',
                     style: 'primary'
                   }
                 ]
@@ -2924,7 +2970,7 @@ export class TelegramController extends EventEmitter {
     } else if (isGroup && activePrefix !== '/' && !text.startsWith('/')) {
       // In a group chat where a custom prefix (e.g. 🎀) is set:
       // If someone attempts a command using another prefix (e.g. !play or .game), remind them of the group prefix.
-      const knownCommands = ['play', 'game', 'quiz', 'trivia', 'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel', 'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall'];
+      const knownCommands = ['play', 'game', 'quiz', 'trivia', 'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel', 'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp'];
       const matchPrefixAttempt = text.match(/^([^\w\s]{1,3})([a-z]+)(\s+.*)?$/i);
       if (matchPrefixAttempt) {
         const attemptedCmd = matchPrefixAttempt[2].toLowerCase();
@@ -3260,6 +3306,24 @@ export class TelegramController extends EventEmitter {
             const sent = await downloaderScreen?.open(this.#ctx(tgId, { message }, { forceNew: true }));
             updateScreenMsg(sent);
           }
+        }
+        return;
+      }
+      if (command === '/pfp' || command === '/matching' || command === '/matchingpfp' || command === '/couplepfp') {
+        await this.sm.reset(tgId, { reason: 'command' });
+        const downloaderScreen = this.screens.get('downloader');
+        const query = rest.join(' ').trim();
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        if (query) {
+          const targetUrl = rest.find((arg) => /^https?:\/\//i.test(arg));
+          if (targetUrl) {
+            await downloaderScreen?.executeDownload(ctx, targetUrl);
+          } else {
+            await downloaderScreen?.executePfpSearch(ctx, query);
+          }
+        } else {
+          const sent = await downloaderScreen?.handle(ctx, 'pfp_menu', []);
+          updateScreenMsg(sent);
         }
         return;
       }
@@ -4319,6 +4383,7 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
       `• <code>${prefix}game</code> — Trivia arena, flag quiz, cars & AI quiz\n` +
       `• <code>${prefix}play &lt;song&gt;</code> — Stream 320k high-speed MP3 audio\n` +
       `• <code>${prefix}grab &lt;link&gt;</code> — Download HD videos/music (TT/IG/YT/X)\n` +
+      `• <code>${prefix}pfp &lt;theme&gt;</code> — Matching PFP albums (duo/couple)\n` +
       `• <code>${prefix}pint &lt;search&gt;</code> — Aesthetic Pinterest gallery\n` +
       `• <code>${prefix}stickers</code> — Telegram sticker studio\n` +
       `• <code>${prefix}postchannel</code> — Post sticker pack to Telegram channel\n` +
@@ -4335,10 +4400,13 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
         ],
         [
           { text: `📥 ${prefix}grab`, switch_inline_query_current_chat: `${prefix}grab ` },
-          { text: `🔍 ${prefix}pint`, switch_inline_query_current_chat: `${prefix}pint ` }
+          { text: `👥 ${prefix}pfp`, switch_inline_query_current_chat: `${prefix}pfp ` }
         ],
         [
-          { text: `🎀 ${prefix}menu`, callback_data: encodeCallback('dashboard', 'open') },
+          { text: `🔍 ${prefix}pint`, switch_inline_query_current_chat: `${prefix}pint ` },
+          { text: `🎀 ${prefix}menu`, callback_data: encodeCallback('dashboard', 'open') }
+        ],
+        [
           { text: `✨ Suggestions ↗️`, switch_inline_query_current_chat: `${prefix}` }
         ]
       ]
@@ -4356,6 +4424,7 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
         { command: 'game', description: `[${prefix}game] Trivia arena & flag quiz` },
         { command: 'play', description: `[${prefix}play] Stream high-speed 320k MP3` },
         { command: 'grab', description: `[${prefix}grab] Download HD video/music` },
+        { command: 'pfp', description: `[${prefix}pfp] Matching PFP albums` },
         { command: 'pint', description: `[${prefix}pint] Search aesthetic Pinterest` },
         { command: 'stickers', description: `[${prefix}stickers] Telegram sticker studio` },
         { command: 'postchannel', description: `[${prefix}postchannel] Post pack to channel` },

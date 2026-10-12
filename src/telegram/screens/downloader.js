@@ -1,6 +1,7 @@
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import sharp from 'sharp';
 import { RichMessageBuilder, rt, block, richButton, encodeCallback } from '../rich.js';
 import { banner, kvTable, statusDot } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
@@ -12,6 +13,7 @@ import { extractMediaForMusicRecognition, recognizeAudio } from '../../media/rec
 import { sleep, parseDurationToSeconds } from '../../utils/time.js';
 import { toTelegramStaticSticker } from '../../media/convert.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
+import { PinterestWebProvider } from '../../pinterest/web.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -233,14 +235,17 @@ export function createDownloaderScreen({ app }) {
 
     b.buttons([
       richButton.callback('✦ Paste / Send Link', encodeCallback(id, 'input'), { style: 'primary' }),
-      richButton.callback('🎬 TikTok Search', encodeCallback(id, 'tiktokSearch'), { style: 'primary' })
+      richButton.callback('👥 Matching PFP', encodeCallback(id, 'pfp_menu'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
-      richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
+      richButton.callback('🎬 TikTok Search', encodeCallback(id, 'tiktokSearch'), { style: 'primary' }),
+      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
+      richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' }),
+      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' })
+    ]);
+    b.buttons([
       richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
     ]);
 
@@ -415,6 +420,77 @@ export function createDownloaderScreen({ app }) {
     return b.toJSON();
   }
 
+  function renderMatchingPfpMenu(ctx = null) {
+    const b = new RichMessageBuilder();
+    b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡ grab aesthetic matching profile pictures ˙ᵕ˙'));
+    b.divider();
+    b.blockquote([
+      '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
+      '💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑷𝑭𝑷 𝑺𝑻𝑼𝑫𝑰𝑶',
+      '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
+      '',
+      'Grabs 2-piece & multi-slide matching albums directly from Pinterest!',
+      'Delivers with instant separate downloads, 1:1 avatar cropping, and sticker pairing.',
+      '',
+      '    𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘',
+      '          ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬'
+    ].join('\n'));
+    b.divider();
+    b.heading('✨ POPULAR MATCHING THEMES', 3);
+    b.buttons([
+      richButton.callback('👩‍❤️‍👨 Couple / Duo Match', encodeCallback(id, 'pfp_search', 'couple matching pfp'), { style: 'primary' }),
+      richButton.callback('⚔️ Anime Matching', encodeCallback(id, 'pfp_search', 'anime matching pfp'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🐱 Cute Cats / Pets', encodeCallback(id, 'pfp_search', 'cat matching pfp'), { style: 'primary' }),
+      richButton.callback('🖤 Dark Gothic / Cyber', encodeCallback(id, 'pfp_search', 'dark anime matching pfp'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🌸 Pastel / Aesthetic', encodeCallback(id, 'pfp_search', 'cute aesthetic matching pfp'), { style: 'primary' }),
+      richButton.callback('🔍 Custom Topic…', encodeCallback(id, 'pfp_custom'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🔗 Paste Pinterest Album Link', encodeCallback(id, 'input', 'from_media'), { style: 'primary' }),
+      richButton.callback('« Downloader', encodeCallback(id, 'open'))
+    ]);
+    b.footer(rt.italic('Tip: You can also type /pfp <character> anytime ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderPfpSearchPrompt(ctx = null) {
+    const b = new RichMessageBuilder();
+    const isGroup = Boolean(ctx?.isGroup);
+
+    b.header('𓆩♡𓆪 SEARCH MATCHING PFP 𓆩♡𓆪', 1);
+    b.divider();
+    b.heading('୨୧ search matching profile pictures', 3);
+    if (isGroup) {
+      b.paragraph(rt.text(
+        '• 👥 Type /pfp <character or theme> directly in this chat\n' +
+        '• 🖼️ Or reply to this card with any character name (e.g. Tanjiro Nezuko, Gojo Geto, Cat couple)!\n' +
+        '• 🔗 Or paste any Pinterest matching album link'
+      ));
+    } else {
+      b.paragraph(rt.text(
+        '• 👥 Send character name or theme (e.g. Tanjiro Nezuko, Loid Yor, Cat couple, Vintage anime)\n' +
+        '• 🔗 Or paste a Pinterest album link directly!'
+      ));
+    }
+    b.divider();
+    b.quote(rt.text(
+      '✨ Lancy will grab both icons, provide 1:1 avatar cropping, and sticker pair them ♡'
+    ));
+    b.divider();
+    b.buttons([
+      richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu')),
+      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
   function renderDownloadProgress({ stage, platform, url, elapsedMs = 0, current = 0, total = 0 }) {
     const b = new RichMessageBuilder();
     b.header('𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪', 1);
@@ -453,8 +529,23 @@ export function createDownloaderScreen({ app }) {
     const files = {};
     const b = new RichMessageBuilder();
 
-    b.header(`𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`, 1);
-    b.paragraph(rt.italic('₊˚⊹♡ aesthetic media delivery ♡ ˙ᵕ˙'));
+    const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result?.artist);
+    const videoCount = mediaItems.filter((m) => m.type === 'video').length;
+    const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
+    const isMatchingPfp = Boolean(
+      result?.isMatchingPfp ||
+      /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(title || '') ||
+      /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(result?.sourceUrl || '') ||
+      (platform.toLowerCase() === 'pinterest' && photoCount >= 2 && videoCount === 0 && (ctx?.isPfp || /pfp|icon|avatar|couple|pair|her|him/i.test(title || '')))
+    );
+
+    if (isMatchingPfp) {
+      b.header('𓆩♡𓆪 MATCHING PFP ALBUM 𓆩♡𓆪', 1);
+      b.paragraph(rt.italic('₊˚⊹♡ duo & matching avatar set ˙ᵕ˙'));
+    } else {
+      b.header(`𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`, 1);
+      b.paragraph(rt.italic('₊˚⊹♡ aesthetic media delivery ♡ ˙ᵕ˙'));
+    }
     b.divider();
 
     // 1. Embed Downloaded Media (Video / Photo / Single Slideshow block) inside Rich Message
@@ -489,7 +580,6 @@ export function createDownloaderScreen({ app }) {
     }
 
     // 2. Embed Audio / Music Track inside the same Rich Message!
-    const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result?.artist);
     if (audioTrack && audioTrack.buffer) {
       const audioField = 'audio_track';
       files[audioField] = {
@@ -515,10 +605,47 @@ export function createDownloaderScreen({ app }) {
 
     // 3. Metadata Table
     b.divider();
-    const videoCount = mediaItems.filter((m) => m.type === 'video').length;
-    const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
 
-    if (isMusic) {
+    if (isMatchingPfp) {
+      const pairLabel = photoCount === 2 ? '𝟐 𝑷𝑨𝑰𝑹' : (photoCount === 3 ? '𝟑 𝑻𝑹𝑰𝑶 𝑺𝑬𝑻' : `𝟎${photoCount} 𝑺𝑬𝑻`);
+      const pfpCard = [
+        '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
+        `💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • ${pairLabel}`,
+        '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
+        '',
+        '╭───────────────────────────╮',
+        ...(photoCount === 2 ? [
+          '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏  │',
+          '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐  │'
+        ] : [
+          `│ 👥 𝐏𝐅𝐏 𝟎𝟏–𝟎${photoCount}  •  𝐒𝐐𝐔𝐀𝐃 𝐌𝐀𝐓𝐂𝐇       │`
+        ]),
+        '╰───────────────────────────╯',
+        '',
+        '✨ 𝐇𝐃 𝐐𝐔𝐀𝐋𝐈𝐓𝐘 • 𝟏:𝟏 𝐀𝐕𝐀𝐓𝐀𝐑 𝐑𝐄𝐀𝐃𝐘 ✨',
+        '',
+        '   💌 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 • 𝐔𝐒𝐄 • 𝐌𝐀𝐓𝐂𝐇',
+        '',
+        '╭───────────────╮',
+        '❤️ 𝐒𝐇𝐀𝐑𝐄   •   💠 𝐑𝐄𝐀𝐂𝐓',
+        '🌸 𝐅𝐎𝐋𝐋𝐎𝐖',
+        '╰───────────────╯',
+        '',
+        '    𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘',
+        '          ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬'
+      ].join('\n');
+      b.blockquote(pfpCard);
+
+      const pfpRows = [
+        ['📱 Platform', 'PINTEREST ALBUM ♡'],
+        ['🏷 Set Title', truncate(title, 36)],
+        ['👥 Matching Icons', `${photoCount} Profile Pictures (HD 1:1)`]
+      ];
+      if (ctx?.isGroup) {
+        pfpRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
+      }
+      b.table(kvTable(pfpRows), { compact: true });
+    } else if (isMusic) {
       const musicRows = [
         ['📱 Platform', 'SPOTIFY / MUSIC ♡'],
         ['🎵 Title', truncate(result?.title || title, 40)],
@@ -607,7 +734,16 @@ export function createDownloaderScreen({ app }) {
       }
     }
 
-    // 6. Action Buttons
+    // 6. Matching PFP action buttons
+    if (isMatchingPfp || (photoCount >= 2 && videoCount === 0 && platform.toLowerCase() === 'pinterest')) {
+      const pfpKey = imageKey || albumKey;
+      b.buttons([
+        richButton.callback(`📸 Send ${photoCount} PFPs Separately`, encodeCallback(id, 'pfp_sep', pfpKey), { style: 'primary' }),
+        richButton.callback('✂️ 1:1 Avatar Crop', encodeCallback(id, 'pfp_crop', pfpKey), { style: 'primary' })
+      ]);
+    }
+
+    // 7. General Action Buttons
     const mediaRow = [
       richButton.callback('📥 Download Link', encodeCallback(id, 'input', 'from_media'), { style: 'primary' })
     ];
@@ -615,21 +751,31 @@ export function createDownloaderScreen({ app }) {
     if (photoCount > 0 && keyForStickers) {
       mediaRow.push(
         richButton.callback(
-          photoCount > 1 ? `🎨 Turn to Sticker (${photoCount})` : '🎨 Turn to Sticker',
+          isMatchingPfp ? `🎨 Sticker Pair (${photoCount})` : (photoCount > 1 ? `🎨 Turn to Sticker (${photoCount})` : '🎨 Turn to Sticker'),
           encodeCallback(id, 'to_sticker', keyForStickers, 'from_media'),
           { style: 'primary' }
         )
       );
-      mediaRow.push(
-        richButton.callback('✦ Sticker Pack', encodeCallback('stickers', 'open', 'from_media'), { style: 'primary' })
-      );
+      if (!isMatchingPfp) {
+        mediaRow.push(
+          richButton.callback('✦ Sticker Pack', encodeCallback('stickers', 'open', 'from_media'), { style: 'primary' })
+        );
+      }
     }
     b.buttons(mediaRow);
 
-    b.buttons([
-      richButton.callback('🎵 Play Another', encodeCallback(id, 'play', 'from_media'), { style: 'primary' }),
-      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
-    ]);
+    if (isMatchingPfp) {
+      const cleanTheme = truncate(title.replace(/matching|pfp|icons?|album|wallpaper/gi, '').trim() || 'anime', 20);
+      b.buttons([
+        richButton.callback('🔍 More Matching PFPs', encodeCallback(id, 'pfp_more', cleanTheme), { style: 'primary' }),
+        richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu'), { style: 'primary' })
+      ]);
+    } else {
+      b.buttons([
+        richButton.callback('🎵 Play Another', encodeCallback(id, 'play', 'from_media'), { style: 'primary' }),
+        richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
+      ]);
+    }
     b.footer(rt.italic(`Delivered with aesthetic love by ${ctx?.botName || 'Lancy Bot'} ♡`));
     b.validate();
 
@@ -1054,6 +1200,163 @@ export function createDownloaderScreen({ app }) {
       b.buttons([richButton.callback('« Downloader Studio', encodeCallback(id, 'open'))]);
       b.validate();
       await tracker.finish(b.toJSON());
+    }
+  }
+
+  async function executePfpSearch(ctx, query) {
+    const q = String(query || '').trim() || 'anime couple';
+    const isGroup = Boolean(ctx.isGroup);
+    const forceNew = Boolean(ctx.forceNew);
+    const api = ctx.api || app.telegram?.api;
+
+    const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
+    const tracker = new ProgressTracker({
+      api: ctx.api || app.telegram.api,
+      chatId: ctx.chatId,
+      messageId: screenMsgId,
+      heartbeatMs: 2000,
+      action: 'upload_photo'
+    });
+
+    await tracker.live((state, { elapsedMs }) => renderDownloadProgress({ ...state, elapsedMs, url: q }), {
+      stage: `🔍 Searching Pinterest for "${q}" matching PFPs… ♡`,
+      platform: 'PINTEREST ALBUM',
+      url: q
+    });
+
+    try {
+      const provider = app.pinterest?.provider || new PinterestWebProvider();
+      let searchRes = await provider.search({
+        query: `${q} matching pfp album`,
+        signal: AbortSignal.timeout(15000)
+      }).catch(() => null);
+
+      if (!searchRes?.items?.length) {
+        searchRes = await provider.search({
+          query: `${q} matching icons`,
+          signal: AbortSignal.timeout(15000)
+        }).catch(() => null);
+      }
+
+      const items = searchRes?.items || [];
+      if (items.length === 0) {
+        await tracker.cleanup();
+        const b = new RichMessageBuilder();
+        b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+        b.paragraph(rt.italic('₊˚⊹♡ no matching icons found ˙ᵕ˙'));
+        b.divider();
+        b.blockquote(`♡ I could not find matching PFP albums for "<b>${escapeHtml(q)}</b>".\nTip: Try searching popular tags like "anime matching pfp", "couple pfp", or paste a Pinterest album link directly! ♡`);
+        b.divider();
+        b.buttons([
+          richButton.callback('🔍 Try Another Topic', encodeCallback(id, 'pfp_custom'), { style: 'primary' }),
+          richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu'))
+        ]);
+        b.validate();
+        return await api.sendRichMessage(ctx.chatId, b.toJSON());
+      }
+
+      tracker.set({ stage: 'Extracting matching avatar images… ♡' });
+
+      let mediaBuffers = [];
+      const albumCandidate = items.find((it) => it.isAlbum && it.albumImages?.length >= 2);
+
+      if (albumCandidate && albumCandidate.albumImages?.length >= 2) {
+        const targetUrls = albumCandidate.albumImages.slice(0, 4);
+        for (let i = 0; i < targetUrls.length; i++) {
+          try {
+            const imgRes = await fetch(targetUrls[i], { signal: AbortSignal.timeout(12000) });
+            if (imgRes.ok) {
+              const buf = Buffer.from(await imgRes.arrayBuffer());
+              mediaBuffers.push({
+                type: 'photo',
+                buffer: buf,
+                filename: `pfp_${i + 1}.jpg`,
+                mimeType: 'image/jpeg'
+              });
+            }
+          } catch {}
+        }
+      }
+
+      if (mediaBuffers.length < 2 && items[0]?.pinId) {
+        const pinUrl = `https://www.pinterest.com/pin/${items[0].pinId}/`;
+        try {
+          const dlRes = await app.mediaDownloader.download(pinUrl, {
+            onProgress: (st) => tracker.set({ stage: st })
+          });
+          if (dlRes?.mediaItems?.length >= 2) {
+            mediaBuffers = dlRes.mediaItems.filter((m) => m.type === 'photo');
+          }
+        } catch {}
+      }
+
+      if (mediaBuffers.length < 2 && items.length >= 2) {
+        for (let i = 0; i < Math.min(2, items.length); i++) {
+          try {
+            const imgRes = await fetch(items[i].mediaUrl, { signal: AbortSignal.timeout(12000) });
+            if (imgRes.ok) {
+              const buf = Buffer.from(await imgRes.arrayBuffer());
+              mediaBuffers.push({
+                type: 'photo',
+                buffer: buf,
+                filename: `pfp_${mediaBuffers.length + 1}.jpg`,
+                mimeType: 'image/jpeg'
+              });
+            }
+          } catch {}
+        }
+      }
+
+      if (mediaBuffers.length === 0 && items[0]?.mediaUrl) {
+        const imgRes = await fetch(items[0].mediaUrl, { signal: AbortSignal.timeout(12000) });
+        if (imgRes.ok) {
+          mediaBuffers.push({
+            type: 'photo',
+            buffer: Buffer.from(await imgRes.arrayBuffer()),
+            filename: 'pfp_1.jpg',
+            mimeType: 'image/jpeg'
+          });
+        }
+      }
+
+      let imageKey = Math.random().toString(36).slice(2, 8);
+      saveMediaImages(imageKey, mediaBuffers);
+      let albumKey = Math.random().toString(36).slice(2, 8);
+      saveAlbum(albumKey, { mediaItems: mediaBuffers, platform: 'pinterest', title: `${q} Matching PFP`, isMatchingPfp: true, imageKey });
+
+      const { rich, files } = buildDeliveryRichMessage({
+        mediaItems: mediaBuffers,
+        platform: 'pinterest',
+        title: `${q} Matching PFP`,
+        result: { isMatchingPfp: true, sourceUrl: `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(q)}` },
+        ctx,
+        offset: 0,
+        albumKey,
+        imageKey
+      });
+
+      const sent = await tracker.finish(rich, files);
+      if (tracker.messageId && sent && !sent.permissionError) {
+        (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(tracker.messageId);
+        app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
+        (ctx.controller || app.telegram?.controller)?.userScreenMessage?.set?.(ctx.tgId, { chatId: ctx.chatId, messageId: tracker.messageId });
+      }
+      return sent;
+    } catch (err) {
+      await tracker.cleanup();
+      logger().error({ err }, 'failed to execute pfp search');
+      const b = new RichMessageBuilder();
+      b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+      b.paragraph(rt.italic('₊˚⊹♡ temporary search issue ˙ᵕ˙'));
+      b.divider();
+      b.blockquote(`♡ Could not grab matching PFP right now: ${escapeHtml(err.message)} ♡\nTip: Paste a Pinterest link directly to download! ♡`);
+      b.divider();
+      b.buttons([
+        richButton.callback('🔍 Search Again', encodeCallback(id, 'pfp_custom'), { style: 'primary' }),
+        richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu'))
+      ]);
+      b.validate();
+      return await api.sendRichMessage(ctx.chatId, b.toJSON());
     }
   }
 
@@ -1965,6 +2268,210 @@ export function createDownloaderScreen({ app }) {
           }
           return;
         }
+        case 'pfp_menu': {
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id).catch(() => {});
+          }
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderMatchingPfpMenu(ctx));
+            } catch {
+              return await ctx.reply('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪\nSend a Pinterest album link or use /pfp <theme> ♡');
+            }
+          }
+          return ctx.editScreen(renderMatchingPfpMenu(ctx));
+        }
+        case 'pfp_custom': {
+          await ctx.sm?.transition(ctx.tgId, States.PFP_SEARCH_INPUT, { context: { mode: 'pfp' } });
+          if (fromMedia) {
+            try {
+              return await ctx.replyRich(renderPfpSearchPrompt(ctx));
+            } catch {
+              return await ctx.reply('👥 Send any character or theme to find matching PFPs, or use /pfp <theme> ♡');
+            }
+          }
+          return ctx.editScreen(renderPfpSearchPrompt(ctx));
+        }
+        case 'pfp_search':
+        case 'pfp_more': {
+          const query = args[0] || 'anime couple';
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: `🔍 Searching matching PFPs for "${query}"… ♡` }).catch(() => {});
+          }
+          return executePfpSearch(ctx, query);
+        }
+        case 'pfp_sep':
+        case 'pfp_separate': {
+          const pfpKey = args[0];
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🌸 Delivering matching profile pictures separately… ♡' }).catch(() => {});
+          }
+          let images = getMediaImages(pfpKey);
+          if (!images || images.length === 0) {
+            const album = getAlbum(pfpKey);
+            if (album?.mediaItems) {
+              images = album.mediaItems.filter((m) => m.type === 'photo');
+            }
+          }
+          if (!images || images.length === 0) {
+            const replyMsg = ctx.query?.message;
+            if (Array.isArray(replyMsg?.photo) && replyMsg.photo.length > 0) {
+              try {
+                const bestPhoto = replyMsg.photo[replyMsg.photo.length - 1];
+                const fileInfo = await ctx.api.getFile(bestPhoto.file_id);
+                if (fileInfo?.file_path) {
+                  const buf = await ctx.api.downloadFile(fileInfo.file_path);
+                  if (buf) images = [{ buffer: buf }];
+                }
+              } catch {}
+            }
+          }
+
+          if (!images || images.length === 0) {
+            await ctx.api.sendMessage(
+              ctx.chatId,
+              '<blockquote>♡ Profile pictures session expired. Paste the Pinterest link or search again with <code>/pfp</code>! ♡</blockquote>',
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return;
+          }
+
+          await ctx.api.sendChatAction(ctx.chatId, 'upload_photo').catch(() => {});
+          const totalPhotos = images.length;
+          for (let i = 0; i < totalPhotos; i++) {
+            const photoNum = String(i + 1).padStart(2, '0');
+            const caption = `𓆩♡𓆪 <b>MATCHING PFP (${i + 1}/${totalPhotos})</b> 𓆩♡𓆪\n` +
+              `<blockquote expandable>` +
+              `╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮\n` +
+              `💠 𝑷𝑹𝑶𝑭𝑰𝑳𝑬 𝑰𝑪𝑶𝑵 • ${photoNum}\n` +
+              `╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯\n\n` +
+              `✨ <b>Aesthetic Match:</b> Profile ${i + 1} of ${totalPhotos}\n` +
+              `💡 <b>How to set:</b> Tap ⋮ at top right → "Set as Profile Photo" ♡\n\n` +
+              `    𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘\n` +
+              `          ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝑰𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥s⃟❥🌸⃟╬` +
+              `</blockquote>`;
+
+            try {
+              const sentPhoto = await ctx.api.sendPhoto(
+                ctx.chatId,
+                images[i].buffer,
+                {
+                  caption,
+                  parse_mode: 'HTML',
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        { text: '✂️ 1:1 Avatar Crop', callback_data: encodeCallback(id, 'pfp_crop', pfpKey) },
+                        { text: '🎨 Make Sticker', callback_data: encodeCallback(id, 'to_sticker', pfpKey, String(i), 'from_media') }
+                      ],
+                      [
+                        { text: '« Matching Studio', callback_data: encodeCallback(id, 'pfp_menu') }
+                      ]
+                    ]
+                  }
+                }
+              );
+              if (sentPhoto?.message_id) {
+                (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sentPhoto.message_id);
+                app.telegram?.markMediaDeliveryMessage?.(sentPhoto.message_id);
+              }
+            } catch (err) {
+              log.warn({ err, idx: i }, 'failed to send separate pfp photo');
+            }
+            await sleep(250);
+          }
+          return;
+        }
+        case 'pfp_crop': {
+          const pfpKey = args[0];
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '✂️ Cropping into 1:1 square avatars… ♡' }).catch(() => {});
+          }
+          let images = getMediaImages(pfpKey);
+          if (!images || images.length === 0) {
+            const album = getAlbum(pfpKey);
+            if (album?.mediaItems) {
+              images = album.mediaItems.filter((m) => m.type === 'photo');
+            }
+          }
+          if (!images || images.length === 0) {
+            const replyMsg = ctx.query?.message;
+            if (Array.isArray(replyMsg?.photo) && replyMsg.photo.length > 0) {
+              try {
+                const bestPhoto = replyMsg.photo[replyMsg.photo.length - 1];
+                const fileInfo = await ctx.api.getFile(bestPhoto.file_id);
+                if (fileInfo?.file_path) {
+                  const buf = await ctx.api.downloadFile(fileInfo.file_path);
+                  if (buf) images = [{ buffer: buf }];
+                }
+              } catch {}
+            }
+          }
+
+          if (!images || images.length === 0) {
+            await ctx.api.sendMessage(
+              ctx.chatId,
+              '<blockquote>♡ Profile picture session expired. Paste the Pinterest link or search again with <code>/pfp</code>! ♡</blockquote>',
+              { parse_mode: 'HTML' }
+            ).catch(() => {});
+            return;
+          }
+
+          await ctx.api.sendChatAction(ctx.chatId, 'upload_photo').catch(() => {});
+          const totalPhotos = images.length;
+          for (let i = 0; i < totalPhotos; i++) {
+            const photoNum = String(i + 1).padStart(2, '0');
+            let croppedBuf = null;
+            try {
+              croppedBuf = await sharp(images[i].buffer)
+                .resize(640, 640, { fit: 'cover', position: 'centre' })
+                .jpeg({ quality: 95 })
+                .toBuffer();
+            } catch (cropErr) {
+              log.warn({ cropErr }, 'sharp 1:1 crop failed, using original buffer');
+              croppedBuf = images[i].buffer;
+            }
+
+            const caption = `𓆩♡𓆪 <b>1:1 AVATAR CROP (${i + 1}/${totalPhotos})</b> 𓆩♡𓆪\n` +
+              `<blockquote expandable>` +
+              `╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮\n` +
+              `💠 𝑺𝑸𝑼𝑨𝑹𝑬 𝑨𝑽𝑨𝑻𝑨𝑹 • ${photoNum}\n` +
+              `╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯\n\n` +
+              `✂️ <b>Centered 640×640 1:1 Square Crop!</b>\n` +
+              `✨ Perfect for Telegram & WhatsApp circular avatars without letterboxing.\n` +
+              `💡 <b>How to set:</b> Tap ⋮ at top right → "Set as Profile Photo" ♡\n\n` +
+              `    𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘\n` +
+              `          ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝑰𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥s⃟❥🌸⃟╬` +
+              `</blockquote>`;
+
+            try {
+              const sentPhoto = await ctx.api.sendPhoto(
+                ctx.chatId,
+                croppedBuf,
+                {
+                  caption,
+                  parse_mode: 'HTML',
+                  reply_markup: {
+                    inline_keyboard: [
+                      [
+                        { text: '🎨 Make Sticker', callback_data: encodeCallback(id, 'to_sticker', pfpKey, String(i), 'from_media') },
+                        { text: '« Matching Studio', callback_data: encodeCallback(id, 'pfp_menu') }
+                      ]
+                    ]
+                  }
+                }
+              );
+              if (sentPhoto?.message_id) {
+                (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(sentPhoto.message_id);
+                app.telegram?.markMediaDeliveryMessage?.(sentPhoto.message_id);
+              }
+            } catch (err) {
+              log.warn({ err, idx: i }, 'failed to send cropped pfp photo');
+            }
+            await sleep(250);
+          }
+          return;
+        }
         case 'cancel':
           await ctx.sm?.reset(ctx.tgId, { reason: 'cancelled' });
           return this.open(ctx);
@@ -1985,6 +2492,10 @@ export function createDownloaderScreen({ app }) {
     executeDownload,
     executeTikTokSearch,
     executeLyricsSearch,
+    executePfpSearch,
+    openPfpMenu(ctx) {
+      return ctx.editScreen ? ctx.editScreen(renderMatchingPfpMenu(ctx)) : ctx.replyRich(renderMatchingPfpMenu(ctx));
+    },
     registerStates(sm) {
       return this.registerStateHandlers(sm);
     },
@@ -2135,6 +2646,35 @@ export function createDownloaderScreen({ app }) {
             await executeDownload(dlCtx, match[0]);
           } else {
             await executeTikTokSearch(dlCtx, text);
+          }
+          return true;
+        },
+        onCancel: async (sctx) => {
+          await sctx.reset?.({ reason: 'cancelled' });
+        }
+      });
+
+      sm.register(States.PFP_SEARCH_INPUT, {
+        onEnter: async (sctx) => {
+          // Handled in handle('pfp_custom')
+        },
+        onMessage: async (sctx, message) => {
+          const text = String(message.text || message.caption || '').trim();
+          if (!text) return true;
+          const match = text.match(/https?:\/\/[^\s]+/i);
+          const dlCtx = {
+            ...sctx,
+            controller: sctx.controller || app.telegram?.controller,
+            api: sctx.api || app.telegram?.api,
+            chatId: message.chat?.id || sctx.chatId,
+            tgId: sctx.tgId || String(message.from?.id),
+            message
+          };
+          await sctx.reset?.({ reason: 'pfp_search_started' });
+          if (match) {
+            await executeDownload(dlCtx, match[0]);
+          } else {
+            await executePfpSearch(dlCtx, text);
           }
           return true;
         },

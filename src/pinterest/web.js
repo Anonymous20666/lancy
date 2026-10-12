@@ -264,9 +264,36 @@ export class PinterestWebProvider extends PinterestProvider {
       }
     }
 
+    // Check for Carousel / Multi-image Album (matching pfps, idea pins, multi-slides)
+    const albumImages = [];
+    const carouselSlots = pin.carousel_data?.carousel_slots || pin.carouselData?.carouselSlots;
+    if (Array.isArray(carouselSlots) && carouselSlots.length > 0) {
+      for (const slot of carouselSlots) {
+        const img = slot.images?.orig?.url
+          || slot.images_orig?.url
+          || (slot.imageSignature ? `https://i.pinimg.com/originals/${slot.imageSignature.slice(0, 2)}/${slot.imageSignature.slice(2, 4)}/${slot.imageSignature.slice(4, 6)}/${slot.imageSignature}.jpg` : null)
+          || (slot.image_signature ? `https://i.pinimg.com/originals/${slot.image_signature.slice(0, 2)}/${slot.image_signature.slice(2, 4)}/${slot.image_signature.slice(4, 6)}/${slot.image_signature}.jpg` : null)
+          || slot.images?.['1200x']?.url
+          || slot.images_1200x?.url
+          || slot.images?.['736x']?.url
+          || slot.images_736x?.url;
+        if (img && !albumImages.includes(img)) albumImages.push(img);
+      }
+    }
+    const storyPages = pin.story_pin_data?.pages || pin.storyPinData?.pages;
+    if (Array.isArray(storyPages) && storyPages.length > 0) {
+      for (const page of storyPages) {
+        const img = page.image?.images?.originals?.url
+          || page.image?.images?.orig?.url
+          || page.image?.images?.['736x']?.url;
+        if (img && !albumImages.includes(img)) albumImages.push(img);
+      }
+    }
+
     // Images: prefer orig, then largest available rendition.
     const images = pin.images ?? {};
     const imageUrl =
+      albumImages[0] ??
       images.orig?.url ??
       images['1200x']?.url ??
       images['736x']?.url ??
@@ -282,7 +309,10 @@ export class PinterestWebProvider extends PinterestProvider {
       mediaUrl: imageUrl,
       type: 'image',
       width: images.orig?.width ?? null,
-      height: images.orig?.height ?? null
+      height: images.orig?.height ?? null,
+      isAlbum: albumImages.length > 1,
+      albumImages: albumImages.length > 0 ? albumImages : [imageUrl],
+      albumCount: Math.max(1, albumImages.length)
     };
   }
 

@@ -33,6 +33,7 @@ export function createPinterestScreen({ app }) {
       richButton.callback('🎬 Videos Only', encodeCallback(id, 'mode', 'videos'), { style: 'primary' })
     ]);
     b.buttons([
+      richButton.callback('👥 Matching PFP Albums', encodeCallback('downloader', 'pfp_menu'), { style: 'primary' }),
       richButton.callback('🕘 Search History', encodeCallback(id, 'history'), { style: 'primary' })
     ]);
     b.divider();

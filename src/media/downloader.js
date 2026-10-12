@@ -440,13 +440,18 @@ export class MediaDownloader {
                   videoUrl = pin.videos.videoUrls.find((u) => /\.mp4(?:[?&]|$)/i.test(u)) || null;
                 }
 
-                // Carousel / Album extraction
-                if (pin.carouselData?.carouselSlots?.length) {
-                  for (const slot of pin.carouselData.carouselSlots) {
+                // Carousel / Album extraction (supports both camelCase and snake_case)
+                const carouselSlots = pin.carouselData?.carouselSlots || pin.carousel_data?.carousel_slots;
+                if (Array.isArray(carouselSlots) && carouselSlots.length > 0) {
+                  for (const slot of carouselSlots) {
                     const img = slot.images_orig?.url
+                      || slot.images?.orig?.url
                       || (slot.imageSignature ? `https://i.pinimg.com/originals/${slot.imageSignature.slice(0, 2)}/${slot.imageSignature.slice(2, 4)}/${slot.imageSignature.slice(4, 6)}/${slot.imageSignature}.jpg` : null)
+                      || (slot.image_signature ? `https://i.pinimg.com/originals/${slot.image_signature.slice(0, 2)}/${slot.image_signature.slice(2, 4)}/${slot.image_signature.slice(4, 6)}/${slot.image_signature}.jpg` : null)
                       || slot.images_1200x?.url
-                      || slot.images_736x?.url;
+                      || slot.images?.['1200x']?.url
+                      || slot.images_736x?.url
+                      || slot.images?.['736x']?.url;
                     if (img && !imageUrls.includes(img)) {
                       imageUrls.push(img);
                     }
@@ -454,9 +459,12 @@ export class MediaDownloader {
                 }
 
                 // Story / Idea Pin extraction
-                if (pin.storyPinData?.pages?.length) {
-                  for (const page of pin.storyPinData.pages) {
-                    const img = page.image?.images?.originals?.url || page.image?.images?.['736x']?.url;
+                const storyPages = pin.storyPinData?.pages || pin.story_pin_data?.pages;
+                if (Array.isArray(storyPages) && storyPages.length > 0) {
+                  for (const page of storyPages) {
+                    const img = page.image?.images?.originals?.url
+                      || page.image?.images?.orig?.url
+                      || page.image?.images?.['736x']?.url;
                     if (img && !imageUrls.includes(img)) imageUrls.push(img);
                     const vid = page.video?.video_list?.V_720P?.url || page.video?.video_list?.V_EXP3?.url;
                     if (vid && !videoUrl) videoUrl = vid;
@@ -473,6 +481,46 @@ export class MediaDownloader {
           }
         }
         searchIdx += relayMarker.length;
+      }
+
+      // 2b. Fallback to Pinterest SSR state (__PWS_DATA__ or __PWS_INITIAL_PROPS__)
+      if (!videoUrl && imageUrls.length === 0) {
+        const pwsMatch = html.match(/<script id="(?:__PWS_DATA__|__PWS_INITIAL_PROPS__)"[^>]*>([\s\S]*?)<\/script>/i);
+        if (pwsMatch?.[1]) {
+          try {
+            const pwsData = JSON.parse(pwsMatch[1]);
+            const pins = pwsData?.props?.initialReduxState?.pins || pwsData?.initialReduxState?.pins;
+            if (pins) {
+              const pin = Object.values(pins)[0];
+              if (pin) {
+                if (pin.title || pin.gridTitle) title = (pin.title || pin.gridTitle).trim();
+                const carouselSlots = pin.carouselData?.carouselSlots || pin.carousel_data?.carousel_slots;
+                if (Array.isArray(carouselSlots) && carouselSlots.length > 0) {
+                  for (const slot of carouselSlots) {
+                    const img = slot.images_orig?.url
+                      || slot.images?.orig?.url
+                      || slot.images_1200x?.url
+                      || slot.images?.['1200x']?.url
+                      || slot.images_736x?.url
+                      || slot.images?.['736x']?.url;
+                    if (img && !imageUrls.includes(img)) imageUrls.push(img);
+                  }
+                }
+                const storyPages = pin.storyPinData?.pages || pin.story_pin_data?.pages;
+                if (Array.isArray(storyPages) && storyPages.length > 0) {
+                  for (const page of storyPages) {
+                    const img = page.image?.images?.originals?.url || page.image?.images?.orig?.url || page.image?.images?.['736x']?.url;
+                    if (img && !imageUrls.includes(img)) imageUrls.push(img);
+                  }
+                }
+                if (imageUrls.length === 0) {
+                  const orig = pin.images_orig?.url || pin.images?.orig?.url || pin.images_736x?.url;
+                  if (orig) imageUrls.push(orig);
+                }
+              }
+            }
+          } catch {}
+        }
       }
 
       // 3. Fallback Video Regex
@@ -548,13 +596,19 @@ export class MediaDownloader {
       }
 
       if (mediaItems.length > 0) {
+        const isMatchingPfp = (
+          /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(title) ||
+          /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(url) ||
+          (mediaItems.length >= 2 && mediaItems.length <= 4 && !videoUrl && /pfp|icon|avatar|profile/i.test(title))
+        );
         return {
           sourceUrl: resolvedUrl,
           platform: 'pinterest',
           title,
           author: 'Pinterest',
           mediaItems,
-          audioTrack
+          audioTrack,
+          isMatchingPfp
         };
       }
     } catch (err) {
