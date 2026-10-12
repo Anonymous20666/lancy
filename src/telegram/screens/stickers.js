@@ -1778,7 +1778,10 @@ function completionRich(settings, pack, { duplicates = 0, query = '', extraPacks
     ]);
   } else {
     b.buttons([
-      richButton.callback('📥 Get Source Media', encodeCallback('stickers', 'getMedia', String(pack.packId ?? pack.id)), { style: 'primary' }),
+      richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'pack', String(pack.packId ?? pack.id)), { style: 'primary' }),
+      richButton.callback('📥 Get Source Media', encodeCallback('stickers', 'getMedia', String(pack.packId ?? pack.id)), { style: 'primary' })
+    ]);
+    b.buttons([
       richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'publishPack', String(pack.packId ?? pack.id)), { style: 'primary' })
     ]);
   }

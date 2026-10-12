@@ -4,6 +4,7 @@ import { LancyError } from '../core/errors.js';
 import { resolveLimits, buildShortName, cleanTgTitle } from './limits.js';
 import { prepareStickerItems } from './telegram.js';
 import { titleCase } from '../utils/text.js';
+import { isVideoBuffer, toLoopingPreviewVideo } from '../media/convert.js';
 
 /**
  * StickerPackService — the orchestration layer between Pinterest results and
@@ -168,9 +169,10 @@ export class StickerPackService extends EventEmitter {
       result.count, packId
     );
     items.forEach((item, i) => {
+      const itType = (item.isVideo || item.sourceType === 'video' || item.type === 'video') ? 'video' : 'static';
       this.db.run(
         'INSERT INTO sticker_items (pack_id, position, emoji, sha256, phash, type) VALUES (?, ?, ?, ?, ?, ?)',
-        packId, (pack.count ?? 0) + i, item.emoji?.join(' ') ?? null, item.sha256 ?? null, item.phash ?? null, item.type ?? 'static'
+        packId, (pack.count ?? 0) + i, item.emoji?.join(' ') ?? null, item.sha256 ?? null, item.phash ?? null, itType
       );
     });
 
@@ -327,6 +329,101 @@ export class StickerPackService extends EventEmitter {
     return null;
   }
 
+  /**
+   * Resolves the hero media for a sticker drop or announcement.
+   * If the pack contains ANY video (even in a mixed pack of photos and videos),
+   * prioritizes picking one of the videos and converts it to a clean looping MP4 preview.
+   * Otherwise returns the static sticker image.
+   *
+   * @param {object} pack
+   * @param {object} [opts]
+   * @param {(fileId: string) => Promise<Buffer|null>} [opts.download]
+   * @returns {Promise<{ type: 'video'|'image', buffer: Buffer|null, isVideo: boolean }>}
+   */
+  async getPackHeroMedia(pack, { download } = {}) {
+    if (!pack) return { type: 'image', buffer: null, isVideo: false };
+    const pId = pack.id || pack.packId;
+    const sName = pack.shortName || pack.tg_short_name || pack.name;
+
+    // 1. Check if DB has any video items for this pack
+    if (pId) {
+      const vidRows = this.db.all(
+        "SELECT id, file_id, sha256, type FROM sticker_items WHERE pack_id = ? AND type = 'video' ORDER BY position ASC",
+        pId
+      );
+      for (const row of vidRows) {
+        // Check cache first for original video buffer
+        if (row.sha256) {
+          const cached = this.media?.cache?.read?.(row.sha256);
+          if (cached && isVideoBuffer(cached)) {
+            const loopingMp4 = await toLoopingPreviewVideo(cached, {
+              configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? ''
+            }).catch(() => null);
+            if (loopingMp4) {
+              return { type: 'video', buffer: loopingMp4, isVideo: true };
+            }
+          }
+        }
+        // If not in cache or cached conversion failed, try downloading file_id from Telegram
+        if (row.file_id && download) {
+          const dlBuf = await download(row.file_id).catch(() => null);
+          if (dlBuf && isVideoBuffer(dlBuf)) {
+            const loopingMp4 = await toLoopingPreviewVideo(dlBuf, {
+              configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? ''
+            }).catch(() => null);
+            if (loopingMp4) {
+              return { type: 'video', buffer: loopingMp4, isVideo: true };
+            }
+          }
+        }
+      }
+
+      // Check all cached buffers in the pack in case type wasn't marked 'video'
+      const allRows = this.db.all(
+        'SELECT id, file_id, sha256, type FROM sticker_items WHERE pack_id = ? ORDER BY position ASC',
+        pId
+      );
+      for (const row of allRows) {
+        if (row.sha256) {
+          const cached = this.media?.cache?.read?.(row.sha256);
+          if (cached && isVideoBuffer(cached)) {
+            const loopingMp4 = await toLoopingPreviewVideo(cached, {
+              configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? ''
+            }).catch(() => null);
+            if (loopingMp4) {
+              return { type: 'video', buffer: loopingMp4, isVideo: true };
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Check live Telegram sticker set for video stickers (st.is_video === true)
+    if (sName && this.stickerService?.api && download) {
+      try {
+        const set = await this.stickerService.api.getStickerSet(sName);
+        if (set?.stickers?.length) {
+          const videoSticker = set.stickers.find((st) => st.is_video);
+          if (videoSticker?.file_id) {
+            const webm = await download(videoSticker.file_id).catch(() => null);
+            if (webm) {
+              const loopingMp4 = await toLoopingPreviewVideo(webm, {
+                configuredFfmpeg: this.settings?.get('media.ffmpegPath') ?? ''
+              }).catch(() => null);
+              if (loopingMp4) {
+                return { type: 'video', buffer: loopingMp4, isVideo: true };
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 3. Fallback to first sticker image buffer
+    const firstImg = await this.getStickerBytes(pack, 0, { download }).catch(() => null);
+    return { type: 'image', buffer: firstImg, isVideo: false };
+  }
+
   async deletePack(userId, packId) {
     const pack = this.getPack(userId, packId);
     if (!pack) return false;
@@ -376,7 +473,8 @@ export class StickerPackService extends EventEmitter {
       'INSERT INTO sticker_items (pack_id, position, emoji, sha256, phash, type) VALUES (?, ?, ?, ?, ?, ?)'
     );
     items.forEach((item, i) => {
-      stmt.run(packId, i, item.emoji?.join(' ') ?? null, item.sha256 ?? null, item.phash ?? null, item.type ?? 'static');
+      const itType = (item.isVideo || item.sourceType === 'video' || item.type === 'video') ? 'video' : 'static';
+      stmt.run(packId, i, item.emoji?.join(' ') ?? null, item.sha256 ?? null, item.phash ?? null, itType);
     });
     return packId;
   }

@@ -237,6 +237,21 @@ export class TelegramAPI {
     return this.call('sendVideo', params);
   }
 
+  sendAnimation(chatId, animation, extra = {}, files = null) {
+    if (Buffer.isBuffer(animation)) {
+      return this.call('sendAnimation', { chat_id: chatId, animation: 'attach://animation', ...extra }, {
+        files: { animation: { buffer: animation, filename: extra.filename ?? 'animation.mp4', contentType: 'video/mp4' } }
+      });
+    }
+    const params = { chat_id: chatId, ...extra };
+    if (files?.animation) {
+      params.animation = 'attach://animation';
+      return this.call('sendAnimation', params, { files });
+    }
+    params.animation = animation;
+    return this.call('sendAnimation', params);
+  }
+
   sendAudio(chatId, audio, extra = {}, files = null) {
     const { filename = 'audio.mp3', thumbnail = null, ...restExtra } = extra;
     const allFiles = files ? { ...files } : {};

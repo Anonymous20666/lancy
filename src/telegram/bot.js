@@ -2970,7 +2970,7 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      if (command === '/postchannel' || command === '/posttochannel') {
+      if (command === '/postchannel' || command === '/posttochannel' || command === '/drop') {
         const channelPostScreen = this.screens.get('channel_post');
         if (channelPostScreen) {
           const sent = await channelPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));

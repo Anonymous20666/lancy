@@ -5,6 +5,7 @@ import { States } from '../../core/stateMachine.js';
 import { sleep } from '../../utils/time.js';
 import { logger } from '../../core/logger.js';
 import { toMathBold, toMathBoldItalic, buildAestheticStickerCaption } from '../../captions/engine.js';
+import { toLoopingPreviewVideo } from '../../media/convert.js';
 export { buildAestheticStickerCaption };
 
 /**
@@ -451,7 +452,11 @@ export function createChannelPostScreen({ app }) {
 
     b.divider();
     b.heading('✨ PUBLISH SEQUENCE', 3);
-    b.paragraph(rt.text('1️⃣ 🖼 Sticker Drop Photo with AI character blockquote caption\n2️⃣ 🎨 First 3 to 5 sample stickers from the pack\n3️⃣ 🎁 Official pack card with green "➕ Add Sticker Pack 🌸" button'));
+    const hasVideo = p?.stickerType === 'video'
+      || Boolean(app.db?.get?.("SELECT id FROM sticker_items WHERE pack_id = ? AND type = 'video' LIMIT 1", p?.id))
+      || false;
+    const heroLabel = hasVideo ? '🎬 Sticker Drop Video' : '🖼 Sticker Drop Photo';
+    b.paragraph(rt.text(`1️⃣ ${heroLabel} with AI character blockquote caption\n2️⃣ 🎨 First 3 to 5 sample stickers from the pack\n3️⃣ 🎁 Official pack card with green "➕ Add Sticker Pack 🌸" button`));
 
     // Default caption if not custom: generate lean character-aware aesthetic card caption
     if (!sel.caption && p) {
@@ -517,7 +522,7 @@ export function createChannelPostScreen({ app }) {
       `sending to ${ch.title}... ♡`
     ])));
     bProg.divider();
-    bProg.paragraph(rt.italic('⏳ Preparing sticker drop photo and uploading sample stickers... please wait ♡'));
+    bProg.paragraph(rt.italic('⏳ Preparing sticker drop media and uploading sample stickers... please wait ♡'));
     bProg.validate();
     await editOrSend(ctx, bProg.toJSON());
 
@@ -529,6 +534,7 @@ export function createChannelPostScreen({ app }) {
       let set = null;
       let sampleStickers = [];
       let sampleBuf = null;
+      let heroVideoBuf = null;
 
       try {
         if (setName) {
@@ -542,7 +548,22 @@ export function createChannelPostScreen({ app }) {
             } catch {}
           }
           sampleStickers = set.stickers.slice(0, Math.min(5, Math.max(3, set.stickers.length)));
-          // Download the first sticker to send as the photo for the drop
+
+          // If the pack contains video stickers, pick one of the videos as the hero preview!
+          const videoSticker = set.stickers.find((st) => st.is_video);
+          if (videoSticker?.file_id) {
+            const fInfo = await api.getFile(videoSticker.file_id).catch(() => null);
+            if (fInfo?.file_path) {
+              const webmBuf = await api.downloadFile(fInfo.file_path).catch(() => null);
+              if (webmBuf) {
+                heroVideoBuf = await toLoopingPreviewVideo(webmBuf, {
+                  configuredFfmpeg: app.settings?.get('media.ffmpegPath') ?? ''
+                }).catch(() => null);
+              }
+            }
+          }
+
+          // Also download the first sticker buffer for static preview/fallback
           const firstSticker = sampleStickers[0];
           const targetFileId = firstSticker?.is_animated && (firstSticker.thumbnail || firstSticker.thumb)
             ? (firstSticker.thumbnail || firstSticker.thumb).file_id
@@ -557,6 +578,18 @@ export function createChannelPostScreen({ app }) {
         }
       } catch (setErr) {
         log.warn({ err: setErr?.message, setName }, 'could not fetch full sticker set info');
+      }
+
+      // Check pack service getPackHeroMedia if hero video was not found via Telegram set
+      if (!heroVideoBuf && app.packs?.getPackHeroMedia) {
+        const heroRes = await app.packs.getPackHeroMedia(p, {
+          download: (fileId) => api.getFile(fileId).then((f) => api.downloadFile(f.file_path)).catch(() => null)
+        }).catch(() => null);
+        if (heroRes?.isVideo && heroRes?.buffer) {
+          heroVideoBuf = heroRes.buffer;
+        } else if (!sampleBuf && heroRes?.buffer) {
+          sampleBuf = heroRes.buffer;
+        }
       }
 
       // Fallback if sampleBuf not found via API download:
@@ -603,31 +636,65 @@ export function createChannelPostScreen({ app }) {
         botUser
       });
 
-      // 4. Post Phase 1: Sticker Photo with Lean Blockquote Caption + Green Success Button
+      // 4. Post Phase 1: Sticker Hero Media (Video or Photo) with Lean Blockquote Caption + Green Success Button
       const formattedCaption = dropCaption.startsWith('<blockquote>')
         ? dropCaption
         : `<blockquote>${dropCaption}</blockquote>`;
-      const photoPayload = {
+      const mediaPayload = {
         caption: formattedCaption,
-        parse_mode: 'HTML',
-        filename: 'sticker.png',
-        contentType: 'image/png'
+        parse_mode: 'HTML'
       };
       if (p.link) {
-        photoPayload.reply_markup = {
+        mediaPayload.reply_markup = {
           inline_keyboard: [
             [{ text: '➕ Add Sticker Pack 🌸', url: p.link, style: 'success' }]
           ]
         };
       }
 
-      if (stickerPhotoBuf) {
-        await api.sendPhoto(ch.channel_id, stickerPhotoBuf, photoPayload);
-      } else {
-        await api.sendMessage(ch.channel_id, `<blockquote>${dropCaption}</blockquote>`, {
-          parse_mode: 'HTML',
-          reply_markup: photoPayload.reply_markup
-        });
+      let heroSent = false;
+      if (heroVideoBuf) {
+        // When pack contains video, use the video as the media with the aesthetic caption!
+        try {
+          if (typeof api.sendAnimation === 'function') {
+            await api.sendAnimation(ch.channel_id, heroVideoBuf, {
+              ...mediaPayload,
+              filename: 'sticker_drop.mp4',
+              contentType: 'video/mp4'
+            });
+            heroSent = true;
+          }
+        } catch (animErr) {
+          log.warn({ err: animErr?.message }, 'sendAnimation failed, trying sendVideo');
+        }
+
+        if (!heroSent && typeof api.sendVideo === 'function') {
+          try {
+            await api.sendVideo(ch.channel_id, heroVideoBuf, {
+              ...mediaPayload,
+              filename: 'sticker_drop.mp4',
+              contentType: 'video/mp4'
+            });
+            heroSent = true;
+          } catch (vidErr) {
+            log.warn({ err: vidErr?.message }, 'sendVideo failed');
+          }
+        }
+      }
+
+      if (!heroSent) {
+        if (stickerPhotoBuf) {
+          await api.sendPhoto(ch.channel_id, stickerPhotoBuf, {
+            ...mediaPayload,
+            filename: 'sticker.png',
+            contentType: 'image/png'
+          });
+        } else {
+          await api.sendMessage(ch.channel_id, formattedCaption, {
+            parse_mode: 'HTML',
+            reply_markup: mediaPayload.reply_markup
+          });
+        }
       }
       await sleep(750);
 
@@ -811,6 +878,14 @@ export function createChannelPostScreen({ app }) {
         case 'page_next':
           sel.page = (sel.page || 0) + 1;
           return renderPackPicker(ctx);
+
+        case 'pack': {
+          const packId = Number(args[0]);
+          sel.packId = packId;
+          const rawPack = app.packs.getPack(Number(tgId), packId) || app.db.get('SELECT * FROM sticker_packs WHERE id = ?', packId);
+          sel.pack = normalizePack(rawPack);
+          return renderChannelPicker(ctx);
+        }
 
         case 'select_pack': {
           const packId = Number(args[0]);

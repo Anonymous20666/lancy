@@ -336,9 +336,34 @@ export class WhatsAppPublisher extends EventEmitter {
       let previewImage = null;
       let previewVideo = null;
       try {
-        const firstBytes = allStickers[0]?.buffer;
-        if (firstBytes && Buffer.isBuffer(firstBytes)) {
-          if (isVideoBuffer(firstBytes)) {
+        // Prioritize picking a video if the pack contains ANY video (even in mixed packs!)
+        let heroBytes = null;
+        let isHeroVideo = false;
+
+        const videoSticker = allStickers.find((st) => st.buffer && isVideoBuffer(st.buffer));
+        if (videoSticker) {
+          heroBytes = videoSticker.buffer;
+          isHeroVideo = true;
+        } else if (packPlan?.pack?.id) {
+          // Check DB and media cache if this pack has cached video items from mixed search
+          const vidRow = this.db?.get?.("SELECT sha256 FROM sticker_items WHERE pack_id = ? AND type = 'video' LIMIT 1", packPlan.pack.id);
+          if (vidRow?.sha256) {
+            const cached = this.media?.cache?.read?.(vidRow.sha256);
+            if (cached && isVideoBuffer(cached)) {
+              heroBytes = cached;
+              isHeroVideo = true;
+            }
+          }
+        }
+
+        if (!heroBytes) {
+          heroBytes = allStickers[0]?.buffer;
+          isHeroVideo = Boolean(heroBytes && isVideoBuffer(heroBytes));
+        }
+
+        if (heroBytes && Buffer.isBuffer(heroBytes)) {
+          const firstBytes = heroBytes;
+          if (isHeroVideo) {
             if (ffmpegPath) {
               const dir = mkdtempSync(join(tmpdir(), 'lancy-prev-'));
               try {

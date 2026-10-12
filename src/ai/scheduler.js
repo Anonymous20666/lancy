@@ -6,6 +6,7 @@ import { generateAuraCaption, buildAestheticStickerCaption } from '../captions/e
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 import { renderChannelBanner, prepareStickerPhotoBuffer } from '../telegram/screens/channelPost.js';
+import { toLoopingPreviewVideo } from '../media/convert.js';
 
 /**
  * Calculates the next run timestamp based on scheduled "HH:MM" slots or fallback interval.
@@ -290,15 +291,31 @@ export class AutonomousScheduler {
           const pName = targetPack.shortName || targetPack.tg_short_name || targetPack.name;
           const pLink = targetPack.link || `https://t.me/addstickers/${pName}`;
 
-          // Retrieve first sticker buffer & sample stickers
+          // Retrieve hero media (prioritizing video if pack contains video) & sample stickers
           let sampleStickers = [];
           let sampleBuf = null;
+          let heroVideoBuf = null;
           try {
             const set = await this.app.telegram.api.getStickerSet(pName);
             if (set?.stickers?.length) {
               sampleStickers = set.stickers.slice(0, Math.min(5, Math.max(3, set.stickers.length)));
+
+              // If pack has video sticker, pick one of the videos as the hero preview!
+              const videoSticker = set.stickers.find((st) => st.is_video);
+              if (videoSticker?.file_id) {
+                const fInfo = await this.app.telegram.api.getFile(videoSticker.file_id).catch(() => null);
+                if (fInfo?.file_path) {
+                  const webm = await this.app.telegram.api.downloadFile(fInfo.file_path).catch(() => null);
+                  if (webm) {
+                    heroVideoBuf = await toLoopingPreviewVideo(webm, {
+                      configuredFfmpeg: this.app.settings?.get('media.ffmpegPath') ?? ''
+                    }).catch(() => null);
+                  }
+                }
+              }
+
               if (sampleStickers[0]?.file_id) {
-                const fInfo = await this.app.telegram.api.getFile(sampleStickers[0].file_id);
+                const fInfo = await this.app.telegram.api.getFile(sampleStickers[0].file_id).catch(() => null);
                 if (fInfo?.file_path) {
                   sampleBuf = await this.app.telegram.api.downloadFile(fInfo.file_path).catch(() => null);
                 }
@@ -306,7 +323,18 @@ export class AutonomousScheduler {
             }
           } catch {}
 
-          // A) Sticker drop photo with lean blockquote caption
+          if (!heroVideoBuf && this.app.packs?.getPackHeroMedia) {
+            const heroRes = await this.app.packs.getPackHeroMedia(targetPack, {
+              download: (fileId) => this.app.telegram.api.getFile(fileId).then((f) => this.app.telegram.api.downloadFile(f.file_path)).catch(() => null)
+            }).catch(() => null);
+            if (heroRes?.isVideo && heroRes?.buffer) {
+              heroVideoBuf = heroRes.buffer;
+            } else if (!sampleBuf && heroRes?.buffer) {
+              sampleBuf = heroRes.buffer;
+            }
+          }
+
+          // A) Sticker drop media with lean blockquote caption
           let photoBuf = null;
           if (sampleBuf) {
             photoBuf = await prepareStickerPhotoBuffer(sampleBuf).catch(() => null);
@@ -322,27 +350,56 @@ export class AutonomousScheduler {
           }
 
           const captionStr = typeof caption === 'object' && caption !== null ? (caption.caption || caption.description || '') : String(caption || '');
-          const photoPayload = {
+          const mediaPayload = {
             caption: captionStr.startsWith('<blockquote>') ? captionStr : `<blockquote>${captionStr}</blockquote>`,
-            parse_mode: 'HTML',
-            filename: 'sticker.png',
-            contentType: 'image/png'
+            parse_mode: 'HTML'
           };
           if (pLink) {
-            photoPayload.reply_markup = {
+            mediaPayload.reply_markup = {
               inline_keyboard: [
                 [{ text: '➕ Add Sticker Pack 🌸', url: pLink, style: 'success' }]
               ]
             };
           }
 
-          if (photoBuf) {
-            await this.app.telegram.api.sendPhoto(tgChannelId, photoBuf, photoPayload);
-          } else {
-            await this.app.telegram.api.sendMessage(tgChannelId, photoPayload.caption, {
-              parse_mode: 'HTML',
-              reply_markup: photoPayload.reply_markup
-            });
+          let heroSent = false;
+          if (heroVideoBuf) {
+            try {
+              if (typeof this.app.telegram.api.sendAnimation === 'function') {
+                await this.app.telegram.api.sendAnimation(tgChannelId, heroVideoBuf, {
+                  ...mediaPayload,
+                  filename: 'sticker_drop.mp4',
+                  contentType: 'video/mp4'
+                });
+                heroSent = true;
+              }
+            } catch {}
+
+            if (!heroSent && typeof this.app.telegram.api.sendVideo === 'function') {
+              try {
+                await this.app.telegram.api.sendVideo(tgChannelId, heroVideoBuf, {
+                  ...mediaPayload,
+                  filename: 'sticker_drop.mp4',
+                  contentType: 'video/mp4'
+                });
+                heroSent = true;
+              } catch {}
+            }
+          }
+
+          if (!heroSent) {
+            if (photoBuf) {
+              await this.app.telegram.api.sendPhoto(tgChannelId, photoBuf, {
+                ...mediaPayload,
+                filename: 'sticker.png',
+                contentType: 'image/png'
+              });
+            } else {
+              await this.app.telegram.api.sendMessage(tgChannelId, mediaPayload.caption, {
+                parse_mode: 'HTML',
+                reply_markup: mediaPayload.reply_markup
+              });
+            }
           }
           await sleep(750);
 

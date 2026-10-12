@@ -1,5 +1,5 @@
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -620,6 +620,42 @@ export async function normalizeVideoForWhatsApp(buffer, { configuredFfmpeg = '',
       output
     ]);
     return { buffer: readFileSync(output), bytes: existsSync(output) ? readFileSync(output).length : 0 };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Converts a video sticker (WebM VP9) or video buffer (MP4/WebM) into a clean,
+ * fast-start, looping MP4 video for channel drop announcements and social previews.
+ * Telegram channels and WhatsApp display this natively with looping autoplay and caption!
+ */
+export async function toLoopingPreviewVideo(buffer, { configuredFfmpeg = '', maxSeconds = 10, maxDimension = 512 } = {}) {
+  if (!buffer || !Buffer.isBuffer(buffer)) return null;
+  const ffmpegPath = resolveFfmpegPath(configuredFfmpeg);
+  if (!ffmpegPath) return null;
+  const dir = mkdtempSync(join(tmpdir(), 'lancy-prev-vid-'));
+  try {
+    const input = join(dir, 'input.bin');
+    const output = join(dir, 'preview.mp4');
+    writeFileSync(input, buffer);
+    await runFfmpeg(ffmpegPath, [
+      '-y', '-i', input,
+      '-t', String(maxSeconds),
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', '+faststart',
+      '-vf', `scale=min(${maxDimension}\\,iw):min(${maxDimension}\\,ih):force_original_aspect_ratio=decrease:force_divisible_by=2`,
+      '-an',
+      output
+    ]);
+    if (existsSync(output) && statSync(output).size > 0) {
+      return readFileSync(output);
+    }
+    return null;
+  } catch (err) {
+    logger().warn({ err: err?.message }, 'toLoopingPreviewVideo failed');
+    return null;
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

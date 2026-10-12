@@ -685,3 +685,202 @@ test('TelegramController inline query: returns command suggestions formatted wit
   db.close();
 });
 
+test('toLoopingPreviewVideo converts video buffer into faststart looping MP4', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { toLoopingPreviewVideo } = await import('../src/media/convert.js');
+
+  const dir = mkdtempSync(join(tmpdir(), 'test-prev-loop-'));
+  try {
+    const vidPath = join(dir, 'test.mp4');
+    execFileSync('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=10',
+      '-pix_fmt', 'yuv420p',
+      vidPath
+    ]);
+    const vidBuf = readFileSync(vidPath);
+    const result = await toLoopingPreviewVideo(vidBuf, { maxSeconds: 5 });
+    assert.ok(result);
+    assert.ok(Buffer.isBuffer(result));
+    assert.ok(result.length > 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('StickerPackService.getPackHeroMedia: mixed pack picks video instead of defaulting to static image', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { StickerPackService } = await import('../src/stickers/packService.js');
+
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+
+  const dir = mkdtempSync(join(tmpdir(), 'test-pack-hero-'));
+  try {
+    const vidPath = join(dir, 'test.mp4');
+    execFileSync('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=10',
+      '-pix_fmt', 'yuv420p',
+      vidPath
+    ]);
+    const vidBuf = readFileSync(vidPath);
+    const imgBuf = await sharp({
+      create: { width: 100, height: 100, channels: 4, background: { r: 0, g: 255, b: 0, alpha: 1 } }
+    }).webp().toBuffer();
+
+    const cacheMap = new Map();
+    const media = {
+      cache: {
+        read: (sha) => cacheMap.get(sha),
+        store: () => {}
+      }
+    };
+    cacheMap.set('img_sha', imgBuf);
+    cacheMap.set('vid_sha', vidBuf);
+
+    const packService = new StickerPackService({ db, settings, media, stickerService: {} });
+
+    // Insert a pack that has mixed media (item 0 is static image, item 1 is video)
+    const insPack = db.run(
+      'INSERT INTO sticker_packs (user_id, tg_short_name, tg_title, query, count, source, sticker_type, link) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      101, 'mixed_pack_by_lancy', 'Mixed Anime Pack', 'mixed', 2, 'pinterest', 'static', 'https://t.me/addstickers/mixed_pack'
+    );
+    const pId = Number(insPack.lastInsertRowid);
+    db.run('INSERT INTO sticker_items (pack_id, position, file_id, sha256, type) VALUES (?, ?, ?, ?, ?)', pId, 0, 'file_img_0', 'img_sha', 'static');
+    db.run('INSERT INTO sticker_items (pack_id, position, file_id, sha256, type) VALUES (?, ?, ?, ?, ?)', pId, 1, 'file_vid_1', 'vid_sha', 'video');
+
+    const packObj = { id: pId, shortName: 'mixed_pack_by_lancy', title: 'Mixed Anime Pack', count: 2 };
+    const hero = await packService.getPackHeroMedia(packObj);
+
+    assert.ok(hero);
+    assert.equal(hero.isVideo, true);
+    assert.equal(hero.type, 'video');
+    assert.ok(Buffer.isBuffer(hero.buffer));
+    assert.ok(hero.buffer.length > 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    db.close();
+  }
+});
+
+test('ChannelPost executeChannelPublish: sends sendAnimation/sendVideo when pack contains video', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { createChannelPostScreen } = await import('../src/telegram/screens/channelPost.js');
+  const { StickerPackService } = await import('../src/stickers/packService.js');
+
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  const dir = mkdtempSync(join(tmpdir(), 'test-post-video-'));
+  try {
+    const vidPath = join(dir, 'test.mp4');
+    execFileSync('ffmpeg', [
+      '-y', '-v', 'error',
+      '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=10',
+      '-pix_fmt', 'yuv420p',
+      vidPath
+    ]);
+    const vidBuf = readFileSync(vidPath);
+
+    const cacheMap = new Map();
+    cacheMap.set('vid_sha', vidBuf);
+    const media = {
+      cache: {
+        read: (sha) => cacheMap.get(sha)
+      }
+    };
+
+    const sentAnimations = [];
+    const sentPhotos = [];
+    const sentMessages = [];
+
+    const mockApi = {
+      getMe: async () => ({ id: 99999, username: 'lancybot' }),
+      sendAnimation: async (chatId, anim, extra) => {
+        sentAnimations.push({ chatId, anim, extra });
+        return { message_id: 111 };
+      },
+      sendVideo: async (chatId, vid, extra) => {
+        return { message_id: 111 };
+      },
+      sendPhoto: async (chatId, photo, extra) => {
+        sentPhotos.push({ chatId, photo, extra });
+        return { message_id: 112 };
+      },
+      sendMessage: async (chatId, text, extra) => {
+        sentMessages.push({ chatId, text, extra });
+        return { message_id: 113 };
+      },
+      sendSticker: async () => ({ message_id: 114 }),
+      sendRichMessage: async () => ({ message_id: 115 }),
+      editMessageRich: async () => ({ message_id: 116 })
+    };
+
+    const packService = new StickerPackService({ db, settings, media, stickerService: {} });
+
+    // Pack with 1 image and 1 video
+    const insPack = db.run(
+      'INSERT INTO sticker_packs (user_id, tg_short_name, tg_title, query, count, source, sticker_type, link) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      888, 'tanjiro_mixed_pack', 'TANJIRO KAMADO', 'Tanjiro', 2, 'pinterest', 'static', 'https://t.me/addstickers/tanjiro_mixed'
+    );
+    const pId = Number(insPack.lastInsertRowid);
+    db.run('INSERT INTO sticker_items (pack_id, position, file_id, sha256, type) VALUES (?, ?, ?, ?, ?)', pId, 0, 'file_1', 'img_sha', 'static');
+    db.run('INSERT INTO sticker_items (pack_id, position, file_id, sha256, type) VALUES (?, ?, ?, ?, ?)', pId, 1, 'file_2', 'vid_sha', 'video');
+
+    db.recordTelegramChannel({
+      channel_id: -100555444,
+      title: 'Anime Channel',
+      username: 'anime_channel',
+      can_post: 1,
+      added_by: 888
+    });
+
+    const app = {
+      db,
+      settings,
+      sm,
+      packs: packService,
+      media,
+      telegram: { api: mockApi, botUsername: 'lancybot' }
+    };
+
+    const screen = createChannelPostScreen({ app });
+
+    // 1. User selects pack directly via 'pack' callback action
+    const ctx = {
+      tgId: 888,
+      chatId: 888,
+      api: mockApi
+    };
+    await screen.handle(ctx, 'pack', [String(pId)]);
+
+    // 2. User selects channel
+    const channels = db.getTelegramChannels(888);
+    await screen.handle(ctx, 'select_channel', [String(channels[0].channel_id)]);
+
+    // 3. Confirm post!
+    await screen.handle(ctx, 'post_confirm', []);
+
+    // Verify: sendAnimation was called with the looping video!
+    assert.equal(sentAnimations.length, 1, 'Should call sendAnimation because pack contains video');
+    assert.equal(sentAnimations[0].chatId, -100555444);
+    assert.ok(Buffer.isBuffer(sentAnimations[0].anim));
+    assert.ok(sentAnimations[0].extra.caption.includes('𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓!'));
+    assert.equal(sentPhotos.length, 0, 'Should not send photo as hero when pack contains video');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    db.close();
+  }
+});
+

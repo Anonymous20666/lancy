@@ -1,7 +1,7 @@
 import { logger } from '../core/logger.js';
 import { LancyError } from '../core/errors.js';
 import { resolveLimits, validateShortName, validateTitle, remainingCapacity } from './limits.js';
-import { toTelegramStaticSticker, toTelegramVideoSticker, toThumbnail } from '../media/convert.js';
+import { toTelegramStaticSticker, toTelegramVideoSticker, toThumbnail, isVideoBuffer } from '../media/convert.js';
 import { emojisForSticker } from './emoji.js';
 import { withRetry } from '../utils/retry.js';
 import { sleep } from '../utils/time.js';
@@ -266,10 +266,13 @@ export async function prepareStickerItems(descriptors, { stickerService, query =
         ? descriptor.emoji
         : (descriptor.emoji ? [descriptor.emoji] : emojisForSticker({ query, packEmoji, index, assignment }));
       const emoji = rawEmoji.map((e) => (e === '♡' ? '🤍' : e)).filter(Boolean);
+      const isVid = descriptor.type === 'video' || Boolean(descriptor.isVideo) || (descriptor.buffer && isVideoBuffer(descriptor.buffer));
       items[index] = {
         buffer: converted.buffer,
         emoji,
-        type: stickerType,
+        type: isVid ? 'video' : stickerType,
+        sourceType: isVid ? 'video' : 'image',
+        isVideo: isVid,
         sha256: descriptor.sha256,
         phash: descriptor.phash,
         sourcePinId: descriptor.pinId ?? null,
