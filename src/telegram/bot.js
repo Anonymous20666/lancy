@@ -2761,18 +2761,14 @@ export class TelegramController extends EventEmitter {
     }
 
     const chatPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
+    const userPrefix = this.db?.getUserPrefix ? this.db.getUserPrefix(tgId) : '/';
 
-    if (chatPrefix !== '/' && text.startsWith(chatPrefix)) {
+    if (userPrefix && userPrefix !== '/' && text.startsWith(userPrefix)) {
+      text = '/' + text.slice(userPrefix.length).trim();
+    } else if (chatPrefix && chatPrefix !== '/' && text.startsWith(chatPrefix)) {
       text = '/' + text.slice(chatPrefix.length).trim();
-    } else if (chatPrefix === '/') {
-      if (text.startsWith('!') || text.startsWith('.')) {
-        text = '/' + text.slice(1);
-      }
-    } else {
-      // Even if custom prefix is active (e.g. '!'), allow /setprefix, /prefix, /help, /start as safety rescue
-      if (/^\/(setprefix|prefix|help|start)(\s+.*)?$/i.test(text)) {
-        // keep as is
-      }
+    } else if (text.startsWith('!') || text.startsWith('.')) {
+      text = '/' + text.slice(1).trim();
     }
 
     if (text.startsWith('/')) {
@@ -4008,22 +4004,67 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
     if (!chatId) return;
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
     const tgId = message.from?.id;
-    const currentPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
+    const currentChatPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
+    const currentUserPrefix = this.db?.getUserPrefix ? this.db.getUserPrefix(tgId) : '/';
 
     if (!args.length) {
+      if (isGroup) {
+        await this.api.sendMessage(
+          chatId,
+          `<blockquote>🌸 <b>Group Command Prefix:</b> <code>${currentChatPrefix}</code>\n` +
+          `👤 <b>Your Personal Prefix:</b> <code>${currentUserPrefix}</code>\n\n` +
+          `🎀 <b>To change prefix:</b>\n` +
+          `• <b>Group Prefix (Admins):</b> <code>${currentChatPrefix}setprefix &lt;symbol or emoji&gt;</code>\n` +
+          `• <b>Your Personal Prefix:</b> <code>${currentChatPrefix}setprefix me &lt;symbol or emoji&gt;</code>\n\n` +
+          `✨ Supports symbols & emojis: <code>!</code>, <code>.</code>, <code>#</code>, <code>✨</code>, <code>🎀</code>, <code>⚡</code>, <code>🤍</code> ♡</blockquote>`,
+          { parse_mode: 'HTML' }
+        );
+      } else {
+        await this.api.sendMessage(
+          chatId,
+          `<blockquote>🌸 <b>Your Command Prefix:</b> <code>${currentUserPrefix}</code>\n\n` +
+          `🎀 <b>To change prefix:</b>\n` +
+          `Send: <code>${currentUserPrefix}setprefix &lt;symbol or emoji&gt;</code>\n\n` +
+          `✨ Examples: <code>${currentUserPrefix}setprefix !</code>, <code>${currentUserPrefix}setprefix ✨</code>, <code>${currentUserPrefix}setprefix 🎀</code>\n` +
+          `<i>Your personal prefix works here in private chat and across all group chats!</i> ♡</blockquote>`,
+          { parse_mode: 'HTML' }
+        );
+      }
+      return;
+    }
+
+    const firstArg = args[0].trim().toLowerCase();
+    const isPersonalExplicit = firstArg === 'me' || firstArg === 'my' || firstArg === 'user';
+    const rawTargetPrefix = isPersonalExplicit ? args[1] : args[0];
+
+    if (!rawTargetPrefix) {
       await this.api.sendMessage(
         chatId,
-        `<blockquote>🌸 <b>Current command prefix:</b> <code>${currentPrefix}</code>\n\n` +
-        `🎀 <b>To change prefix:</b>\n` +
-        `Send: <code>${currentPrefix}setprefix &lt;symbol&gt;</code>\n` +
-        `Examples: <code>${currentPrefix}setprefix !</code> or <code>${currentPrefix}setprefix .</code>\n\n` +
-        `🔒 Group admins can configure prefixes for groups. Private chats are personalized ♡</blockquote>`,
+        `<blockquote>✕ Please provide a symbol or emoji for your personal prefix (e.g. <code>${currentChatPrefix}setprefix me ✨</code>) ♡</blockquote>`,
         { parse_mode: 'HTML' }
       );
       return;
     }
 
-    if (isGroup) {
+    const newPrefix = rawTargetPrefix.trim();
+    const segs = [...new Intl.Segmenter().segment(newPrefix)];
+    const hasSpace = /\s/.test(newPrefix);
+    const isPlainWord = /^[a-zA-Z0-9]+$/.test(newPrefix);
+
+    if (!newPrefix || hasSpace || isPlainWord || segs.length === 0 || segs.length > 3) {
+      await this.api.sendMessage(
+        chatId,
+        `<blockquote>✕ Invalid prefix! Please provide 1 to 3 non-alphanumeric symbols or emojis (e.g. <code>!</code>, <code>.</code>, <code>#</code>, <code>✨</code>, <code>🎀</code>, <code>⚡</code>) ♡</blockquote>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    // Determine target: personal vs group
+    const isSettingPersonal = isPersonalExplicit || !isGroup;
+
+    if (!isSettingPersonal) {
+      // Trying to set group-wide prefix
       const isOwner = this.isOwner(tgId);
       let isAdmin = isOwner;
       if (!isAdmin) {
@@ -4035,43 +4076,77 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
       if (!isAdmin) {
         await this.api.sendMessage(
           chatId,
-          `<blockquote>✕ Only group administrators or the bot owner can change the command prefix ♡</blockquote>`,
+          `<blockquote>✕ Only group administrators or the bot owner can change the group-wide prefix.\n\n` +
+          `💡 <b>Tip:</b> You can set your <b>personal prefix</b> instead! Send: <code>${currentChatPrefix}setprefix me ${newPrefix}</code> (or message me in private DM), and your commands with <code>${newPrefix}</code> will work for you everywhere! ♡</blockquote>`,
           { parse_mode: 'HTML' }
         );
         return;
       }
-    }
 
-    const newPrefix = args[0].trim();
-    if (!newPrefix || newPrefix.length > 3 || /\s/.test(newPrefix) || /^[a-zA-Z0-9]+$/.test(newPrefix)) {
+      if (this.db?.setChatPrefix) {
+        this.db.setChatPrefix(chatId, newPrefix);
+      }
+      if (args[1]?.toLowerCase() === 'global' && this.isOwner(tgId)) {
+        this.settings?.set?.('telegram.prefix', newPrefix);
+      }
+
+      await this.updateCommandsForChat(chatId, newPrefix);
+
       await this.api.sendMessage(
         chatId,
-        `<blockquote>✕ Invalid prefix! Please provide 1 to 3 non-alphanumeric symbols (e.g. <code>!</code>, <code>.</code>, <code>#</code>, <code>/</code>, <code>$</code>) ♡</blockquote>`,
+        `<blockquote>✨ <b>Group command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
+        `Everyone in this group can now use:\n` +
+        `• <code>${newPrefix}game</code>\n` +
+        `• <code>${newPrefix}play &lt;song&gt;</code>\n` +
+        `• <code>${newPrefix}grab &lt;link&gt;</code>\n` +
+        `• <code>${newPrefix}menu</code>\n\n` +
+        `<i>(Safety note: standard <code>/</code> commands will always remain recognized)</i> ♡</blockquote>`,
         { parse_mode: 'HTML' }
       );
       return;
     }
 
-    if (this.db?.setChatPrefix) {
+    // Setting personal prefix
+    if (this.db?.setUserPrefix) {
+      this.db.setUserPrefix(tgId, newPrefix);
+    }
+    if (!isGroup && this.db?.setChatPrefix) {
       this.db.setChatPrefix(chatId, newPrefix);
     }
 
-    if (args[1]?.toLowerCase() === 'global' && this.isOwner(tgId)) {
-      this.settings?.set?.('telegram.prefix', newPrefix);
-    }
+    await this.updateCommandsForChat(chatId, newPrefix);
 
     await this.api.sendMessage(
       chatId,
-      `<blockquote>✨ <b>Command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
-      `You can now use commands like:\n` +
-      `• <code>${newPrefix}menu</code>\n` +
-      `• <code>${newPrefix}game</code>\n` +
+      `<blockquote>✨ <b>Personal command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
+      `You can now use commands with your personal prefix here and across all group chats:\n` +
       `• <code>${newPrefix}play &lt;song&gt;</code>\n` +
+      `• <code>${newPrefix}game</code>\n` +
       `• <code>${newPrefix}grab &lt;link&gt;</code>\n` +
-      `• <code>${newPrefix}setprefix &lt;char&gt;</code>\n\n` +
-      `<i>(Safety note: <code>/setprefix</code> and <code>/help</code> will always remain recognized)</i> ♡</blockquote>`,
+      `• <code>${newPrefix}menu</code>\n` +
+      `• <code>${newPrefix}setprefix me &lt;char&gt;</code>\n\n` +
+      `<i>(Your command suggestions list in this chat has also been updated to reflect <code>${newPrefix}</code>!)</i> ♡</blockquote>`,
       { parse_mode: 'HTML' }
     );
+  }
+
+  async updateCommandsForChat(chatId, prefix = '/') {
+    try {
+      const commands = [
+        { command: 'play', description: `[${prefix}play] Stream high-speed 320k MP3` },
+        { command: 'game', description: `[${prefix}game] Trivia arena & flag quiz` },
+        { command: 'grab', description: `[${prefix}grab] Download HD video/music` },
+        { command: 'pint', description: `[${prefix}pint] Search aesthetic Pinterest` },
+        { command: 'stickers', description: `[${prefix}stickers] Telegram sticker studio` },
+        { command: 'menu', description: `[${prefix}menu] Open dashboard & settings` },
+        { command: 'setprefix', description: `[${prefix}setprefix] Change command trigger prefix` },
+        { command: 'help', description: `[${prefix}help] Complete studio guide` }
+      ];
+      await this.api.call('setMyCommands', {
+        commands,
+        scope: { type: 'chat', chat_id: Number(chatId) }
+      }).catch(() => {});
+    } catch {}
   }
 
   #chatIdFor(tgId, source) {

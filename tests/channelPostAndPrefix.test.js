@@ -134,40 +134,68 @@ test('TelegramController /setprefix: view, update and dispatch with custom prefi
   });
 
   assert.ok(sentMessages.length > 0);
-  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Current command prefix:</b> <code>/</code>'));
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Group Command Prefix:</b> <code>/</code>'));
 
-  // 3. Change prefix to !
+  // 3. Change group prefix to emoji ✨
   await controller.handleUpdate({
     message: {
       message_id: 2,
       chat: { id: chatId, type: 'group' },
       from: { id: 801, first_name: 'AdminBob' },
-      text: '/setprefix !'
+      text: '/setprefix ✨'
     }
   });
 
-  assert.equal(db.getChatPrefix(chatId), '!');
-  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Command prefix changed to:</b> <code>!</code>'));
+  assert.equal(db.getChatPrefix(chatId), '✨');
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Group command prefix changed to:</b> <code>✨</code>'));
 
-  // 4. Send command using the new prefix !setprefix
+  // 4. Send command using the new emoji prefix ✨setprefix
   await controller.handleUpdate({
     message: {
       message_id: 3,
       chat: { id: chatId, type: 'group' },
       from: { id: 801, first_name: 'AdminBob' },
-      text: '!setprefix'
+      text: '✨setprefix'
     }
   });
 
-  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Current command prefix:</b> <code>!</code>'));
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Group Command Prefix:</b> <code>✨</code>'));
 
-  // 5. Reset prefix back to / using !setprefix /
+  // 5. User Alice (id 802) sets her personal prefix to 🎀
   await controller.handleUpdate({
     message: {
       message_id: 4,
       chat: { id: chatId, type: 'group' },
+      from: { id: 802, first_name: 'Alice' },
+      text: '✨setprefix me 🎀'
+    }
+  });
+
+  assert.equal(db.getUserPrefix(802), '🎀');
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Personal command prefix changed to:</b> <code>🎀</code>'));
+
+  // 6. User Alice uses her personal prefix 🎀setprefix in the group
+  await controller.handleUpdate({
+    message: {
+      message_id: 5,
+      chat: { id: chatId, type: 'group' },
+      from: { id: 802, first_name: 'Alice' },
+      text: '🎀setprefix'
+    }
+  });
+
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Your Personal Prefix:</b> <code>🎀</code>'));
+
+  // 7. Group prefix is still ✨ for the group
+  assert.equal(db.getChatPrefix(chatId), '✨');
+
+  // 8. Reset group prefix back to /
+  await controller.handleUpdate({
+    message: {
+      message_id: 6,
+      chat: { id: chatId, type: 'group' },
       from: { id: 801, first_name: 'AdminBob' },
-      text: '!setprefix /'
+      text: '✨setprefix /'
     }
   });
 

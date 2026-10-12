@@ -388,6 +388,17 @@ export class Database {
     );
   }
 
+  getUserPrefix(userId) {
+    if (!userId) return '/';
+    return this.getUserSetting(Number(userId), 'prefix', '/');
+  }
+
+  setUserPrefix(userId, prefix = '/') {
+    if (!userId) return;
+    const clean = String(prefix).trim() || '/';
+    this.setUserSetting(Number(userId), 'prefix', clean);
+  }
+
   recordTelegramChannel({ channel_id, title, username = null, can_post = 1, added_by = null }) {
     if (!channel_id) return;
     const cid = Number(channel_id);
