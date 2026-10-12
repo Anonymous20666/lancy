@@ -2,7 +2,7 @@
  * Autonomous Scheduled Sticker Drops (Pinterest -> Telegram Channels & WhatsApp Channels).
  * Runs background drops on a recurring schedule with interactive clock picks and multi-day calendar support.
  */
-import { generateAuraCaption } from '../captions/engine.js';
+import { generateAuraCaption, buildAestheticStickerCaption } from '../captions/engine.js';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 import { renderChannelBanner, prepareStickerPhotoBuffer } from '../telegram/screens/channelPost.js';
@@ -267,7 +267,13 @@ export class AutonomousScheduler {
         packs: 1,
         aiService: this.app.ai
       }).catch(() => null);
-      caption = (typeof aura === 'object' && aura !== null ? aura.caption : aura) || `✦ <b>${String(packTitle).toUpperCase()}</b> ✦\n📦 <b>${stickerCount} Stickers</b>\n🌸 Created with @${this.app.telegram?.botUsername || 'Lancy_easy_bot'} ♡`;
+      caption = (typeof aura === 'object' && aura !== null ? aura.caption : aura) || buildAestheticStickerCaption({
+        title: packTitle,
+        character: drop.topic,
+        count: stickerCount,
+        packsCount: 1,
+        botUser: this.app.telegram?.botUsername || 'Lancy_easy_bot'
+      });
     }
 
     // 3. Publish to Telegram Channel if requested

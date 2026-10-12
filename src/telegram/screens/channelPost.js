@@ -3,8 +3,9 @@ import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
 import { navButtons, banner, ACCENT, SPARK } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { sleep } from '../../utils/time.js';
-import { sanitizeWhatsAppPackName } from '../../whatsapp/publisher.js';
 import { logger } from '../../core/logger.js';
+import { toMathBold, toMathBoldItalic, buildAestheticStickerCaption } from '../../captions/engine.js';
+export { buildAestheticStickerCaption };
 
 /**
  * Escapes XML/SVG special characters safely.
@@ -179,6 +180,9 @@ export function extractCharacterName(raw = '') {
  */
 export function getFallbackCharacterDescription(characterName = '') {
   const lower = String(characterName || '').toLowerCase();
+  if (lower.includes('tanjiro') || lower.includes('demon') || lower.includes('kamado') || lower.includes('kimetsu') || lower.includes('slayer')) {
+    return 'A fresh demon-slayer pack filled with funny\nreactions, emotional moments, battles & vibes. ⚔️🔥';
+  }
   if (lower.includes('toji')) {
     return 'Cold-blooded sorcerer killer aura, swagger smirks, and unhinged combat energy. 🗡️⚡';
   }
@@ -449,7 +453,7 @@ export function createChannelPostScreen({ app }) {
     b.heading('✨ PUBLISH SEQUENCE', 3);
     b.paragraph(rt.text('1️⃣ 🖼 Sticker Drop Photo with AI character blockquote caption\n2️⃣ 🎨 First 3 to 5 sample stickers from the pack\n3️⃣ 🎁 Official pack card with green "➕ Add Sticker Pack 🌸" button'));
 
-    // Default caption if not custom: generate lean character-aware AI description
+    // Default caption if not custom: generate lean character-aware aesthetic card caption
     if (!sel.caption && p) {
       const characterName = extractCharacterName(p.query || p.title);
       let aiDesc = '';
@@ -459,15 +463,14 @@ export function createChannelPostScreen({ app }) {
       if (!aiDesc || aiDesc.includes('A fresh pack filled with')) {
         aiDesc = getFallbackCharacterDescription(characterName);
       }
-      sel.caption = [
-        `✦ <b>${p.title}</b> ✦`,
-        '',
-        aiDesc,
-        '',
-        `📦 <b>${p.count} Stickers</b> • ${(p.stickerType || 'static').toUpperCase()}`,
-        `🔗 <a href="${p.link}">Add to Telegram</a>`,
-        `🌸 Created with @${botUser} ♡`
-      ].join('\n');
+      sel.caption = buildAestheticStickerCaption({
+        title: p.title,
+        character: characterName,
+        count: p.count,
+        packsCount: 1,
+        description: aiDesc,
+        botUser
+      });
     }
 
     b.divider();
@@ -579,7 +582,7 @@ export function createChannelPostScreen({ app }) {
         }).catch(() => null);
       }
 
-      // 3. Prepare AI Character Description and Lean Caption
+      // 3. Prepare AI Character Description and Aesthetic Card Caption
       const characterName = extractCharacterName(p.query || p.title);
       let aiDesc = '';
       if (!sel.caption) {
@@ -591,19 +594,21 @@ export function createChannelPostScreen({ app }) {
         }
       }
 
-      const dropCaption = sel.caption || [
-        `✦ <b>${p.title}</b> ✦`,
-        '',
-        aiDesc,
-        '',
-        `📦 <b>${p.count} Stickers</b> • ${(p.stickerType || 'static').toUpperCase()}`,
-        `🔗 <a href="${p.link}">Add to Telegram</a>`,
-        `🌸 Created with @${botUser} ♡`
-      ].join('\n');
+      const dropCaption = sel.caption || buildAestheticStickerCaption({
+        title: p.title,
+        character: characterName,
+        count: p.count,
+        packsCount: 1,
+        description: aiDesc,
+        botUser
+      });
 
       // 4. Post Phase 1: Sticker Photo with Lean Blockquote Caption + Green Success Button
+      const formattedCaption = dropCaption.startsWith('<blockquote>')
+        ? dropCaption
+        : `<blockquote>${dropCaption}</blockquote>`;
       const photoPayload = {
-        caption: `<blockquote>${dropCaption}</blockquote>`,
+        caption: formattedCaption,
         parse_mode: 'HTML',
         filename: 'sticker.png',
         contentType: 'image/png'

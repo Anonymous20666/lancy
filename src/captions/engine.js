@@ -81,10 +81,10 @@ export class CaptionEngine {
     const headline = vars.headline ?? `${cleanCharacter.toUpperCase()} 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓!`;
     const defaultDescription = 'A fresh pack filled with cool reactions,\nfunny moments, moods & everyday vibes. 🫶🏼💫';
     const description = vars.description ?? defaultDescription;
-    const defaultFooter = '†🤍🌷𝗟𝗔𝗡𝗖𝗬❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥𝗦🌸†';
+    const defaultFooter = '╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬';
     const footer = vars.footer ?? this.settings?.get('captions.creatorFooter') ?? defaultFooter;
-    const styled_title = vars.styled_title ?? toMathBold(cleanCharacter);
-    const styled_character = vars.styled_character ?? toMathBoldItalic(cleanCharacter);
+    const styled_title = vars.styled_title ?? toMathBold(cleanCharacter.toUpperCase());
+    const styled_character = vars.styled_character ?? toMathBoldItalic(cleanCharacter.toUpperCase());
 
     const context = {
       title: rawTitle,
@@ -135,12 +135,15 @@ export class CaptionEngine {
     const isSoftCute = /cortis|cat|kitty|kuromi|sanrio|pink|blossom|flower|sweet|cute|love|pastel|kpop|idol|kawaii|anya/i.test(lower);
     const isCyber = /cyber|neon|matrix|robot|tech|future|glitch|vaporwave/i.test(lower);
 
-    let templateKey = preferredStyle || (isDarkBadass ? 'badass' : (isSoftCute ? 'blossom' : (isCyber ? 'cyber' : 'badass')));
+    let templateKey = preferredStyle || 'aesthetic';
 
     let headline = `${toMathBold(clean.toUpperCase())} 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓!`;
     let description = 'A fresh pack filled with cool reactions,\nfunny moments, moods & everyday vibes. 🫶🏼💫';
 
-    if (isDarkBadass) {
+    if (/tanjiro|kamado|demon\s*slayer|kimetsu/i.test(lower)) {
+      headline = '𝐓𝐀𝐍𝐉𝐈𝐑𝐎 𝐊𝐀𝐌𝐀𝐃𝐎 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓!';
+      description = 'A fresh demon-slayer pack filled with funny\nreactions, emotional moments, battles & vibes. ⚔️🔥';
+    } else if (isDarkBadass) {
       if (/toji/i.test(lower)) {
         headline = '𝐓𝐇𝐄 𝐒𝐎𝐑𝐂𝐄𝐑𝐄𝐑 𝐊𝐈𝐋𝐋𝐄𝐑 𝐇𝐀𝐒 𝐋𝐀𝐍𝐃𝐄𝐃';
         description = 'Zero cursed energy, pure heavenly restriction & lethal instinct.\nRuthless smirks, cold stares, and peak menace moods. 🗡️🩸';
@@ -274,3 +277,103 @@ export async function generateAuraCaption(options = {}) {
   const engine = new CaptionEngine();
   return engine.generateAuraCaption(options);
 }
+
+/**
+ * Renders the exact user-requested aesthetic sticker drop card for channels:
+ *
+ * ╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮
+ * 💠 𝑻𝑨𝑵𝑱𝑰𝑹𝑶 𝑲𝑨𝑴𝑨𝑫𝑶
+ * ╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯
+ *
+ * ╭───────────────╮
+ * │ 💠 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒  •  60
+ * │ 📦 𝐏𝐀𝐂𝐊𝐒       •  02
+ * ╰───────────────╯
+ *
+ * ╭─━━━━━━━♡━━━━━━━─╮
+ * ✨ 𝐓𝐀𝐍𝐉𝐈𝐑𝐎 𝐊𝐀𝐌𝐀𝐃𝐎 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓! ✨
+ * ╰─━━━━━━━♡━━━━━━━─╯
+ *
+ * A fresh demon-slayer pack filled with funny
+ * reactions, emotional moments, battles & vibes. ⚔️🔥
+ *
+ *    💌 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 • 𝐔𝐒𝐄 • 𝐄𝐍𝐉𝐎𝐘
+ *
+ * ╭───────────────╮
+ * ❤️ 𝐒𝐇𝐀𝐑𝐄   •   💠 𝐑𝐄𝐀𝐂𝐓
+ * 🌸 𝐅𝐎𝐋𝐋𝐎𝐖
+ * ╰───────────────╯
+ *
+ *     𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘
+ *           ╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬
+ */
+export function buildAestheticStickerCaption({
+  title = '',
+  character = '',
+  count = 0,
+  packsCount = 1,
+  description = '',
+  botUser = 'Lancy_easy_bot'
+} = {}) {
+  const rawCandidate = character || title || 'Stickers';
+  const cleanChar = String(rawCandidate)
+    .replace(/^ᥫ᭡[^\s-]+\s*-\s*/, '')
+    .replace(/^(?:lancy\s*-\s*)/i, '')
+    .replace(/\s*(?:stickers?|collection|wa\s*import|part\s*\d+|pack)/gi, '')
+    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+    .trim() || 'Stickers';
+
+  const upperChar = cleanChar.toUpperCase();
+  const styledChar = toMathBoldItalic(upperChar);
+  const headline = `${toMathBold(upperChar)} 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓!`;
+  const stickers = String(count || 0);
+  const packs = String(packsCount || 1).padStart(2, '0');
+
+  let desc = description;
+  if (!desc) {
+    const lower = cleanChar.toLowerCase();
+    if (lower.includes('tanjiro') || lower.includes('demon') || lower.includes('kamado') || lower.includes('kimetsu') || lower.includes('slayer')) {
+      desc = 'A fresh demon-slayer pack filled with funny\nreactions, emotional moments, battles & vibes. ⚔️🔥';
+    } else if (lower.includes('toji')) {
+      desc = 'Cold-blooded sorcerer killer aura, swagger smirks, and unhinged combat energy. 🗡️⚡';
+    } else if (lower.includes('sukuna')) {
+      desc = 'Cursed king malevolence, four-eyed smirks, and demonic slaughter moods. 🩸🔥';
+    } else if (lower.includes('gojo')) {
+      desc = 'The limitless honored one, smug blindfolded smirks, and peak domain swagger. 🤞🏼✨';
+    } else if (lower.includes('cat') || lower.includes('kitty') || lower.includes('cute')) {
+      desc = 'Soft pastel aesthetics, heartwarming reactions, and darling cozy moments. 🐾🌸';
+    } else {
+      desc = 'A fresh pack filled with cool reactions,\nfunny moments, moods & everyday vibes. 🫶🏼💫';
+    }
+  }
+
+  const footer = '╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬';
+
+  return [
+    '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
+    `💠 ${styledChar}`,
+    '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
+    '',
+    '╭───────────────╮',
+    `│ 💠 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒  •  ${stickers}`,
+    `│ 📦 𝐏𝐀𝐂𝐊𝐒       •  ${packs}`,
+    '╰───────────────╯',
+    '',
+    '╭─━━━━━━━♡━━━━━━━─╮',
+    `✨ ${headline} ✨`,
+    '╰─━━━━━━━♡━━━━━━━─╯',
+    '',
+    desc,
+    '',
+    '   💌 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 • 𝐔𝐒𝐄 • 𝐄𝐍𝐉𝐎𝐘',
+    '',
+    '╭───────────────╮',
+    '❤️ 𝐒𝐇𝐀𝐑𝐄   •   💠 𝐑𝐄𝐀𝐂𝐓',
+    '🌸 𝐅𝐎𝐋𝐋𝐎𝐖',
+    '╰───────────────╯',
+    '',
+    '    𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘',
+    `          ${footer}`
+  ].join('\n');
+}
+

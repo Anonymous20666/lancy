@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { CaptionEngine, validateTemplate, CAPTION_VARIABLES } from '../src/captions/engine.js';
+import { CaptionEngine, validateTemplate, CAPTION_VARIABLES, buildAestheticStickerCaption } from '../src/captions/engine.js';
 import { BUILTIN_TEMPLATES, TemplateStore } from '../src/captions/templates.js';
 import { Database } from '../src/core/db.js';
 
@@ -70,9 +70,9 @@ test('default template renders a full caption', () => {
     query: 'gojo', title: 'Gojo Pack', stickers: 100, packs: 2,
     packName: 'Gojo Pack', telegramLink: 'https://t.me/addstickers/gojo_by_lancybot'
   });
-  assert.match(out, /Gojo Pack/);
-  assert.match(out, /𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 • 100/);
-  assert.match(out, /𝐏𝐀𝐂𝐊𝐒 • 02/);
+  assert.match(out, /GOJO/);
+  assert.match(out, /𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒\s+•\s+100/);
+  assert.match(out, /𝐏𝐀𝐂𝐊𝐒\s+•\s+02/);
 });
 
 test('aesthetic template renders ornate gothic box caption', () => {
@@ -84,10 +84,29 @@ test('aesthetic template renders ornate gothic box caption', () => {
     packs: 1
   });
   assert.match(out, /THE OWL HOUSE/);
-  assert.match(out, /𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 • 60/);
-  assert.match(out, /𝐏𝐀𝐂𝐊𝐒 • 01/);
+  assert.match(out, /𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒\s+•\s+60/);
+  assert.match(out, /𝐏𝐀𝐂𝐊𝐒\s+•\s+01/);
   assert.match(out, /THE OWL HOUSE STICKERS ARE OUT!/);
   assert.match(out, /𝗟𝗔𝗡𝗖𝗬/);
+});
+
+test('buildAestheticStickerCaption renders exact Tanjiro aesthetic card matching layout', () => {
+  const caption = buildAestheticStickerCaption({
+    title: 'Tanjiro Kamado',
+    character: 'Tanjiro Kamado',
+    count: 60,
+    packsCount: 2
+  });
+  assert.ok(caption.includes('╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮'));
+  assert.ok(caption.includes('💠 𝑻𝑨𝑵𝑱𝑰𝑹𝑶 𝑲𝑨𝑴𝑨𝑫𝑶'));
+  assert.ok(caption.includes('│ 💠 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒  •  60'));
+  assert.ok(caption.includes('│ 📦 𝐏𝐀𝐂𝐊𝐒       •  02'));
+  assert.ok(caption.includes('✨ 𝐓𝐀𝐍𝐉𝐈𝐑𝐎 𝐊𝐀𝐌𝐀𝐃𝐎 𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓! ✨'));
+  assert.ok(caption.includes('A fresh demon-slayer pack filled with funny'));
+  assert.ok(caption.includes('💌 𝐃𝐎𝐖𝐍𝐋𝐎𝐀𝐃 • 𝐔𝐒𝐄 • 𝐄𝐍𝐉𝐎𝐘'));
+  assert.ok(caption.includes('❤️ 𝐒𝐇𝐀𝐑𝐄   •   💠 𝐑𝐄𝐀𝐂𝐓'));
+  assert.ok(caption.includes('𓆩♡𓆪 𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘'));
+  assert.ok(caption.includes('╬♥︎⃝🌷⃟𝗟𝗔𝗡𝗖𝗬ᵕ̈❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖ᵕ̈✿ 𝗦𝗧𝗜𝗖𝐊𝐄𝗥s⃟❥🌸⃟╬'));
 });
 
 test('every builtin template is valid', () => {

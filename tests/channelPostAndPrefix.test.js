@@ -337,10 +337,12 @@ test('ChannelPost screen: wizard flow and full publishing execution (pic, sample
   // 6. Confirm publish!
   await screen.handle(ctx, 'post_confirm');
 
-  // Verify Phase 1: Photo sent to channel with caption
+  // Verify Phase 1: Photo sent to channel with aesthetic card caption
   assert.equal(sentPhotos.length, 1);
   assert.equal(sentPhotos[0].cid, channelId);
-  assert.ok(sentPhotos[0].opts.caption.includes('Cute Cats Collection'));
+  assert.ok(sentPhotos[0].opts.caption.includes('╭━━━'));
+  assert.ok(sentPhotos[0].opts.caption.includes('💠'));
+  assert.ok(sentPhotos[0].opts.caption.includes('𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘'));
   assert.ok(sentPhotos[0].opts.caption.startsWith('<blockquote>'));
   assert.ok(sentPhotos[0].opts.caption.endsWith('</blockquote>'));
   assert.equal(sentPhotos[0].opts.reply_markup.inline_keyboard[0][0].style, 'success');
