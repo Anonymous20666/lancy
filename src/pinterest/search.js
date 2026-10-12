@@ -76,11 +76,11 @@ export class DeepSearchPipeline extends EventEmitter {
       ? Math.min(20, Math.max(1, Number(requestedGoal) || 20))
       : (Number(requestedGoal) > 0 ? Number(requestedGoal) : Math.max(targetResults, configuredTarget));
     const computedPages = effectiveMode === 'videos'
-      ? Math.min(3, Math.ceil(goal / 10) + 1)
-      : Math.max(depthCfg.pages, Math.ceil(goal / 15) + 3);
+      ? Math.max(4, Math.ceil(goal / 5) + 2)
+      : (depth === 'quick' ? Math.max(2, depthCfg.pages + 1) : Math.max(8, Math.ceil(goal / 15) + 5));
     const maxPages = effectiveMode === 'videos'
       ? computedPages
-      : (Number(requestedGoal) > 0 ? computedPages : (this.settings?.get('pinterest.depthPages')?.[depth] ?? computedPages));
+      : (Number(requestedGoal) > 0 ? computedPages : Math.max(computedPages, this.settings?.get('pinterest.depthPages')?.[depth] ?? computedPages));
     const maxConcurrent = Math.max(1, this.settings?.get('pinterest.maxConcurrentSearches') ?? 2);
     const timeoutMs = (this.settings?.get('pinterest.searchTimeoutSeconds') ?? 30) * 1000;
 
@@ -100,9 +100,41 @@ export class DeepSearchPipeline extends EventEmitter {
 
     const collected = [];      // raw candidates
     const seenPins = new Set(); // pin-level dedupe across pages
+    const seenMediaUrls = new Set();
     let duplicatesFound = 0;
     let bookmark = null;
     let pagesFetched = 0;
+
+    // Deep cross-search deduplication: pre-seed seenPins and seenMediaUrls with user's historical media
+    // so previous results are skipped during candidate discovery and the crawler explores deeper pages!
+    if (userId != null && this.db) {
+      try {
+        const historyPins = this.db.all(
+          `SELECT pin_id FROM user_media_history WHERE user_id = ? AND pin_id IS NOT NULL
+           UNION
+           SELECT pin_id FROM pinterest_media WHERE user_id = ? AND pin_id IS NOT NULL AND is_duplicate = 0`,
+          userId, userId
+        );
+        for (const row of (historyPins || [])) {
+          if (row.pin_id) seenPins.add(row.pin_id);
+        }
+      } catch {}
+
+      try {
+        const historyUrls = this.db.all(
+          `SELECT media_url FROM user_media_history WHERE user_id = ? AND media_url IS NOT NULL
+           UNION
+           SELECT media_url FROM pinterest_media WHERE user_id = ? AND media_url IS NOT NULL AND is_duplicate = 0
+           UNION
+           SELECT source_url FROM pinterest_media WHERE user_id = ? AND source_url IS NOT NULL AND is_duplicate = 0`,
+          userId, userId, userId
+        );
+        for (const row of (historyUrls || [])) {
+          if (row.media_url) seenMediaUrls.add(row.media_url);
+          if (row.source_url) seenMediaUrls.add(row.source_url);
+        }
+      } catch {}
+    }
 
     this.emit('stage', { stage: 'searching', searchId });
     onProgress?.({ stage: 'searching', pagesFetched, collected: collected.length });
@@ -122,11 +154,12 @@ export class DeepSearchPipeline extends EventEmitter {
       }
       pagesFetched++;
       for (const item of page.items) {
-        if (seenPins.has(item.pinId)) {
+        if (seenPins.has(item.pinId) || (item.mediaUrl && seenMediaUrls.has(item.mediaUrl))) {
           duplicatesFound++;
           continue;
         }
         seenPins.add(item.pinId);
+        if (item.mediaUrl) seenMediaUrls.add(item.mediaUrl);
         collected.push({ ...item, searchId });
       }
       bookmark = page.bookmark;
@@ -148,8 +181,9 @@ export class DeepSearchPipeline extends EventEmitter {
       try {
         const vidPage = await this.provider.search({ query: `${normalized} edit video`, signal });
         for (const item of (vidPage?.items ?? [])) {
-          if (!seenPins.has(item.pinId)) {
+          if (!seenPins.has(item.pinId) && !(item.mediaUrl && seenMediaUrls.has(item.mediaUrl))) {
             seenPins.add(item.pinId);
+            if (item.mediaUrl) seenMediaUrls.add(item.mediaUrl);
             collected.push({ ...item, searchId });
           }
         }
@@ -158,8 +192,9 @@ export class DeepSearchPipeline extends EventEmitter {
       try {
         const altPage = await this.provider.search({ query: `${normalized} video`, signal });
         for (const item of (altPage?.items ?? [])) {
-          if (!seenPins.has(item.pinId)) {
+          if (!seenPins.has(item.pinId) && !(item.mediaUrl && seenMediaUrls.has(item.mediaUrl))) {
             seenPins.add(item.pinId);
+            if (item.mediaUrl) seenMediaUrls.add(item.mediaUrl);
             collected.push({ ...item, searchId });
           }
         }

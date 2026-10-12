@@ -582,13 +582,13 @@ test('Matching PFP preserves complete albums without dropping slides (10 request
     assert.ok(text.includes('10 - 5extra'), `Expected '10 - 5extra' in delivery, got: ${text}`);
     assert.ok(text.includes('15') || text.includes('05 FULL ALBUM'), 'Expected 15 total items or extra count');
 
-    // Verify files map contains all 10 slideshow items for page 1
+    // Verify files map contains 2 slideshow items for couple 1 (partner 1 & partner 2 duo)
     assert.ok(delivery.files, 'files should be attached');
     assert.ok(delivery.files.photo_0, 'photo_0 should exist');
-    assert.ok(delivery.files.photo_9, 'photo_9 should exist');
+    assert.ok(delivery.files.photo_1, 'photo_1 should exist');
 
-    // Verify pagination button for remaining slides 11-15 exists
-    assert.ok(text.includes('Next 5 Slides (11–15) →'), `Expected Next 5 Slides button, got: ${text}`);
+    // Verify couple pagination button for next couple exists
+    assert.ok(text.includes('Next Couple') || text.includes('Next Couple (2/'), `Expected Next Couple button, got: ${text}`);
   } finally {
     globalThis.fetch = origFetch;
     db.close();

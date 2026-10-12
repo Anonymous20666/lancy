@@ -454,28 +454,72 @@ export function createDownloaderScreen({ app }) {
     b.divider();
     b.heading('✨ POPULAR MATCHING THEMES', 3);
     b.buttons([
-      richButton.callback('👩‍❤️‍👨 Couple / Duo Match', encodeCallback(id, 'pfp_search', 'couple matching pfp'), { style: 'primary' }),
-      richButton.callback('⚔️ Anime Matching', encodeCallback(id, 'pfp_search', 'anime matching pfp'), { style: 'primary' })
+      richButton.callback('👩‍❤️‍👨 Couple / Duo Match', encodeCallback(id, 'pfp_ask_count', 'couple matching pfp'), { style: 'primary' }),
+      richButton.callback('⚔️ Anime Matching', encodeCallback(id, 'pfp_ask_count', 'anime matching pfp'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🐱 Cute Cats / Pets', encodeCallback(id, 'pfp_search', 'cat matching pfp'), { style: 'primary' }),
-      richButton.callback('🖤 Dark Gothic / Cyber', encodeCallback(id, 'pfp_search', 'dark anime matching pfp'), { style: 'primary' })
+      richButton.callback('🐱 Cute Cats / Pets', encodeCallback(id, 'pfp_ask_count', 'cat matching pfp'), { style: 'primary' }),
+      richButton.callback('🖤 Dark Gothic / Cyber', encodeCallback(id, 'pfp_ask_count', 'dark anime matching pfp'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🌸 Pastel / Aesthetic', encodeCallback(id, 'pfp_search', 'cute aesthetic matching pfp'), { style: 'primary' }),
+      richButton.callback('🌸 Pastel / Aesthetic', encodeCallback(id, 'pfp_ask_count', 'cute aesthetic matching pfp'), { style: 'primary' }),
       richButton.callback('🔍 Custom Topic…', encodeCallback(id, 'pfp_custom'), { style: 'primary' })
     ]);
     b.divider();
     b.heading('📦 PICK NUMBER OF MATCHING PICS', 3);
     b.buttons([
-      richButton.callback('🎯 10 Picks (Full Albums)', encodeCallback(id, 'pfp_count', '10'), { style: 'primary' }),
-      richButton.callback('🎯 20 Picks (Full Albums)', encodeCallback(id, 'pfp_count', '20'), { style: 'primary' })
+      richButton.callback('10 (5 couples)', encodeCallback(id, 'pfp_count', '10'), { style: 'primary' }),
+      richButton.callback('20 (10 couples)', encodeCallback(id, 'pfp_count', '20'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('60 (30 couples)', encodeCallback(id, 'pfp_count', '60'), { style: 'primary' }),
+      richButton.callback('120 (60 couples)', encodeCallback(id, 'pfp_count', '120'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('♾️ Continuous Search', encodeCallback(id, 'pfp_count', 'continuous'), { style: 'primary' }),
+      richButton.callback('✎ Custom Count (Max 200)', encodeCallback(id, 'pfp_custom_count_ask'), { style: 'primary' })
     ]);
     b.buttons([
       richButton.callback('🔗 Paste Pinterest Album Link', encodeCallback(id, 'input', 'from_media'), { style: 'primary' }),
       richButton.callback('« Downloader', encodeCallback(id, 'open'))
     ]);
     b.footer(rt.italic('Tip: You can also type /pfp <character> [count] anytime ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderMatchingAmountPicker(ctx = null, query = 'anime couple') {
+    const b = new RichMessageBuilder();
+    b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic(`₊˚⊹♡ select matching couple picks for "${truncate(query, 24)}" ˙ᵕ˙`));
+    b.divider();
+    b.blockquote([
+      '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
+      '💠 𝑺𝑬𝑳𝑬𝑪𝑻 𝑨𝑴𝑶𝑼𝑵𝑻',
+      '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
+      '',
+      `🎯 Theme: ${truncate(query, 28)}`,
+      '📦 Delivered in 2-by-2 rich message couple slides!',
+      '💡 Full albums preserved • fresh pins explored ♡'
+    ].join('\n'));
+    b.divider();
+    b.buttons([
+      richButton.callback('10 (5 couples)', encodeCallback(id, 'pfp_exec_goal', query, '10'), { style: 'primary' }),
+      richButton.callback('20 (10 couples)', encodeCallback(id, 'pfp_exec_goal', query, '20'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('60 (30 couples)', encodeCallback(id, 'pfp_exec_goal', query, '60'), { style: 'primary' }),
+      richButton.callback('120 (60 couples)', encodeCallback(id, 'pfp_exec_goal', query, '120'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('♾️ Continuous Search', encodeCallback(id, 'pfp_exec_goal', query, 'continuous'), { style: 'primary' }),
+      richButton.callback('✎ Custom Count (Max 200)', encodeCallback(id, 'pfp_custom_count_ask', query), { style: 'primary' })
+    ]);
+    b.divider();
+    b.buttons([
+      richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu')),
+      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+    ]);
     b.validate();
     return b.toJSON();
   }
@@ -591,8 +635,10 @@ export function createDownloaderScreen({ app }) {
       }
     } else if (mediaItems.length > 1) {
       // Telegram Bot API allows AT MOST ONE slideshow / media group block per message (max 10 items).
-      // We slice exactly one page (up to 10 items) for this message to prevent client button detachment:
-      const pageSlice = mediaItems.slice(offset, offset + SLIDESHOW_PAGE_SIZE);
+      // For matching PFPs, we slice exactly 2 items (a couple pair: partner 1 & partner 2) per slide message
+      // so users browse couples smoothly without spamming individual photos into chat:
+      const effectivePageSize = isMatchingPfp ? 2 : SLIDESHOW_PAGE_SIZE;
+      const pageSlice = mediaItems.slice(offset, offset + effectivePageSize);
       const optimizedSlice = await Promise.all(
         pageSlice.map(async (item) => {
           if (item.type === 'photo' && item.buffer) {
@@ -602,17 +648,29 @@ export function createDownloaderScreen({ app }) {
           return item;
         })
       );
-      const chunkBlocks = optimizedSlice.map((item, idx) => {
-        const globalIdx = offset + idx;
-        const field = `${item.type}_${globalIdx}`;
+      if (optimizedSlice.length === 1) {
+        const item = optimizedSlice[0];
+        const field = `${item.type}_${offset}`;
         files[field] = {
           buffer: item.buffer,
           filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
           contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
         };
-        return item.type === 'video' ? block.video(`attach://${field}`) : block.photo(`attach://${field}`);
-      });
-      b.slideshow(chunkBlocks);
+        if (item.type === 'video') b.video(`attach://${field}`);
+        else b.photo(`attach://${field}`);
+      } else {
+        const chunkBlocks = optimizedSlice.map((item, idx) => {
+          const globalIdx = offset + idx;
+          const field = `${item.type}_${globalIdx}`;
+          files[field] = {
+            buffer: item.buffer,
+            filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
+            contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
+          };
+          return item.type === 'video' ? block.video(`attach://${field}`) : block.photo(`attach://${field}`);
+        });
+        b.slideshow(chunkBlocks);
+      }
     }
 
     // 2. Embed Audio / Music Track inside the same Rich Message!
@@ -643,24 +701,33 @@ export function createDownloaderScreen({ app }) {
     b.divider();
 
     if (isMatchingPfp) {
-      const pairLabel = (targetGoal && extraCount > 0)
-        ? `${photoCount} 𝑺𝑬𝑻 (${targetGoal} - ${extraCount}extra)`
-        : (photoCount === 2 ? '𝟐 𝑷𝑨𝑰𝑹' : (photoCount === 3 ? '𝟑 𝑻𝑹𝑰𝑶 𝑺𝑬𝑻' : `${String(photoCount).padStart(2, '0')} 𝑺𝑬𝑻`));
+      const coupleIdx = Math.floor(offset / 2) + 1;
+      const totalCouples = Math.max(1, Math.ceil(mediaItems.length / 2));
+      const isContinuous = Boolean(result?.isContinuous || targetGoal === 'continuous');
 
-      const middleBoxLines = (targetGoal && extraCount > 0) ? [
-        `│ 🎯 𝐓𝐀𝐑𝐆𝐄𝐓      •  ${String(targetGoal).padStart(2, '0')} 𝐏𝐈𝐂𝐊𝐒          │`,
-        `│ 🎁 𝐄𝐗𝐓𝐑𝐀       •  +${String(extraCount).padStart(2, '0')} 𝐅𝐔𝐋𝐋 𝐀𝐋𝐁𝐔𝐌    │`,
-        `│ 👥 𝐓𝐎𝐓𝐀𝐋 𝐏𝐅𝐏𝐒  •  ${String(photoCount).padStart(2, '0')} (${targetGoal} - ${extraCount}extra) │`
+      const middleBoxLines = (totalCouples > 1) ? [
+        '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏       │',
+        '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐       │',
+        `│ 👥 𝐂𝐎𝐔𝐏𝑳𝑬  •  ${String(coupleIdx).padStart(2, '0')} 𝒐𝒇 ${String(totalCouples).padStart(2, '0')}${isContinuous ? ' (♾️)' : ''}         │`
       ] : (photoCount === 2 ? [
         '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏  │',
         '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐  │'
+      ] : (targetGoal && extraCount > 0 ? [
+        `│ 🎯 𝐓𝐀𝐑𝐆𝐄𝐓      •  ${String(targetGoal).padStart(2, '0')} 𝐏𝐈𝐂𝐊𝐒          │`,
+        `│ 🎁 𝐄𝐗𝐓𝐑𝐀       •  +${String(extraCount).padStart(2, '0')} 𝐅𝐔𝐋𝐋 𝐀𝐋𝐁𝐔𝐌    │`,
+        `│ 👥 𝐓𝐎𝐓𝐀𝐋 𝐏𝐅𝐏𝐒  •  ${String(photoCount).padStart(2, '0')} (${targetGoal} - ${extraCount}extra) │`
       ] : [
         `│ 👥 𝐏𝐅𝐏 𝟎𝟏–${String(photoCount).padStart(2, '0')}  •  𝐒𝐐𝐔𝐀𝐃 𝐌𝐀𝐓𝐂𝐇       │`
-      ]);
+      ]));
+      if (totalCouples > 1 && targetGoal && extraCount > 0 && !isContinuous) {
+        middleBoxLines.push(`│ 🎁 𝐁𝐎𝐍𝐔𝐒   •  +${String(extraCount).padStart(2, '0')} 𝐅𝐔𝐋𝐋 𝐀𝐋𝐁𝐔𝐌         │`);
+      }
 
       const pfpCard = [
         '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
-        `💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • ${pairLabel}`,
+        totalCouples > 1
+          ? `💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • 𝑪𝑶𝑼𝑷𝑳𝑬 ${coupleIdx}/${totalCouples}`
+          : '💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • 𝟐 𝑷𝑨𝑰𝑹',
         '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
         '',
         '╭───────────────────────────╮',
@@ -761,8 +828,43 @@ export function createDownloaderScreen({ app }) {
       b.buttons(audioActionRow);
     }
 
-    // 5. Album Pagination Row (when total media > 10)
-    if (mediaItems.length > SLIDESHOW_PAGE_SIZE && albumKey) {
+    // 5. Album / Couple Pagination Row
+    if (isMatchingPfp && mediaItems.length > 2 && albumKey) {
+      const coupleIdx = Math.floor(offset / 2) + 1;
+      const totalCouples = Math.max(1, Math.ceil(mediaItems.length / 2));
+      const hasPrev = offset > 0;
+      const hasNext = offset + 2 < mediaItems.length;
+      const prevOffset = Math.max(0, offset - 2);
+      const nextOffset = offset + 2;
+      const prevCouple = coupleIdx - 1;
+      const nextCouple = coupleIdx + 1;
+
+      if (hasPrev && hasNext) {
+        b.buttons([
+          richButton.callback(`← Prev Couple (${prevCouple}/${totalCouples})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' }),
+          richButton.callback(`Next Couple (${nextCouple}/${totalCouples}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
+        ]);
+      } else if (hasNext) {
+        b.buttons([
+          richButton.callback(`Next Couple (${nextCouple}/${totalCouples}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
+        ]);
+      } else if (hasPrev) {
+        if (pfpSessionKey && pfpCurrentIndex + 1 < pfpTotalCount) {
+          b.buttons([
+            richButton.callback(`← Prev Couple (${prevCouple}/${totalCouples})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' }),
+            richButton.callback('Next Couple (Explore More) →', encodeCallback(id, 'pfp_nav_next', pfpSessionKey, albumKey, String(pfpCurrentIndex + 1)), { style: 'primary' })
+          ]);
+        } else {
+          b.buttons([
+            richButton.callback(`← Prev Couple (${prevCouple}/${totalCouples})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' })
+          ]);
+        }
+      } else if (pfpSessionKey && pfpCurrentIndex + 1 < pfpTotalCount) {
+        b.buttons([
+          richButton.callback('Next Couple (Explore More) →', encodeCallback(id, 'pfp_nav_next', pfpSessionKey, albumKey, String(pfpCurrentIndex + 1)), { style: 'primary' })
+        ]);
+      }
+    } else if (!isMatchingPfp && mediaItems.length > SLIDESHOW_PAGE_SIZE && albumKey) {
       const hasPrev = offset > 0;
       const hasNext = offset + SLIDESHOW_PAGE_SIZE < mediaItems.length;
       const prevOffset = Math.max(0, offset - SLIDESHOW_PAGE_SIZE);
@@ -788,10 +890,16 @@ export function createDownloaderScreen({ app }) {
     // 6. Matching PFP action buttons
     if (isMatchingPfp || (photoCount >= 2 && videoCount === 0 && platform.toLowerCase() === 'pinterest')) {
       const pfpKey = imageKey || albumKey;
-      b.buttons([
-        richButton.callback(`📸 Send ${photoCount} PFPs Separately`, encodeCallback(id, 'pfp_sep', pfpKey), { style: 'primary' }),
-        richButton.callback('✂️ 1:1 Avatar Crop', encodeCallback(id, 'pfp_crop', pfpKey), { style: 'primary' })
-      ]);
+      if (mediaItems.length === 2) {
+        b.buttons([
+          richButton.callback(`📸 Send 2 PFPs Separately`, encodeCallback(id, 'pfp_sep', pfpKey), { style: 'primary' }),
+          richButton.callback('✂️ 1:1 Avatar Crop', encodeCallback(id, 'pfp_crop', pfpKey), { style: 'primary' })
+        ]);
+      } else {
+        b.buttons([
+          richButton.callback('✂️ 1:1 Avatar Crop', encodeCallback(id, 'pfp_crop', pfpKey), { style: 'primary' })
+        ]);
+      }
     }
 
     // 7. General Action Buttons
@@ -1278,30 +1386,39 @@ export function createDownloaderScreen({ app }) {
     let sessionKey = null;
     let targetIndex = 0;
     let requestedGoal = null;
+    let isContinuous = false;
 
     if (typeof optsOrIndex === 'object' && optsOrIndex !== null) {
       sessionKey = optsOrIndex.sessionKey || null;
       targetIndex = Number(optsOrIndex.targetIndex) || 0;
       requestedGoal = optsOrIndex.goal ?? optsOrIndex.requestedGoal ?? null;
+      isContinuous = Boolean(optsOrIndex.isContinuous || requestedGoal === 'continuous');
     } else {
       targetIndex = Number(optsOrIndex) || 0;
       sessionKey = maybeSessionKey;
       requestedGoal = maybeGoal;
+      isContinuous = requestedGoal === 'continuous';
     }
 
     let session = sessionKey ? getPfpSession(sessionKey) : null;
     let q = session?.query || String(query || '').trim() || 'anime couple';
-    let targetGoal = requestedGoal ? Number(requestedGoal) : (session?.targetGoal ? Number(session.targetGoal) : null);
+    let targetGoal = isContinuous ? null : (requestedGoal ? Number(requestedGoal) : (session?.targetGoal ? Number(session.targetGoal) : null));
 
-    // Extract target picture count if user typed e.g. "anime 10", "10 pit", "couple 10", "10"
-    if (!session && !targetGoal) {
-      const countMatch = q.match(/\b(\d+)\s*(?:pit|pins?|pics?|photos?|images?|pfps?|sets?)?\b/i) || q.match(/(?:^|\s)(\d+)$/);
-      if (countMatch) {
-        const parsedCount = parseInt(countMatch[1], 10);
-        if (parsedCount >= 2 && parsedCount <= 100) {
-          targetGoal = parsedCount;
-          q = q.replace(countMatch[0], '').replace(/\b(?:pit|pins?|pics?|photos?|images?|pfps?|sets?)\b/gi, '').trim();
-          if (!q) q = 'aesthetic matching';
+    // Extract target picture count if user typed e.g. "anime 10", "10 pit", "couple 60", "120", "200"
+    if (!session && !targetGoal && !isContinuous) {
+      if (/(?:^|\s)(continuous|infinite)(?:\s|$)/i.test(q)) {
+        isContinuous = true;
+        q = q.replace(/(?:^|\s)(continuous|infinite)(?:\s|$)/gi, ' ').trim();
+        if (!q) q = 'aesthetic matching';
+      } else {
+        const countMatch = q.match(/\b(\d+)\s*(?:pit|pins?|pics?|photos?|images?|pfps?|sets?|couples?)?\b/i) || q.match(/(?:^|\s)(\d+)$/);
+        if (countMatch) {
+          const parsedCount = parseInt(countMatch[1], 10);
+          if (parsedCount >= 2 && parsedCount <= 200) {
+            targetGoal = parsedCount;
+            q = q.replace(countMatch[0], '').replace(/\b(?:pit|pins?|pics?|photos?|images?|pfps?|sets?|couples?)\b/gi, '').trim();
+            if (!q) q = 'aesthetic matching';
+          }
         }
       }
     }
@@ -1335,14 +1452,36 @@ export function createDownloaderScreen({ app }) {
         const candidateMap = new Map();
         const searchQueries = [
           `${q} matching pfp album`,
-          `${q} matching pfp`,
-          `${q} couple pfp`,
-          `${q} matching icons`
+          `${q} matching couple pfp`,
+          `${q} matching icons`,
+          `${q} anime couple pfp`,
+          `${q} matching pfp`
         ];
+
+        const userId = Number(ctx.tgId || ctx.user?.id);
+        const seenPins = new Set();
+        const seenUrls = new Set();
+        const db = app.db || ctx.db;
+        if (userId && db) {
+          try {
+            const rows = db.all(
+              `SELECT pin_id, media_url FROM user_media_history WHERE user_id = ?
+               UNION
+               SELECT pin_id, media_url FROM pinterest_media WHERE user_id = ? AND is_duplicate = 0`,
+              userId, userId
+            );
+            for (const r of (rows || [])) {
+              if (r.pin_id) seenPins.add(r.pin_id);
+              if (r.media_url) seenUrls.add(r.media_url);
+            }
+          } catch {}
+        }
+
+        const neededMap = Math.min(60, Math.max(25, targetGoal ? Math.ceil(targetGoal / 2) + 5 : 25));
 
         for (const sq of searchQueries) {
           let bookmark = null;
-          for (let page = 1; page <= 3; page++) {
+          for (let page = 1; page <= 6; page++) {
             try {
               const res = await provider.search({
                 query: sq,
@@ -1352,29 +1491,31 @@ export function createDownloaderScreen({ app }) {
               if (!res?.items?.length) break;
               for (const item of res.items) {
                 if (candidateMap.has(item.pinId)) continue;
+                if (seenPins.has(item.pinId) || (item.mediaUrl && seenUrls.has(item.mediaUrl))) continue;
                 // Strictly filter for pins that contain 2 or more images!
                 if (item.isAlbum && Array.isArray(item.albumImages) && item.albumImages.length >= 2) {
+                  if (item.albumImages.some((u) => seenUrls.has(u))) continue;
                   candidateMap.set(item.pinId, item);
                 }
               }
               bookmark = res.bookmark;
-              if (!bookmark || candidateMap.size >= 25) break;
+              if (!bookmark || candidateMap.size >= neededMap) break;
             } catch {
               break;
             }
           }
-          if (candidateMap.size >= 25) break;
+          if (candidateMap.size >= neededMap) break;
         }
 
-        // Secondary fallback: if 0 albums found across deep searches, check top 10 pins for 2-in-1 collage pins
+        // Secondary fallback: if 0 albums found across deep searches, check top 15 pins for 2-in-1 collage pins
         if (candidateMap.size === 0) {
           try {
             const fallbackRes = await provider.search({
               query: `${q} matching pfp`,
               signal: AbortSignal.timeout(12000)
             });
-            for (const item of (fallbackRes?.items || []).slice(0, 10)) {
-              if (item?.mediaUrl) {
+            for (const item of (fallbackRes?.items || []).slice(0, 15)) {
+              if (item?.mediaUrl && !seenPins.has(item.pinId) && !seenUrls.has(item.mediaUrl)) {
                 candidateMap.set(item.pinId, item);
               }
             }
@@ -1383,7 +1524,7 @@ export function createDownloaderScreen({ app }) {
 
         candidates = Array.from(candidateMap.values());
         activeSessionKey = Math.random().toString(36).slice(2, 8);
-        savePfpSession(activeSessionKey, { query: q, candidates, currentIndex: 0, targetGoal });
+        savePfpSession(activeSessionKey, { query: q, candidates, currentIndex: 0, targetGoal, isContinuous });
       }
 
       if (candidates.length === 0) {
@@ -1482,6 +1623,8 @@ export function createDownloaderScreen({ app }) {
               // All photos in fetchedBuffers remain intact in mediaBuffers.
               break;
             }
+          } else if (isContinuous) {
+            if (mediaBuffers.length >= 4) break;
           } else {
             // Default: single matching set
             break;
@@ -1517,6 +1660,8 @@ export function createDownloaderScreen({ app }) {
               lastProcessedIdx = i;
               if (targetGoal && targetGoal > 1) {
                 if (mediaBuffers.length >= targetGoal) break;
+              } else if (isContinuous) {
+                if (mediaBuffers.length >= 4) break;
               } else {
                 break;
               }
@@ -1546,19 +1691,57 @@ export function createDownloaderScreen({ app }) {
       if (sess) {
         sess.currentIndex = lastProcessedIdx;
         sess.targetGoal = targetGoal;
+        sess.isContinuous = isContinuous;
         savePfpSession(activeSessionKey, sess);
+      }
+
+      // Record delivered pins/URLs into user_media_history so they are never repeated in future searches!
+      const userId = Number(ctx.tgId || ctx.user?.id);
+      const db = app.db || ctx.db;
+      if (userId && db) {
+        try {
+          for (const cand of candidates.slice(chosenIdx, lastProcessedIdx + 1)) {
+            if (cand.pinId) {
+              db.run(
+                'INSERT INTO user_media_history (user_id, pin_id, search_id) VALUES (?, ?, ?)',
+                userId, cand.pinId, null
+              );
+            }
+            if (Array.isArray(cand.albumImages)) {
+              for (const imgUrl of cand.albumImages) {
+                db.run(
+                  'INSERT INTO user_media_history (user_id, media_url, search_id) VALUES (?, ?, ?)',
+                  userId, imgUrl, null
+                );
+              }
+            }
+          }
+        } catch {}
       }
 
       let imageKey = Math.random().toString(36).slice(2, 8);
       saveMediaImages(imageKey, mediaBuffers);
       let albumKey = Math.random().toString(36).slice(2, 8);
-      saveAlbum(albumKey, { mediaItems: mediaBuffers, platform: 'pinterest', title: `${q} Matching PFP`, isMatchingPfp: true, imageKey, targetGoal, extraCount });
+      saveAlbum(albumKey, {
+        mediaItems: mediaBuffers,
+        platform: 'pinterest',
+        title: `${q} Matching PFP`,
+        isMatchingPfp: true,
+        imageKey,
+        targetGoal,
+        extraCount,
+        isContinuous
+      });
 
       const { rich, files } = await buildDeliveryRichMessage({
         mediaItems: mediaBuffers,
         platform: 'pinterest',
         title: `${q} Matching PFP`,
-        result: { isMatchingPfp: true, sourceUrl: `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(q)}` },
+        result: {
+          isMatchingPfp: true,
+          isContinuous,
+          sourceUrl: `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(q)}`
+        },
         ctx,
         offset: 0,
         albumKey,
@@ -2547,22 +2730,33 @@ export function createDownloaderScreen({ app }) {
           return executePfpSearch(ctx, null, { sessionKey, targetIndex, goal: session?.targetGoal });
         }
         case 'pfp_count': {
-          const count = Number(args[0]) || 10;
-          await ctx.sm?.transition(ctx.tgId, States.PFP_SEARCH_INPUT, { context: { mode: 'pfp', requestedGoal: count } });
+          const rawArg = args[0] || '10';
+          const isContinuous = rawArg === 'continuous';
+          const count = isContinuous ? null : (Number(rawArg) || 10);
+          await ctx.sm?.transition(ctx.tgId, States.PFP_SEARCH_INPUT, {
+            context: { mode: 'pfp', requestedGoal: count, isContinuous }
+          });
           const b = new RichMessageBuilder();
           b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
-          b.paragraph(rt.italic(`₊˚⊹♡ target: ${count} picks • full albums preserved ˙ᵕ˙`));
+          b.paragraph(rt.italic(isContinuous
+            ? '₊˚⊹♡ continuous search • infinite couples • full albums preserved ˙ᵕ˙'
+            : `₊˚⊹♡ target: ${count} picks • full albums preserved ˙ᵕ˙`
+          ));
           b.divider();
-          b.paragraph(rt.italic(`What character or aesthetic theme would you like for ${count} picks? ♡`));
+          b.paragraph(rt.italic(isContinuous
+            ? 'What character or aesthetic theme would you like to explore continuously? ♡'
+            : `What character or aesthetic theme would you like for ${count} picks? ♡`
+          ));
           b.paragraph(rt.concat(rt.text('Example: '), rt.code('anime couple'), rt.text(' or '), rt.code('naruto sasuke')));
           b.divider();
+          const goalParam = isContinuous ? 'continuous' : String(count);
           b.buttons([
-            richButton.callback('👩‍❤️‍👨 Couple / Duo', encodeCallback(id, 'pfp_search_with_goal', 'couple matching pfp', String(count)), { style: 'primary' }),
-            richButton.callback('⚔️ Anime Matching', encodeCallback(id, 'pfp_search_with_goal', 'anime matching pfp', String(count)), { style: 'primary' })
+            richButton.callback('👩‍❤️‍👨 Couple / Duo', encodeCallback(id, 'pfp_exec_goal', 'couple matching pfp', goalParam), { style: 'primary' }),
+            richButton.callback('⚔️ Anime Matching', encodeCallback(id, 'pfp_exec_goal', 'anime matching pfp', goalParam), { style: 'primary' })
           ]);
           b.buttons([
-            richButton.callback('🐱 Cute Cats', encodeCallback(id, 'pfp_search_with_goal', 'cat matching pfp', String(count)), { style: 'primary' }),
-            richButton.callback('🖤 Dark Gothic', encodeCallback(id, 'pfp_search_with_goal', 'dark anime matching pfp', String(count)), { style: 'primary' })
+            richButton.callback('🐱 Cute Cats', encodeCallback(id, 'pfp_exec_goal', 'cat matching pfp', goalParam), { style: 'primary' }),
+            richButton.callback('🖤 Dark Gothic', encodeCallback(id, 'pfp_exec_goal', 'dark anime matching pfp', goalParam), { style: 'primary' })
           ]);
           b.buttons([
             richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu')),
@@ -2573,20 +2767,144 @@ export function createDownloaderScreen({ app }) {
             try {
               return await ctx.replyRich(b.toJSON());
             } catch {
-              return await ctx.reply(`👥 Send any character or theme to find ${count} matching PFPs! ♡`);
+              return await ctx.reply(`👥 Send any character or theme to find matching PFPs! ♡`);
             }
           }
           return ctx.editScreen(b.toJSON());
         }
+        case 'pfp_custom_count_ask': {
+          const query = args[0] || null;
+          await ctx.sm?.transition(ctx.tgId, States.PFP_SEARCH_INPUT, {
+            context: { mode: 'pfp', stage: 'custom_count', query }
+          });
+          const b = new RichMessageBuilder();
+          b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+          b.paragraph(rt.italic('₊˚⊹♡ enter custom result count ˙ᵕ˙'));
+          b.divider();
+          b.blockquote([
+            '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
+            '💠 𝑪𝑼𝑺𝑻𝑶𝑴 𝑪𝑶𝑼𝑵𝑻',
+            '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
+            '',
+            'Send me the number of matching picks you want (2 to 200 picks) ♡',
+            'Examples: 14, 50, 80, 150, 200'
+          ].join('\n'));
+          b.divider();
+          b.buttons([
+            richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu')),
+            richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+          ]);
+          b.validate();
+          if (fromMedia) {
+            try { return await ctx.replyRich(b.toJSON()); }
+            catch { return await ctx.reply('Send the number of matching pictures you want (2 to 200) ♡'); }
+          }
+          return ctx.editScreen(b.toJSON());
+        }
+        case 'pfp_ask_count': {
+          const query = args[0] || 'anime couple';
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id).catch(() => {});
+          }
+          const screen = renderMatchingAmountPicker(ctx, query);
+          if (fromMedia) {
+            try { return await ctx.replyRich(screen); }
+            catch { return await ctx.reply(`Select amount of matching pictures for "${query}" ♡`); }
+          }
+          return ctx.editScreen(screen);
+        }
+        case 'pfp_exec_goal':
         case 'pfp_search_with_goal': {
           const query = args[0] || 'matching pfp';
-          const goal = Number(args[1]) || 10;
+          const goalArg = args[1] || '10';
+          const isContinuous = goalArg === 'continuous';
+          const goal = isContinuous ? null : (Number(goalArg) || 10);
           if (ctx.query?.id) {
-            await ctx.api.answerCallbackQuery(ctx.query.id, { text: `🔍 Searching ${goal} matching picks… ♡` }).catch(() => {});
+            await ctx.api.answerCallbackQuery(ctx.query.id, {
+              text: isContinuous ? '♾️ Exploring continuous matching couples… ♡' : `🔍 Searching ${goal} matching picks… ♡`
+            }).catch(() => {});
           }
-          return executePfpSearch(ctx, query, { goal });
+          return executePfpSearch(ctx, query, { goal, isContinuous });
         }
-        case 'pfp_search':
+        case 'pfp_nav_next': {
+          const sessionKey = args[0];
+          const albumKey = args[1];
+          const targetIndex = parseInt(args[2], 10) || 0;
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🌸 Exploring next matching couple… ♡' }).catch(() => {});
+          }
+          const album = getAlbum(albumKey);
+          const session = getPfpSession(sessionKey);
+          if (session && session.candidates && targetIndex < session.candidates.length) {
+            const cand = session.candidates[targetIndex];
+            let fetchedBuffers = [];
+            if (cand.albumImages?.length >= 2) {
+              const targetUrls = cand.albumImages.slice(0, 4);
+              const fetched = await Promise.all(
+                targetUrls.map(async (u, idx) => {
+                  try {
+                    const r = await fetch(u, { signal: AbortSignal.timeout(10000) });
+                    if (r.ok) {
+                      return {
+                        type: 'photo',
+                        buffer: Buffer.from(await r.arrayBuffer()),
+                        filename: `pfp_${idx + 1}.jpg`,
+                        mimeType: 'image/jpeg'
+                      };
+                    }
+                  } catch {}
+                  return null;
+                })
+              );
+              fetchedBuffers = fetched.filter(Boolean);
+            }
+            if (fetchedBuffers.length >= 2) {
+              const currentMedia = album?.mediaItems || [];
+              const newOffset = currentMedia.length;
+              currentMedia.push(...fetchedBuffers);
+              album.mediaItems = currentMedia;
+              saveAlbum(albumKey, album);
+              session.currentIndex = targetIndex;
+              savePfpSession(sessionKey, session);
+
+              const { rich, files } = await buildDeliveryRichMessage({
+                ...album,
+                ctx,
+                offset: newOffset,
+                albumKey,
+                pfpSessionKey: sessionKey,
+                pfpCurrentIndex: targetIndex,
+                pfpTotalCount: session.candidates.length
+              });
+              const chatId = ctx.chatId;
+              const targetMsgId = ctx.query?.message?.message_id || ctx.messageId;
+              try {
+                const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                if (sent?.message_id) {
+                  if (targetMsgId && sent.message_id !== targetMsgId) {
+                    await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
+                  }
+                  ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+                  app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+                  ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+                }
+              } catch (err) {
+                log.warn({ err }, 'failed to update continuous couple slide');
+              }
+              return;
+            }
+          }
+          return executePfpSearch(ctx, null, { sessionKey, targetIndex, goal: session?.targetGoal });
+        }
+        case 'pfp_search': {
+          const query = args[0] || 'anime couple';
+          const goal = args[1] || null;
+          if (goal) {
+            const isContinuous = goal === 'continuous';
+            return executePfpSearch(ctx, query, { goal: isContinuous ? null : Number(goal), isContinuous });
+          }
+          return this.handle(ctx, 'pfp_ask_count', [query]);
+        }
         case 'pfp_more': {
           const query = args[0] || 'anime couple';
           if (ctx.query?.id) {
@@ -2955,6 +3273,12 @@ export function createDownloaderScreen({ app }) {
         onMessage: async (sctx, message) => {
           const text = String(message.text || message.caption || '').trim();
           if (!text) return true;
+
+          const isGroup = Boolean(sctx.isGroup || message.chat?.type === 'group' || message.chat?.type === 'supergroup' || (sctx.chatId && Number(sctx.chatId) < 0));
+          if (!isGroup && message.message_id && app.settings.get('telegram.messageCleanup')) {
+            await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+          }
+
           const match = text.match(/https?:\/\/[^\s]+/i);
           const dlCtx = {
             ...sctx,
@@ -2964,13 +3288,85 @@ export function createDownloaderScreen({ app }) {
             tgId: sctx.tgId || String(message.from?.id),
             message
           };
-          const requestedGoal = sctx.context?.requestedGoal || null;
-          await sctx.reset?.({ reason: 'pfp_search_started' });
+
           if (match) {
+            await sctx.reset?.({ reason: 'pfp_search_started' });
             await executeDownload(dlCtx, match[0]);
-          } else {
-            await executePfpSearch(dlCtx, text, { goal: requestedGoal });
+            return true;
           }
+
+          const stage = sctx.context?.stage;
+          const contextQuery = sctx.context?.query;
+
+          if (stage === 'custom_count') {
+            const isCont = /\b(continuous|infinite|explore|unlimited)\b/i.test(text);
+            const numMatch = text.match(/\b\d+\b/);
+            const parsedCount = numMatch ? parseInt(numMatch[0], 10) : null;
+            const goal = isCont ? null : (parsedCount ? Math.min(200, Math.max(2, parsedCount)) : 10);
+
+            if (contextQuery) {
+              await sctx.reset?.({ reason: 'pfp_search_started' });
+              await executePfpSearch(dlCtx, contextQuery, { goal, isContinuous: isCont });
+              return true;
+            }
+
+            // If context query is not present, check if text has theme words besides numbers/continuous
+            const cleanQuery = text.replace(/\b\d+\b/g, '').replace(/\b(continuous|infinite|explore|unlimited)\b/gi, '').trim();
+            if (cleanQuery.length >= 2) {
+              await sctx.reset?.({ reason: 'pfp_search_started' });
+              await executePfpSearch(dlCtx, cleanQuery, { goal, isContinuous: isCont });
+              return true;
+            }
+
+            // Only count provided, prompt for query with count remembered
+            await sctx.transition?.(sctx.tgId, States.PFP_SEARCH_INPUT, {
+              context: { mode: 'pfp', requestedGoal: goal, isContinuous: isCont }
+            });
+            const b = new RichMessageBuilder();
+            b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+            b.paragraph(rt.italic(isCont ? '₊˚⊹♡ continuous exploration chosen ˙ᵕ˙' : `₊˚⊹♡ target: ${goal} picks chosen ˙ᵕ˙`));
+            b.divider();
+            b.paragraph(rt.italic('Now send the character, anime, or aesthetic theme to search for ♡'));
+            b.paragraph(rt.concat(rt.text('Example: '), rt.code('anime couple'), rt.text(' or '), rt.code('gojo geto')));
+            b.divider();
+            b.buttons([
+              richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu')),
+              richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+            ]);
+            b.validate();
+            const api = sctx.api || app.telegram?.api;
+            await api.sendRichMessage(sctx.chatId, b.toJSON()).catch(() => {});
+            return true;
+          }
+
+          let query = text;
+          let requestedGoal = sctx.context?.requestedGoal || null;
+          let isContinuous = Boolean(sctx.context?.isContinuous);
+
+          if (/\b(continuous|infinite|explore|unlimited)\b/i.test(query)) {
+            isContinuous = true;
+            requestedGoal = null;
+            query = query.replace(/\b(continuous|infinite|explore|unlimited)\b/gi, ' ').trim();
+          }
+
+          const countMatch = query.match(/\b(\d+)\s*(?:pit|pins?|pics?|photos?|images?|pfps?|sets?|couples?)?\b/i) || query.match(/(?:^|\s)(\d+)$/);
+          if (countMatch) {
+            const parsedNum = parseInt(countMatch[1], 10);
+            if (parsedNum >= 2) {
+              requestedGoal = Math.min(200, parsedNum);
+              isContinuous = false;
+              const remainingText = query.replace(countMatch[0], '').replace(/\b(?:pit|pins?|pics?|photos?|images?|pfps?|sets?|couples?)\b/gi, '').trim();
+              if (remainingText.length >= 2) {
+                query = remainingText;
+              } else if (remainingText.length === 0) {
+                query = 'aesthetic matching';
+              }
+            }
+          }
+
+          if (!query) query = 'anime couple';
+          await sctx.reset?.({ reason: 'pfp_search_started' });
+          await executePfpSearch(dlCtx, query, { goal: requestedGoal, isContinuous });
           return true;
         },
         onCancel: async (sctx) => {

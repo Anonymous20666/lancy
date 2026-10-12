@@ -150,7 +150,10 @@ export function createPinterestScreen({ app }) {
       ]);
     }
     b.buttons([
-      richButton.callback('✎ Custom Count', encodeCallback(id, 'customCount', mode, query), { style: 'primary' }),
+      richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', mode, query), { style: 'primary' }),
+      richButton.callback('✎ Custom Count', encodeCallback(id, 'customCount', mode, query), { style: 'primary' })
+    ]);
+    b.buttons([
       richButton.callback('« Back', encodeCallback(id, 'mode', mode), { style: 'primary' })
     ]);
     b.divider();
@@ -228,9 +231,10 @@ export function createPinterestScreen({ app }) {
 
   async function runSearch(sctx, query, targetGoal = null) {
     const mode = sctx.context.mode ?? 'normal';
-    const depth = app.settings.get('pinterest.searchDepth') ?? 'deep';
     const rawGoal = targetGoal ?? sctx.context.goal ?? null;
-    const goal = mode === 'videos' ? Math.min(20, Math.max(1, Number(rawGoal) || 20)) : (Number(rawGoal) > 0 ? Number(rawGoal) : 60);
+    const isContinuous = rawGoal === 'continuous' || targetGoal === 'continuous' || sctx.context.goal === 'continuous';
+    const depth = isContinuous ? 'continuous' : (app.settings.get('pinterest.searchDepth') ?? 'deep');
+    const goal = isContinuous ? 10 : (mode === 'videos' ? Math.min(20, Math.max(1, Number(rawGoal) || 20)) : (Number(rawGoal) > 0 ? Number(rawGoal) : 60));
     const userId = Number(sctx.tgId);
     const api = sctx.api || app.telegram.api;
     const chatId = sctx.chatId;
@@ -336,7 +340,9 @@ export function createPinterestScreen({ app }) {
       }
 
       result.mode = mode;
-      result.requestedGoal = goal;
+      result.requestedGoal = isContinuous ? 'continuous' : goal;
+      result.isContinuous = isContinuous;
+      result.depth = depth;
       const rich = resultsRich(result, previewBlocks.length, totalMedia, previewBlocks, 0);
       const files = previewBlocks.length > 0 ? mediaFiles : null;
       try {
@@ -623,22 +629,52 @@ export function createPinterestScreen({ app }) {
     const chatId = ctx.chatId;
     const numOffset = Math.max(0, Number(offset) || 0);
 
-    const nextMedia = app.pinterest.db.all(
+    let nextMedia = app.pinterest.db.all(
       `SELECT * FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0
        ORDER BY quality_score DESC LIMIT 10 OFFSET ?`,
       searchId, numOffset
     );
 
-    const totalMediaRow = app.pinterest.db.get(
+    let totalMediaRow = app.pinterest.db.get(
       `SELECT COUNT(*) as count FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0`,
       searchId
     );
-    const totalMedia = totalMediaRow?.count ?? 0;
+    let totalMedia = totalMediaRow?.count ?? 0;
 
     const searchRow = app.pinterest.db.get(
       'SELECT * FROM pinterest_searches WHERE id = ?',
       searchId
     );
+
+    const isContinuous = searchRow?.depth === 'continuous';
+    if (!nextMedia.length && isContinuous && searchRow?.query && typeof app.pinterest?.search === 'function') {
+      try {
+        const expansion = await app.pinterest.search({
+          userId: searchRow.user_id,
+          query: searchRow.query,
+          mode: searchRow.mode,
+          depth: 'continuous',
+          goal: 10
+        });
+        if (expansion?.results?.length) {
+          app.pinterest.markResultsDelivered?.(searchRow.user_id, searchId, expansion.results);
+          app.pinterest.db.run(
+            'UPDATE pinterest_media SET search_id = ? WHERE search_id = ?',
+            searchId, expansion.searchId
+          );
+          nextMedia = app.pinterest.db.all(
+            `SELECT * FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0
+             ORDER BY quality_score DESC LIMIT 10 OFFSET ?`,
+            searchId, numOffset
+          );
+          totalMediaRow = app.pinterest.db.get(
+            `SELECT COUNT(*) as count FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0`,
+            searchId
+          );
+          totalMedia = totalMediaRow?.count ?? 0;
+        }
+      } catch {}
+    }
 
     if (!nextMedia.length) {
       const isVideo = searchRow?.mode === 'videos';
@@ -696,6 +732,8 @@ export function createPinterestScreen({ app }) {
       searchId,
       query: searchRow?.query ?? '',
       mode: searchRow?.mode ?? 'normal',
+      depth: searchRow?.depth ?? 'deep',
+      isContinuous: searchRow?.depth === 'continuous',
       results: { length: totalMedia },
       stats: { duplicatesFound: searchRow?.duplicates_found ?? 0 }
     };
@@ -757,12 +795,20 @@ export function createPinterestScreen({ app }) {
         }
 
         if (sctx.context.stage === 'count') {
-          const parsed = parseInt(text, 10);
-          if (!isNaN(parsed) && parsed > 0) {
+          if (/\b(continuous|infinite|explore|unlimited)\b/i.test(text)) {
             if (!isGroup && message.message_id) {
               await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
             }
-            await runSearch(sctx, sctx.context.query, parsed);
+            await runSearch(sctx, sctx.context.query, 'continuous');
+            return true;
+          }
+          const parsed = parseInt(text, 10);
+          if (!isNaN(parsed) && parsed > 0) {
+            const capped = Math.min(200, parsed);
+            if (!isGroup && message.message_id) {
+              await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+            }
+            await runSearch(sctx, sctx.context.query, capped);
             return true;
           }
         }
@@ -833,13 +879,33 @@ export function createPinterestScreen({ app }) {
     id,
     registerStateHandlers,
     async executeSearch(ctx, query, count = 5) {
+      let q = String(query || '').trim();
+      let targetCount = count;
+      let isContinuous = false;
+
+      if (/\b(continuous|infinite)\b/i.test(q)) {
+        isContinuous = true;
+        q = q.replace(/\b(continuous|infinite)\b/gi, '').trim();
+      }
+
+      const countMatch = q.match(/\b(\d+)\s*(?:pins?|pics?|photos?|images?|picks?)?\b/i) || q.match(/(?:^|\s)(\d+)$/);
+      if (countMatch) {
+        const parsedNum = parseInt(countMatch[1], 10);
+        if (parsedNum >= 1) {
+          targetCount = Math.min(200, parsedNum);
+          const remaining = q.replace(countMatch[0], '').replace(/\b(?:pins?|pics?|photos?|images?|picks?)\b/gi, '').trim();
+          if (remaining.length >= 2) q = remaining;
+        }
+      }
+
+      const effectiveGoal = isContinuous ? 'continuous' : targetCount;
       await ctx.sm.transition(ctx.tgId, States.PINTEREST_SEARCH, {
-        context: { query, mode: 'normal', goal: count, stage: 'count' }
+        context: { query: q, mode: 'normal', goal: effectiveGoal, stage: 'count' }
       });
       const sctx = ctx.sm.ctxFor(ctx.tgId);
       sctx.messageId = ctx.messageId;
       sctx.screenMessageId = ctx.messageId;
-      return runSearch(sctx, query, count);
+      return runSearch(sctx, q, effectiveGoal);
     },
     async open(ctx) {
       await ctx.sm.reset(ctx.tgId, { reason: 'navigate' });
@@ -978,12 +1044,17 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
   const total = Math.max(Number(totalImages) || 0, Number(count) || 0);
   const requestedGoal = result.requestedGoal || result.stats?.requestedGoal || null;
   const extraCount = (requestedGoal && total > requestedGoal) ? (total - requestedGoal) : (result.stats?.extraCount || 0);
+  const isContinuous = Boolean(result.isContinuous || result.depth === 'continuous' || requestedGoal === 'continuous');
 
-  const bannerLines = ['𓆩♡𓆪 SEARCH COMPLETED 𓆩♡𓆪'];
-  if (extraCount > 0) {
-    bannerLines.push(`found: ${total} aesthetic picks (${requestedGoal} - ${extraCount}extra)`);
-  } else {
-    bannerLines.push(`found: ${count} aesthetic picks`);
+  const bannerLines = isContinuous
+    ? ['𓆩♡𓆪 CONTINUOUS SEARCH 𓆩♡𓆪', 'infinite exploration • duplicate-free picks ˙ᵕ˙']
+    : ['𓆩♡𓆪 SEARCH COMPLETED 𓆩♡𓆪'];
+  if (!isContinuous) {
+    if (extraCount > 0) {
+      bannerLines.push(`found: ${total} aesthetic picks (${requestedGoal} - ${extraCount}extra)`);
+    } else {
+      bannerLines.push(`found: ${count} aesthetic picks`);
+    }
   }
   b.paragraph(rt.bold(banner(bannerLines)));
   b.divider();
@@ -1004,8 +1075,8 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
       { text: rt.bold(truncate(result.query, 24)), align: 'right', valign: 'middle' }
     ],
     [
-      { text: '˙ᵕ˙ Unique results', align: 'left', valign: 'middle' },
-      { text: rt.bold(extraCount > 0 ? `${total} (${requestedGoal} + ${extraCount} extra)` : String(count)), align: 'right', valign: 'middle' }
+      { text: isContinuous ? '˙ᵕ˙ Mode' : '˙ᵕ˙ Unique results', align: 'left', valign: 'middle' },
+      { text: rt.bold(isContinuous ? `${result.mode} (Continuous Exploration ♾️)` : (extraCount > 0 ? `${total} (${requestedGoal} + ${extraCount} extra)` : String(count))), align: 'right', valign: 'middle' }
     ],
     [
       { text: '୨୧ Twins removed', align: 'left', valign: 'middle' },
@@ -1035,7 +1106,7 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
 
   const isVideo = result.mode === 'videos';
   const hasPrev = start > 0;
-  const hasNext = total > currentOffset;
+  const hasNext = isContinuous ? (total > currentOffset || total >= 10) : (total > currentOffset);
 
   const prevOffset = Math.max(0, start - 10);
   const prevBatchSize = start - prevOffset;
@@ -1044,18 +1115,18 @@ function resultsRich(result, currentOffset = 10, totalImages = 0, previewAttachm
 
   if (hasPrev && hasNext) {
     const prevRange = `(${prevOffset + 1}–${prevOffset + prevBatchSize})`;
-    const nextRange = `(${nextOffset + 1}–${nextOffset + nextBatchSize})`;
+    const nextRange = isContinuous ? '(Explore More) →' : `(${nextOffset + 1}–${nextOffset + nextBatchSize}) →`;
     const prevLabel = isVideo ? `← Prev ${prevRange}` : `← Prev ${prevRange}`;
-    const nextLabel = isVideo ? `Next ${nextRange} →` : `Next ${nextRange} →`;
+    const nextLabel = isContinuous ? (isVideo ? '🎬 Next Videos (Explore More) →' : '♾️ Next Picks (Explore More) →') : (isVideo ? `Next ${nextRange}` : `Next ${nextRange}`);
     b.buttons([
       richButton.callback(prevLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(prevOffset)), { style: 'primary' }),
       richButton.callback(nextLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(nextOffset)), { style: 'primary' })
     ]);
   } else if (hasNext) {
-    const nextRange = `(${nextOffset + 1}–${nextOffset + nextBatchSize})`;
+    const nextRange = isContinuous ? '(Explore More) →' : `(${nextOffset + 1}–${nextOffset + nextBatchSize}) →`;
     const nextLabel = isVideo
-      ? `🎬 Next ${nextBatchSize} Videos ${nextRange} →`
-      : `🖼 Next ${nextBatchSize} Picks ${nextRange} →`;
+      ? (isContinuous ? '🎬 Next Videos (Explore More) →' : `🎬 Next ${nextBatchSize} Videos ${nextRange}`)
+      : (isContinuous ? '♾️ Next Picks (Explore More) →' : `🖼 Next ${nextBatchSize} Picks ${nextRange}`);
     b.buttons([
       richButton.callback(nextLabel, encodeCallback('pinterest', 'moreAlbum', String(result.searchId), String(nextOffset)), { style: 'primary' })
     ]);
