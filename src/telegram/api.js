@@ -35,14 +35,10 @@ function sanitizeInlineResults(results) {
               b.text = [...b.text.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
             }
             if (typeof b.switch_inline_query_current_chat === 'string') {
-              const norm = b.switch_inline_query_current_chat.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-              const clean = norm.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-              b.switch_inline_query_current_chat = [...clean.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
+              b.switch_inline_query_current_chat = [...b.switch_inline_query_current_chat.toWellFormed()].slice(0, 64).join('').toWellFormed();
             }
             if (typeof b.switch_inline_query === 'string') {
-              const norm = b.switch_inline_query.normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
-              const clean = norm.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim();
-              b.switch_inline_query = [...clean.toWellFormed()].slice(0, 64).join('').trim().toWellFormed();
+              b.switch_inline_query = [...b.switch_inline_query.toWellFormed()].slice(0, 64).join('').toWellFormed();
             }
             return b;
           }) : row

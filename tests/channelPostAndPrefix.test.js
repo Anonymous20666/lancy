@@ -90,6 +90,7 @@ test('ChannelPost: renderChannelBanner produces crisp 1000x560 PNG buffer', asyn
 test('TelegramController /setprefix: view, update and dispatch with custom prefix', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
+  settings.set('security.publicAccess', true);
   const sm = new StateMachine();
   const sentMessages = [];
   const chatId = -100777;
@@ -174,7 +175,7 @@ test('TelegramController /setprefix: view, update and dispatch with custom prefi
   assert.equal(db.getUserPrefix(802), '🎀');
   assert.ok(sentMessages[sentMessages.length - 1].text.includes('Personal command prefix changed to:</b> <code>🎀</code>'));
 
-  // 6. User Alice uses her personal prefix 🎀setprefix in the group
+  // 6. User Alice tries her personal prefix 🎀setprefix in the group -> group prefix ✨ is enforced
   await controller.handleUpdate({
     message: {
       message_id: 5,
@@ -184,15 +185,51 @@ test('TelegramController /setprefix: view, update and dispatch with custom prefi
     }
   });
 
-  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Your Personal Prefix:</b> <code>🎀</code>'));
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('In this group, the command prefix is <code>✨</code>! Use <code>✨setprefix</code>'));
 
-  // 7. Group prefix is still ✨ for the group
-  assert.equal(db.getChatPrefix(chatId), '✨');
-
-  // 8. Reset group prefix back to /
+  // 7. Group members use group prefix ✨
   await controller.handleUpdate({
     message: {
       message_id: 6,
+      chat: { id: chatId, type: 'group' },
+      from: { id: 802, first_name: 'Alice' },
+      text: '✨setprefix'
+    }
+  });
+  assert.ok(sentMessages[sentMessages.length - 1].text.includes('Group Command Prefix:</b> <code>✨</code>'));
+
+  // 8. User types prefix alone ✨ in group -> displays rich Command Suggestions card
+  await controller.handleUpdate({
+    message: {
+      message_id: 7,
+      chat: { id: chatId, type: 'group' },
+      from: { id: 802, first_name: 'Alice' },
+      text: '✨'
+    }
+  });
+  const groupSugg = sentMessages[sentMessages.length - 1];
+  assert.ok(groupSugg.text.includes('COMMAND SUGGESTIONS (✨)'));
+  assert.ok(groupSugg.opts.reply_markup.inline_keyboard.length >= 3);
+
+  // 9. In private DM, Alice uses her personal prefix 🎀
+  await controller.handleUpdate({
+    message: {
+      message_id: 8,
+      chat: { id: 802, type: 'private' },
+      from: { id: 802, first_name: 'Alice' },
+      text: '🎀'
+    }
+  });
+  const dmSugg = sentMessages[sentMessages.length - 1];
+  assert.ok(dmSugg.text.includes('COMMAND SUGGESTIONS (🎀)'));
+
+  // 10. Group prefix is still ✨ for the group
+  assert.equal(db.getChatPrefix(chatId), '✨');
+
+  // 11. Reset group prefix back to /
+  await controller.handleUpdate({
+    message: {
+      message_id: 9,
       chat: { id: chatId, type: 'group' },
       from: { id: 801, first_name: 'AdminBob' },
       text: '✨setprefix /'
@@ -564,6 +601,84 @@ test('AutoPost: AUTOPOST_AI_CHAT handles message with contextual clone api witho
   assert.equal(sentCloneMessages.length, 1);
   assert.equal(sentCloneMessages[0].chatId, cloneChatId);
   assert.ok(sentCloneMessages[0].text.includes('Theme locked in: "I want random popular animes"!'));
+
+  db.close();
+});
+
+test('TelegramController inline query: returns command suggestions formatted with custom prefix', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.set('security.publicAccess', true);
+  const sm = new StateMachine();
+  let answeredQuery = null;
+
+  const mockApi = {
+    getMe: async () => ({ id: 99999, username: 'lancybot' }),
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        answeredQuery = payload;
+        return { ok: true };
+      }
+      return { ok: true };
+    }
+  };
+
+  const app = {
+    telegram: { api: mockApi, botUsername: 'lancybot' },
+    db,
+    settings,
+    sm,
+    packs: { listPacks: () => ({ packs: [], total: 0 }), getPack: () => null }
+  };
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    sm,
+    app,
+    log: console
+  });
+
+  // 1. User with personal prefix 🎀 types prefix in inline query: "@lancybot 🎀"
+  db.setUserPrefix(777, '🎀');
+
+  await controller.handleUpdate({
+    inline_query: {
+      id: 'iq_101',
+      from: { id: 777, first_name: 'Luna' },
+      query: '🎀',
+      offset: ''
+    }
+  });
+
+  assert.ok(answeredQuery);
+  assert.equal(answeredQuery.inline_query_id, 'iq_101');
+  assert.ok(answeredQuery.results.length >= 8);
+  const gameCmd = answeredQuery.results.find(r => r.id === 'cmd_game_🎀');
+  assert.ok(gameCmd);
+  assert.equal(gameCmd.title, '🎮 🎀game');
+  assert.equal(gameCmd.input_message_content.message_text, '🎀game');
+
+  const playCmd = answeredQuery.results.find(r => r.id === 'cmd_play_🎀');
+  assert.ok(playCmd);
+  assert.equal(playCmd.title, '🎵 🎀play <song>');
+  assert.equal(playCmd.input_message_content.message_text, '🎀play ');
+
+  // 2. User filters by command name: "@lancybot 🎀pl"
+  answeredQuery = null;
+  await controller.handleUpdate({
+    inline_query: {
+      id: 'iq_102',
+      from: { id: 777, first_name: 'Luna' },
+      query: '🎀pl',
+      offset: ''
+    }
+  });
+
+  assert.ok(answeredQuery);
+  const filteredPlay = answeredQuery.results.find(r => r.id === 'cmd_play_🎀');
+  assert.ok(filteredPlay);
 
   db.close();
 });

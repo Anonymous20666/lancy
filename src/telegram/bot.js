@@ -2191,6 +2191,122 @@ export class TelegramController extends EventEmitter {
     const offset = parseInt(inlineQuery.offset || '0', 10) || 0;
     const botName = this.botContext?.botName || 'Lancy';
     const botTag = this.botUsername ? `@${this.botUsername}` : '';
+    const tgId = inlineQuery.from?.id;
+    const userPrefix = tgId && this.db?.getUserPrefix ? this.db.getUserPrefix(tgId) : '/';
+    const activePrefix = userPrefix || '/';
+
+    const getCommandArticles = (prefix = '/') => [
+      {
+        type: 'article',
+        id: `cmd_game_${prefix}`,
+        title: `🎮 ${prefix}game`,
+        description: 'Interactive trivia arena, flag challenge, cars & AI quiz ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}game`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_play_${prefix}`,
+        title: `🎵 ${prefix}play <song>`,
+        description: 'Stream or download high-speed 320kbps MP3 audio ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        input_message_content: {
+          message_text: `${prefix}play `
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_grab_${prefix}`,
+        title: `📥 ${prefix}grab <link>`,
+        description: 'Download HD videos & music from TikTok, IG, YT & X ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        input_message_content: {
+          message_text: `${prefix}grab `
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_pint_${prefix}`,
+        title: `🔍 ${prefix}pint <search>`,
+        description: 'Search aesthetic Pinterest photos and wallpapers ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        input_message_content: {
+          message_text: `${prefix}pint `
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_stickers_${prefix}`,
+        title: `🎀 ${prefix}stickers`,
+        description: 'Create, convert & manage Telegram sticker packs ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        input_message_content: {
+          message_text: `${prefix}stickers`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_postchannel_${prefix}`,
+        title: `📢 ${prefix}postchannel`,
+        description: 'Publish sticker packs with aesthetic previews to Telegram channels ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+        input_message_content: {
+          message_text: `${prefix}postchannel`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_autopost_${prefix}`,
+        title: `📅 ${prefix}autopost`,
+        description: 'Schedule automated sticker drop campaigns across days ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1506784365847-bbad939e9335?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1506784365847-bbad939e9335?w=150',
+        input_message_content: {
+          message_text: `${prefix}autopost`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_menu_${prefix}`,
+        title: `✦ ${prefix}menu`,
+        description: 'Open Lancy aesthetic dashboard & control center ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+        input_message_content: {
+          message_text: `${prefix}menu`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_setprefix_${prefix}`,
+        title: `⚡ ${prefix}setprefix <prefix>`,
+        description: 'Change command prefix trigger symbol or emoji ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+        input_message_content: {
+          message_text: `${prefix}setprefix `
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_help_${prefix}`,
+        title: `୨୧ ${prefix}help`,
+        description: 'Display all commands & studio documentation ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1518709268805-4e9042af9f23?w=150',
+        input_message_content: {
+          message_text: `${prefix}help`
+        }
+      }
+    ];
 
     try {
       // 1. If query is empty: provide intuitive entrypoint cards (Shazam style)
@@ -2293,10 +2409,34 @@ export class TelegramController extends EventEmitter {
         await this.api.call('answerInlineQuery', {
           inline_query_id: qId,
           results: defaultResults,
-          cache_time: 10,
-          is_personal: false
+          cache_time: 5,
+          is_personal: true
         });
         return;
+      }
+
+      // Check if user is typing prefix or prefix command (e.g. "@bot 🎀", "@bot 🎀play", "@bot /", "@bot /game")
+      const isQueryingPrefix = rawText === activePrefix || rawText === '/'
+        || (activePrefix !== '/' && rawText.startsWith(activePrefix))
+        || rawText.startsWith('/');
+
+      if (isQueryingPrefix) {
+        const currentQueryPrefix = (activePrefix !== '/' && rawText.startsWith(activePrefix)) ? activePrefix : (rawText.startsWith('/') ? '/' : activePrefix);
+        const queryClean = rawText.slice(currentQueryPrefix.length).trim().toLowerCase();
+        const allCmds = getCommandArticles(currentQueryPrefix);
+        const matchedCmds = queryClean
+          ? allCmds.filter(c => c.id.replace(`_${currentQueryPrefix}`, '').slice(4).includes(queryClean))
+          : allCmds;
+
+        if (matchedCmds.length > 0) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: matchedCmds,
+            cache_time: 5,
+            is_personal: true
+          });
+          return;
+        }
       }
 
       // 2. Check if user pasted a media URL (TikTok, Pinterest, direct media, etc.)
@@ -2763,12 +2903,40 @@ export class TelegramController extends EventEmitter {
     const chatPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
     const userPrefix = this.db?.getUserPrefix ? this.db.getUserPrefix(tgId) : '/';
 
-    if (userPrefix && userPrefix !== '/' && text.startsWith(userPrefix)) {
-      text = '/' + text.slice(userPrefix.length).trim();
-    } else if (chatPrefix && chatPrefix !== '/' && text.startsWith(chatPrefix)) {
-      text = '/' + text.slice(chatPrefix.length).trim();
-    } else if (text.startsWith('!') || text.startsWith('.')) {
+    // Group chats: the chat's prefix set by admin is the single universal prefix for all group members!
+    // Private chats (DM): the user's personal prefix or chat prefix applies.
+    const activePrefix = isGroup ? (chatPrefix || '/') : (userPrefix && userPrefix !== '/' ? userPrefix : (chatPrefix || '/'));
+
+    // Check if message is prefix alone (e.g. "🎀") or custom prefix help trigger (e.g. "🎀help", "🎀commands")
+    const isPrefixOnly = text === activePrefix || (activePrefix !== '/' && text.startsWith(activePrefix) && text.slice(activePrefix.length).trim() === '');
+    const remainder = text.startsWith(activePrefix) ? text.slice(activePrefix.length).trim().toLowerCase() : '';
+    const isCustomHelp = activePrefix !== '/' && ['help', 'commands', 'cmds'].includes(remainder);
+
+    if (isPrefixOnly || (isCustomHelp && text.startsWith(activePrefix))) {
+      await this.handleCommandSuggestions(message, activePrefix);
+      return;
+    }
+
+    if (activePrefix !== '/' && text.startsWith(activePrefix)) {
+      text = '/' + text.slice(activePrefix.length).trim();
+    } else if (activePrefix === '/' && (text.startsWith('!') || text.startsWith('.'))) {
       text = '/' + text.slice(1).trim();
+    } else if (isGroup && activePrefix !== '/' && !text.startsWith('/')) {
+      // In a group chat where a custom prefix (e.g. 🎀) is set:
+      // If someone attempts a command using another prefix (e.g. !play or .game), remind them of the group prefix.
+      const knownCommands = ['play', 'game', 'quiz', 'trivia', 'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel', 'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall'];
+      const matchPrefixAttempt = text.match(/^([^\w\s]{1,3})([a-z]+)(\s+.*)?$/i);
+      if (matchPrefixAttempt) {
+        const attemptedCmd = matchPrefixAttempt[2].toLowerCase();
+        if (knownCommands.includes(attemptedCmd)) {
+          await this.api.sendMessage(
+            chatId,
+            `<blockquote>💡 In this group, the command prefix is <code>${activePrefix}</code>! Use <code>${activePrefix}${attemptedCmd}</code> to run it ♡</blockquote>`,
+            { parse_mode: 'HTML' }
+          );
+          return;
+        }
+      }
     }
 
     if (text.startsWith('/')) {
@@ -3187,7 +3355,11 @@ export class TelegramController extends EventEmitter {
         updateScreenMsg(sent);
         return;
       }
-      if (command === '/help') {
+      if (command === '/help' || command === '/commands' || command === '/cmds') {
+        if (isGroup) {
+          await this.handleCommandSuggestions(message, activePrefix);
+          return;
+        }
         const help = this.screens.get('help');
         const sent = await help?.open(this.#ctx(tgId, { message }, { forceNew: true }));
         updateScreenMsg(sent);
@@ -4011,12 +4183,11 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
       if (isGroup) {
         await this.api.sendMessage(
           chatId,
-          `<blockquote>🌸 <b>Group Command Prefix:</b> <code>${currentChatPrefix}</code>\n` +
-          `👤 <b>Your Personal Prefix:</b> <code>${currentUserPrefix}</code>\n\n` +
-          `🎀 <b>To change prefix:</b>\n` +
-          `• <b>Group Prefix (Admins):</b> <code>${currentChatPrefix}setprefix &lt;symbol or emoji&gt;</code>\n` +
-          `• <b>Your Personal Prefix:</b> <code>${currentChatPrefix}setprefix me &lt;symbol or emoji&gt;</code>\n\n` +
-          `✨ Supports symbols & emojis: <code>!</code>, <code>.</code>, <code>#</code>, <code>✨</code>, <code>🎀</code>, <code>⚡</code>, <code>🤍</code> ♡</blockquote>`,
+          `<blockquote>🌸 <b>Group Command Prefix:</b> <code>${currentChatPrefix}</code>\n\n` +
+          `Everyone in this group uses: <code>${currentChatPrefix}&lt;command&gt;</code>\n\n` +
+          `🎀 <b>To change prefix (Admins):</b>\n` +
+          `Send: <code>${currentChatPrefix}setprefix &lt;symbol or emoji&gt;</code>\n\n` +
+          `✨ Examples: <code>${currentChatPrefix}setprefix !</code>, <code>${currentChatPrefix}setprefix 🎀</code>, <code>${currentChatPrefix}setprefix ✨</code> ♡</blockquote>`,
           { parse_mode: 'HTML' }
         );
       } else {
@@ -4025,8 +4196,7 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
           `<blockquote>🌸 <b>Your Command Prefix:</b> <code>${currentUserPrefix}</code>\n\n` +
           `🎀 <b>To change prefix:</b>\n` +
           `Send: <code>${currentUserPrefix}setprefix &lt;symbol or emoji&gt;</code>\n\n` +
-          `✨ Examples: <code>${currentUserPrefix}setprefix !</code>, <code>${currentUserPrefix}setprefix ✨</code>, <code>${currentUserPrefix}setprefix 🎀</code>\n` +
-          `<i>Your personal prefix works here in private chat and across all group chats!</i> ♡</blockquote>`,
+          `✨ Examples: <code>${currentUserPrefix}setprefix !</code>, <code>${currentUserPrefix}setprefix ✨</code>, <code>${currentUserPrefix}setprefix 🎀</code> ♡</blockquote>`,
           { parse_mode: 'HTML' }
         );
       }
@@ -4040,7 +4210,7 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
     if (!rawTargetPrefix) {
       await this.api.sendMessage(
         chatId,
-        `<blockquote>✕ Please provide a symbol or emoji for your personal prefix (e.g. <code>${currentChatPrefix}setprefix me ✨</code>) ♡</blockquote>`,
+        `<blockquote>✕ Please provide a symbol or emoji for the prefix (e.g. <code>${currentChatPrefix}setprefix 🎀</code>) ♡</blockquote>`,
         { parse_mode: 'HTML' }
       );
       return;
@@ -4076,8 +4246,8 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
       if (!isAdmin) {
         await this.api.sendMessage(
           chatId,
-          `<blockquote>✕ Only group administrators or the bot owner can change the group-wide prefix.\n\n` +
-          `💡 <b>Tip:</b> You can set your <b>personal prefix</b> instead! Send: <code>${currentChatPrefix}setprefix me ${newPrefix}</code> (or message me in private DM), and your commands with <code>${newPrefix}</code> will work for you everywhere! ♡</blockquote>`,
+          `<blockquote>✕ Only group administrators or the bot owner can change the group prefix.\n\n` +
+          `💡 <b>Tip:</b> To use a personal prefix for yourself in private chats, message me in DM! ♡</blockquote>`,
           { parse_mode: 'HTML' }
         );
         return;
@@ -4095,12 +4265,13 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
       await this.api.sendMessage(
         chatId,
         `<blockquote>✨ <b>Group command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
-        `Everyone in this group can now use:\n` +
+        `Everyone in this group must now use: <code>${newPrefix}</code>\n` +
         `• <code>${newPrefix}game</code>\n` +
         `• <code>${newPrefix}play &lt;song&gt;</code>\n` +
         `• <code>${newPrefix}grab &lt;link&gt;</code>\n` +
-        `• <code>${newPrefix}menu</code>\n\n` +
-        `<i>(Safety note: standard <code>/</code> commands will always remain recognized)</i> ♡</blockquote>`,
+        `• <code>${newPrefix}menu</code>\n` +
+        `• <code>${newPrefix}setprefix &lt;char&gt;</code>\n\n` +
+        `<i>Type <code>${newPrefix}</code> anytime to view full command suggestions!</i> ♡</blockquote>`,
         { parse_mode: 'HTML' }
       );
       return;
@@ -4116,35 +4287,91 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
 
     await this.updateCommandsForChat(chatId, newPrefix);
 
+    const groupNotice = isGroup
+      ? `\n\n⚠️ <i>Note: In this group chat, the active group prefix is <code>${currentChatPrefix}</code>. Your personal prefix works in private DM!</i>`
+      : '';
+
     await this.api.sendMessage(
       chatId,
       `<blockquote>✨ <b>Personal command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
-      `You can now use commands with your personal prefix here and across all group chats:\n` +
+      `You can now use commands with your personal prefix in private chat:\n` +
       `• <code>${newPrefix}play &lt;song&gt;</code>\n` +
       `• <code>${newPrefix}game</code>\n` +
       `• <code>${newPrefix}grab &lt;link&gt;</code>\n` +
       `• <code>${newPrefix}menu</code>\n` +
-      `• <code>${newPrefix}setprefix me &lt;char&gt;</code>\n\n` +
-      `<i>(Your command suggestions list in this chat has also been updated to reflect <code>${newPrefix}</code>!)</i> ♡</blockquote>`,
+      `• <code>${newPrefix}setprefix &lt;char&gt;</code>${groupNotice}\n\n` +
+      `<i>Type <code>${newPrefix}</code> anytime to view full command suggestions!</i> ♡</blockquote>`,
       { parse_mode: 'HTML' }
     );
+  }
+
+  async handleCommandSuggestions(message, prefix = '/') {
+    const chatId = message.chat?.id;
+    if (!chatId) return;
+    const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+    const scopeLabel = isGroup ? 'Group' : 'Personal';
+
+    const cardHtml =
+      `𓆩♡𓆪 <b>COMMAND SUGGESTIONS (${prefix})</b> 𓆩♡𓆪\n` +
+      `₊˚⊹♡  <i>available studio commands</i>  ˙ᵕ˙\n\n` +
+      `<blockquote>🎀 <b>Active ${scopeLabel} Prefix:</b> <code>${prefix}</code>\n\n` +
+      `✨ <b>Quick Commands:</b>\n` +
+      `• <code>${prefix}game</code> — Trivia arena, flag quiz, cars & AI quiz\n` +
+      `• <code>${prefix}play &lt;song&gt;</code> — Stream 320k high-speed MP3 audio\n` +
+      `• <code>${prefix}grab &lt;link&gt;</code> — Download HD videos/music (TT/IG/YT/X)\n` +
+      `• <code>${prefix}pint &lt;search&gt;</code> — Aesthetic Pinterest gallery\n` +
+      `• <code>${prefix}stickers</code> — Telegram sticker studio\n` +
+      `• <code>${prefix}postchannel</code> — Post sticker pack to Telegram channel\n` +
+      `• <code>${prefix}autopost</code> — Schedule automated sticker drops\n` +
+      `• <code>${prefix}menu</code> — Studio dashboard & settings\n` +
+      `• <code>${prefix}setprefix &lt;char&gt;</code> — Change command trigger prefix\n\n` +
+      `<i>💡 Tap any button below to run or open suggestions!</i> ♡</blockquote>`;
+
+    const keyboard = {
+      inline_keyboard: [
+        [
+          { text: `🎮 ${prefix}game`, callback_data: 'game_start:flags' },
+          { text: `🎵 ${prefix}play`, switch_inline_query_current_chat: `${prefix}play ` }
+        ],
+        [
+          { text: `📥 ${prefix}grab`, switch_inline_query_current_chat: `${prefix}grab ` },
+          { text: `🔍 ${prefix}pint`, switch_inline_query_current_chat: `${prefix}pint ` }
+        ],
+        [
+          { text: `🎀 ${prefix}menu`, callback_data: encodeCallback('dashboard', 'open') },
+          { text: `✨ Suggestions ↗️`, switch_inline_query_current_chat: `${prefix}` }
+        ]
+      ]
+    };
+
+    return await this.api.sendMessage(chatId, cardHtml, {
+      parse_mode: 'HTML',
+      reply_markup: keyboard
+    });
   }
 
   async updateCommandsForChat(chatId, prefix = '/') {
     try {
       const commands = [
-        { command: 'play', description: `[${prefix}play] Stream high-speed 320k MP3` },
         { command: 'game', description: `[${prefix}game] Trivia arena & flag quiz` },
+        { command: 'play', description: `[${prefix}play] Stream high-speed 320k MP3` },
         { command: 'grab', description: `[${prefix}grab] Download HD video/music` },
         { command: 'pint', description: `[${prefix}pint] Search aesthetic Pinterest` },
         { command: 'stickers', description: `[${prefix}stickers] Telegram sticker studio` },
+        { command: 'postchannel', description: `[${prefix}postchannel] Post pack to channel` },
+        { command: 'autopost', description: `[${prefix}autopost] Schedule sticker drops` },
         { command: 'menu', description: `[${prefix}menu] Open dashboard & settings` },
         { command: 'setprefix', description: `[${prefix}setprefix] Change command trigger prefix` },
-        { command: 'help', description: `[${prefix}help] Complete studio guide` }
+        { command: 'help', description: `[${prefix}help] View command suggestions` }
       ];
       await this.api.call('setMyCommands', {
         commands,
         scope: { type: 'chat', chat_id: Number(chatId) }
+      }).catch(() => {});
+
+      await this.api.call('setChatMenuButton', {
+        chat_id: Number(chatId),
+        menu_button: { type: 'commands' }
       }).catch(() => {});
     } catch {}
   }
