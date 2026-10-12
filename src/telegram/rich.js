@@ -155,7 +155,13 @@ export function richTextToString(text) {
 // ── Block builders ────────────────────────────────────────────────────────
 
 export const block = {
-  paragraph: (text) => ({ type: 'paragraph', text }),
+  paragraph: (text) => {
+    let parsedText = text;
+    if (typeof text === 'string' && text.includes('<') && /<\/?(b|strong|i|em|u|ins|s|strike|del|code|tg-spoiler|spoiler|a|tg-emoji)\b/i.test(text)) {
+      parsedText = parseHtmlToRichText(text);
+    }
+    return { type: 'paragraph', text: parsedText };
+  },
   heading: (text, size = 1) => ({ type: 'heading', text, size: clampSize(size) }),
   header: (text, size = 1) => ({ type: 'heading', text, size: clampSize(size) }),
   pre: (text, language) => ({ type: 'pre', text, ...(language ? { language } : {}) }),

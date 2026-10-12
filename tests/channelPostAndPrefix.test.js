@@ -417,3 +417,38 @@ test('RichMessage: normalizeButtonStyle ensures only primary, success, or danger
   assert.equal(ik.inline_keyboard[0][0].style, 'primary');
   assert.equal(ik.inline_keyboard[0][1].style, 'danger');
 });
+
+test('ChannelPost: add_channel renders true blockquote without raw HTML tags', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+  let renderedRich = null;
+
+  const app = {
+    telegram: { api: {}, botUsername: 'lancybot' },
+    db, settings, sm,
+    packs: { listPacks: () => ({ packs: [], total: 0 }), getPack: () => null }
+  };
+
+  const screen = createChannelPostScreen({ app });
+  const ctx = {
+    tgId: 100,
+    chatId: 100,
+    messageId: 50,
+    editScreen: async (rich) => { renderedRich = rich; return rich; }
+  };
+
+  await screen.handle(ctx, 'add_channel');
+
+  assert.ok(renderedRich);
+  const blockquoteBlock = renderedRich.blocks.find((b) => b.type === 'blockquote');
+  assert.ok(blockquoteBlock, 'renders native blockquote');
+
+  const str = JSON.stringify(renderedRich);
+  assert.ok(!str.includes('<b>'), 'does not contain raw <b> tags');
+  assert.ok(!str.includes('<code>'), 'does not contain raw <code> tags');
+  assert.ok(!str.includes('<i>'), 'does not contain raw <i> tags');
+
+  db.close();
+});
+

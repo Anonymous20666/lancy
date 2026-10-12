@@ -332,7 +332,8 @@ export function createAutoPostScreen({ app }) {
     b.divider();
     b.paragraph(rt.concat(
       rt.bold('📊 Total Drops in Campaign: '),
-      rt.text(`<b>${totalDrops} sticker packs</b> scheduled ♡`)
+      rt.bold(`${totalDrops} sticker packs `),
+      rt.text('scheduled ♡')
     ));
 
     b.divider();
@@ -364,11 +365,11 @@ export function createAutoPostScreen({ app }) {
     ])));
     b.divider();
 
-    b.blockquote(
-      `⏰ <b>SET ${slotLabel} POST TIME</b>\n\n` +
-      `Current Setting: <b>${formatted}</b> (${currentTime} 24h)\n\n` +
-      `Use the buttons below to increase (+) or reduce (-) the posting time:`
-    );
+    b.quote(rt.concat(
+      rt.bold(`⏰ SET ${slotLabel} POST TIME\n\n`),
+      rt.text('Current Setting: '), rt.bold(formatted), rt.text(` (${currentTime} 24h)\n\n`),
+      rt.text('Use the buttons below to increase (+) or reduce (-) the posting time:')
+    ));
 
     b.divider();
     // Buttons to add / reduce hours and minutes
@@ -408,7 +409,7 @@ export function createAutoPostScreen({ app }) {
     b.divider();
 
     b.paragraph(rt.concat(
-      rt.bold('Campaign Scale: '), rt.text(`<b>${totalDrops} posts needed</b> (${sel.days} days × ${sel.timesPerDay}/day)\n`),
+      rt.bold('Campaign Scale: '), rt.bold(`${totalDrops} posts needed `), rt.text(`(${sel.days} days × ${sel.timesPerDay}/day)\n`),
       rt.bold('Active Mode: '), rt.text(sel.contentMode === 'ai' ? '🪄 Autonomous AI Curator' : '📦 Curated Existing Packs')
     ));
     b.spacer();
@@ -433,17 +434,19 @@ export function createAutoPostScreen({ app }) {
 
     if (isAi) {
       b.heading('🪄 AUTONOMOUS AI CURATION', 3);
-      b.blockquote(
-        `Topic / Theme: <b>${sel.aiTopic}</b>\n` +
-        `The AI will autonomously scour Pinterest, convert aesthetic media into HD packs, craft custom captions, and publish by the scheduled time!`
-      );
+      b.quote(rt.concat(
+        rt.bold('Topic / Theme: '), rt.text(`${sel.aiTopic}\n`),
+        rt.text('The AI will autonomously scour Pinterest, convert aesthetic media into HD packs, craft custom captions, and publish by the scheduled time!')
+      ));
       b.buttons([
         richButton.callback('💬 Chat with AI to Customize Themes', encodeCallback(id, 'chat_ai'), { style: 'primary' })
       ]);
     } else {
       b.heading('📦 EXISTING PACK SELECTION', 3);
       const userPacks = app.packs.listPacks(userId, { limit: 10 }).packs;
-      b.paragraph(rt.text(`Selected Packs: <b>${sel.selectedPackIds.length} / ${totalDrops}</b> selected.`));
+      b.paragraph(rt.concat(
+        rt.text('Selected Packs: '), rt.bold(`${sel.selectedPackIds.length} / ${totalDrops}`), rt.text(' selected.')
+      ));
       for (const p of userPacks.slice(0, 5)) {
         const isSelected = sel.selectedPackIds.includes(p.id);
         const radio = isSelected ? '🔘' : '⚪';
@@ -489,13 +492,13 @@ export function createAutoPostScreen({ app }) {
     const eTime = sel.timesPerDay >= 3 ? ` • 🌙 ${formatTime12h(sel.slots.evening)}` : '';
     const slotsLine = `🌅 ${mTime}${aTime}${eTime}`;
 
-    b.blockquote(
-      `🌐 <b>Platforms:</b> ${(sel.platform || 'telegram').toUpperCase()}\n` +
-      `📅 <b>Duration:</b> ${sel.days} Days (until ${endDate})\n` +
-      `⏰ <b>Daily Schedule:</b> ${slotsLine}\n` +
-      `📦 <b>Content Mode:</b> ${sel.contentMode === 'ai' ? `AI Curator ("${sel.aiTopic}")` : 'Curated Packs'}\n` +
-      `🚀 <b>Total Drops:</b> <b>${totalDrops} Posts Scheduled</b>`
-    );
+    b.quote(rt.concat(
+      rt.bold('🌐 Platforms: '), rt.text(`${(sel.platform || 'telegram').toUpperCase()}\n`),
+      rt.bold('📅 Duration: '), rt.text(`${sel.days} Days (until ${endDate})\n`),
+      rt.bold('⏰ Daily Schedule: '), rt.text(`${slotsLine}\n`),
+      rt.bold('📦 Content Mode: '), rt.text(`${sel.contentMode === 'ai' ? `AI Curator ("${sel.aiTopic}")` : 'Curated Packs'}\n`),
+      rt.bold('🚀 Total Drops: '), rt.bold(`${totalDrops} Posts Scheduled`)
+    ));
 
     b.divider();
     b.buttons([

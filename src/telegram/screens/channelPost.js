@@ -289,7 +289,11 @@ export function createChannelPostScreen({ app }) {
 
     if (!channels.length) {
       b.paragraph(rt.bold('ℹ️ No connected channels found yet!'));
-      b.paragraph(rt.text('To post to a channel:\n1. Make sure you added this bot as an <b>Administrator</b> in your channel.\n2. Tap "➕ Add Channel" below or forward a post from the channel! ♡'));
+      b.quote(rt.concat(
+        rt.bold('To post to a channel:\n'),
+        rt.text('1. Add this bot as an '), rt.bold('Administrator'), rt.text(' in your channel.\n'),
+        rt.text('2. Tap "➕ Add Channel" below or forward a post from your channel! ♡')
+      ));
     } else {
       b.paragraph(rt.italic('choose which channel to broadcast to:'));
       for (const ch of channels) {
@@ -507,7 +511,10 @@ export function createChannelPostScreen({ app }) {
         'could not post to channel ♡'
       ])));
       bErr.divider();
-      bErr.paragraph(rt.text(`Telegram returned: <i>${escapeXml(publishErr.message || 'Unknown error')}</i>\n\nPlease ensure the bot is still an Administrator in <b>${escapeXml(ch.title)}</b> with "Post Messages" permission enabled! ♡`));
+      bErr.quote(rt.concat(
+        rt.text('Telegram returned: '), rt.italic(publishErr.message || 'Unknown error'), rt.text('\n\n'),
+        rt.text('Please ensure the bot is still an Administrator in '), rt.bold(ch.title), rt.text(' with "Post Messages" permission enabled! ♡')
+      ));
       bErr.divider();
       bErr.buttons([
         richButton.callback('🔄 Try Again', encodeCallback(id, 'to_preview')),
@@ -651,10 +658,10 @@ export function createChannelPostScreen({ app }) {
             'connect destination channel ♡'
           ])));
           b.divider();
-          b.paragraph(rt.text(
-            '📢 <b>Send the channel @username, channel ID, or forward any post from your channel here!</b>\n\n' +
-            'Example: <code>@MyAestheticChannel</code> or <code>-1001234567890</code>\n\n' +
-            '⚠️ <i>Make sure the bot has already been added to the channel as an Administrator!</i> ♡'
+          b.quote(rt.concat(
+            rt.bold('📢 Send the channel @username, channel ID, or forward any post from your channel here!\n\n'),
+            rt.text('Example: '), rt.code('@MyAestheticChannel'), rt.text(' or '), rt.code('-1001234567890'), rt.text('\n\n'),
+            rt.italic('⚠️ Make sure the bot has already been added to the channel as an Administrator! ♡')
           ));
           b.divider();
           b.buttons([
