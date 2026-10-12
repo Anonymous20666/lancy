@@ -223,16 +223,24 @@ function normalizeCell(cell) {
 
 // ── RichMessageButton ─────────────────────────────────────────────────────
 
+const VALID_BUTTON_STYLES = new Set(['primary', 'success', 'danger']);
+export function normalizeButtonStyle(style) {
+  if (typeof style === 'string' && VALID_BUTTON_STYLES.has(style.toLowerCase())) {
+    return style.toLowerCase();
+  }
+  return 'primary';
+}
+
 export const richButton = {
   callback: (text, callbackData, { style = 'primary' } = {}) => ({
     text: rt.text(text),
     callback_data: callbackData,
-    style
+    style: normalizeButtonStyle(style)
   }),
-  url: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), url, style }),
-  copy: (text, copyText, { style = 'primary' } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, style }),
-  switchInline: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query: query, style }),
-  switchInlineCurrent: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query_current_chat: query, style }),
+  url: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), url, style: normalizeButtonStyle(style) }),
+  copy: (text, copyText, { style = 'primary' } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, style: normalizeButtonStyle(style) }),
+  switchInline: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query: query, style: normalizeButtonStyle(style) }),
+  switchInlineCurrent: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query_current_chat: query, style: normalizeButtonStyle(style) }),
   disabled: (text) => ({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' }, style: 'primary' })
 };
 
@@ -445,6 +453,15 @@ export class RichMessageBuilder {
   toJSON({ useCustomEmojis = true } = {}) {
     const normalizedBlocks = this.blocks.map((b) => {
       if (b && b.type === 'header') return { ...b, type: 'heading' };
+      if (b && b.type === 'buttons' && Array.isArray(b.buttons)) {
+        return {
+          ...b,
+          buttons: b.buttons.map((btn) => ({
+            ...btn,
+            style: normalizeButtonStyle(btn.style)
+          }))
+        };
+      }
       return b;
     });
     return {
@@ -503,7 +520,7 @@ export function inlineKeyboard(rows) {
         if (btn.callback_data !== undefined) out.callback_data = btn.callback_data;
         if (btn.url !== undefined) out.url = btn.url;
         if (btn.copy_text !== undefined) out.copy_text = btn.copy_text;
-        out.style = btn.style ?? 'primary'; // danger | success | primary
+        out.style = normalizeButtonStyle(btn.style); // danger | success | primary
         if (btn.disabled) out.disabled = btn.disabled;
         if (btn.switch_inline_query !== undefined) out.switch_inline_query = btn.switch_inline_query;
         if (btn.switch_inline_query_current_chat !== undefined) out.switch_inline_query_current_chat = btn.switch_inline_query_current_chat;

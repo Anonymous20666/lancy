@@ -6,6 +6,7 @@ import { SettingsManager } from '../src/config/settings.js';
 import { StateMachine, States } from '../src/core/stateMachine.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { renderChannelBanner, createChannelPostScreen } from '../src/telegram/screens/channelPost.js';
+import { richButton, RichMessageBuilder, normalizeButtonStyle, inlineKeyboard } from '../src/telegram/rich.js';
 
 test('Database: chat prefix and tg_channels persistence', () => {
   const db = new Database(':memory:');
@@ -350,4 +351,41 @@ test('TelegramController #handleMyChatMemberUpdated auto-registers channels when
   assert.equal(db.getTelegramChannels().length, 0);
 
   db.close();
+});
+
+test('RichMessage: normalizeButtonStyle ensures only primary, success, or danger styles are emitted', () => {
+  assert.equal(normalizeButtonStyle('primary'), 'primary');
+  assert.equal(normalizeButtonStyle('success'), 'success');
+  assert.equal(normalizeButtonStyle('danger'), 'danger');
+  assert.equal(normalizeButtonStyle('secondary'), 'primary');
+  assert.equal(normalizeButtonStyle('warn'), 'primary');
+  assert.equal(normalizeButtonStyle(null), 'primary');
+  assert.equal(normalizeButtonStyle(undefined), 'primary');
+
+  // Verify richButton
+  const btn1 = richButton.callback('Test', 'test', { style: 'secondary' });
+  assert.equal(btn1.style, 'primary');
+
+  const btn2 = richButton.callback('Test2', 'test2', { style: 'danger' });
+  assert.equal(btn2.style, 'danger');
+
+  // Verify RichMessageBuilder.toJSON output
+  const b = new RichMessageBuilder();
+  b.buttons([
+    { text: 'Custom 1', callback_data: 'c1', style: 'secondary' },
+    { text: 'Custom 2', callback_data: 'c2', style: 'success' }
+  ]);
+  const json = b.toJSON();
+  const buttonsBlock = json.blocks.find((blk) => blk.type === 'buttons');
+  assert.ok(buttonsBlock);
+  assert.equal(buttonsBlock.buttons[0].style, 'primary');
+  assert.equal(buttonsBlock.buttons[1].style, 'success');
+
+  // Verify inlineKeyboard
+  const ik = inlineKeyboard([[
+    { text: 'IK 1', callback_data: 'ik1', style: 'secondary' },
+    { text: 'IK 2', callback_data: 'ik2', style: 'danger' }
+  ]]);
+  assert.equal(ik.inline_keyboard[0][0].style, 'primary');
+  assert.equal(ik.inline_keyboard[0][1].style, 'danger');
 });

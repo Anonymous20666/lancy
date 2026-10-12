@@ -115,17 +115,17 @@ export function createAutoPostScreen({ app }) {
 
     b.buttons([
       richButton.callback(`${isTg ? '🔘' : '⚪'} 📢 Telegram Channels`, encodeCallback(id, 'set_platform', 'telegram'), {
-        style: isTg ? 'primary' : 'secondary'
+        style: isTg ? 'success' : 'primary'
       })
     ]);
     b.buttons([
       richButton.callback(`${isWa ? '🔘' : '⚪'} 📱 WhatsApp Channels`, encodeCallback(id, 'set_platform', 'whatsapp'), {
-        style: isWa ? 'primary' : 'secondary'
+        style: isWa ? 'success' : 'primary'
       })
     ]);
     b.buttons([
       richButton.callback(`${isBoth ? '🔘' : '⚪'} 🌐 Both (Cross-Post TG & WA)`, encodeCallback(id, 'set_platform', 'both'), {
-        style: isBoth ? 'primary' : 'secondary'
+        style: isBoth ? 'success' : 'primary'
       })
     ]);
 
@@ -168,7 +168,7 @@ export function createAutoPostScreen({ app }) {
           const tag = ch.username ? `@${ch.username}` : `ID: ${ch.channel_id}`;
           b.buttons([
             richButton.callback(`${radio} ${ch.title} (${tag})`, encodeCallback(id, 'toggle_tg_ch', ch.channel_id), {
-              style: isSelected ? 'primary' : 'secondary'
+              style: isSelected ? 'success' : 'primary'
             })
           ]);
         }
@@ -200,7 +200,7 @@ export function createAutoPostScreen({ app }) {
           const radio = isSelected ? '🔘' : '⚪';
           b.buttons([
             richButton.callback(`${radio} 📱 ${ch.name || ch.channel_jid}`, encodeCallback(id, 'toggle_wa_ch', ch.channel_jid), {
-              style: isSelected ? 'primary' : 'secondary'
+              style: isSelected ? 'success' : 'primary'
             })
           ]);
         }
@@ -253,12 +253,12 @@ export function createAutoPostScreen({ app }) {
     const is30 = sel.days === 30;
 
     b.buttons([
-      richButton.callback(`${is5 ? '🔘' : '⚪'} 5 Days`, encodeCallback(id, 'set_days', 5), { style: is5 ? 'primary' : 'secondary' }),
-      richButton.callback(`${is10 ? '🔘' : '⚪'} 10 Days`, encodeCallback(id, 'set_days', 10), { style: is10 ? 'primary' : 'secondary' })
+      richButton.callback(`${is5 ? '🔘' : '⚪'} 5 Days`, encodeCallback(id, 'set_days', 5), { style: is5 ? 'success' : 'primary' }),
+      richButton.callback(`${is10 ? '🔘' : '⚪'} 10 Days`, encodeCallback(id, 'set_days', 10), { style: is10 ? 'success' : 'primary' })
     ]);
     b.buttons([
-      richButton.callback(`${is20 ? '🔘' : '⚪'} 20 Days`, encodeCallback(id, 'set_days', 20), { style: is20 ? 'primary' : 'secondary' }),
-      richButton.callback(`${is30 ? '🔘' : '⚪'} 30 Days (Select All)`, encodeCallback(id, 'set_days', 30), { style: is30 ? 'primary' : 'secondary' })
+      richButton.callback(`${is20 ? '🔘' : '⚪'} 20 Days`, encodeCallback(id, 'set_days', 20), { style: is20 ? 'success' : 'primary' }),
+      richButton.callback(`${is30 ? '🔘' : '⚪'} 30 Days (Select All)`, encodeCallback(id, 'set_days', 30), { style: is30 ? 'success' : 'primary' })
     ]);
     b.buttons([
       richButton.callback('✏️ Custom Days...', encodeCallback(id, 'custom_days'))
@@ -295,9 +295,9 @@ export function createAutoPostScreen({ app }) {
     const is3 = sel.timesPerDay === 3;
 
     b.buttons([
-      richButton.callback(`${is1 ? '🔘' : '⚪'} 1 Post / Day`, encodeCallback(id, 'set_freq', 1), { style: is1 ? 'primary' : 'secondary' }),
-      richButton.callback(`${is2 ? '🔘' : '⚪'} 2 Posts / Day`, encodeCallback(id, 'set_freq', 2), { style: is2 ? 'primary' : 'secondary' }),
-      richButton.callback(`${is3 ? '🔘' : '⚪'} 3 Posts / Day`, encodeCallback(id, 'set_freq', 3), { style: is3 ? 'primary' : 'secondary' })
+      richButton.callback(`${is1 ? '🔘' : '⚪'} 1 Post / Day`, encodeCallback(id, 'set_freq', 1), { style: is1 ? 'success' : 'primary' }),
+      richButton.callback(`${is2 ? '🔘' : '⚪'} 2 Posts / Day`, encodeCallback(id, 'set_freq', 2), { style: is2 ? 'success' : 'primary' }),
+      richButton.callback(`${is3 ? '🔘' : '⚪'} 3 Posts / Day`, encodeCallback(id, 'set_freq', 3), { style: is3 ? 'success' : 'primary' })
     ]);
 
     b.divider();
@@ -419,13 +419,13 @@ export function createAutoPostScreen({ app }) {
 
     b.buttons([
       richButton.callback(`${isAi ? '🔘' : '⚪'} 🪄 Ask AI / Auto-Generate Packs`, encodeCallback(id, 'set_content_ai'), {
-        style: isAi ? 'primary' : 'secondary'
+        style: isAi ? 'success' : 'primary'
       })
     ]);
 
     b.buttons([
       richButton.callback(`${isPacks ? '🔘' : '⚪'} 📦 Select Existing Sticker Packs`, encodeCallback(id, 'set_content_packs'), {
-        style: isPacks ? 'primary' : 'secondary'
+        style: isPacks ? 'success' : 'primary'
       })
     ]);
 
@@ -449,7 +449,7 @@ export function createAutoPostScreen({ app }) {
         const radio = isSelected ? '🔘' : '⚪';
         b.buttons([
           richButton.callback(`${radio} ${p.tg_title} (${p.count})`, encodeCallback(id, 'toggle_pack', p.id), {
-            style: isSelected ? 'primary' : 'secondary'
+            style: isSelected ? 'success' : 'primary'
           })
         ]);
       }

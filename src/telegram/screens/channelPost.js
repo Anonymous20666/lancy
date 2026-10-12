@@ -232,7 +232,7 @@ export function createChannelPostScreen({ app }) {
       const label = `${radio} ${p.tg_title || p.query || 'Pack'} (${p.count ?? 0})`;
       b.buttons([
         richButton.callback(label, encodeCallback(id, 'select_pack', p.id), {
-          style: isSelected ? 'primary' : 'secondary'
+          style: isSelected ? 'success' : 'primary'
         })
       ]);
     }
@@ -299,7 +299,7 @@ export function createChannelPostScreen({ app }) {
         const label = `${radio} 📢 ${ch.title} (${tag})`;
         b.buttons([
           richButton.callback(label, encodeCallback(id, 'select_channel', ch.channel_id), {
-            style: isSelected ? 'primary' : 'secondary'
+            style: isSelected ? 'success' : 'primary'
           })
         ]);
       }
