@@ -499,8 +499,8 @@ export function createDownloaderScreen({ app }) {
       '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
       '',
       `🎯 Theme: ${truncate(query, 28)}`,
-      '📦 Delivered in 2-by-2 rich message couple slides!',
-      '💡 Full albums preserved • fresh pins explored ♡'
+      '📦 Delivered in 10-item swipeable slideshow scroll!',
+      '💡 Full albums preserved • smooth in-place browsing ♡'
     ].join('\n'));
     b.divider();
     b.buttons([
@@ -635,9 +635,7 @@ export function createDownloaderScreen({ app }) {
       }
     } else if (mediaItems.length > 1) {
       // Telegram Bot API allows AT MOST ONE slideshow / media group block per message (max 10 items).
-      // For matching PFPs, we slice exactly 2 items (a couple pair: partner 1 & partner 2) per slide message
-      // so users browse couples smoothly without spamming individual photos into chat:
-      const effectivePageSize = isMatchingPfp ? 2 : SLIDESHOW_PAGE_SIZE;
+      const effectivePageSize = SLIDESHOW_PAGE_SIZE;
       const pageSlice = mediaItems.slice(offset, offset + effectivePageSize);
       const optimizedSlice = await Promise.all(
         pageSlice.map(async (item) => {
@@ -701,33 +699,28 @@ export function createDownloaderScreen({ app }) {
     b.divider();
 
     if (isMatchingPfp) {
-      const coupleIdx = Math.floor(offset / 2) + 1;
-      const totalCouples = Math.max(1, Math.ceil(mediaItems.length / 2));
+      const pageStart = offset + 1;
+      const pageEnd = Math.min(offset + SLIDESHOW_PAGE_SIZE, mediaItems.length);
       const isContinuous = Boolean(result?.isContinuous || targetGoal === 'continuous');
 
-      const middleBoxLines = (totalCouples > 1) ? [
-        '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏       │',
-        '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐       │',
-        `│ 👥 𝐂𝐎𝐔𝐏𝑳𝑬  •  ${String(coupleIdx).padStart(2, '0')} 𝒐𝒇 ${String(totalCouples).padStart(2, '0')}${isContinuous ? ' (♾️)' : ''}         │`
-      ] : (photoCount === 2 ? [
-        '│ 👤 𝐏𝐅𝐏 𝟎𝟏  •  𝐇𝐈𝐌 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟏  │',
-        '│ 👤 𝐏𝐅𝐏 𝟎𝟐  •  𝐇𝐄𝐑 / 𝐏𝐀𝐑𝐓𝐍𝐄𝐑 𝟐  │'
+      const middleBoxLines = (mediaItems.length > SLIDESHOW_PAGE_SIZE) ? [
+        `│ 🎯 𝐒𝐇𝐎𝐖𝐈𝐍𝐆  •  ${String(pageStart).padStart(2, '0')}–${String(pageEnd).padStart(2, '0')} 𝒐𝒇 ${String(mediaItems.length).padStart(2, '0')} 𝐏𝐈𝐂𝐊𝐒 │`,
+        `│ 👥 𝐌𝐀𝐓𝐂𝐇    •  𝐒𝐖𝐈𝐏𝐄 𝐒𝐋𝐈𝐃𝐄𝐒𝐇𝐎𝐖 𝐀𝐁𝐎𝐕𝐄 ♡  │`
       ] : (targetGoal && extraCount > 0 ? [
         `│ 🎯 𝐓𝐀𝐑𝐆𝐄𝐓      •  ${String(targetGoal).padStart(2, '0')} 𝐏𝐈𝐂𝐊𝐒          │`,
         `│ 🎁 𝐄𝐗𝐓𝐑𝐀       •  +${String(extraCount).padStart(2, '0')} 𝐅𝐔𝐋𝐋 𝐀𝐋𝐁𝐔𝐌    │`,
         `│ 👥 𝐓𝐎𝐓𝐀𝐋 𝐏𝐅𝐏𝐒  •  ${String(photoCount).padStart(2, '0')} (${targetGoal} - ${extraCount}extra) │`
       ] : [
-        `│ 👥 𝐏𝐅𝐏 𝟎𝟏–${String(photoCount).padStart(2, '0')}  •  𝐒𝐐𝐔𝐀𝐃 𝐌𝐀𝐓𝐂𝐇       │`
-      ]));
-      if (totalCouples > 1 && targetGoal && extraCount > 0 && !isContinuous) {
+        `│ 👥 𝐌𝐀𝐓𝐂𝐇    •  ${String(mediaItems.length).padStart(2, '0')} 𝐏𝐈𝐂𝐊𝐒 𝐈𝐍 𝐒𝐂𝐑𝐎𝐋𝐋 𝐀𝐁𝐎𝐕𝐄 │`,
+        `│ 💌 𝐀𝐕𝐀𝐓𝐀𝐑   •  𝟏:𝟏 𝐀𝐄𝐒𝐓𝐇𝐄𝐓𝐈𝐂 𝐑𝐄𝐀𝐃𝐘 ♡      │`
+      ]);
+      if (mediaItems.length > SLIDESHOW_PAGE_SIZE && targetGoal && extraCount > 0 && !isContinuous) {
         middleBoxLines.push(`│ 🎁 𝐁𝐎𝐍𝐔𝐒   •  +${String(extraCount).padStart(2, '0')} 𝐅𝐔𝐋𝐋 𝐀𝐋𝐁𝐔𝐌         │`);
       }
 
       const pfpCard = [
         '╭━━━ ⋆｡˚❀˚｡⋆ ━━━╮',
-        totalCouples > 1
-          ? `💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • 𝑪𝑶𝑼𝑷𝑳𝑬 ${coupleIdx}/${totalCouples}`
-          : '💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • 𝟐 𝑷𝑨𝑰𝑹',
+        `💠 𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑰𝑪𝑶𝑵𝑺 • ${mediaItems.length} 𝑷𝑰𝑪𝑲𝑺`,
         '╰━━━ ⋆｡˚❀˚｡⋆ ━━━╯',
         '',
         '╭───────────────────────────╮',
@@ -829,35 +822,34 @@ export function createDownloaderScreen({ app }) {
     }
 
     // 5. Album / Couple Pagination Row
-    if (isMatchingPfp && mediaItems.length > 2 && albumKey) {
-      const coupleIdx = Math.floor(offset / 2) + 1;
-      const totalCouples = Math.max(1, Math.ceil(mediaItems.length / 2));
-      const hasPrev = offset > 0;
-      const hasNext = offset + 2 < mediaItems.length;
-      const prevOffset = Math.max(0, offset - 2);
-      const nextOffset = offset + 2;
-      const prevCouple = coupleIdx - 1;
-      const nextCouple = coupleIdx + 1;
+    if (isMatchingPfp && albumKey) {
+      if (mediaItems.length > SLIDESHOW_PAGE_SIZE) {
+        const hasPrev = offset > 0;
+        const hasNext = offset + SLIDESHOW_PAGE_SIZE < mediaItems.length;
+        const prevOffset = Math.max(0, offset - SLIDESHOW_PAGE_SIZE);
+        const nextOffset = offset + SLIDESHOW_PAGE_SIZE;
+        const prevEnd = offset;
+        const prevStart = prevOffset + 1;
+        const nextStart = nextOffset + 1;
+        const nextEnd = Math.min(mediaItems.length, nextOffset + SLIDESHOW_PAGE_SIZE);
 
-      if (hasPrev && hasNext) {
-        b.buttons([
-          richButton.callback(`← Prev Couple (${prevCouple}/${totalCouples})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' }),
-          richButton.callback(`Next Couple (${nextCouple}/${totalCouples}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
-        ]);
-      } else if (hasNext) {
-        b.buttons([
-          richButton.callback(`Next Couple (${nextCouple}/${totalCouples}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
-        ]);
-      } else if (hasPrev) {
-        if (pfpSessionKey && pfpCurrentIndex + 1 < pfpTotalCount) {
-          b.buttons([
-            richButton.callback(`← Prev Couple (${prevCouple}/${totalCouples})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' }),
+        const navRow = [];
+        if (hasPrev) {
+          navRow.push(
+            richButton.callback(`← Prev Couple (${prevStart}–${prevEnd})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' })
+          );
+        }
+        if (hasNext) {
+          navRow.push(
+            richButton.callback(`Next Couple (${nextStart}–${nextEnd}) →`, encodeCallback(id, 'moreSlide', albumKey, String(nextOffset)), { style: 'primary' })
+          );
+        } else if (pfpSessionKey && pfpCurrentIndex + 1 < pfpTotalCount) {
+          navRow.push(
             richButton.callback('Next Couple (Explore More) →', encodeCallback(id, 'pfp_nav_next', pfpSessionKey, albumKey, String(pfpCurrentIndex + 1)), { style: 'primary' })
-          ]);
-        } else {
-          b.buttons([
-            richButton.callback(`← Prev Couple (${prevCouple}/${totalCouples})`, encodeCallback(id, 'prevSlide', albumKey, String(prevOffset)), { style: 'primary' })
-          ]);
+          );
+        }
+        if (navRow.length > 0) {
+          b.buttons(navRow);
         }
       } else if (pfpSessionKey && pfpCurrentIndex + 1 < pfpTotalCount) {
         b.buttons([
@@ -1662,9 +1654,9 @@ export function createDownloaderScreen({ app }) {
               if (targetGoal && targetGoal > 1) {
                 if (mediaBuffers.length >= targetGoal) break;
               } else if (isContinuous) {
-                if (mediaBuffers.length >= 4) break;
+                if (mediaBuffers.length >= 10) break;
               } else {
-                break;
+                if (mediaBuffers.length >= 10) break;
               }
             }
           }
@@ -1993,18 +1985,41 @@ export function createDownloaderScreen({ app }) {
           const chatId = ctx.chatId;
           const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
 
-          try {
-            const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
-            if (sent?.message_id) {
-              if (targetMsgId && sent.message_id !== targetMsgId) {
-                await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
+          if (targetMsgId) {
+            try {
+              await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+              return { message_id: targetMsgId };
+            } catch (err) {
+              const errMsg = String(err?.description ?? err?.message);
+              if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
+              try {
+                const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                if (sent?.message_id) {
+                  if (targetMsgId && sent.message_id !== targetMsgId) {
+                    await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
+                  }
+                  ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+                  app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+                  ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+                  ctx.sm?.update?.(ctx.tgId, { screenMessageId: sent.message_id });
+                }
+                return sent;
+              } catch (sendErr) {
+                log.warn({ err: sendErr }, 'failed to send replacement slide album');
               }
-              ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
-              app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
-              ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
             }
-          } catch (err) {
-            log.warn({ err }, 'failed to page slide album');
+          } else {
+            try {
+              const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+              if (sent?.message_id) {
+                ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+                app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+                ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+              }
+              return sent;
+            } catch (sendErr) {
+              log.warn({ err: sendErr }, 'failed to send slide album');
+            }
           }
           return;
         }
@@ -2703,24 +2718,10 @@ export function createDownloaderScreen({ app }) {
           if (ctx.query?.id) {
             await ctx.api.answerCallbackQuery(ctx.query.id).catch(() => {});
           }
-          if (fromMedia) {
-            try {
-              return await ctx.replyRich(renderMatchingPfpMenu(ctx));
-            } catch {
-              return await ctx.reply('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪\nSend a Pinterest album link or use /pfp <theme> ♡');
-            }
-          }
           return ctx.editScreen(renderMatchingPfpMenu(ctx));
         }
         case 'pfp_custom': {
           await ctx.sm?.transition(ctx.tgId, States.PFP_SEARCH_INPUT, { context: { mode: 'pfp' } });
-          if (fromMedia) {
-            try {
-              return await ctx.replyRich(renderPfpSearchPrompt(ctx));
-            } catch {
-              return await ctx.reply('👥 Send any character or theme to find matching PFPs, or use /pfp <theme> ♡');
-            }
-          }
           return ctx.editScreen(renderPfpSearchPrompt(ctx));
         }
         case 'pfp_nav': {
@@ -2766,13 +2767,6 @@ export function createDownloaderScreen({ app }) {
             richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
           ]);
           b.validate();
-          if (fromMedia) {
-            try {
-              return await ctx.replyRich(b.toJSON());
-            } catch {
-              return await ctx.reply(`👥 Send any character or theme to find matching PFPs! ♡`);
-            }
-          }
           return ctx.editScreen(b.toJSON());
         }
         case 'pfp_custom_count_ask': {
@@ -2798,10 +2792,6 @@ export function createDownloaderScreen({ app }) {
             richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
           ]);
           b.validate();
-          if (fromMedia) {
-            try { return await ctx.replyRich(b.toJSON()); }
-            catch { return await ctx.reply('Send the number of matching pictures you want (2 to 200) ♡'); }
-          }
           return ctx.editScreen(b.toJSON());
         }
         case 'pfp_ask_count': {
@@ -2809,12 +2799,7 @@ export function createDownloaderScreen({ app }) {
           if (ctx.query?.id) {
             await ctx.api.answerCallbackQuery(ctx.query.id).catch(() => {});
           }
-          const screen = renderMatchingAmountPicker(ctx, query);
-          if (fromMedia) {
-            try { return await ctx.replyRich(screen); }
-            catch { return await ctx.reply(`Select amount of matching pictures for "${query}" ♡`); }
-          }
-          return ctx.editScreen(screen);
+          return ctx.editScreen(renderMatchingAmountPicker(ctx, query));
         }
         case 'pfp_exec_goal':
         case 'pfp_search_with_goal': {
@@ -2881,18 +2866,41 @@ export function createDownloaderScreen({ app }) {
               });
               const chatId = ctx.chatId;
               const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
-              try {
-                const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
-                if (sent?.message_id) {
-                  if (targetMsgId && sent.message_id !== targetMsgId) {
-                    await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
+              if (targetMsgId) {
+                try {
+                  await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+                  return { message_id: targetMsgId };
+                } catch (err) {
+                  const errMsg = String(err?.description ?? err?.message);
+                  if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
+                  try {
+                    const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                    if (sent?.message_id) {
+                      if (targetMsgId && sent.message_id !== targetMsgId) {
+                        await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
+                      }
+                      ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+                      app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+                      ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+                      ctx.sm?.update?.(ctx.tgId, { screenMessageId: sent.message_id });
+                    }
+                    return sent;
+                  } catch (sendErr) {
+                    log.warn({ err: sendErr }, 'failed to send replacement continuous couple slide');
                   }
-                  ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
-                  app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
-                  ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
                 }
-              } catch (err) {
-                log.warn({ err }, 'failed to update continuous couple slide');
+              } else {
+                try {
+                  const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                  if (sent?.message_id) {
+                    ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+                    app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+                    ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+                  }
+                  return sent;
+                } catch (sendErr) {
+                  log.warn({ err: sendErr }, 'failed to send continuous couple slide');
+                }
               }
               return;
             }

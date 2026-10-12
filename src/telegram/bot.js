@@ -2824,10 +2824,8 @@ export class TelegramController extends EventEmitter {
         action === 'prevSlide' ||
         action === 'more_slide' ||
         action === 'prev_slide' ||
-        action === 'pfp_nav' ||
-        action === 'pfp_nav_next' ||
-        action === 'pfp_more' ||
         action === 'next_slide' ||
+        action.startsWith('pfp_') ||
         action.startsWith('nav_') ||
         action.startsWith('page_') ||
         action.includes('nav') ||

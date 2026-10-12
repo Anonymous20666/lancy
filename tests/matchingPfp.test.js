@@ -747,3 +747,108 @@ test('Pinterest DeepSearchPipeline preserves full carousel slides beyond goal an
   db.close();
 });
 
+test('Matching Studio menu from A to Z edits same message in-place and scroll contains up to 10 photos', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  const sentMessages = [];
+  const editedMessages = [];
+
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      const msg = { message_id: 800 + sentMessages.length, rich, files };
+      sentMessages.push(msg);
+      return msg;
+    },
+    editMessageRich: async (chatId, msgId, rich, extra, files) => {
+      const msg = { message_id: msgId, rich, files };
+      editedMessages.push(msg);
+      return msg;
+    },
+    answerCallbackQuery: async () => ({ ok: true })
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: mockApi, controller: null }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  downloader.registerStateHandlers(sm);
+
+  const ctx = {
+    chatId: 99999,
+    tgId: '99999',
+    api: mockApi,
+    query: { id: 'cb1', message: { message_id: 555 } },
+    messageId: 555,
+    screenMessageId: 555,
+    db,
+    settings,
+    sm,
+    editScreen: async (rich, extra = {}, files = null) => {
+      return mockApi.editMessageRich(99999, 555, rich, extra, files);
+    }
+  };
+
+  // 1. Enter Matching Studio menu: must edit in-place
+  await downloader.handle(ctx, 'pfp_menu', []);
+  assert.equal(editedMessages.length, 1);
+  assert.equal(editedMessages[0].message_id, 555);
+
+  // 2. Select amount picker: must edit in-place
+  await downloader.handle(ctx, 'pfp_ask_count', ['naruto sasuke']);
+  assert.equal(editedMessages.length, 2);
+  assert.equal(editedMessages[1].message_id, 555);
+
+  // 3. Pick 10 count preset: must edit in-place
+  await downloader.handle(ctx, 'pfp_count', ['10']);
+  assert.equal(editedMessages.length, 3);
+  assert.equal(editedMessages[2].message_id, 555);
+
+  // 4. Custom count prompt: must edit in-place
+  await downloader.handle(ctx, 'pfp_custom_count_ask', ['anime']);
+  assert.equal(editedMessages.length, 4);
+  assert.equal(editedMessages[3].message_id, 555);
+
+  // 5. Custom topic prompt: must edit in-place
+  await downloader.handle(ctx, 'pfp_custom', []);
+  assert.equal(editedMessages.length, 5);
+  assert.equal(editedMessages[4].message_id, 555);
+
+  // 6. Return back to menu: must edit in-place
+  await downloader.handle(ctx, 'pfp_menu', []);
+  assert.equal(editedMessages.length, 6);
+  assert.equal(editedMessages[5].message_id, 555);
+
+  // No separate messages should have been sent during menu navigation
+  assert.equal(sentMessages.length, 0, 'No extra messages sent during Matching menu from A to Z');
+
+  // 7. Verify slideshow contains 10 photos in scroll
+  const albumKey = 'test_pfp_scroll_10';
+  const tenPhotos = Array.from({ length: 10 }, (_, i) => ({
+    type: 'photo',
+    buffer: Buffer.from(`img_${i + 1}`),
+    filename: `pfp_${i + 1}.jpg`
+  }));
+
+  downloader.saveAlbum(albumKey, {
+    mediaItems: tenPhotos,
+    platform: 'pinterest',
+    title: 'Gojo Geto Matching',
+    isMatchingPfp: true
+  });
+
+  await downloader.handle(ctx, 'moreSlide', [albumKey, '0']);
+  assert.equal(editedMessages.length, 7);
+  const delivery = editedMessages[6];
+  assert.ok(delivery.files, 'Files must be attached');
+  for (let i = 0; i < 10; i++) {
+    assert.ok(delivery.files[`photo_${i}`], `photo_${i} must be in the slideshow scroll`);
+  }
+
+  db.close();
+});
+
