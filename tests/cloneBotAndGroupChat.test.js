@@ -905,3 +905,127 @@ test('Group Chat Multitask: concurrent /play requests by multiple users deliver 
   db.close();
 });
 
+test('Cloned Bot environment: has isolated stickerService, packs, botUsername, and preserves main botUsername setting', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.telegram.botUsername = 'MainLancyBot';
+
+  const fakeApi = {
+    getMe: async () => ({ id: 555, username: 'CloneChildBot', first_name: 'ChildBot', supports_inline_queries: false }),
+    call: async () => ({ ok: true }),
+    sendRichMessage: async () => ({ message_id: 2001 }),
+    deleteMessage: async () => ({ ok: true })
+  };
+
+  const sm = new StateMachine();
+  const botContext = { botId: 10, botName: 'ChildBot', isClone: true, ownerId: 123456 };
+
+  const cloneApp = {
+    db,
+    settings,
+    media: {},
+    publisher: { telegramApi: null }
+  };
+
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    botContext,
+    app: cloneApp
+  });
+
+  await bot.start();
+
+  // 1. Main bot username setting must NOT be overwritten by clone
+  assert.equal(settings.values.telegram.botUsername, 'MainLancyBot');
+
+  // 2. Clone bot has its own username
+  assert.equal(bot.botUsername, 'CloneChildBot');
+
+  // 3. Test ctx in clone has botUsername populated
+  const ctx = bot.createContext('999', { message: { message_id: 1, chat: { id: 999 } } });
+  assert.equal(ctx.botUsername, 'CloneChildBot');
+  assert.equal(ctx.isClone, true);
+
+  await bot.stop();
+  db.close();
+});
+
+test('Pagination: moreSlide cleanly replaces target message without leaving duplicate', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine();
+
+  const deletedMsgIds = [];
+  const sentMsgs = [];
+  const fakeApi = {
+    getMe: async () => ({ id: 1, username: 'LancyBot', first_name: 'Lancy' }),
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      const msg = { message_id: 900 + sentMsgs.length, rich, files };
+      sentMsgs.push(msg);
+      return msg;
+    },
+    editMessageRich: async () => {
+      throw new Error('Telegram editMessageText: Bad Request: message can not be edited');
+    },
+    deleteMessage: async (chatId, msgId) => {
+      deletedMsgIds.push(msgId);
+      return { ok: true };
+    },
+    call: async (method, params) => {
+      if (method === 'deleteMessage') {
+        deletedMsgIds.push(params.message_id);
+      }
+      return { ok: true };
+    },
+    answerCallbackQuery: async () => ({ ok: true })
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: fakeApi, controller: null }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  downloader.registerStateHandlers(sm);
+
+  // Setup an album with 4 photos
+  const albumKey = 'test_album_1';
+  downloader.saveAlbum?.(albumKey, {
+    mediaItems: [
+      { type: 'photo', buffer: Buffer.from('1'), filename: '1.jpg' },
+      { type: 'photo', buffer: Buffer.from('2'), filename: '2.jpg' },
+      { type: 'photo', buffer: Buffer.from('3'), filename: '3.jpg' },
+      { type: 'photo', buffer: Buffer.from('4'), filename: '4.jpg' }
+    ],
+    platform: 'pinterest',
+    title: 'Test Couple Album',
+    isMatchingPfp: true
+  });
+
+  const ctx = {
+    chatId: 12345,
+    tgId: '12345',
+    api: fakeApi,
+    query: { message: { message_id: 888 } },
+    messageId: 888,
+    db,
+    settings,
+    sm
+  };
+
+  // User clicks Next Couple (moreSlide to offset 2)
+  await downloader.handle(ctx, 'moreSlide', [albumKey, '2']);
+
+  // Verify new couple slide was sent
+  assert.ok(sentMsgs.length >= 1, 'New slide was sent');
+
+  // Verify the target message 888 was deleted so NO duplicate message was dropped!
+  assert.ok(deletedMsgIds.includes(888), 'Target message 888 was cleanly deleted to avoid dropping extra messages');
+
+  db.close();
+});
+

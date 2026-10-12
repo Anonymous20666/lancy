@@ -208,7 +208,9 @@ export class TelegramController extends EventEmitter {
     const me = await this.api.getMe();
     this.botUsername = me.username;
     this.supportsInline = Boolean(me.supports_inline_queries);
-    this.settings.values.telegram.botUsername = me.username;
+    if (!this.botContext?.isClone) {
+      this.settings.values.telegram.botUsername = me.username;
+    }
     this.log.info({ bot: `@${me.username}`, supportsInline: this.supportsInline }, 'telegram connected');
     if (!this.supportsInline) {
       this.log.warn({ bot: `@${me.username}` }, 'Inline mode is disabled in @BotFather. Send /setinline to @BotFather to enable live @bot search in chats.');
@@ -2821,7 +2823,16 @@ export class TelegramController extends EventEmitter {
         action === 'moreSlide' ||
         action === 'prevSlide' ||
         action === 'more_slide' ||
-        action === 'prev_slide'
+        action === 'prev_slide' ||
+        action === 'pfp_nav' ||
+        action === 'pfp_nav_next' ||
+        action === 'pfp_more' ||
+        action === 'next_slide' ||
+        action.startsWith('nav_') ||
+        action.startsWith('page_') ||
+        action.includes('nav') ||
+        action.includes('slide') ||
+        action.includes('page')
       );
 
       const isFromMedia = !isPagination && Boolean(
@@ -2829,11 +2840,11 @@ export class TelegramController extends EventEmitter {
         (query.message && this.isMediaDeliveryMessage(query.message)) ||
         (query.message?.message_id && this.isMediaDeliveryMessageId(query.message.message_id))
       );
-      const ctx = this.#ctx(tgId, query, { forceNew: isFromMedia, fromMedia: isFromMedia });
+      const ctx = this.#ctx(tgId, query, { forceNew: isFromMedia, fromMedia: isFromMedia, isPagination });
 
       // State-agnostic global actions.
       if (this.globalCallbacks.has(action)) {
-        await this.api.answerCallbackQuery(query.id);
+        void this.api.answerCallbackQuery(query.id).catch(() => {});
         await this.globalCallbacks.get(action)(ctx, args);
         return;
       }
@@ -2844,7 +2855,7 @@ export class TelegramController extends EventEmitter {
         await this.api.answerCallbackQuery(query.id, { text: '♡ That screen is not available right now.' });
         return;
       }
-      await this.api.answerCallbackQuery(query.id);
+      void this.api.answerCallbackQuery(query.id).catch(() => {});
       await screenModule.handle(ctx, action, args);
     } catch (error) {
       this.log.error({ err: error, tgId, data }, 'callback failed');
@@ -3036,10 +3047,12 @@ export class TelegramController extends EventEmitter {
         if (sent?.message_id) {
           this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
           this.sm.update(tgId, { screenMessageId: sent.message_id });
-          this.db.run(
-            'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
-            sent.message_id, Number(tgId)
-          );
+          if (!this.botContext?.isClone) {
+            this.db.run(
+              'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
+              sent.message_id, Number(tgId)
+            );
+          }
         }
       };
 
@@ -3729,8 +3742,9 @@ export class TelegramController extends EventEmitter {
     const message = queryMessage ?? directMessage ?? null;
     const chatId = queryMessage?.chat?.id ?? directMessage?.chat?.id ?? source?.chatId ?? Number(tgId);
     const messageId = queryMessage?.message_id ?? directMessage?.message_id ?? null;
-    const forceNew = Boolean(opts.forceNew || source?.forceNew || opts.fromMedia || source?.fromMedia);
-    const fromMedia = Boolean(opts.fromMedia || source?.fromMedia || forceNew);
+    const isPagination = Boolean(opts.isPagination || source?.isPagination);
+    const forceNew = !isPagination && Boolean(opts.forceNew || source?.forceNew);
+    const fromMedia = !isPagination && Boolean(opts.fromMedia || source?.fromMedia || forceNew);
 
     const chatType = queryMessage?.chat?.type ?? directMessage?.chat?.type ?? message?.chat?.type ?? 'private';
     const isGroup = chatType === 'group' || chatType === 'supergroup' || Number(chatId) < 0;
@@ -3745,12 +3759,14 @@ export class TelegramController extends EventEmitter {
       tgId,
       forceNew,
       fromMedia,
+      isPagination,
       user: this.db.get('SELECT * FROM users WHERE tg_id = ?', Number(tgId)),
       chatId,
       chatType,
       isGroup,
       bot: this.botContext,
       botName: this.botContext?.botName || 'Lancy',
+      botUsername: this.botUsername || this.botContext?.botUsername || 'Lancy_easy_bot',
       botId: this.botContext?.botId ?? 0,
       isClone: Boolean(this.botContext?.isClone),
       lang: userLang,
@@ -3778,28 +3794,32 @@ export class TelegramController extends EventEmitter {
           this.sm?.for(tgId)?.screenMessageId ||
           this.sm?.context?.(tgId)?.screenMessageId;
 
-        const isTargetMedia = Boolean(activeScreenMsgId && this.isMediaDeliveryMessageId(activeScreenMsgId));
-
-        const isMediaDelivery = fromMedia || forceNew || isTargetMedia ||
+        const isTargetMedia = !isPagination && Boolean(
+          (activeScreenMsgId && this.isMediaDeliveryMessageId(activeScreenMsgId)) ||
           (queryMessage && this.isMediaDeliveryMessage(queryMessage)) ||
-          (queryMessage?.message_id && this.isMediaDeliveryMessageId(queryMessage.message_id));
+          (queryMessage?.message_id && this.isMediaDeliveryMessageId(queryMessage.message_id))
+        );
 
-        // If fromMedia, forceNew, the current message contains delivered media, or no existing screen message:
+        const isMediaDelivery = fromMedia || forceNew || isTargetMedia;
+
+        // If fromMedia, forceNew, navigating away from a delivered media message, or no existing screen message:
         // send a fresh rich message so the user never loses their video, photo, or audio!
         if (isMediaDelivery || !activeScreenMsgId) {
           const sent = await this.api.sendRichMessage(chatId, rich, extra, files);
           if (sent?.message_id) {
             this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
             this.sm?.update?.(tgId, { screenMessageId: sent.message_id });
-            this.db.run(
-              'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
-              sent.message_id, Number(tgId)
-            );
+            if (!this.botContext?.isClone) {
+              this.db.run(
+                'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
+                sent.message_id, Number(tgId)
+              );
+            }
           }
           return sent;
         }
 
-        // When we have an active screen message (either from callback query or prior prompt):
+        // When we have an active screen message, edit in-place or cleanly replace:
         const targetMsgId = activeScreenMsgId;
         const targetChatId = chatId;
 
@@ -3820,10 +3840,12 @@ export class TelegramController extends EventEmitter {
             }
             this.userScreenMessage.set(tgId, { chatId: targetChatId, messageId: sent.message_id });
             this.sm?.update?.(tgId, { screenMessageId: sent.message_id });
-            this.db.run(
-              'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
-              sent.message_id, Number(tgId)
-            );
+            if (!this.botContext?.isClone) {
+              this.db.run(
+                'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
+                sent.message_id, Number(tgId)
+              );
+            }
           }
           return sent;
         }

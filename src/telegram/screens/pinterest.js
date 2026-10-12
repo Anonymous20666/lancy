@@ -741,7 +741,7 @@ export function createPinterestScreen({ app }) {
     // In-place update with new slideshow in the SAME message!
     const rich = resultsRich(resultStub, nextOffset, totalMedia, previewBlocks, numOffset);
     const files = previewBlocks.length > 0 ? mediaFiles : null;
-    const targetMsgId = ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId;
+    const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
     if (targetMsgId) {
       try {
         await api.editMessageRich(chatId, targetMsgId, rich, {}, files);

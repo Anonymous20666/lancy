@@ -1424,10 +1424,11 @@ export function createDownloaderScreen({ app }) {
     }
 
     const isGroup = Boolean(ctx.isGroup);
-    const forceNew = Boolean(ctx.forceNew);
+    const forceNew = Boolean(ctx.forceNew && !sessionKey);
     const api = ctx.api || app.telegram?.api;
 
-    const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
+    const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
+    const screenMsgId = forceNew ? null : ((isGroup && !sessionKey) ? null : targetMsgId);
     const tracker = new ProgressTracker({
       api: ctx.api || app.telegram.api,
       chatId: ctx.chatId,
@@ -1895,6 +1896,8 @@ export function createDownloaderScreen({ app }) {
     executeDownload,
     executeTikTokSearch,
     executeLyricsSearch,
+    saveAlbum,
+    getAlbum,
     async open(ctx) {
       return ctx.editScreen(renderMainMenu(ctx));
     },
@@ -1988,7 +1991,7 @@ export function createDownloaderScreen({ app }) {
           });
 
           const chatId = ctx.chatId;
-          const targetMsgId = ctx.query?.message?.message_id || ctx.messageId;
+          const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
 
           try {
             const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
@@ -2877,7 +2880,7 @@ export function createDownloaderScreen({ app }) {
                 pfpTotalCount: session.candidates.length
               });
               const chatId = ctx.chatId;
-              const targetMsgId = ctx.query?.message?.message_id || ctx.messageId;
+              const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
               try {
                 const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
                 if (sent?.message_id) {
@@ -3376,3 +3379,5 @@ export function createDownloaderScreen({ app }) {
     }
   };
 }
+
+export { saveAlbum, getAlbum };

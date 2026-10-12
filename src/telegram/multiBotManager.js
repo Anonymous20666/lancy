@@ -3,6 +3,8 @@ import { TelegramController } from './bot.js';
 import { StateMachine } from '../core/stateMachine.js';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
+import { TelegramStickerService } from '../stickers/telegram.js';
+import { StickerPackService } from '../stickers/packService.js';
 
 import { createDashboardScreen } from './screens/dashboard.js';
 import { createPinterestScreen } from './screens/pinterest.js';
@@ -155,16 +157,36 @@ export class MultiBotManager {
     cloneApp.telegram = {
       api,
       controller: null,
+      get botUsername() { return me.username || api.botUsername; },
       markMediaDeliveryMessage: (id) => controller?.markMediaDeliveryMessage?.(id),
       isMediaDeliveryMessage: (msg) => controller?.isMediaDeliveryMessage?.(msg),
       isMediaDeliveryMessageId: (id) => controller?.isMediaDeliveryMessageId?.(id)
     };
+
+    const cloneStickerService = new TelegramStickerService({
+      api,
+      db: this.db,
+      settings: this.settings
+    });
+    const clonePacks = new StickerPackService({
+      db: this.db,
+      settings: this.settings,
+      stickerService: cloneStickerService,
+      media: this.app.media
+    });
+    cloneApp.stickerService = cloneStickerService;
+    cloneApp.packs = clonePacks;
+    if (this.app.publisher) {
+      cloneApp.publisher = Object.create(this.app.publisher);
+      cloneApp.publisher.telegramApi = api;
+    }
 
     const cloneScreens = new Map();
     for (const factory of SCREEN_FACTORIES) {
       const screen = factory({ app: cloneApp });
       cloneScreens.set(screen.id, screen);
       screen.registerStateHandlers?.(sm);
+      screen.registerStates?.(sm);
     }
 
     controller = new TelegramController({

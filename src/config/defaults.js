@@ -127,11 +127,11 @@ export const DEFAULT_SETTINGS = {
   },
 
   performance: {
-    workerConcurrency: 4,
-    queueConcurrency: 2,
-    pinterestConcurrency: 2,
-    whatsappSessionConcurrency: 3,
-    aiConcurrency: 1,
+    workerConcurrency: 8,
+    queueConcurrency: 6,
+    pinterestConcurrency: 6,
+    whatsappSessionConcurrency: 5,
+    aiConcurrency: 2,
     cpuLimitPercent: 80,
     memoryLimitMb: 1024,
     retryCount: 3,
