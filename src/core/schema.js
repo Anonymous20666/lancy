@@ -298,7 +298,7 @@ CREATE TABLE IF NOT EXISTS ai_conversations (
 );
 CREATE INDEX IF NOT EXISTS idx_ai_conversations_user ON ai_conversations(user_id, created_at);
 
--- Autonomous scheduled sticker drops (Pinterest -> WhatsApp)
+-- Autonomous scheduled sticker drops (Telegram & WhatsApp Channel Publisher)
 CREATE TABLE IF NOT EXISTS scheduled_drops (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
@@ -309,8 +309,15 @@ CREATE TABLE IF NOT EXISTS scheduled_drops (
   total_days INTEGER NOT NULL DEFAULT 30,
   total_runs INTEGER NOT NULL DEFAULT 30,
   runs_completed INTEGER NOT NULL DEFAULT 0,
+  platform TEXT NOT NULL DEFAULT 'telegram', -- 'telegram' | 'whatsapp' | 'both'
   session_id TEXT,
   channel_jid TEXT,
+  tg_channel_id INTEGER,
+  pack_ids_json TEXT NOT NULL DEFAULT '[]',
+  schedule_times_json TEXT NOT NULL DEFAULT '[]',
+  content_mode TEXT NOT NULL DEFAULT 'ai', -- 'ai' | 'packs'
+  custom_caption TEXT,
+  ai_prompt TEXT,
   style TEXT NOT NULL DEFAULT 'girly',
   status TEXT NOT NULL DEFAULT 'active', -- 'active' | 'paused' | 'completed' | 'cancelled'
   last_run_at TEXT,

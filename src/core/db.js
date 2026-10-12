@@ -28,6 +28,27 @@ export class Database {
       this.db.exec("ALTER TABLE wa_sessions ADD COLUMN prefix TEXT DEFAULT '.';");
     } catch {}
     try {
+      this.db.exec("ALTER TABLE scheduled_drops ADD COLUMN platform TEXT DEFAULT 'telegram';");
+    } catch {}
+    try {
+      this.db.exec('ALTER TABLE scheduled_drops ADD COLUMN tg_channel_id INTEGER;');
+    } catch {}
+    try {
+      this.db.exec("ALTER TABLE scheduled_drops ADD COLUMN pack_ids_json TEXT DEFAULT '[]';");
+    } catch {}
+    try {
+      this.db.exec("ALTER TABLE scheduled_drops ADD COLUMN schedule_times_json TEXT DEFAULT '[]';");
+    } catch {}
+    try {
+      this.db.exec("ALTER TABLE scheduled_drops ADD COLUMN content_mode TEXT DEFAULT 'ai';");
+    } catch {}
+    try {
+      this.db.exec('ALTER TABLE scheduled_drops ADD COLUMN custom_caption TEXT;');
+    } catch {}
+    try {
+      this.db.exec('ALTER TABLE scheduled_drops ADD COLUMN ai_prompt TEXT;');
+    } catch {}
+    try {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS cached_audio_tracks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,

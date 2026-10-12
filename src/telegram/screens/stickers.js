@@ -43,6 +43,9 @@ export function createStickersScreen({ app }) {
       richButton.callback('📚 My Packs', encodeCallback(id, 'packs')),
       richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' })
     ]);
+    b.buttons([
+      richButton.callback('📅 Auto Post Scheduler', encodeCallback('autopost', 'open'), { style: 'success' })
+    ]);
     b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));
     const limits = resolveLimits(ctx.settings, 'static');

@@ -259,6 +259,7 @@ export class TelegramController extends EventEmitter {
       { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
       { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
       { command: 'postchannel', description: '📢 Post sticker pack to Telegram channel' },
+      { command: 'autopost', description: '📅 Schedule automated sticker drops' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       ...(isClone ? [] : [
         { command: 'whatsapp', description: '📱 WhatsApp publishing & channels' },
@@ -2792,6 +2793,19 @@ export class TelegramController extends EventEmitter {
         const channelPostScreen = this.screens.get('channel_post');
         if (channelPostScreen) {
           const sent = await channelPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
+          if (sent?.message_id) {
+            this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
+            this.sm.update(tgId, { screenMessageId: sent.message_id });
+            this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+          }
+          return;
+        }
+      }
+
+      if (command === '/autopost' || command === '/autoposting' || command === '/schedulepost') {
+        const autoPostScreen = this.screens.get('autopost');
+        if (autoPostScreen) {
+          const sent = await autoPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
           if (sent?.message_id) {
             this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
             this.sm.update(tgId, { screenMessageId: sent.message_id });

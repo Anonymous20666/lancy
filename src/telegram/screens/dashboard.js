@@ -189,19 +189,22 @@ ${stickerSection}
         richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
       ]);
       b.buttons([
+        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
+      ]);
+      b.buttons([
         richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' }),
-        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open'))
+        richButton.callback('📅 Auto Post', encodeCallback('autopost', 'open'), { style: 'success' })
       ]);
       b.buttons([
-        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open')),
-        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play'))
+        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open')),
+        richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open'))
       ]);
       b.buttons([
-        richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open')),
-        richButton.callback('⚙ Settings', encodeCallback('settings', 'open'))
+        richButton.callback('⚙ Settings', encodeCallback('settings', 'open')),
+        richButton.callback('🌐 Language', encodeCallback(id, 'language'))
       ]);
       b.buttons([
-        richButton.callback('🌐 Language', encodeCallback(id, 'language')),
         richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
       ]);
     }
