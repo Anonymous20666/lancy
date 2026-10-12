@@ -237,6 +237,26 @@ CREATE TABLE IF NOT EXISTS bot_settings (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Chat specific settings (e.g. custom command trigger prefix)
+CREATE TABLE IF NOT EXISTS chat_settings (
+  chat_id INTEGER PRIMARY KEY,
+  prefix TEXT NOT NULL DEFAULT '/',
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Telegram channels where bot is an administrator for broadcasting sticker packs
+CREATE TABLE IF NOT EXISTS tg_channels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  channel_id INTEGER NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  username TEXT,
+  can_post INTEGER NOT NULL DEFAULT 1,
+  added_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_tg_channels_user ON tg_channels(added_by);
+
 -- Audit log
 CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,

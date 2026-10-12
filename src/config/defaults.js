@@ -26,7 +26,8 @@ export const DEFAULT_SETTINGS = {
     previewBehavior: 'inline',   // inline | photo
     messageCleanup: false,       // do not delete user or screen messages
     notificationPreferences: 'all', // all | errors | none
-    stickerAddDelayMs: 250       // gentle pacing between addStickerToSet calls
+    stickerAddDelayMs: 250,      // gentle pacing between addStickerToSet calls
+    prefix: '/'
   },
 
   whatsapp: {

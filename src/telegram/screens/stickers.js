@@ -40,7 +40,8 @@ export function createStickersScreen({ app }) {
       richButton.callback('➕ Add to Existing Pack', encodeCallback(id, 'addExisting'))
     ]);
     b.buttons([
-      richButton.callback('📚 My Packs', encodeCallback(id, 'packs'))
+      richButton.callback('📚 My Packs', encodeCallback(id, 'packs')),
+      richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' })
     ]);
     b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));

@@ -76,6 +76,24 @@ export class Database {
           PRIMARY KEY (chat_id, user_id)
         );
         CREATE INDEX IF NOT EXISTS idx_game_scores_chat_score ON game_scores(chat_id, score DESC);
+
+        CREATE TABLE IF NOT EXISTS chat_settings (
+          chat_id INTEGER PRIMARY KEY,
+          prefix TEXT NOT NULL DEFAULT '/',
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS tg_channels (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          channel_id INTEGER NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          username TEXT,
+          can_post INTEGER NOT NULL DEFAULT 1,
+          added_by INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_tg_channels_user ON tg_channels(added_by);
       `);
     } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
@@ -324,6 +342,79 @@ export class Database {
     } catch (err) {
       logger().warn({ err, chatId }, 'failed to fetch game leaderboard');
       return [];
+    }
+  }
+
+  getChatPrefix(chatId) {
+    if (!chatId) return '/';
+    try {
+      const row = this.get('SELECT prefix FROM chat_settings WHERE chat_id = ?', Number(chatId));
+      return row?.prefix || '/';
+    } catch {
+      return '/';
+    }
+  }
+
+  setChatPrefix(chatId, prefix = '/') {
+    if (!chatId) return;
+    const clean = String(prefix).trim() || '/';
+    this.run(
+      `INSERT INTO chat_settings (chat_id, prefix, updated_at)
+       VALUES (?, ?, datetime('now'))
+       ON CONFLICT(chat_id) DO UPDATE SET prefix = excluded.prefix, updated_at = datetime('now')`,
+      Number(chatId),
+      clean
+    );
+  }
+
+  recordTelegramChannel({ channel_id, title, username = null, can_post = 1, added_by = null }) {
+    if (!channel_id) return;
+    const cid = Number(channel_id);
+    const cleanTitle = String(title || 'Telegram Channel').trim();
+    const cleanUsername = username ? String(username).replace(/^@/, '').trim() : null;
+    const uid = added_by ? Number(added_by) : null;
+    this.run(
+      `INSERT INTO tg_channels (channel_id, title, username, can_post, added_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(channel_id) DO UPDATE SET
+         title = excluded.title,
+         username = COALESCE(excluded.username, tg_channels.username),
+         can_post = excluded.can_post,
+         added_by = COALESCE(excluded.added_by, tg_channels.added_by),
+         updated_at = datetime('now')`,
+      cid,
+      cleanTitle,
+      cleanUsername,
+      can_post ? 1 : 0,
+      uid
+    );
+  }
+
+  removeTelegramChannel(channel_id) {
+    if (!channel_id) return;
+    this.run('DELETE FROM tg_channels WHERE channel_id = ?', Number(channel_id));
+  }
+
+  getTelegramChannels(userId = null) {
+    try {
+      if (userId) {
+        return this.all(
+          'SELECT * FROM tg_channels WHERE added_by = ? OR added_by IS NULL ORDER BY updated_at DESC',
+          Number(userId)
+        );
+      }
+      return this.all('SELECT * FROM tg_channels ORDER BY updated_at DESC');
+    } catch {
+      return [];
+    }
+  }
+
+  getTelegramChannel(channelId) {
+    if (!channelId) return null;
+    try {
+      return this.get('SELECT * FROM tg_channels WHERE channel_id = ?', Number(channelId)) || null;
+    } catch {
+      return null;
     }
   }
 

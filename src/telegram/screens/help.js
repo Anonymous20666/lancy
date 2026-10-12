@@ -74,6 +74,8 @@ export function createHelpScreen({ app }) {
       [{ text: rt.bold('/search'), align: 'left', valign: 'middle' }, { text: 'Pinterest HD aesthetic search', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/lyrics'), align: 'left', valign: 'middle' }, { text: 'Get synchronized lyrics', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/clone'), align: 'left', valign: 'middle' }, { text: 'Bring your own bot (60s)', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/setprefix'), align: 'left', valign: 'middle' }, { text: 'Change prefix trigger (/ to !)', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/postchannel'), align: 'left', valign: 'middle' }, { text: 'Post sticker pack to TG channel', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/cancel'), align: 'left', valign: 'middle' }, { text: 'Cancel active operation', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/help'), align: 'left', valign: 'middle' }, { text: 'Open this guide', align: 'left', valign: 'middle' }]
     ], { compact: true });

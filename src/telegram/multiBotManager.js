@@ -13,6 +13,7 @@ import { createSettingsScreen } from './screens/settings.js';
 import { createHelpScreen } from './screens/help.js';
 import { createDownloaderScreen } from './screens/downloader.js';
 import { createCloneScreen } from './screens/clone.js';
+import { createChannelPostScreen } from './screens/channelPost.js';
 
 const SCREEN_FACTORIES = [
   createDashboardScreen,
@@ -23,7 +24,8 @@ const SCREEN_FACTORIES = [
   createSettingsScreen,
   createHelpScreen,
   createDownloaderScreen,
-  createCloneScreen
+  createCloneScreen,
+  createChannelPostScreen
 ];
 
 /**

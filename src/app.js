@@ -37,6 +37,7 @@ import { createSettingsScreen } from './telegram/screens/settings.js';
 import { createHelpScreen } from './telegram/screens/help.js';
 import { createDownloaderScreen } from './telegram/screens/downloader.js';
 import { createCloneScreen } from './telegram/screens/clone.js';
+import { createChannelPostScreen } from './telegram/screens/channelPost.js';
 import { MultiBotManager } from './telegram/multiBotManager.js';
 
 /**
@@ -188,7 +189,7 @@ export class LancyApp {
     const factories = [
       createDashboardScreen, createPinterestScreen, createStickersScreen,
       createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
-      createDownloaderScreen, createCloneScreen
+      createDownloaderScreen, createCloneScreen, createChannelPostScreen
     ];
     for (const factory of factories) {
       const screen = factory({ app: this });

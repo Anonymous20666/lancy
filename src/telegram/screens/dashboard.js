@@ -189,12 +189,12 @@ ${stickerSection}
         richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
       ]);
       b.buttons([
-        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open')),
-        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
+        richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' }),
+        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open'))
       ]);
       b.buttons([
-        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
-        richButton.callback('🪄 AI Assistant', encodeCallback('ai', 'open'))
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open')),
+        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play'))
       ]);
       b.buttons([
         richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open')),

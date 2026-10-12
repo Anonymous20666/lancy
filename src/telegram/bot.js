@@ -241,6 +241,7 @@ export class TelegramController extends EventEmitter {
       { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
       { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
       { command: 'start', description: `✦ Open ${botName} group companion menu` },
+      { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       { command: 'help', description: '୨୧ Bot commands & feature guide' },
       { command: 'cancel', description: '✕ Cancel current active operation' }
     ];
@@ -257,6 +258,8 @@ export class TelegramController extends EventEmitter {
       { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
       { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
       { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
+      { command: 'postchannel', description: '📢 Post sticker pack to Telegram channel' },
+      { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       ...(isClone ? [] : [
         { command: 'whatsapp', description: '📱 WhatsApp publishing & channels' },
         { command: 'ai', description: '🪄 Aesthetic AI assistant' },
@@ -360,7 +363,27 @@ export class TelegramController extends EventEmitter {
 
   #handleMyChatMemberUpdated(myChatMember) {
     if (!myChatMember?.chat?.id) return;
-    const chatId = myChatMember.chat.id;
+    const chat = myChatMember.chat;
+    const chatId = chat.id;
+    const newStatus = myChatMember.new_chat_member?.status;
+    const isChannel = chat.type === 'channel';
+
+    if (isChannel) {
+      if (['administrator', 'creator'].includes(newStatus)) {
+        this.log.info?.({ channelId: chatId, title: chat.title, status: newStatus }, 'bot added or updated as admin in channel');
+        this.db.recordTelegramChannel({
+          channel_id: chatId,
+          title: chat.title || 'Untitled Channel',
+          username: chat.username || null,
+          can_post: 1,
+          added_by: myChatMember.from?.id || null
+        });
+      } else if (newStatus === 'kicked' || newStatus === 'left') {
+        this.log.info?.({ channelId: chatId, status: newStatus }, 'bot removed from channel');
+        this.db.removeTelegramChannel(chatId);
+      }
+    }
+
     if (myChatMember.from && !myChatMember.from.is_bot) {
       this.db.recordGroupMember(chatId, myChatMember.from);
     }
@@ -2735,8 +2758,20 @@ export class TelegramController extends EventEmitter {
     if (/^(rm\s*bot|remove\s*bot|delete\s*bot)(\s+.*)?$/i.test(text)) {
       text = text.replace(/^(rm\s*bot|remove\s*bot|delete\s*bot)/i, '/rmbot');
     }
-    if (text.startsWith('!') || text.startsWith('.')) {
-      text = '/' + text.slice(1);
+
+    const chatPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
+
+    if (chatPrefix !== '/' && text.startsWith(chatPrefix)) {
+      text = '/' + text.slice(chatPrefix.length).trim();
+    } else if (chatPrefix === '/') {
+      if (text.startsWith('!') || text.startsWith('.')) {
+        text = '/' + text.slice(1);
+      }
+    } else {
+      // Even if custom prefix is active (e.g. '!'), allow /setprefix, /prefix, /help, /start as safety rescue
+      if (/^\/(setprefix|prefix|help|start)(\s+.*)?$/i.test(text)) {
+        // keep as is
+      }
     }
 
     if (text.startsWith('/')) {
@@ -2746,6 +2781,24 @@ export class TelegramController extends EventEmitter {
       const targetBot = parts[1]?.toLowerCase();
       if (targetBot && this.botUsername && targetBot !== this.botUsername.toLowerCase()) {
         return;
+      }
+
+      if (command === '/setprefix' || command === '/prefix') {
+        await this.handleSetPrefix(message, rest);
+        return;
+      }
+
+      if (command === '/postchannel' || command === '/posttochannel') {
+        const channelPostScreen = this.screens.get('channel_post');
+        if (channelPostScreen) {
+          const sent = await channelPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
+          if (sent?.message_id) {
+            this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
+            this.sm.update(tgId, { screenMessageId: sent.message_id });
+            this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+          }
+          return;
+        }
       }
 
       if (command === '/game' || command === '/quiz' || command === '/guess' || command === '/trivia') {
@@ -3934,6 +3987,77 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
     }
 
     await this.api.answerCallbackQuery(query.id);
+  }
+
+  async handleSetPrefix(message, args = []) {
+    const chatId = message.chat?.id;
+    if (!chatId) return;
+    const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+    const tgId = message.from?.id;
+    const currentPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
+
+    if (!args.length) {
+      await this.api.sendMessage(
+        chatId,
+        `<blockquote>🌸 <b>Current command prefix:</b> <code>${currentPrefix}</code>\n\n` +
+        `🎀 <b>To change prefix:</b>\n` +
+        `Send: <code>${currentPrefix}setprefix &lt;symbol&gt;</code>\n` +
+        `Examples: <code>${currentPrefix}setprefix !</code> or <code>${currentPrefix}setprefix .</code>\n\n` +
+        `🔒 Group admins can configure prefixes for groups. Private chats are personalized ♡</blockquote>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    if (isGroup) {
+      const isOwner = this.isOwner(tgId);
+      let isAdmin = isOwner;
+      if (!isAdmin) {
+        try {
+          const member = await this.api.getChatMember(chatId, tgId);
+          isAdmin = member.status === 'administrator' || member.status === 'creator';
+        } catch {}
+      }
+      if (!isAdmin) {
+        await this.api.sendMessage(
+          chatId,
+          `<blockquote>✕ Only group administrators or the bot owner can change the command prefix ♡</blockquote>`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+    }
+
+    const newPrefix = args[0].trim();
+    if (!newPrefix || newPrefix.length > 3 || /\s/.test(newPrefix) || /^[a-zA-Z0-9]+$/.test(newPrefix)) {
+      await this.api.sendMessage(
+        chatId,
+        `<blockquote>✕ Invalid prefix! Please provide 1 to 3 non-alphanumeric symbols (e.g. <code>!</code>, <code>.</code>, <code>#</code>, <code>/</code>, <code>$</code>) ♡</blockquote>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    if (this.db?.setChatPrefix) {
+      this.db.setChatPrefix(chatId, newPrefix);
+    }
+
+    if (args[1]?.toLowerCase() === 'global' && this.isOwner(tgId)) {
+      this.settings?.set?.('telegram.prefix', newPrefix);
+    }
+
+    await this.api.sendMessage(
+      chatId,
+      `<blockquote>✨ <b>Command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
+      `You can now use commands like:\n` +
+      `• <code>${newPrefix}menu</code>\n` +
+      `• <code>${newPrefix}game</code>\n` +
+      `• <code>${newPrefix}play &lt;song&gt;</code>\n` +
+      `• <code>${newPrefix}grab &lt;link&gt;</code>\n` +
+      `• <code>${newPrefix}setprefix &lt;char&gt;</code>\n\n` +
+      `<i>(Safety note: <code>/setprefix</code> and <code>/help</code> will always remain recognized)</i> ♡</blockquote>`,
+      { parse_mode: 'HTML' }
+    );
   }
 
   #chatIdFor(tgId, source) {
