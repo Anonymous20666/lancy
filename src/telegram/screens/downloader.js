@@ -11,7 +11,7 @@ import { truncate } from '../../utils/text.js';
 import { getLyrics, formatBlockquoteLyrics, chunkLyrics, escapeHtml } from '../../media/lyrics.js';
 import { extractMediaForMusicRecognition, recognizeAudio } from '../../media/recognizer.js';
 import { sleep, parseDurationToSeconds } from '../../utils/time.js';
-import { toTelegramStaticSticker, optimizePreviewImage } from '../../media/convert.js';
+import { toTelegramStaticSticker, optimizePreviewImage, splitMatchingCollage } from '../../media/convert.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 import { PinterestWebProvider } from '../../pinterest/web.js';
 
@@ -23,6 +23,21 @@ const trackAudioCache = new Map();
 const audioMetaCache = new Map();
 const imageStickerCache = new Map();
 const albumCache = new Map();
+
+// Global cache for matching PFP deep search sessions: sessionId -> { query, candidates, currentIndex }
+const pfpSearchSessions = new Map();
+
+function savePfpSession(id, data) {
+  if (pfpSearchSessions.size > 50) {
+    const oldestKey = pfpSearchSessions.keys().next().value;
+    pfpSearchSessions.delete(oldestKey);
+  }
+  pfpSearchSessions.set(id, data);
+}
+
+function getPfpSession(id) {
+  return pfpSearchSessions.get(id);
+}
 
 function saveMediaImages(key, items) {
   if (imageStickerCache.size > 50) {
@@ -524,7 +539,10 @@ export function createDownloaderScreen({ app }) {
     albumKey = null,
     imageKey = null,
     audioKey = null,
-    lyrics = null
+    lyrics = null,
+    pfpSessionKey = null,
+    pfpCurrentIndex = 0,
+    pfpTotalCount = 0
   }) {
     const files = {};
     const b = new RichMessageBuilder();
@@ -775,6 +793,20 @@ export function createDownloaderScreen({ app }) {
 
     if (isMatchingPfp) {
       const cleanTheme = truncate(title.replace(/matching|pfp|icons?|album|wallpaper/gi, '').trim() || 'anime', 20);
+      if (pfpSessionKey && pfpTotalCount > 1) {
+        const navRow = [];
+        if (pfpCurrentIndex > 0) {
+          navRow.push(
+            richButton.callback(`← Prev Set (${pfpCurrentIndex}/${pfpTotalCount})`, encodeCallback(id, 'pfp_nav', pfpSessionKey, String(pfpCurrentIndex - 1)), { style: 'primary' })
+          );
+        }
+        if (pfpCurrentIndex + 1 < pfpTotalCount) {
+          navRow.push(
+            richButton.callback(`🔄 Next Set (${pfpCurrentIndex + 2}/${pfpTotalCount}) →`, encodeCallback(id, 'pfp_nav', pfpSessionKey, String(pfpCurrentIndex + 1)), { style: 'primary' })
+          );
+        }
+        if (navRow.length > 0) b.buttons(navRow);
+      }
       b.buttons([
         richButton.callback('🔍 More Matching PFPs', encodeCallback(id, 'pfp_more', cleanTheme), { style: 'primary' }),
         richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu'), { style: 'primary' })
@@ -1212,8 +1244,9 @@ export function createDownloaderScreen({ app }) {
     }
   }
 
-  async function executePfpSearch(ctx, query) {
-    const q = String(query || '').trim() || 'anime couple';
+  async function executePfpSearch(ctx, query, { sessionKey = null, targetIndex = 0 } = {}) {
+    let session = sessionKey ? getPfpSession(sessionKey) : null;
+    const q = session?.query || String(query || '').trim() || 'anime couple';
     const isGroup = Boolean(ctx.isGroup);
     const forceNew = Boolean(ctx.forceNew);
     const api = ctx.api || app.telegram?.api;
@@ -1228,33 +1261,79 @@ export function createDownloaderScreen({ app }) {
     });
 
     await tracker.live((state, { elapsedMs }) => renderDownloadProgress({ ...state, elapsedMs, url: q }), {
-      stage: `🔍 Searching Pinterest for "${q}" matching PFPs… ♡`,
+      stage: session ? `🌸 Loading matching set ${targetIndex + 1} for "${q}"… ♡` : `🔍 Deep searching Pinterest for "${q}" matching albums… ♡`,
       platform: 'PINTEREST ALBUM',
       url: q
     });
 
     try {
-      const provider = app.pinterest?.provider || new PinterestWebProvider();
-      let searchRes = await provider.search({
-        query: `${q} matching pfp album`,
-        signal: AbortSignal.timeout(15000)
-      }).catch(() => null);
+      let candidates = session?.candidates || [];
+      let activeSessionKey = sessionKey;
 
-      if (!searchRes?.items?.length) {
-        searchRes = await provider.search({
-          query: `${q} matching icons`,
-          signal: AbortSignal.timeout(15000)
-        }).catch(() => null);
+      if (!session || candidates.length === 0) {
+        tracker.set({ stage: `🔍 Deep searching across Pinterest matching albums for "${q}"… ♡` });
+        const provider = app.pinterest?.provider || new PinterestWebProvider();
+        const candidateMap = new Map();
+        const searchQueries = [
+          `${q} matching pfp album`,
+          `${q} matching pfp`,
+          `${q} couple pfp`,
+          `${q} matching icons`
+        ];
+
+        for (const sq of searchQueries) {
+          let bookmark = null;
+          for (let page = 1; page <= 3; page++) {
+            try {
+              const res = await provider.search({
+                query: sq,
+                bookmark,
+                signal: AbortSignal.timeout(12000)
+              });
+              if (!res?.items?.length) break;
+              for (const item of res.items) {
+                if (candidateMap.has(item.pinId)) continue;
+                // Strictly filter for pins that contain 2 or more images!
+                if (item.isAlbum && Array.isArray(item.albumImages) && item.albumImages.length >= 2) {
+                  candidateMap.set(item.pinId, item);
+                }
+              }
+              bookmark = res.bookmark;
+              if (!bookmark || candidateMap.size >= 25) break;
+            } catch {
+              break;
+            }
+          }
+          if (candidateMap.size >= 25) break;
+        }
+
+        // Secondary fallback: if 0 albums found across deep searches, check top 10 pins for 2-in-1 collage pins
+        if (candidateMap.size === 0) {
+          try {
+            const fallbackRes = await provider.search({
+              query: `${q} matching pfp`,
+              signal: AbortSignal.timeout(12000)
+            });
+            for (const item of (fallbackRes?.items || []).slice(0, 10)) {
+              if (item?.mediaUrl) {
+                candidateMap.set(item.pinId, item);
+              }
+            }
+          } catch {}
+        }
+
+        candidates = Array.from(candidateMap.values());
+        activeSessionKey = Math.random().toString(36).slice(2, 8);
+        savePfpSession(activeSessionKey, { query: q, candidates, currentIndex: 0 });
       }
 
-      const items = searchRes?.items || [];
-      if (items.length === 0) {
+      if (candidates.length === 0) {
         await tracker.cleanup();
         const b = new RichMessageBuilder();
         b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
-        b.paragraph(rt.italic('₊˚⊹♡ no matching icons found ˙ᵕ˙'));
+        b.paragraph(rt.italic('₊˚⊹♡ no matching albums found ˙ᵕ˙'));
         b.divider();
-        b.blockquote(`♡ I could not find matching PFP albums for "<b>${escapeHtml(q)}</b>".\nTip: Try searching popular tags like "anime matching pfp", "couple pfp", or paste a Pinterest album link directly! ♡`);
+        b.blockquote(`♡ I could not find matching 2-piece PFP albums for "<b>${escapeHtml(q)}</b>".\nTip: Try searching popular tags like "anime matching pfp", "couple pfp", or paste a Pinterest album link directly! ♡`);
         b.divider();
         b.buttons([
           richButton.callback('🔍 Try Another Topic', encodeCallback(id, 'pfp_custom'), { style: 'primary' }),
@@ -1267,65 +1346,134 @@ export function createDownloaderScreen({ app }) {
       tracker.set({ stage: 'Extracting matching avatar images… ♡' });
 
       let mediaBuffers = [];
-      const albumCandidate = items.find((it) => it.isAlbum && it.albumImages?.length >= 2);
+      let chosenIdx = Math.max(0, Math.min(targetIndex, candidates.length - 1));
 
-      if (albumCandidate && albumCandidate.albumImages?.length >= 2) {
-        const targetUrls = albumCandidate.albumImages.slice(0, 4);
-        for (let i = 0; i < targetUrls.length; i++) {
+      // Try candidates starting from targetIndex until we get >= 2 matching photos from the SAME post
+      for (let i = chosenIdx; i < candidates.length; i++) {
+        const cand = candidates[i];
+        let fetchedBuffers = [];
+
+        if (cand.albumImages?.length >= 2) {
+          const targetUrls = cand.albumImages.slice(0, 10);
+          const fetched = await Promise.all(
+            targetUrls.map(async (u, idx) => {
+              try {
+                const res = await fetch(u, { signal: AbortSignal.timeout(12000) });
+                if (res.ok) {
+                  return {
+                    type: 'photo',
+                    buffer: Buffer.from(await res.arrayBuffer()),
+                    filename: `pfp_${idx + 1}.jpg`,
+                    mimeType: 'image/jpeg'
+                  };
+                }
+              } catch {}
+              return null;
+            })
+          );
+          fetchedBuffers = fetched.filter(Boolean);
+        } else if (cand.pinId) {
+          const pinUrl = `https://www.pinterest.com/pin/${cand.pinId}/`;
           try {
-            const imgRes = await fetch(targetUrls[i], { signal: AbortSignal.timeout(12000) });
-            if (imgRes.ok) {
-              const buf = Buffer.from(await imgRes.arrayBuffer());
-              mediaBuffers.push({
+            const dlRes = await app.mediaDownloader.download(pinUrl, {
+              onProgress: (st) => tracker.set({ stage: st })
+            });
+            if (dlRes?.mediaItems?.length >= 2) {
+              fetchedBuffers = dlRes.mediaItems.filter((m) => m.type === 'photo');
+            }
+          } catch {}
+        } else if (cand.mediaUrl) {
+          try {
+            const res = await fetch(cand.mediaUrl, { signal: AbortSignal.timeout(12000) });
+            if (res.ok) {
+              const buf = Buffer.from(await res.arrayBuffer());
+              fetchedBuffers = [{
                 type: 'photo',
                 buffer: buf,
-                filename: `pfp_${i + 1}.jpg`,
+                filename: 'pfp_1.jpg',
                 mimeType: 'image/jpeg'
-              });
+              }];
             }
           } catch {}
         }
-      }
 
-      if (mediaBuffers.length < 2 && items[0]?.pinId) {
-        const pinUrl = `https://www.pinterest.com/pin/${items[0].pinId}/`;
-        try {
-          const dlRes = await app.mediaDownloader.download(pinUrl, {
-            onProgress: (st) => tracker.set({ stage: st })
-          });
-          if (dlRes?.mediaItems?.length >= 2) {
-            mediaBuffers = dlRes.mediaItems.filter((m) => m.type === 'photo');
+        // Smart collage split: if single photo, check if it's a 2-in-1 side-by-side or stacked collage!
+        if (fetchedBuffers.length === 1 && fetchedBuffers[0]?.buffer) {
+          const parts = await splitMatchingCollage(fetchedBuffers[0].buffer);
+          if (parts.length >= 2) {
+            fetchedBuffers = parts.map((buf, pIdx) => ({
+              type: 'photo',
+              buffer: buf,
+              filename: `pfp_${pIdx + 1}.jpg`,
+              mimeType: 'image/jpeg'
+            }));
           }
-        } catch {}
+        }
+
+        // Strictly verify that we have 2 or more photos!
+        if (fetchedBuffers.length >= 2) {
+          mediaBuffers = fetchedBuffers;
+          chosenIdx = i;
+          const sess = getPfpSession(activeSessionKey);
+          if (sess) {
+            sess.currentIndex = i;
+            savePfpSession(activeSessionKey, sess);
+          }
+          break;
+        }
       }
 
-      if (mediaBuffers.length < 2 && items.length >= 2) {
-        for (let i = 0; i < Math.min(2, items.length); i++) {
-          try {
-            const imgRes = await fetch(items[i].mediaUrl, { signal: AbortSignal.timeout(12000) });
-            if (imgRes.ok) {
-              const buf = Buffer.from(await imgRes.arrayBuffer());
-              mediaBuffers.push({
-                type: 'photo',
-                buffer: buf,
-                filename: `pfp_${mediaBuffers.length + 1}.jpg`,
-                mimeType: 'image/jpeg'
-              });
+      if (mediaBuffers.length < 2) {
+        // If forward scan didn't find >= 2, try backward scan from chosenIdx - 1
+        for (let i = chosenIdx - 1; i >= 0; i--) {
+          const cand = candidates[i];
+          if (cand.albumImages?.length >= 2) {
+            const targetUrls = cand.albumImages.slice(0, 10);
+            const fetched = await Promise.all(
+              targetUrls.map(async (u, idx) => {
+                try {
+                  const res = await fetch(u, { signal: AbortSignal.timeout(12000) });
+                  if (res.ok) {
+                    return {
+                      type: 'photo',
+                      buffer: Buffer.from(await res.arrayBuffer()),
+                      filename: `pfp_${idx + 1}.jpg`,
+                      mimeType: 'image/jpeg'
+                    };
+                  }
+                } catch {}
+                return null;
+              })
+            );
+            const fb = fetched.filter(Boolean);
+            if (fb.length >= 2) {
+              mediaBuffers = fb;
+              chosenIdx = i;
+              const sess = getPfpSession(activeSessionKey);
+              if (sess) {
+                sess.currentIndex = i;
+                savePfpSession(activeSessionKey, sess);
+              }
+              break;
             }
-          } catch {}
+          }
         }
       }
 
-      if (mediaBuffers.length === 0 && items[0]?.mediaUrl) {
-        const imgRes = await fetch(items[0].mediaUrl, { signal: AbortSignal.timeout(12000) });
-        if (imgRes.ok) {
-          mediaBuffers.push({
-            type: 'photo',
-            buffer: Buffer.from(await imgRes.arrayBuffer()),
-            filename: 'pfp_1.jpg',
-            mimeType: 'image/jpeg'
-          });
-        }
+      if (mediaBuffers.length < 2) {
+        await tracker.cleanup();
+        const b = new RichMessageBuilder();
+        b.header('𓆩♡𓆪 MATCHING PFP STUDIO 𓆩♡𓆪', 1);
+        b.paragraph(rt.italic('₊˚⊹♡ no matching 2-piece set found ˙ᵕ˙'));
+        b.divider();
+        b.blockquote(`♡ Could not retrieve 2 or more matching photos for "<b>${escapeHtml(q)}</b>".\nTip: Try searching another character or theme (e.g. "Tanjiro Nezuko", "Gojo Geto", "Couple")! ♡`);
+        b.divider();
+        b.buttons([
+          richButton.callback('🔍 Try Another Topic', encodeCallback(id, 'pfp_custom'), { style: 'primary' }),
+          richButton.callback('« Matching Studio', encodeCallback(id, 'pfp_menu'))
+        ]);
+        b.validate();
+        return await api.sendRichMessage(ctx.chatId, b.toJSON());
       }
 
       let imageKey = Math.random().toString(36).slice(2, 8);
@@ -1341,7 +1489,10 @@ export function createDownloaderScreen({ app }) {
         ctx,
         offset: 0,
         albumKey,
-        imageKey
+        imageKey,
+        pfpSessionKey: activeSessionKey,
+        pfpCurrentIndex: chosenIdx,
+        pfpTotalCount: candidates.length
       });
 
       const sent = await tracker.finish(rich, files);
@@ -2310,6 +2461,14 @@ export function createDownloaderScreen({ app }) {
             }
           }
           return ctx.editScreen(renderPfpSearchPrompt(ctx));
+        }
+        case 'pfp_nav': {
+          const sessionKey = args[0];
+          const targetIndex = parseInt(args[1], 10) || 0;
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: `🌸 Loading matching set ${targetIndex + 1}… ♡` }).catch(() => {});
+          }
+          return executePfpSearch(ctx, null, { sessionKey, targetIndex });
         }
         case 'pfp_search':
         case 'pfp_more': {

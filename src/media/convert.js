@@ -435,6 +435,73 @@ export async function optimizePreviewImage(buffer, { maxDimension = 1080, qualit
   }
 }
 
+/**
+ * Detects if an image buffer is a combined 2-in-1 (or 3-in-1) matching collage
+ * (e.g. two avatars placed side-by-side or stacked top-and-bottom in a single image)
+ * and splits it into separate 1:1 square profile avatars!
+ * Returns an array of Buffers (2 or 3 items), or [buffer] if not a collage.
+ */
+export async function splitMatchingCollage(buffer) {
+  if (!buffer) return [];
+  try {
+    const meta = await sharp(buffer, { failOn: 'none', animated: false }).metadata();
+    const { width, height } = meta;
+    if (!width || !height) return [buffer];
+
+    const ratio = width / height;
+
+    // 1. Side-by-side duo (aspect ratio ~ 2:1, e.g. 1000x500, 1200x600, 800x400)
+    if (ratio >= 1.65 && ratio <= 2.35 && width >= 300 && height >= 150) {
+      const halfWidth = Math.floor(width / 2);
+      const part1 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: 0, top: 0, width: halfWidth, height })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      const part2 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: halfWidth, top: 0, width: width - halfWidth, height })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      return [part1, part2];
+    }
+
+    // 2. Stacked vertical duo (aspect ratio ~ 1:2, e.g. 500x1000, 600x1200)
+    if (ratio >= 0.42 && ratio <= 0.60 && height >= 300 && width >= 150) {
+      const halfHeight = Math.floor(height / 2);
+      const part1 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: 0, top: 0, width, height: halfHeight })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      const part2 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: 0, top: halfHeight, width, height: height - halfHeight })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      return [part1, part2];
+    }
+
+    // 3. Side-by-side trio (aspect ratio ~ 3:1, e.g. 1500x500)
+    if (ratio >= 2.65 && ratio <= 3.35 && width >= 450 && height >= 150) {
+      const thirdWidth = Math.floor(width / 3);
+      const part1 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: 0, top: 0, width: thirdWidth, height })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      const part2 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: thirdWidth, top: 0, width: thirdWidth, height })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      const part3 = await sharp(buffer, { failOn: 'none', animated: false })
+        .extract({ left: thirdWidth * 2, top: 0, width: width - thirdWidth * 2, height })
+        .jpeg({ quality: 92 })
+        .toBuffer();
+      return [part1, part2, part3];
+    }
+
+    return [buffer];
+  } catch {
+    return [buffer];
+  }
+}
+
 // ── Video conversion ──────────────────────────────────────────────────────
 
 /**

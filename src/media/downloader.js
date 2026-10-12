@@ -20,6 +20,7 @@ import {
 import { searchSongByLyrics, cleanSongMetadata } from './lyrics.js';
 import { searchYouTubeFast } from './youtubeSearch.js';
 import { parseDurationToSeconds } from '../utils/time.js';
+import { splitMatchingCollage } from './convert.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -596,11 +597,26 @@ export class MediaDownloader {
       }
 
       if (mediaItems.length > 0) {
-        const isMatchingPfp = (
+        let isMatchingPfp = Boolean(
           /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(title) ||
           /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(url) ||
           (mediaItems.length >= 2 && mediaItems.length <= 4 && !videoUrl && /pfp|icon|avatar|profile/i.test(title))
         );
+
+        // Smart collage split: if a single photo was downloaded and title/URL hints at matching or photo is split 2-in-1
+        if (mediaItems.length === 1 && mediaItems[0].type === 'photo' && !videoUrl) {
+          const splitParts = await splitMatchingCollage(mediaItems[0].buffer);
+          if (splitParts.length >= 2) {
+            mediaItems = splitParts.map((buf, i) => ({
+              type: 'photo',
+              buffer: buf,
+              filename: `pinterest_matching_${i + 1}.jpg`,
+              mimeType: 'image/jpeg'
+            }));
+            isMatchingPfp = true;
+          }
+        }
+
         return {
           sourceUrl: resolvedUrl,
           platform: 'pinterest',

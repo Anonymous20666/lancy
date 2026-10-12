@@ -311,3 +311,160 @@ test('bot routes /pfp and /matching commands and offers inline query hints', asy
 
   db.close();
 });
+
+test('splitMatchingCollage: accurately splits 2-in-1 side-by-side and stacked collages into separate 1:1 avatars', async () => {
+  const { splitMatchingCollage } = await import('../src/media/convert.js');
+
+  // 1. Side-by-side duo (1000x500)
+  const duo = await sharp({
+    create: { width: 1000, height: 500, channels: 3, background: { r: 255, g: 100, b: 150 } }
+  }).jpeg().toBuffer();
+  const duoParts = await splitMatchingCollage(duo);
+  assert.equal(duoParts.length, 2, 'should split side-by-side 2:1 image into 2 parts');
+  const dMeta1 = await sharp(duoParts[0]).metadata();
+  const dMeta2 = await sharp(duoParts[1]).metadata();
+  assert.equal(dMeta1.width, 500);
+  assert.equal(dMeta1.height, 500);
+  assert.equal(dMeta2.width, 500);
+  assert.equal(dMeta2.height, 500);
+
+  // 2. Stacked vertical duo (500x1000)
+  const stacked = await sharp({
+    create: { width: 500, height: 1000, channels: 3, background: { r: 100, g: 150, b: 255 } }
+  }).jpeg().toBuffer();
+  const stackedParts = await splitMatchingCollage(stacked);
+  assert.equal(stackedParts.length, 2, 'should split stacked 1:2 image into 2 parts');
+  const sMeta1 = await sharp(stackedParts[0]).metadata();
+  const sMeta2 = await sharp(stackedParts[1]).metadata();
+  assert.equal(sMeta1.width, 500);
+  assert.equal(sMeta1.height, 500);
+  assert.equal(sMeta2.width, 500);
+  assert.equal(sMeta2.height, 500);
+
+  // 3. Normal portrait pin (1000x1500) — must NOT be split
+  const normal = await sharp({
+    create: { width: 1000, height: 1500, channels: 3, background: { r: 150, g: 255, b: 150 } }
+  }).jpeg().toBuffer();
+  const normalParts = await splitMatchingCollage(normal);
+  assert.equal(normalParts.length, 1, 'should preserve normal portrait image intact');
+});
+
+test('executePfpSearch: deep searches multi-slide pins and pages with pfp_nav', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine({ db });
+
+  const imgBuf1 = await sharp({ create: { width: 400, height: 400, channels: 3, background: { r: 255, g: 50, b: 50 } } }).jpeg().toBuffer();
+  const imgBuf2 = await sharp({ create: { width: 400, height: 400, channels: 3, background: { r: 50, g: 50, b: 255 } } }).jpeg().toBuffer();
+  const imgBuf3 = await sharp({ create: { width: 400, height: 400, channels: 3, background: { r: 50, g: 255, b: 50 } } }).jpeg().toBuffer();
+  const imgBuf4 = await sharp({ create: { width: 400, height: 400, channels: 3, background: { r: 255, g: 255, b: 50 } } }).jpeg().toBuffer();
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const sUrl = String(url);
+    if (sUrl.includes('album1_1')) return new Response(imgBuf1, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+    if (sUrl.includes('album1_2')) return new Response(imgBuf2, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+    if (sUrl.includes('album2_1')) return new Response(imgBuf3, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+    if (sUrl.includes('album2_2')) return new Response(imgBuf4, { status: 200, headers: { 'content-type': 'image/jpeg' } });
+    return new Response(Buffer.alloc(0), { status: 404 });
+  };
+
+  let sentRichMessages = [];
+  let editedRichMessages = [];
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, extra, files) => {
+      const msg = { message_id: 800 + sentRichMessages.length };
+      sentRichMessages.push({ rich, files });
+      return msg;
+    },
+    editMessageRich: async (chatId, messageId, rich, extra, files) => {
+      editedRichMessages.push({ messageId, rich, files });
+      return { message_id: messageId };
+    },
+    sendChatAction: async () => {},
+    answerCallbackQuery: async () => {}
+  };
+
+  const mockProvider = {
+    search: async ({ query }) => {
+      return {
+        items: [
+          // Album 1 (2 slides)
+          {
+            pinId: 'pin_album_1',
+            isAlbum: true,
+            albumImages: ['https://example.com/album1_1.jpg', 'https://example.com/album1_2.jpg'],
+            albumCount: 2
+          },
+          // Album 2 (2 slides)
+          {
+            pinId: 'pin_album_2',
+            isAlbum: true,
+            albumImages: ['https://example.com/album2_1.jpg', 'https://example.com/album2_2.jpg'],
+            albumCount: 2
+          },
+          // Single pin (should be ignored because it is not an album)
+          {
+            pinId: 'pin_single_bad',
+            isAlbum: false,
+            mediaUrl: 'https://example.com/single.jpg'
+          }
+        ],
+        bookmark: null
+      };
+    }
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: { api: mockApi },
+    pinterest: { provider: mockProvider }
+  };
+
+  const downloader = createDownloaderScreen({ app });
+  downloader.registerStates(sm);
+
+  const ctx = {
+    tgId: 4001,
+    chatId: 4001,
+    api: mockApi,
+    db,
+    settings,
+    sm,
+    user: { first_name: 'Test' }
+  };
+
+  try {
+    // 1. Initial deep search delivers Album 1 (2 matching avatars from same pin)
+    await downloader.executePfpSearch(ctx, 'Tanjiro Nezuko');
+    const delivery1 = editedRichMessages[editedRichMessages.length - 1] || sentRichMessages[sentRichMessages.length - 1];
+    assert.ok(delivery1, 'should have delivered album 1 card');
+    const text1 = JSON.stringify(delivery1.rich);
+    assert.ok(text1.includes('MATCHING PFP') || text1.includes('𝑴𝑨𝑻𝑪𝑯𝑰𝑵𝑮 𝑷𝑭𝑷'));
+    assert.ok(text1.includes('Next Set (2/2) →'));
+
+    // Extract sessionKey from callback_data
+    let sessionKey = null;
+    for (const blk of delivery1.rich.blocks || []) {
+      if (blk.type === 'buttons') {
+        for (const btn of blk.buttons || []) {
+          if (btn.callback_data?.includes(':pfp_nav:')) {
+            sessionKey = btn.callback_data.split(':pfp_nav:')[1].split(':')[0];
+          }
+        }
+      }
+    }
+    assert.ok(sessionKey, 'should have extracted sessionKey');
+
+    // 2. Next set callback delivers Album 2
+    await downloader.handle(ctx, 'pfp_nav', [sessionKey, '1']);
+    const delivery2 = editedRichMessages[editedRichMessages.length - 1] || sentRichMessages[sentRichMessages.length - 1];
+    assert.ok(delivery2, 'should have delivered album 2 card');
+    const text2 = JSON.stringify(delivery2.rich);
+    assert.ok(text2.includes('Prev Set (1/2)'));
+  } finally {
+    globalThis.fetch = origFetch;
+    db.close();
+  }
+});
