@@ -1448,7 +1448,10 @@ export function createDownloaderScreen({ app }) {
           `${q} matching couple pfp`,
           `${q} matching icons`,
           `${q} anime couple pfp`,
-          `${q} matching pfp`
+          `${q} matching pfp`,
+          `${q} aesthetic matching pfp`,
+          `${q} icons matching duo`,
+          `${q} couple matching avatar`
         ];
 
         const userId = Number(ctx.tgId || ctx.user?.id);
@@ -1460,8 +1463,10 @@ export function createDownloaderScreen({ app }) {
             const rows = db.all(
               `SELECT pin_id, media_url FROM user_media_history WHERE user_id = ?
                UNION
-               SELECT pin_id, media_url FROM pinterest_media WHERE user_id = ? AND is_duplicate = 0`,
-              userId, userId
+               SELECT pin_id, media_url FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND is_duplicate = 0
+               UNION
+               SELECT pin_id, source_url as media_url FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND is_duplicate = 0`,
+              userId, userId, String(userId), userId, String(userId)
             );
             for (const r of (rows || [])) {
               if (r.pin_id) seenPins.add(r.pin_id);
@@ -1474,7 +1479,7 @@ export function createDownloaderScreen({ app }) {
 
         for (const sq of searchQueries) {
           let bookmark = null;
-          for (let page = 1; page <= 6; page++) {
+          for (let page = 1; page <= 10; page++) {
             try {
               const res = await provider.search({
                 query: sq,
@@ -1698,6 +1703,12 @@ export function createDownloaderScreen({ app }) {
               db.run(
                 'INSERT INTO user_media_history (user_id, pin_id, search_id) VALUES (?, ?, ?)',
                 userId, cand.pinId, null
+              );
+            }
+            if (cand.mediaUrl) {
+              db.run(
+                'INSERT INTO user_media_history (user_id, media_url, search_id) VALUES (?, ?, ?)',
+                userId, cand.mediaUrl, null
               );
             }
             if (Array.isArray(cand.albumImages)) {
@@ -2854,6 +2865,24 @@ export function createDownloaderScreen({ app }) {
               saveAlbum(albumKey, album);
               session.currentIndex = targetIndex;
               savePfpSession(sessionKey, session);
+
+              const userId = Number(ctx.tgId || ctx.user?.id);
+              const db = app.db || ctx.db;
+              if (userId && db) {
+                try {
+                  if (cand.pinId) {
+                    db.run('INSERT INTO user_media_history (user_id, pin_id, search_id) VALUES (?, ?, ?)', userId, cand.pinId, null);
+                  }
+                  if (cand.mediaUrl) {
+                    db.run('INSERT INTO user_media_history (user_id, media_url, search_id) VALUES (?, ?, ?)', userId, cand.mediaUrl, null);
+                  }
+                  if (Array.isArray(cand.albumImages)) {
+                    for (const imgUrl of cand.albumImages) {
+                      db.run('INSERT INTO user_media_history (user_id, media_url, search_id) VALUES (?, ?, ?)', userId, imgUrl, null);
+                    }
+                  }
+                } catch {}
+              }
 
               const { rich, files } = await buildDeliveryRichMessage({
                 ...album,

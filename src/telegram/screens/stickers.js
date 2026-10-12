@@ -390,6 +390,8 @@ export function createStickersScreen({ app }) {
         throw new LancyError('♡ I could not find any usable media for that search.', { code: 'NO_RESULTS' });
       }
 
+      app.pinterest.markResultsDelivered?.(userId, search.searchId, unique);
+
       // 2. Convert + create with live progress.
       await sctx.transition(States.PACK_CREATION, {
         context: { ...sctx.context, searchId: search.searchId, packQuery: query, mode },

@@ -1277,15 +1277,18 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  async #fetchInlinePinterestSearch(queryTopic, offset = 0) {
+  async #fetchInlinePinterestSearch(queryTopic, offset = 0, userId = null) {
     if (!queryTopic) return { results: [], nextOffset: '' };
     try {
       const botUser = this.botUsername || 'Lancy_easy_bot';
       const cleanTopic = queryTopic.trim();
-      const cacheKey = `pint_${cleanTopic.toLowerCase()}`;
+      const numOffset = parseInt(offset, 10) || 0;
+      const sessionUserKey = userId ? `${userId}_` : '';
+      const cacheKey = `pint_${sessionUserKey}${cleanTopic.toLowerCase()}`;
       let cached = inlinePinterestCache.get(cacheKey);
 
-      if (!cached || (Date.now() - cached.timestamp > 180000)) {
+      // On new searches (offset 0), always start fresh live crawler without serving stale cached results
+      if (!cached || numOffset === 0 || (Date.now() - cached.timestamp > 30000)) {
         cached = {
           items: [],
           bookmark: null,
@@ -1297,6 +1300,27 @@ export class TelegramController extends EventEmitter {
           const firstKey = inlinePinterestCache.keys().next().value;
           inlinePinterestCache.delete(firstKey);
         }
+      }
+
+      // Pre-seed seen pins and media URLs from user's history so previous results are never repeated!
+      const seenPins = new Set();
+      const seenUrls = new Set();
+      if (userId && this.db) {
+        try {
+          const numUserId = Number(userId);
+          const historyRows = this.db.all(
+            `SELECT pin_id, media_url FROM user_media_history WHERE user_id = ?
+             UNION
+             SELECT pin_id, media_url FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND is_duplicate = 0
+             UNION
+             SELECT pin_id, source_url as media_url FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND is_duplicate = 0`,
+            numUserId, numUserId, String(userId), numUserId, String(userId)
+          );
+          for (const row of (historyRows || [])) {
+            if (row.pin_id) seenPins.add(row.pin_id);
+            if (row.media_url) seenUrls.add(row.media_url);
+          }
+        } catch {}
       }
 
       const combos = [
@@ -1312,7 +1336,7 @@ export class TelegramController extends EventEmitter {
       const provider = this.app?.pinterest?.provider || new PinterestWebProvider();
 
       // Ensure we have enough items in the pool for the requested offset + 15
-      while (cached.items.length < (offset + 15) && cached.combosTried < combos.length) {
+      while (cached.items.length < (numOffset + 15) && cached.combosTried < combos.length) {
         let res = null;
         if (cached.bookmark && cached.combosTried === 0) {
           res = await provider.search({ query: cleanTopic, bookmark: cached.bookmark }).catch(() => null);
@@ -1329,6 +1353,8 @@ export class TelegramController extends EventEmitter {
           const seen = new Set(cached.items.map((i) => i.mediaUrl || i.pinId));
           for (const item of res.items) {
             const key = item.mediaUrl || item.pinId;
+            if (item.pinId && seenPins.has(item.pinId)) continue;
+            if (item.mediaUrl && seenUrls.has(item.mediaUrl)) continue;
             if (key && !seen.has(key)) {
               seen.add(key);
               cached.items.push(item);
@@ -1341,9 +1367,9 @@ export class TelegramController extends EventEmitter {
 
       if (cached.items.length === 0) return { results: [], nextOffset: '' };
 
-      const paged = cached.items.slice(offset, offset + 15);
-      const nextOffset = (offset + paged.length < cached.items.length || cached.combosTried < combos.length) && paged.length >= 8
-        ? String(offset + paged.length)
+      const paged = cached.items.slice(numOffset, numOffset + 15);
+      const nextOffset = (numOffset + paged.length < cached.items.length || cached.combosTried < combos.length) && paged.length >= 8
+        ? String(numOffset + paged.length)
         : '';
 
       const results = [];
@@ -1414,20 +1440,22 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  async #fetchInlineTikTokSearch(queryTopic, offset = 0) {
+  async #fetchInlineTikTokSearch(queryTopic, offset = 0, userId = null) {
     if (!queryTopic) return { results: [], nextOffset: '' };
     try {
       const botUser = this.botUsername || 'Lancy_easy_bot';
       const cleanTopic = queryTopic.trim();
-      const cacheKey = `tt_pool_${cleanTopic.toLowerCase()}`;
+      const numOffset = parseInt(offset, 10) || 0;
+      const sessionUserKey = userId ? `${userId}_` : '';
+      const cacheKey = `tt_pool_${sessionUserKey}${cleanTopic.toLowerCase()}`;
       let cached = inlineTikTokCache.get(cacheKey);
 
       // Support legacy array format if seeded by test or previous cache
       const legacyKey = `tt_${cleanTopic.toLowerCase()}`;
       const legacyCached = inlineTikTokCache.get(legacyKey);
 
-      if (!cached || !Array.isArray(cached.items) || (Date.now() - cached.timestamp > 180000)) {
-        if (Array.isArray(legacyCached)) {
+      if (!cached || !Array.isArray(cached.items) || (numOffset === 0 && (!Array.isArray(legacyCached) || legacyCached.length === 0)) || (Date.now() - cached.timestamp > 30000)) {
+        if (Array.isArray(legacyCached) && legacyCached.length > 0) {
           cached = {
             items: legacyCached,
             combosTried: 99,
@@ -1466,7 +1494,7 @@ export class TelegramController extends EventEmitter {
       // Expand video items in the pool until offset + 10 is reached or timeout/combos exhausted
       const searchStart = Date.now();
       let comboLoops = 0;
-      while (cached.items.length < (offset + 10) && cached.combosTried < 25 && comboLoops < 3 && (Date.now() - searchStart < 1800)) {
+      while (cached.items.length < (numOffset + 10) && cached.combosTried < 25 && comboLoops < 3 && (Date.now() - searchStart < 1800)) {
         comboLoops++;
         const mod = cached.combosTried < combos.length
           ? combos[cached.combosTried]
@@ -1482,7 +1510,7 @@ export class TelegramController extends EventEmitter {
             }
           }
         }
-        if (cached.items.length >= offset + 5) break;
+        if (cached.items.length >= numOffset + 5) break;
       }
 
       // Synchronize legacy key for backwards-compatibility with tests checking raw array
@@ -1490,9 +1518,9 @@ export class TelegramController extends EventEmitter {
 
       if (cached.items.length === 0) return { results: [], nextOffset: '' };
 
-      const paged = cached.items.slice(offset, offset + 10);
-      const nextOffset = (offset + paged.length < cached.items.length || cached.combosTried < 25) && paged.length > 0
-        ? String(offset + paged.length)
+      const paged = cached.items.slice(numOffset, numOffset + 10);
+      const nextOffset = (numOffset + paged.length < cached.items.length || cached.combosTried < 25) && paged.length > 0
+        ? String(numOffset + paged.length)
         : '';
 
       const results = [];
@@ -2583,28 +2611,28 @@ export class TelegramController extends EventEmitter {
 
           let trendingPhotos = [];
           try {
-            const trend = await this.#fetchInlinePinterestSearch('aesthetic wallpaper', 0);
+            const trend = await this.#fetchInlinePinterestSearch('aesthetic wallpaper', 0, tgId);
             if (trend?.results?.length) trendingPhotos = trend.results.slice(0, 10);
           } catch {}
 
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
             results: [...suggestionCards, ...trendingPhotos],
-            cache_time: 15,
-            is_personal: false
+            cache_time: 1,
+            is_personal: true
           });
           return;
         }
 
-        const { results: pintResults, nextOffset } = await this.#fetchInlinePinterestSearch(queryTopic, offset);
+        const { results: pintResults, nextOffset } = await this.#fetchInlinePinterestSearch(queryTopic, offset, tgId);
 
         if (pintResults && pintResults.length > 0) {
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
             results: pintResults,
             next_offset: nextOffset,
-            cache_time: 15,
-            is_personal: false
+            cache_time: 1,
+            is_personal: true
           });
           return;
         }
@@ -2635,8 +2663,8 @@ export class TelegramController extends EventEmitter {
               ]
             }
           }],
-          cache_time: 15,
-          is_personal: false
+          cache_time: 1,
+          is_personal: true
         });
         return;
       }
@@ -2670,21 +2698,21 @@ export class TelegramController extends EventEmitter {
                 ]
               }
             }],
-            cache_time: 2,
-            is_personal: false
+            cache_time: 1,
+            is_personal: true
           });
           return;
         }
 
-        const { results: ttResults, nextOffset } = await this.#fetchInlineTikTokSearch(queryTopic, offset);
+        const { results: ttResults, nextOffset } = await this.#fetchInlineTikTokSearch(queryTopic, offset, tgId);
 
         if (ttResults && ttResults.length > 0) {
           await this.api.call('answerInlineQuery', {
             inline_query_id: qId,
             results: ttResults,
             next_offset: nextOffset,
-            cache_time: 2,
-            is_personal: false
+            cache_time: 1,
+            is_personal: true
           });
           return;
         }
@@ -2715,8 +2743,8 @@ export class TelegramController extends EventEmitter {
               ]
             }
           }],
-          cache_time: 2,
-          is_personal: false
+          cache_time: 1,
+          is_personal: true
         });
         return;
       }

@@ -107,13 +107,14 @@ export class DeepSearchPipeline extends EventEmitter {
 
     // Deep cross-search deduplication: pre-seed seenPins and seenMediaUrls with user's historical media
     // so previous results are skipped during candidate discovery and the crawler explores deeper pages!
-    if (userId != null && this.db) {
+    const numUserId = userId != null ? Number(userId) : null;
+    if (numUserId != null && this.db) {
       try {
         const historyPins = this.db.all(
           `SELECT pin_id FROM user_media_history WHERE user_id = ? AND pin_id IS NOT NULL
            UNION
-           SELECT pin_id FROM pinterest_media WHERE user_id = ? AND pin_id IS NOT NULL AND is_duplicate = 0`,
-          userId, userId
+           SELECT pin_id FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND pin_id IS NOT NULL AND is_duplicate = 0`,
+          numUserId, numUserId, String(numUserId)
         );
         for (const row of (historyPins || [])) {
           if (row.pin_id) seenPins.add(row.pin_id);
@@ -124,14 +125,13 @@ export class DeepSearchPipeline extends EventEmitter {
         const historyUrls = this.db.all(
           `SELECT media_url FROM user_media_history WHERE user_id = ? AND media_url IS NOT NULL
            UNION
-           SELECT media_url FROM pinterest_media WHERE user_id = ? AND media_url IS NOT NULL AND is_duplicate = 0
+           SELECT media_url FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND media_url IS NOT NULL AND is_duplicate = 0
            UNION
-           SELECT source_url FROM pinterest_media WHERE user_id = ? AND source_url IS NOT NULL AND is_duplicate = 0`,
-          userId, userId, userId
+           SELECT source_url as media_url FROM pinterest_media WHERE (user_id = ? OR user_id = ?) AND source_url IS NOT NULL AND is_duplicate = 0`,
+          numUserId, numUserId, String(numUserId), numUserId, String(numUserId)
         );
         for (const row of (historyUrls || [])) {
           if (row.media_url) seenMediaUrls.add(row.media_url);
-          if (row.source_url) seenMediaUrls.add(row.source_url);
         }
       } catch {}
     }
@@ -141,7 +141,8 @@ export class DeepSearchPipeline extends EventEmitter {
 
     // 2–4. Search + paginate/expand. Keep going until we have enough
     // candidates to survive validation + dedupe down to the goal.
-    while (pagesFetched < maxPages) {
+    const maxCrawlPages = Math.max(maxPages, 20);
+    while (pagesFetched < maxCrawlPages) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const pageTimeout = AbortSignal.any ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)].filter(Boolean)) : signal;
       let page;
@@ -199,6 +200,35 @@ export class DeepSearchPipeline extends EventEmitter {
           }
         }
       } catch { /* non-fatal */ }
+    }
+
+    // Deep fallback: if seen deduplication filtered early candidates and targetCount < goal, crawl topic variations
+    const currentTargetCount = mode === 'videos'
+      ? collected.filter((i) => i.type === 'video').length
+      : mode === 'images'
+      ? collected.filter((i) => i.type === 'image').length
+      : collected.length;
+    if (currentTargetCount < goal && !signal?.aborted) {
+      const topicVariations = [
+        `${normalized} aesthetic`,
+        `${normalized} wallpaper`,
+        `${normalized} art`,
+        `${normalized} hd 4k`,
+        `${normalized} photography`
+      ];
+      for (const varTerm of topicVariations) {
+        if (collected.length >= goal * 2 || signal?.aborted) break;
+        try {
+          const varPage = await this.provider.search({ query: varTerm, signal });
+          for (const item of (varPage?.items ?? [])) {
+            if (!seenPins.has(item.pinId) && !(item.mediaUrl && seenMediaUrls.has(item.mediaUrl))) {
+              seenPins.add(item.pinId);
+              if (item.mediaUrl) seenMediaUrls.add(item.mediaUrl);
+              collected.push({ ...item, searchId });
+            }
+          }
+        } catch {}
+      }
     }
 
     // 5–6. Identify type + apply the media-mode filter.
@@ -306,6 +336,23 @@ export class DeepSearchPipeline extends EventEmitter {
       'UPDATE pinterest_searches SET result_count = ?, duplicates_found = ? WHERE id = ?',
       ranked.length, duplicatesFound, searchId
     );
+
+    // Deep cross-search dedup guarantee: record delivered results in user_media_history right away
+    if (numUserId != null) {
+      for (const item of ranked) {
+        try {
+          if (this.media?.markDelivered) {
+            this.media.markDelivered(numUserId, item, { searchId });
+          } else if (this.db) {
+            this.db.run(
+              `INSERT INTO user_media_history (user_id, sha256, phash, pin_id, media_url, search_id)
+               VALUES (?, ?, ?, ?, ?, ?)`,
+              numUserId, item.sha256 ?? null, item.phash ?? null, item.pinId ?? null, item.mediaUrl ?? null, searchId
+            );
+          }
+        } catch {}
+      }
+    }
 
     this.emit('done', { searchId, results: ranked });
     onProgress?.({ stage: 'done', results: ranked.length });
