@@ -122,36 +122,36 @@ export function createPinterestScreen({ app }) {
 
     if (isVideo) {
       b.buttons([
-        richButton.callback('5', encodeCallback(id, 'runCount', '5', mode, query), { style: 'primary' }),
-        richButton.callback('10', encodeCallback(id, 'runCount', '10', mode, query), { style: 'primary' }),
-        richButton.callback('15', encodeCallback(id, 'runCount', '15', mode, query), { style: 'primary' }),
-        richButton.callback('20', encodeCallback(id, 'runCount', '20', mode, query), { style: 'primary' })
+        richButton.callback('5', encodeCallback(id, 'runCount', '5', mode), { style: 'primary' }),
+        richButton.callback('10', encodeCallback(id, 'runCount', '10', mode), { style: 'primary' }),
+        richButton.callback('15', encodeCallback(id, 'runCount', '15', mode), { style: 'primary' }),
+        richButton.callback('20', encodeCallback(id, 'runCount', '20', mode), { style: 'primary' })
       ]);
       b.buttons([
-        richButton.callback('🎬 More Videos (+10)', encodeCallback(id, 'runCount', '30', mode, query), { style: 'primary' })
+        richButton.callback('🎬 More Videos (+10)', encodeCallback(id, 'runCount', '30', mode), { style: 'primary' })
       ]);
     } else {
       b.buttons([
-        richButton.callback('10', encodeCallback(id, 'runCount', '10', mode, query), { style: 'primary' }),
-        richButton.callback('20', encodeCallback(id, 'runCount', '20', mode, query), { style: 'primary' }),
-        richButton.callback('30', encodeCallback(id, 'runCount', '30', mode, query), { style: 'primary' }),
-        richButton.callback('50', encodeCallback(id, 'runCount', '50', mode, query), { style: 'primary' })
+        richButton.callback('10', encodeCallback(id, 'runCount', '10', mode), { style: 'primary' }),
+        richButton.callback('20', encodeCallback(id, 'runCount', '20', mode), { style: 'primary' }),
+        richButton.callback('30', encodeCallback(id, 'runCount', '30', mode), { style: 'primary' }),
+        richButton.callback('50', encodeCallback(id, 'runCount', '50', mode), { style: 'primary' })
       ]);
       b.buttons([
-        richButton.callback('60', encodeCallback(id, 'runCount', '60', mode, query), { style: 'primary' }),
-        richButton.callback('80', encodeCallback(id, 'runCount', '80', mode, query), { style: 'primary' }),
-        richButton.callback('100', encodeCallback(id, 'runCount', '100', mode, query), { style: 'primary' }),
-        richButton.callback('120', encodeCallback(id, 'runCount', '120', mode, query), { style: 'primary' })
+        richButton.callback('60', encodeCallback(id, 'runCount', '60', mode), { style: 'primary' }),
+        richButton.callback('80', encodeCallback(id, 'runCount', '80', mode), { style: 'primary' }),
+        richButton.callback('100', encodeCallback(id, 'runCount', '100', mode), { style: 'primary' }),
+        richButton.callback('120', encodeCallback(id, 'runCount', '120', mode), { style: 'primary' })
       ]);
       b.buttons([
-        richButton.callback('130 (+10)', encodeCallback(id, 'runCount', '130', mode, query), { style: 'primary' }),
-        richButton.callback('140 (+20)', encodeCallback(id, 'runCount', '140', mode, query), { style: 'primary' }),
-        richButton.callback('150 (+30)', encodeCallback(id, 'runCount', '150', mode, query), { style: 'primary' })
+        richButton.callback('130 (+10)', encodeCallback(id, 'runCount', '130', mode), { style: 'primary' }),
+        richButton.callback('140 (+20)', encodeCallback(id, 'runCount', '140', mode), { style: 'primary' }),
+        richButton.callback('150 (+30)', encodeCallback(id, 'runCount', '150', mode), { style: 'primary' })
       ]);
     }
     b.buttons([
-      richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', mode, query), { style: 'primary' }),
-      richButton.callback('✎ Custom Count', encodeCallback(id, 'customCount', mode, query), { style: 'primary' })
+      richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', mode), { style: 'primary' }),
+      richButton.callback('✎ Custom Count', encodeCallback(id, 'customCount', mode), { style: 'primary' })
     ]);
     b.buttons([
       richButton.callback('« Back', encodeCallback(id, 'mode', mode), { style: 'primary' })
@@ -924,10 +924,11 @@ export function createPinterestScreen({ app }) {
         }
         case 'count':
         case 'runCount': {
-          const count = Number(args[0]);
-          const mode = args[1] || 'normal';
-          const query = args[2] || '';
+          const rawCount = args[0];
+          const count = rawCount === 'continuous' ? 'continuous' : Number(rawCount);
           const sctx = ctx.sm.ctxFor(ctx.tgId);
+          const mode = args[1] || sctx.mode || 'normal';
+          const query = args[2] || sctx.query || '';
           const clickedMsgId = ctx.query?.message?.message_id;
           if (clickedMsgId) {
             sctx.screenMessageId = clickedMsgId;
@@ -939,8 +940,9 @@ export function createPinterestScreen({ app }) {
           return runSearch(sctx, query, count);
         }
         case 'customCount': {
-          const mode = args[0] || 'normal';
-          const query = args[1] || '';
+          const sctx = ctx.sm.ctxFor(ctx.tgId);
+          const mode = args[0] || sctx.mode || 'normal';
+          const query = args[1] || sctx.query || '';
           return askCustomCount(ctx, query, mode);
         }
         case 'results':
