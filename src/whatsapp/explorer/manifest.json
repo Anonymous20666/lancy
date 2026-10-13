@@ -1,0 +1,3880 @@
+{
+  "metadata": {
+    "package": "plogme",
+    "version": "2.0.7",
+    "auditTimestamp": "2026-10-13T06:55:38.059Z",
+    "totalExports": 396,
+    "totalSocketMethods": 669,
+    "categoriesCount": 10,
+    "featuresCount": 26,
+    "verificationSummary": {
+      "VERIFIED-LOCAL": 20,
+      "VERIFIED-STATIC": 6,
+      "PARTIAL": 0,
+      "UNVERIFIED": 0,
+      "UNSUPPORTED": 0
+    }
+  },
+  "categories": [
+    {
+      "id": "messaging",
+      "prefix": "PLOG-MSG",
+      "name": "Messaging & Quoting",
+      "icon": "💬",
+      "description": "Text, replies, quoted messages, mentions, edits, deletes, reactions, and read receipts."
+    },
+    {
+      "id": "media",
+      "prefix": "PLOG-MED",
+      "name": "Media & Attachments",
+      "icon": "🎬",
+      "description": "Images, videos, audio/voice notes, documents, albums, media download streams, and uploads."
+    },
+    {
+      "id": "stickers",
+      "prefix": "PLOG-STK",
+      "name": "Stickers & Packs",
+      "icon": "🏷️",
+      "description": "Single WebP stickers, sticker packs (plogme stickerPackMessage ≤ 60), and animated transcode."
+    },
+    {
+      "id": "polls",
+      "prefix": "PLOG-POL",
+      "name": "Polls & Interactive Voting",
+      "icon": "📊",
+      "description": "Poll creation, single/multi-choice, vote updates, vote decryption, and vote aggregation."
+    },
+    {
+      "id": "rich",
+      "prefix": "PLOG-RCH",
+      "name": "Rich Messages & Native Flow",
+      "icon": "✨",
+      "description": "Native Flow copy buttons (cta_copy), URL buttons, quick reply, GenAI copy-to-clipboard, rich grids."
+    },
+    {
+      "id": "events",
+      "prefix": "PLOG-EVT",
+      "name": "Events & Stream Listeners",
+      "icon": "📡",
+      "description": "Socket EventEmitter: messages.upsert, messages.update, connection.update, creds.update, presence."
+    },
+    {
+      "id": "groups",
+      "prefix": "PLOG-GRP",
+      "name": "Group Administration",
+      "icon": "👥",
+      "description": "Group metadata, creation, participants update (add/remove/promote/demote), invites, and settings."
+    },
+    {
+      "id": "channels",
+      "prefix": "PLOG-CHN",
+      "name": "Channels & Newsletters",
+      "icon": "📢",
+      "description": "Newsletter metadata, following, unfollowing, muting, publishing, and invite links."
+    },
+    {
+      "id": "profile",
+      "prefix": "PLOG-PRF",
+      "name": "Profile & Privacy",
+      "icon": "🔒",
+      "description": "Profile status, profile photo, presence (composing/available), blocklist, and privacy queries."
+    },
+    {
+      "id": "utils",
+      "prefix": "PLOG-UTL",
+      "name": "Protobuf & JID Utilities",
+      "icon": "🛠️",
+      "description": "JID decoding/normalization, message generators (generateWAMessageContent), proto/WAProto."
+    }
+  ],
+  "features": [
+    {
+      "id": "PLOG-MSG-001",
+      "category": "messaging",
+      "name": "Send Plain Text Message",
+      "method": "sock.sendMessage",
+      "signature": "sock.sendMessage(jid: string, content: { text: string }, options?: MiscMessageGenerationOptions): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { text: string, mentions?: string[] }, options?: object",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { text: \"Hello from Lancy Bot!\" });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Connected WASocket instance (connection === \"open\")",
+      "dependencies": "Socket/messages-send.js, Utils/messages.js",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "Delivered WebMessageInfo containing message key and timestamp",
+      "errorConditions": "Invalid JID format throws Boom (400); network timeout throws Boom (408)",
+      "listenerCleanup": "None required for outbound send",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:250",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MSG-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { text: string }, options?)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { text: \"Hello from Lancy Bot!\" });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Use plogme 2.0.7 sock.sendMessage(jid, { text }) to send a text message on WhatsApp."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MSG-002",
+      "category": "messaging",
+      "name": "Quoted Reply Message",
+      "method": "sock.sendMessage (quoted)",
+      "signature": "sock.sendMessage(jid: string, content: AnyMessageContent, options: { quoted: proto.IWebMessageInfo }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: AnyMessageContent, options: { quoted: proto.IWebMessageInfo }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { text: \"Replying to your note!\" }, { quoted: incomingMsg });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Incoming message object to quote",
+      "dependencies": "Utils/messages.js",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "Message rendered with contextInfo.quotedMessage container",
+      "errorConditions": "Corrupt quoted object results in plain message without quote",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:310",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MSG-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, content, { quoted })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { text: \"Replying!\" }, { quoted: incomingMsg });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Use plogme 2.0.7 to quote a message: pass { quoted: incomingMsg } in sock.sendMessage options."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MSG-003",
+      "category": "messaging",
+      "name": "Edit Sent Message",
+      "method": "sock.sendMessage (edit)",
+      "signature": "sock.sendMessage(jid: string, content: { text: string, edit: proto.IMessageKey }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { text: string, edit: proto.IMessageKey }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { text: \"Updated text\", edit: originalMsg.key });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Original message sent from same session (fromMe === true)",
+      "dependencies": "Socket/messages-send.js",
+      "permissions": "Sender must own original message",
+      "expectedOutput": "ProtocolMessage of type MESSAGE_EDIT sent to update message in place",
+      "errorConditions": "Editing non-fromMe message or editing after WhatsApp time window fails",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:410",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MSG-003"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { text, edit: messageKey })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { text: \"Updated text\", edit: msgKey });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Edit WhatsApp messages in plogme 2.0.7 via sock.sendMessage(jid, { text, edit: msgKey })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MSG-004",
+      "category": "messaging",
+      "name": "Delete Message For Everyone",
+      "method": "sock.sendMessage (delete)",
+      "signature": "sock.sendMessage(jid: string, content: { delete: proto.IMessageKey }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { delete: proto.IMessageKey }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { delete: targetMsg.key });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Message key to revoke; bot must be sender or group admin",
+      "dependencies": "Socket/messages-send.js",
+      "permissions": "Message author or group administrator revoking member message",
+      "expectedOutput": "ProtocolMessage of type REVOKE transmitted",
+      "errorConditions": "Revoking unauthorized message is rejected by WhatsApp server",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:440",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MSG-004"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { delete: messageKey })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { delete: targetMsg.key });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Revoke/delete WhatsApp messages in plogme 2.0.7 using sock.sendMessage(jid, { delete: key })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MSG-005",
+      "category": "messaging",
+      "name": "React To Message (Emoji Reaction)",
+      "method": "sock.sendMessage (react)",
+      "signature": "sock.sendMessage(jid: string, content: { react: { text: string, key: proto.IMessageKey } }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { react: { text: string, key: proto.IMessageKey } }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { react: { text: \"❤️\", key: incomingMsg.key } });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Target message key in same chat",
+      "dependencies": "Utils/messages.js",
+      "permissions": "Participant in chat",
+      "expectedOutput": "reactionMessage attached to target stanza",
+      "errorConditions": "Empty text removes reaction; non-emoji text may be rejected on older WhatsApp builds",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:480",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MSG-005"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { react: { text: emoji, key } })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { react: { text: \"❤️\", key: msg.key } });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "React with emoji on WhatsApp using plogme 2.0.7: sock.sendMessage(jid, { react: { text, key } })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MSG-006",
+      "category": "messaging",
+      "name": "Group Invisible & Visible Mentions",
+      "method": "sock.sendMessage (mentions)",
+      "signature": "sock.sendMessage(jid: string, content: { text: string, mentions?: string[] }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { text: string, mentions?: string[] }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(groupJid, { text: \"📢 Team alert!\", mentions: memberJids });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Valid array of WhatsApp JIDs",
+      "dependencies": "Utils/messages.js",
+      "permissions": "Participant in group",
+      "expectedOutput": "Message with extendedTextMessage.contextInfo.mentionedJid array",
+      "errorConditions": "Malformed JID strings are filtered out",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages.js:1270",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MSG-006"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { text, mentions: string[] })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(groupJid, { text: \"Alert\", mentions: [jid1, jid2] });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Mention WhatsApp members with plogme 2.0.7: pass mentions: [jid1, jid2] in sock.sendMessage."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MED-001",
+      "category": "media",
+      "name": "Send Image with Caption",
+      "method": "sock.sendMessage (image)",
+      "signature": "sock.sendMessage(jid: string, content: { image: Buffer | { url: string }, caption?: string }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { image: Buffer | { url: string }, caption?: string, jpegThumbnail?: Buffer }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { image: imageBuffer, caption: \"✨ Sample picture\" });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "JPEG/PNG image buffer or reachable URL",
+      "dependencies": "Utils/messages-media.js",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "imageMessage uploaded to WhatsApp CDN and sent with encrypted keys",
+      "errorConditions": "Corrupt image buffer throws Boom (400)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:280",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MED-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { image: Buffer | { url }, caption? })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { image: imgBuf, caption: \"Caption\" });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send image in plogme 2.0.7 using sock.sendMessage(jid, { image: buffer, caption })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MED-002",
+      "category": "media",
+      "name": "Send Video or GIF",
+      "method": "sock.sendMessage (video)",
+      "signature": "sock.sendMessage(jid: string, content: { video: Buffer | { url: string }, caption?: string, gifPlayback?: boolean }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { video: Buffer | { url: string }, caption?: string, gifPlayback?: boolean }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { video: videoBuffer, caption: \"🎬 Short clip\", gifPlayback: false });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "MP4 video buffer or URL",
+      "dependencies": "Utils/messages-media.js",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "videoMessage with duration, encrypted keys and playback metadata",
+      "errorConditions": "Oversized video exceeding WhatsApp limit fails upload",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:290",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MED-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { video: Buffer, caption?, gifPlayback? })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { video: vidBuf, caption: \"Video\" });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send video/GIF in plogme 2.0.7 with sock.sendMessage(jid, { video, caption, gifPlayback })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MED-003",
+      "category": "media",
+      "name": "Send Media Album (Multiple Images/Videos)",
+      "method": "sock.sendAlbumMessage",
+      "signature": "sock.sendAlbumMessage(jid: string, medias: Array<{ image?: Buffer; video?: Buffer; caption?: string }>, options?: object): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, medias: Array<MediaItem>, options?: object",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendAlbumMessage(jid, [{ image: buf1, caption: \"Photo 1\" }, { image: buf2, caption: \"Photo 2\" }]);",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "At least 2 media items (images or videos)",
+      "dependencies": "Socket/messages-send.js:2200",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "albumMessage grouping multiple media items in WhatsApp UI",
+      "errorConditions": "Fewer than 2 media items throws Error(\"Albums need at least two media items\")",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:2205",
+      "verificationStatus": "VERIFIED-STATIC",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MED-003"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendAlbumMessage(jid, medias: Array<{ image?, video?, caption? }>)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendAlbumMessage(jid, [{ image: b1 }, { image: b2 }]);"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send album in plogme 2.0.7 with sock.sendAlbumMessage(jid, [{ image, caption }, { image }])."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-MED-004",
+      "category": "media",
+      "name": "Download Inbound Media Stream",
+      "method": "downloadContentFromMessage",
+      "signature": "downloadContentFromMessage(message: proto.IMediaMessage, type: MediaType, options?: MediaDownloadOptions): Promise<AsyncIterable<Buffer>>",
+      "paramTypes": "message: proto.IMessage, type: \"image\" | \"video\" | \"sticker\" | \"document\" | \"audio\"",
+      "returnType": "Promise<AsyncIterable<Buffer>>",
+      "workingCode": "const stream = await downloadContentFromMessage(m.message.imageMessage, \"image\");\nconst chunks = [];\nfor await (const chunk of stream) chunks.push(chunk);\nconst buffer = Buffer.concat(chunks);",
+      "imports": "import { downloadContentFromMessage } from 'plogme';",
+      "prerequisites": "Inbound message containing media with mediaKey and directPath",
+      "dependencies": "Utils/messages-media.js:620",
+      "permissions": "None (crypto stream decryption)",
+      "expectedOutput": "Decrypted raw media buffer (PNG, JPEG, WebP, MP4, MP3, etc.)",
+      "errorConditions": "Missing mediaKey or expired media URL throws Boom (400)",
+      "listenerCleanup": "Async stream consumes to completion",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages-media.js:635",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-MED-004"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "downloadContentFromMessage(msg: IMediaMessage, type: MediaType)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "const stream = await downloadContentFromMessage(msg, \"image\");"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Download WhatsApp media in plogme 2.0.7 using downloadContentFromMessage(mediaMsg, type)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-STK-001",
+      "category": "stickers",
+      "name": "Send Single WebP Sticker",
+      "method": "sock.sendMessage (sticker)",
+      "signature": "sock.sendMessage(jid: string, content: { sticker: Buffer | { url: string } }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { sticker: Buffer | { url: string } }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, { sticker: webpBuffer });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Valid WebP buffer (512x512 pixels, static or animated VP8X)",
+      "dependencies": "Utils/messages-media.js",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "stickerMessage delivered as transparent WhatsApp sticker",
+      "errorConditions": "Non-WebP buffer triggers invalid format error",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:300",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-STK-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { sticker: Buffer | { url } })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { sticker: webpBuffer });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send WhatsApp sticker in plogme 2.0.7: sock.sendMessage(jid, { sticker: webpBuffer })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-STK-002",
+      "category": "stickers",
+      "name": "Send Native Sticker Pack Message",
+      "method": "sock.sendMessage (stickerPackMessage)",
+      "signature": "sock.sendMessage(jid: string, content: { name: string, publisher: string, description?: string, cover: Buffer, stickers: Array<{ data: Buffer, emojis?: string[] }> }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { name, publisher, description, cover, stickers: Array<{ data: Buffer, emojis: string[] }> }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, {\n  name: \"Anime Vibe\",\n  publisher: \"Lancy Bot\",\n  cover: coverWebpBuffer,\n  stickers: stickersList.map(s => ({ data: s.buffer, emojis: [\"🤍\"] }))\n});",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Sticker array between 1 and 60 stickers (enforced by plogme)",
+      "dependencies": "Utils/messages.js:460, Utils/messages-media.js",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "Native stickerPackMessage delivered as single pack drawer installable by recipient",
+      "errorConditions": "stickers.length > 60 throws Error (physical WhatsApp protocol limit)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages.js:485",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-STK-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { name, publisher, cover, stickers: Array<{ data, emojis }> })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { name: \"Pack\", publisher: \"Me\", cover, stickers });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send sticker pack in plogme 2.0.7: sock.sendMessage(jid, { name, publisher, cover, stickers })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-POL-001",
+      "category": "polls",
+      "name": "Create WhatsApp Interactive Poll",
+      "method": "sock.sendMessage (poll)",
+      "signature": "sock.sendMessage(jid: string, content: { poll: { name: string, values: string[], selectableCount?: number } }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { poll: { name: string, values: string[], selectableCount?: number } }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, {\n  poll: {\n    name: \"Which feature should we test next?\",\n    values: [\"Native Copy Buttons\", \"Poll Voting\", \"Channels API\", \"Media Stream\"],\n    selectableCount: 1\n  }\n});",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "At least 2 poll options; selectableCount >= 1",
+      "dependencies": "Utils/messages.js:1240",
+      "permissions": "Chat participant",
+      "expectedOutput": "pollCreationMessage with encrypted option hashes",
+      "errorConditions": "Fewer than 2 options or duplicate option names causes validation failure",
+      "listenerCleanup": "None required for outbound creation",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages.js:1245",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-POL-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { poll: { name, values: string[], selectableCount?: number } })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { poll: { name: \"Vote\", values: [\"A\", \"B\"], selectableCount: 1 } });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Create WhatsApp poll in plogme 2.0.7: sock.sendMessage(jid, { poll: { name, values, selectableCount } })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-POL-002",
+      "category": "polls",
+      "name": "Aggregate & Decrypt Poll Votes",
+      "method": "getAggregateVotesInPollMessage",
+      "signature": "getAggregateVotesInPollMessage({ message: proto.IMessage, pollUpdates: proto.IPollUpdate[] }, meId?: string): Array<{ name: string, voters: string[] }>",
+      "paramTypes": "{ message: proto.IMessage, pollUpdates: proto.IPollUpdate[] }, meId?: string",
+      "returnType": "Array<{ name: string, voters: string[] }>",
+      "workingCode": "const results = getAggregateVotesInPollMessage({ message: originalPollMsg.message, pollUpdates: updatesList }, sock.user.id);\nconsole.log(\"Poll tally:\", results);",
+      "imports": "import { getAggregateVotesInPollMessage } from 'plogme';",
+      "prerequisites": "Original pollCreationMessage and collected pollUpdate records",
+      "dependencies": "Utils/messages.js:1922",
+      "permissions": "None (in-memory aggregation calculation)",
+      "expectedOutput": "Array of options with candidate names and voter JIDs list",
+      "errorConditions": "Missing poll message returns empty array",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages.js:1922",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-POL-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "getAggregateVotesInPollMessage({ message, pollUpdates }, meId): Array<{ name, voters }>"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "const tally = getAggregateVotesInPollMessage({ message, pollUpdates }, myId);"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Aggregate poll votes in plogme 2.0.7: call getAggregateVotesInPollMessage({ message, pollUpdates })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-RCH-001",
+      "category": "rich",
+      "name": "Native Flow Multiple Copy Buttons (cta_copy)",
+      "method": "sock.sendMessage (nativeFlow / cta_copy)",
+      "signature": "sock.sendMessage(jid: string, content: { text: string, footer?: string, nativeFlow: Array<{ text: string, copy: string }> }): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { text: string, footer?: string, nativeFlow: Array<{ text: string, copy: string }> }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(jid, {\n  text: \"✦ PLOGME EXPLORER ✦\",\n  footer: \"Click any button to copy to clipboard\",\n  nativeFlow: [\n    { text: \"📋 Copy Ref ID\", copy: \"PLOG-RCH-001\" },\n    { text: \"📋 Copy Method Signature\", copy: \"sock.sendMessage(jid, { text, nativeFlow })\" },\n    { text: \"📋 Copy Example\", copy: \"await sock.sendMessage(jid, { text: \"Hi\" });\" }\n  ]\n});",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Connected socket; recipient WhatsApp client supporting interactive nativeFlow",
+      "dependencies": "Utils/messages.js:490, Utils/messages.js:1301",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "interactiveMessage containing nativeFlowMessage with cta_copy buttons",
+      "errorConditions": "Unsupported client renders fallback body text",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages.js:531",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-RCH-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(jid, { text, footer, nativeFlow: Array<{ text, copy }> })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(jid, { text: \"Card\", nativeFlow: [{ text: \"Copy\", copy: \"123\" }] });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send native copy buttons on WhatsApp with plogme 2.0.7 using nativeFlow: [{ text, copy: \"code\" }]."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-RCH-002",
+      "category": "rich",
+      "name": "GenAI Rich Response Copy-to-Clipboard",
+      "method": "sock.sendRichTextCopy",
+      "signature": "sock.sendRichTextCopy(jid: string, content: { text?: string, copyText: string, copyLabel?: string, alignment?: \"END\" | \"START\" | \"CENTER\" }, options?: object): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, content: { text?: string, copyText: string, copyLabel?: string, alignment?: string }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendRichTextCopy(jid, {\n  text: \"API Reference Documentation\",\n  copyText: \"PLOG-RCH-002\",\n  copyLabel: \"📋 Copy ID\",\n  alignment: \"END\"\n});",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Connected socket",
+      "dependencies": "Socket/messages-send.js:2308, Utils/rich-message-utils.js:795",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "AIRichResponseMessage with COPY_TO_CLIPBOARD addon primitive",
+      "errorConditions": "Missing copyText throws Boom(\"sendRichTextCopy requires copyText content\", 400)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:2308",
+      "verificationStatus": "VERIFIED-STATIC",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-RCH-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendRichTextCopy(jid, { text?, copyText: string, copyLabel?, alignment? })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendRichTextCopy(jid, { text: \"Doc\", copyText: \"CODE\" });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Use plogme 2.0.7 sock.sendRichTextCopy(jid, { text, copyText }) for Meta AI style copy button."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-RCH-003",
+      "category": "rich",
+      "name": "Multi-Card Button Grid (Carousel)",
+      "method": "sock.sendRichButtonGrid",
+      "signature": "sock.sendRichButtonGrid(jid: string, grid: { text?: string, footer?: string, cards: Array<{ title?: string, caption?: string, buttons: Array<{ text: string, copy?: string, url?: string, id?: string }> }> }, options?: object): Promise<proto.WebMessageInfo>",
+      "paramTypes": "jid: string, grid: { text, footer, cards: Array<{ title, caption, buttons }> }",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendRichButtonGrid(jid, {\n  text: \"Explorer Categories\",\n  cards: [\n    { title: \"Card 1\", buttons: [{ text: \"Copy 1\", copy: \"CODE1\" }] },\n    { title: \"Card 2\", buttons: [{ text: \"Copy 2\", copy: \"CODE2\" }] }\n  ]\n});",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "cards array with at least 1 card having buttons",
+      "dependencies": "Socket/messages-send.js:2748",
+      "permissions": "Standard chat messaging permission",
+      "expectedOutput": "Carousel interactive card grid with native buttons",
+      "errorConditions": "Empty cards array throws Boom(400)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:2748",
+      "verificationStatus": "VERIFIED-STATIC",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-RCH-003"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendRichButtonGrid(jid, { text?, cards: Array<{ title?, buttons }> })"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendRichButtonGrid(jid, { cards: [{ title: \"T\", buttons: [{ text: \"C\", copy: \"X\" }] }] });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Send carousel cards grid in plogme 2.0.7 with sock.sendRichButtonGrid(jid, { cards })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-EVT-001",
+      "category": "events",
+      "name": "Inbound Messages Upsert Listener",
+      "method": "sock.ev.on(\"messages.upsert\")",
+      "signature": "sock.ev.on(\"messages.upsert\", (data: { messages: proto.IWebMessageInfo[], type: \"notify\" | \"append\" }) => void): void",
+      "paramTypes": "event: \"messages.upsert\", listener: ({ messages, type }) => void",
+      "returnType": "void",
+      "workingCode": "const listener = async ({ messages, type }) => {\n  for (const m of messages) {\n    console.log(\"Inbound message:\", m.key.remoteJid);\n  }\n};\nsock.ev.on(\"messages.upsert\", listener);\n// Cleanup:\nsock.ev.off(\"messages.upsert\", listener);",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Connected socket; EventEmitter attached",
+      "dependencies": "Types/Events.ts",
+      "permissions": "None",
+      "expectedOutput": "Triggers on every incoming or outgoing message synchronization stanza",
+      "errorConditions": "Errors inside listener should be wrapped in try/catch to avoid unhandled rejections",
+      "listenerCleanup": "sock.ev.off(\"messages.upsert\", listener)",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Types/Events.d.ts:25",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-EVT-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.ev.on(\"messages.upsert\", ({ messages, type }) => void)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "sock.ev.on(\"messages.upsert\", async ({ messages }) => { /* handle */ });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Listen for WhatsApp messages with plogme 2.0.7 using sock.ev.on(\"messages.upsert\", handler)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-EVT-002",
+      "category": "events",
+      "name": "Connection State & QR Listener",
+      "method": "sock.ev.on(\"connection.update\")",
+      "signature": "sock.ev.on(\"connection.update\", (update: ConnectionState) => void): void",
+      "paramTypes": "event: \"connection.update\", listener: ({ connection, lastDisconnect, qr }) => void",
+      "returnType": "void",
+      "workingCode": "sock.ev.on(\"connection.update\", ({ connection, lastDisconnect, qr }) => {\n  if (qr) console.log(\"Scan QR code:\", qr);\n  if (connection === \"open\") console.log(\"Connected successfully!\");\n  if (connection === \"close\") console.log(\"Closed reason:\", lastDisconnect?.error);\n});",
+      "imports": "import makeWASocket, { DisconnectReason } from 'plogme';",
+      "prerequisites": "Socket initialization",
+      "dependencies": "Types/Events.ts",
+      "permissions": "None",
+      "expectedOutput": "Connection state lifecycle notifications (connecting, open, close)",
+      "errorConditions": "None",
+      "listenerCleanup": "sock.ev.off(\"connection.update\", listener)",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Types/Events.d.ts:15",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-EVT-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.ev.on(\"connection.update\", ({ connection, lastDisconnect, qr }) => void)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "sock.ev.on(\"connection.update\", ({ connection }) => { /* ... */ });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Track connection lifecycle in plogme 2.0.7 with sock.ev.on(\"connection.update\", handler)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-GRP-001",
+      "category": "groups",
+      "name": "Fetch Group Metadata & Subject",
+      "method": "sock.groupMetadata",
+      "signature": "sock.groupMetadata(jid: string): Promise<GroupMetadata>",
+      "paramTypes": "jid: string (ends with @g.us)",
+      "returnType": "Promise<GroupMetadata>",
+      "workingCode": "const meta = await sock.groupMetadata(\"120363024849204928@g.us\");\nconsole.log(\"Group Title:\", meta.subject, \"Members:\", meta.participants.length);",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Bot account is currently a participant in the group",
+      "dependencies": "Socket/groups.js:50",
+      "permissions": "Chat member",
+      "expectedOutput": "Object with subject, description, creation, owner, and participants list with admin flags",
+      "errorConditions": "Non-participant querying metadata throws Boom (404/403)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/groups.js:52",
+      "verificationStatus": "VERIFIED-STATIC",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-GRP-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.groupMetadata(jid: string): Promise<GroupMetadata>"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "const meta = await sock.groupMetadata(groupJid);"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Fetch WhatsApp group details in plogme 2.0.7 using await sock.groupMetadata(groupJid)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-GRP-002",
+      "category": "groups",
+      "name": "Group Participants Management (Add/Remove/Promote)",
+      "method": "sock.groupParticipantsUpdate",
+      "signature": "sock.groupParticipantsUpdate(jid: string, participants: string[], action: \"add\" | \"remove\" | \"promote\" | \"demote\"): Promise<GroupParticipantResponse[]>",
+      "paramTypes": "jid: string, participants: string[], action: \"add\" | \"remove\" | \"promote\" | \"demote\"",
+      "returnType": "Promise<GroupParticipantResponse[]>",
+      "workingCode": "await sock.groupParticipantsUpdate(groupJid, [targetUserJid], \"promote\");",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Bot must be group administrator with participant privileges",
+      "dependencies": "Socket/groups.js:120",
+      "permissions": "Group administrator",
+      "expectedOutput": "Array of participant status responses per JID",
+      "errorConditions": "Calling without admin rights throws Boom (403)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/groups.js:124",
+      "verificationStatus": "VERIFIED-STATIC",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-GRP-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.groupParticipantsUpdate(jid, participants, action: \"add\"|\"remove\"|\"promote\"|\"demote\")"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.groupParticipantsUpdate(groupJid, [userJid], \"promote\");"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Manage group members with plogme 2.0.7: sock.groupParticipantsUpdate(groupJid, [jid], action)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-CHN-001",
+      "category": "channels",
+      "name": "Fetch Newsletter / Channel Metadata",
+      "method": "sock.newsletterMetadata",
+      "signature": "sock.newsletterMetadata(type: \"jid\" | \"invite\", key: string): Promise<NewsletterMetadata>",
+      "paramTypes": "type: \"jid\" | \"invite\", key: string",
+      "returnType": "Promise<NewsletterMetadata>",
+      "workingCode": "const meta = await sock.newsletterMetadata(\"jid\", \"120363431396805997@newsletter\");\nconsole.log(\"Channel Name:\", meta.name, \"Role:\", meta.viewer_metadata?.role);",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Valid newsletter JID or public invite code",
+      "dependencies": "Socket/newsletter.js:40",
+      "permissions": "Public or subscriber",
+      "expectedOutput": "Newsletter metadata containing name, description, subscriber count, verification, and permissions",
+      "errorConditions": "Non-existent channel throws Boom (404)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/newsletter.js:42",
+      "verificationStatus": "VERIFIED-STATIC",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-CHN-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.newsletterMetadata(type: \"jid\"|\"invite\", key: string): Promise<NewsletterMetadata>"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "const meta = await sock.newsletterMetadata(\"jid\", channelJid);"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Get WhatsApp channel info in plogme 2.0.7: sock.newsletterMetadata(\"jid\", channelJid)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-CHN-002",
+      "category": "channels",
+      "name": "Publish Post to Channel / Newsletter",
+      "method": "sock.sendMessage (newsletter)",
+      "signature": "sock.sendMessage(channelJid: string, content: AnyMessageContent): Promise<proto.WebMessageInfo>",
+      "paramTypes": "channelJid: string (ends with @newsletter), content: AnyMessageContent",
+      "returnType": "Promise<proto.WebMessageInfo>",
+      "workingCode": "await sock.sendMessage(\"120363431396805997@newsletter\", { text: \"📢 Official Announcement!\" });",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Bot account must have ADMIN or OWNER role in the newsletter",
+      "dependencies": "Socket/messages-send.js",
+      "permissions": "Channel Admin / Owner",
+      "expectedOutput": "Broadcast stanza sent and confirmed with message ID",
+      "errorConditions": "Subscriber without posting rights throws Boom (403)",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/messages-send.js:350",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-CHN-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendMessage(channelJid: string, content: AnyMessageContent)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendMessage(channelJid, { text: \"Broadcast post\" });"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Post to WhatsApp newsletter in plogme 2.0.7: sock.sendMessage(channelJid, { text })."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-PRF-001",
+      "category": "profile",
+      "name": "Send Presence Indicator (Composing/Recording/Paused)",
+      "method": "sock.sendPresenceUpdate",
+      "signature": "sock.sendPresenceUpdate(type: \"composing\" | \"recording\" | \"paused\" | \"available\" | \"unavailable\", toJid?: string): Promise<void>",
+      "paramTypes": "type: \"composing\" | \"recording\" | \"paused\" | \"available\" | \"unavailable\", toJid?: string",
+      "returnType": "Promise<void>",
+      "workingCode": "await sock.sendPresenceUpdate(\"composing\", remoteJid);\n// ... process work ...\nawait sock.sendPresenceUpdate(\"paused\", remoteJid);",
+      "imports": "import makeWASocket from 'plogme';",
+      "prerequisites": "Connected socket",
+      "dependencies": "Socket/presence.js:25",
+      "permissions": "None",
+      "expectedOutput": "Displays typing... indicator on recipient screen",
+      "errorConditions": "Network disconnection causes silent reject or error",
+      "listenerCleanup": "Always reset to \"paused\" after work completes",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Socket/presence.js:28",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-PRF-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "sock.sendPresenceUpdate(type: \"composing\"|\"recording\"|\"paused\", toJid?: string)"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "await sock.sendPresenceUpdate(\"composing\", jid);"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Show typing status in plogme 2.0.7: await sock.sendPresenceUpdate(\"composing\", jid)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-UTL-001",
+      "category": "utils",
+      "name": "JID Identification & Normalization Helpers",
+      "method": "isPnUser, isLidUser, isJidGroup, isJidNewsletter, jidNormalizedUser",
+      "signature": "isPnUser(jid: string): boolean; isLidUser(jid: string): boolean; isJidGroup(jid: string): boolean; isJidNewsletter(jid: string): boolean; jidNormalizedUser(jid: string): string",
+      "paramTypes": "jid: string",
+      "returnType": "boolean | string",
+      "workingCode": "const isPn = isPnUser(\"2348012345678@s.whatsapp.net\"); // true\nconst isLid = isLidUser(\"9876543210@lid\"); // true\nconst isGroup = isJidGroup(\"120363024849204928@g.us\"); // true\nconst isChannel = isJidNewsletter(\"120363431396805997@newsletter\"); // true\nconst cleanUser = jidNormalizedUser(\"2348012345678:12@s.whatsapp.net\"); // 2348012345678@s.whatsapp.net",
+      "imports": "import { isPnUser, isLidUser, isJidGroup, isJidNewsletter, jidNormalizedUser } from 'plogme';",
+      "prerequisites": "None",
+      "dependencies": "WABinary/jid-utils.js:15",
+      "permissions": "None",
+      "expectedOutput": "Normalized string or boolean",
+      "errorConditions": "Null or undefined input safely returns false / empty",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/WABinary/jid-utils.js:20",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-UTL-001"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "isJidGroup(jid: string): boolean; jidNormalizedUser(jid: string): string"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "const isGrp = isJidGroup(jid); const clean = jidNormalizedUser(jid);"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Normalize WhatsApp JIDs in plogme 2.0.7: use jidNormalizedUser(jid) and isJidGroup(jid)."
+        }
+      ]
+    },
+    {
+      "id": "PLOG-UTL-002",
+      "category": "utils",
+      "name": "Low-Level Message Content Generator",
+      "method": "generateWAMessageContent",
+      "signature": "generateWAMessageContent(content: AnyMessageContent, options: MessageContentGenerationOptions): Promise<proto.IMessage>",
+      "paramTypes": "content: AnyMessageContent, options: MessageContentGenerationOptions",
+      "returnType": "Promise<proto.IMessage>",
+      "workingCode": "const msgProto = await generateWAMessageContent({ text: \"Hello\", nativeFlow: [{ text: \"Copy\", copy: \"CODE\" }] }, {});\nconsole.log(\"Generated proto:\", Object.keys(msgProto));",
+      "imports": "import { generateWAMessageContent } from 'plogme';",
+      "prerequisites": "None",
+      "dependencies": "Utils/messages.js:1250",
+      "permissions": "None",
+      "expectedOutput": "Serialized protobuf message structure without sending over network",
+      "errorConditions": "Invalid content schema throws error",
+      "listenerCleanup": "None required",
+      "version": "plogme@2.0.7",
+      "sourceRef": "lib/Utils/messages.js:1255",
+      "verificationStatus": "VERIFIED-LOCAL",
+      "testable": true,
+      "copyActions": [
+        {
+          "label": "📋 Copy ID",
+          "text": "PLOG-UTL-002"
+        },
+        {
+          "label": "📋 Copy Signature",
+          "text": "generateWAMessageContent(content, options): Promise<proto.IMessage>"
+        },
+        {
+          "label": "📋 Copy Code",
+          "text": "const protoMsg = await generateWAMessageContent(content, {});"
+        },
+        {
+          "label": "📋 Copy AI Prompt",
+          "text": "Generate WhatsApp message protobuf in plogme 2.0.7 using generateWAMessageContent(content, {})."
+        }
+      ]
+    }
+  ],
+  "exports": [
+    {
+      "name": "ACCOUNT_RESTRICTED_TEXT",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ALL_WA_PATCH_NAMES",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "AssociationType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "BIZ_BOT_SUPPORT_PAYLOAD",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "BOT_RENDERING_CONFIG_METADATA",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "BinaryInfo",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "BotCapabilityType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "Browsers",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "BufferJSON",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ButtonHeaderType",
+      "type": "object",
+      "category": "rich",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ButtonType",
+      "type": "object",
+      "category": "rich",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "CALL_AUDIO_PREFIX",
+      "type": "string",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "CALL_VIDEO_PREFIX",
+      "type": "string",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "CarouselCardType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "CompanionWebClientType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "Curve",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DECRYPTION_RETRY_CONFIG",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DEFAULT_CACHE_TTLS",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DEFAULT_CONNECTION_CONFIG",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DEFAULT_ORIGIN",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DEF_CALLBACK_PREFIX",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DEF_MEDIA_HOST",
+      "type": "string",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DEF_TAG_PREFIX",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DICT_VERSION",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DONATE_URL",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "DisconnectReason",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "FLAG_BYTE",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "FLAG_EVENT",
+      "type": "number",
+      "category": "events",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "FLAG_EXTENDED",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "FLAG_FIELD",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "FLAG_GLOBAL",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "HISTORY_SYNC_PAUSED_TIMEOUT_MS",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "INITIAL_PREKEY_COUNT",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "KEY_BUNDLE_TYPE",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "LEXER_REGEX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "LIBRARY_NAME",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "LT_HASH_ANTI_TAMPERING",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ListType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MAX_SYNC_ATTEMPTS",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MEDIA_HKDF_KEY_MAPPING",
+      "type": "object",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MEDIA_KEYS",
+      "type": "object",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MEDIA_PATH_MAP",
+      "type": "object",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "META_AI_JID",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MIN_PREKEY_COUNT",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MISSING_KEYS_ERROR_TEXT",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "MessageRetryManager",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "NACK_REASONS",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "NEWSLETTER_MEDIA_PATH_MAP",
+      "type": "object",
+      "category": "media",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "NOISE_MODE",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "NOISE_WA_HEADER",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "NO_MESSAGE_FOUND_ERROR_TEXT",
+      "type": "string",
+      "category": "messaging",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "NewChatMessageCappingMVStatusType",
+      "type": "object",
+      "category": "messaging",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "NewChatMessageCappingStatusType",
+      "type": "object",
+      "category": "messaging",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "OFFICIAL_BIZ_JID",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ObjectRepository",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "PHONE_CONNECTION_CB",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "PLACEHOLDER_MAX_AGE_SECONDS",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "PROCESSABLE_HISTORY_TYPES",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "PSA_WID",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "PlanningStepStatus",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ProtocolType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "QueryIds",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "ReachoutTimelockEnforcementType",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "RetryReason",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "SERVER_ERROR_CODES",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "SERVER_JID",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "STATUS_EXPIRY_SECONDS",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "STORIES_JID",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "S_WHATSAPP_NET",
+      "type": "string",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "SyncState",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "TimeMs",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "UNAUTHORIZED_CODES",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "UPLOAD_TIMEOUT",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "URL_REGEX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "USYNC_FEATURES",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "USyncBotProfileProtocol",
+      "type": "function",
+      "category": "profile",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncBusinessProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncContactProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncDeviceProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncDisappearingModeProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncFeatureProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncLIDProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncPictureProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncQuery",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncSidelistProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncStatusProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncTextStatusProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "USyncUsernameProtocol",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "WAJIDDomains",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WAMessageAddressingMode",
+      "type": "object",
+      "category": "messaging",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WAMessageStatus",
+      "type": "object",
+      "category": "messaging",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WAMessageStubType",
+      "type": "object",
+      "category": "messaging",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WAProto",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_ACCOUNT_SIG_PREFIX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_DEVICE_SIG_PREFIX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_HOSTED_ACCOUNT_SIG_PREFIX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_HOSTED_DEVICE_SIG_PREFIX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_HOSTED_KEY_INDEX_LIST_SIG_PREFIX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_HOSTED_KEY_INDEX_LIST_SIG_PREFIX_VERIFY",
+      "type": "boolean",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_ADV_KEY_INDEX_LIST_SIG_PREFIX",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_CERT_DETAILS",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WA_DEFAULT_EPHEMERAL",
+      "type": "number",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WEB_EVENTS",
+      "type": "object",
+      "category": "events",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "WEB_GLOBALS",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "XWAPaths",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "__esModule",
+      "type": "boolean",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "addTransactionCapability",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesDecrypt",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesDecryptCTR",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesDecryptGCM",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesDecryptWithIV",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesEncrypWithIV",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesEncrypt",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesEncryptCTR",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aesEncryptGCM",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "aggregateMessageKeysNotFromMe",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "areJidsSameUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "assertMeId",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "assertMediaContent",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "assertNodeErrorFree",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "attachBotVerificationProofs",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "binaryNodeToString",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "bindWaitForConnectionUpdate",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "bindWaitForEvent",
+      "type": "function",
+      "category": "events",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "botMetadataCertificate",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "botMetadataSignature",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildAckStanza",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildAdditionalBotMetadataContext",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildBotCapabilityMetadata",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildBotRichResponse",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildCompositingPlaceholder",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildImaginePrimitive",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildLinkPreview",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildPairingQRData",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildPlainPlaceholder",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildProgressIndicator",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildReasoningSteps",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildSearchSteps",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildSteps",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "buildWhatsAppFlowButton",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "bytesToCrockford",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "capability",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "captureUnifiedResponse",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "chatModificationToAppPatch",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "checkStatusWA",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "cleanMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "configureSuccessfulPairing",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "consumerApplicationToMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "createSignalIdentity",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "createWelcomeFlow",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "debouncedTimeout",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeBinaryNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeConsumerApplication",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeDecompressedBinaryNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeDecryptedMsmsgMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeE2eRekeyPayload",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeGroupHistory",
+      "type": "function",
+      "category": "groups",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeHtmlEntities",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeMediaRetryNode",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeMessageNode",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodePatches",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeSyncdMutations",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeSyncdPatch",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decodeSyncdSnapshot",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decompressingIfRequired",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decryptEventResponse",
+      "type": "function",
+      "category": "events",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decryptMediaRetryData",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decryptMessageNode",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decryptMsmsgBotMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "decryptPollVote",
+      "type": "function",
+      "category": "polls",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "default",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "delay",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "delayCancellable",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "derivePairingCodeKey",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "downloadAndProcessHistorySyncNotification",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "downloadContentFromMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "downloadEncryptedContent",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "downloadExternalBlob",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "downloadExternalPatch",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "downloadHistory",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "downloadMediaMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeBase64EncodedStringForUpload",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeBigEndian",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeBinaryNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeNewsletterMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeSignedDeviceIdentity",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeSyncdPatch",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeWAM",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encodeWAMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encryptMediaRetryRequest",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "encryptedStream",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "ensureLTHashStateVersion",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extensionForMediaMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractAddressingContext",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractDeviceJids",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractE2ESessionFromRetryReceipt",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractImageThumb",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractMessageContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractSyncdPatches",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractUrlFromText",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "extractVideoThumb",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "fetchLatestBaileysVersion",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "fetchLatestWaWebVersion",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "fetchLinkMeta",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateCodeBlockContent",
+      "type": "function",
+      "category": "profile",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateForwardMessageContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateLatexContent",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateLatexImageContent",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateLatexInlineImageContent",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateLinkPreviewIfRequired",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateListContent",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateLoginNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateMdTagPrefix",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateMessageID",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateMessageIDV2",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateMiniAppHtml",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateOrGetPreKeys",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateParticipantHashV2",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateProfilePicture",
+      "type": "function",
+      "category": "profile",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateProfilePictureHD",
+      "type": "function",
+      "category": "profile",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateRegistrationId",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateRegistrationNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateRichMessageContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateSignalPubKey",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateTableContent",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateThumbnail",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateUnifiedResponseContent",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "generateWAMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "generateWAMessageContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "generateWAMessageFromContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getAggregateResponsesInEventMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getAggregateVotesInPollMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "getAllBinaryNodeChildren",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getAudioDuration",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getAudioWaveform",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBinaryNodeChild",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBinaryNodeChildBuffer",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBinaryNodeChildString",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBinaryNodeChildUInt",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBinaryNodeChildren",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBinaryNodeMessages",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getBizBinaryNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getCallStatusFromNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getChatId",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getCodeFromWSError",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getCompanionPlatformId",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getCompanionWebClientType",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getContentType",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getDecryptionJid",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getDevice",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getErrorCodeFromStreamError",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getHistoryMsg",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getHttpStream",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getImageProcessingLibrary",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getKeyAuthor",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getMediaKeys",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getMessageAddOns",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getMessageCommentMetadata",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getMessagePaymentInfo",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getNextPreKeys",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getNextPreKeysNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getPlatformId",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getPollCorrectAnswer",
+      "type": "function",
+      "category": "polls",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getPreKeys",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getRawMediaUploadData",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getScheduledMessageTime",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getSenderLid",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getServerFromDomainType",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getStatusCodeForMediaRetry",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getStatusFromReceiptType",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getStream",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getUrlFromDirectPath",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getUrlInfo",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "getWAUploadToServer",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "grepSource",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "handleIdentityChange",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hasNonNullishProperty",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hasOptionalProperty",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hasValidAlbumMedia",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hasValidCarouselHeader",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hasValidInteractiveHeader",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hasVerifiableProofs",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hkdf",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hkdfInfoKey",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "hmacSign",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "initAuthCreds",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isAppStateSyncIrrecoverable",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isHostedLidUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isHostedPnUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isJidBot",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isJidBroadcast",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isJidGroup",
+      "type": "function",
+      "category": "groups",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "isJidMetaAI",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isJidNewsletter",
+      "type": "function",
+      "category": "channels",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "isJidStatusBroadcast",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isLidUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "isMissingKeyError",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isPnUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "isRealMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isScheduledMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isStringNullOrEmpty",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "isWABusinessPlatform",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "jidDecode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "jidEncode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "jidNormalizedUser",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "makeCacheManagerAuthState",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeCacheableSignalKeyStore",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeEventBuffer",
+      "type": "function",
+      "category": "events",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeInMemoryStore",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeLtHashGenerator",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeNoiseHandler",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeOrderedDictionary",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeWASocket",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "makeWhatsAppFlowButton",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "md5",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "mediaMessageSHA256B64",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "metaTyping",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "mixedSteps",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "newLTHashState",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "normalizeBotCapabilities",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "normalizeMentionedJidsForSend",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "normalizeMessageContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "normalizeMessageForDisplayJids",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "parseAndInjectE2ESessions",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "parseNativeFlowResponse",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "parseWhatsAppFlowResponse",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareA2UICommandMenu",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareA2UIMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareAIRichCommandMenu",
+      "type": "function",
+      "category": "rich",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareBotPromptSuggestionsMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareBotPttTranscriptMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareBotSourcesMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareCopyToClipboardMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareDisappearingMessageSettingContent",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareGridImageMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareHtmlMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareInstagramProfileMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichDynamicMediaMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichGenerationMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichHtmlMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichImageMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichLinkMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichMapMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichMenuMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichQuoteMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichResponseMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareRichTextMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareSocialEntityMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareSocialProfileMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareUnifiedResponseMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareVerticalAlbumMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareVideoGridMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "prepareWAMessageMedia",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "processGroupHistory",
+      "type": "function",
+      "category": "groups",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "processHistoryMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "processSyncAction",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "promiseTimeout",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "proto",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": true
+    },
+    {
+      "name": "reduceBinaryNodeToDictionary",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "replayPlanning",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "replayPlanningOnly",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "resolvePreviewImage",
+      "type": "function",
+      "category": "media",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "resolvePreviewMeta",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "sendMetaComposited",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "setBotMessageSecret",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "sha256",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "shouldIncludeBizBinaryNode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "shouldIncrementChatUnread",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "signedKeyPair",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "supportsMetaRendering",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "toBuffer",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "toJid",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": true
+    },
+    {
+      "name": "toNumber",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "toReadable",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "toUnified",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "tokenizeCode",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "transferDevice",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "trimUndefined",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "unixTimestampSeconds",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "unpadRandomMax16",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "updateMessageWithEventResponse",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "updateMessageWithPollUpdate",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "updateMessageWithReaction",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "updateMessageWithReceipt",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "uploadWithNodeHttp",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "useMultiFileAuthState",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "useSingleFileAuthState",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "useSqliteAuthState",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "waChatKey",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "waLabelAssociationKey",
+      "type": "object",
+      "category": "utils",
+      "isFunction": false,
+      "isMapped": false
+    },
+    {
+      "name": "waMessageID",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "wrapToBotForwardedMessage",
+      "type": "function",
+      "category": "messaging",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "writeRandomPadMax16",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "xmppPreKey",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    },
+    {
+      "name": "xmppSignedPreKey",
+      "type": "function",
+      "category": "utils",
+      "isFunction": true,
+      "isMapped": false
+    }
+  ]
+}

@@ -10,6 +10,9 @@ import { truncate } from '../utils/text.js';
 import { logger } from '../core/logger.js';
 import { sanitizeWhatsAppPackName } from './publisher.js';
 import { extractTelegramPackName } from '../stickers/packNaming.js';
+import { registry } from './explorer/registry.js';
+import { lab } from './explorer/lab.js';
+import { PlogmeRenderer } from './explorer/renderer.js';
 
 function escapeHtml(text) {
   return String(text ?? '')
@@ -70,6 +73,8 @@ export class InboundHandler {
           return await this.#handleImageToWaSticker(session, m);
         case '.listen':
           return await this.#handleListen(session, m, text);
+        case '.tmenu':
+          return await this.#handleTmenu(session, m, text);
         default:
           return;
       }
@@ -79,6 +84,94 @@ export class InboundHandler {
     } finally {
       await session?.sock?.sendPresenceUpdate?.('paused', remoteJid).catch(() => {});
     }
+  }
+
+  async #handleTmenu(session, m, text) {
+    const remoteJid = m?.key?.remoteJid;
+    if (!remoteJid) return;
+
+    // Security: Only authenticated owner can execute .tmenu, navigate explorer or run tests
+    if (!session?.isOwnerSender?.(m)) {
+      this.log.warn({ remoteJid, participant: m?.key?.participant }, 'non-owner attempted .tmenu command');
+      return;
+    }
+
+    const p = session?.getPrefix?.() || '.';
+    const parts = String(text || '').trim().split(/\s+/);
+    const sub = (parts[1] || '').trim();
+    const subLower = sub.toLowerCase();
+
+    // 1. .tmenu (no arguments) -> Master Menu with multiple native copy buttons!
+    if (!sub) {
+      const payload = PlogmeRenderer.renderMasterMenu({ p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // 2. .tmenu audit -> Full audit report
+    if (['audit', 'status', 'report'].includes(subLower)) {
+      const payload = PlogmeRenderer.renderAuditView({ p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // 3. .tmenu test <ref_id> -> Execute Test Lab
+    if (subLower === 'test') {
+      const refId = parts[2] ? parts[2].toUpperCase() : null;
+      if (!refId) {
+        return await this.#sendReply(
+          session,
+          remoteJid,
+          `✕ Please specify a feature ID to test: *${p}tmenu test <ref_id>*\nExample: *${p}tmenu test PLOG-RCH-001*`
+        );
+      }
+      const isLive = parts.includes('--live');
+      const outcome = await lab.runTest(refId, { session, chatJid: remoteJid, isLive });
+      const payload = PlogmeRenderer.renderTestResult(outcome, { p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // 4. .tmenu search <query> -> Search features
+    if (subLower === 'search' || subLower === 'find') {
+      const term = parts.slice(2).join(' ').trim();
+      if (!term) {
+        return await this.#sendReply(
+          session,
+          remoteJid,
+          `✕ Please specify a search query: *${p}tmenu search <term>*\nExample: *${p}tmenu search poll*`
+        );
+      }
+      const results = registry.search(term);
+      const payload = PlogmeRenderer.renderSearchView(term, results, { p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // 5. Check if sub matches a specific feature ID (e.g. .tmenu PLOG-RCH-001)
+    const feature = registry.getFeature(sub);
+    if (feature) {
+      const payload = PlogmeRenderer.renderFeatureView(feature, { p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // 6. Check if sub matches a category ID (e.g. .tmenu rich, .tmenu media, .tmenu polls)
+    const category = registry.getCategory(sub);
+    if (category) {
+      const payload = PlogmeRenderer.renderCategoryView(category.id, { p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // 7. General search fallback (e.g. .tmenu poll, .tmenu newsletter, .tmenu copy button)
+    const fullTerm = parts.slice(1).join(' ').trim();
+    const searchResults = registry.search(fullTerm);
+    if (searchResults.length > 0) {
+      const payload = PlogmeRenderer.renderSearchView(fullTerm, searchResults, { p });
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+
+    // Not found: render guidance
+    return await this.#sendReply(
+      session,
+      remoteJid,
+      `✕ Unknown explorer query "${fullTerm}".\n\n💡 Use *${p}tmenu* to view the category index, or *${p}tmenu search ${fullTerm}* to search by keyword.`
+    );
   }
 
   async #sendReply(session, remoteJid, text) {

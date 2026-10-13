@@ -286,8 +286,13 @@ export class WASession extends EventEmitter {
       };
       const canonical = aliasMap[matchedCmd] || matchedCmd;
 
-      const validCmds = new Set(['.ping', '.menu', '.cv', '.tg', '.s', '.prefix', '.listen']);
+      const validCmds = new Set(['.ping', '.menu', '.cv', '.tg', '.s', '.prefix', '.listen', '.tmenu']);
       if (!validCmds.has(canonical)) {
+        return;
+      }
+
+      // Security: .tmenu is strictly owner-only
+      if (canonical === '.tmenu' && !this.isOwnerSender(m)) {
         return;
       }
 
@@ -501,6 +506,32 @@ export class WASession extends EventEmitter {
     const result = await this.sock.sendMessage(jid, { text });
     this.stats.messagesSent++;
     return result;
+  }
+
+  /**
+   * Send a WhatsApp interactive message with native flow buttons (e.g. cta_copy).
+   * Renders genuine native copy buttons within the SAME message on supported WhatsApp clients.
+   * Gracefully falls back to formatted text with copyable code blocks if needed.
+   */
+  async sendInteractiveMessage(jid, { text, footer, nativeFlow = [] }) {
+    this.#assertOnline();
+    try {
+      const payload = {
+        text,
+        footer,
+        nativeFlow
+      };
+      const result = await this.sock.sendMessage(jid, payload);
+      this.stats.messagesSent++;
+      return result;
+    } catch (err) {
+      this.log.warn({ err: err?.message, jid }, 'sendInteractiveMessage failed, attempting text fallback');
+      const fallbackButtons = (nativeFlow || [])
+        .map((b) => `• *${b.text}*: \`${b.copy}\``)
+        .join('\n');
+      const fallbackText = `${text}\n\n📋 *Copy Actions:*\n${fallbackButtons}${footer ? `\n\n_${footer}_` : ''}`;
+      return await this.sendText(jid, fallbackText);
+    }
   }
 
   /** Edit an existing text message in-place on WhatsApp. */
