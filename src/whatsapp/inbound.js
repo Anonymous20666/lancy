@@ -101,16 +101,16 @@ export class InboundHandler {
     const sub = (parts[1] || '').trim();
     const subLower = sub.toLowerCase();
 
-    // 1. .tmenu (no arguments) -> Master Menu with multiple native copy buttons!
+    // 1. .tmenu (no arguments) -> Master Menu with GenAI copy buttons at FRONT!
     if (!sub) {
       const payload = PlogmeRenderer.renderMasterMenu({ p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // 2. .tmenu audit -> Full audit report
     if (['audit', 'status', 'report'].includes(subLower)) {
       const payload = PlogmeRenderer.renderAuditView({ p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // 3. .tmenu test <ref_id> -> Execute Test Lab
@@ -126,7 +126,7 @@ export class InboundHandler {
       const isLive = parts.includes('--live');
       const outcome = await lab.runTest(refId, { session, chatJid: remoteJid, isLive });
       const payload = PlogmeRenderer.renderTestResult(outcome, { p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // 4. .tmenu search <query> -> Search features
@@ -141,21 +141,21 @@ export class InboundHandler {
       }
       const results = registry.search(term);
       const payload = PlogmeRenderer.renderSearchView(term, results, { p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // 5. Check if sub matches a specific feature ID (e.g. .tmenu PLOG-RCH-001)
     const feature = registry.getFeature(sub);
     if (feature) {
       const payload = PlogmeRenderer.renderFeatureView(feature, { p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // 6. Check if sub matches a category ID (e.g. .tmenu rich, .tmenu media, .tmenu polls)
     const category = registry.getCategory(sub);
     if (category) {
       const payload = PlogmeRenderer.renderCategoryView(category.id, { p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // 7. General search fallback (e.g. .tmenu poll, .tmenu newsletter, .tmenu copy button)
@@ -163,7 +163,7 @@ export class InboundHandler {
     const searchResults = registry.search(fullTerm);
     if (searchResults.length > 0) {
       const payload = PlogmeRenderer.renderSearchView(fullTerm, searchResults, { p });
-      return await session.sendInteractiveMessage(remoteJid, payload);
+      return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
     // Not found: render guidance
@@ -172,6 +172,16 @@ export class InboundHandler {
       remoteJid,
       `✕ Unknown explorer query "${fullTerm}".\n\n💡 Use *${p}tmenu* to view the category index, or *${p}tmenu search ${fullTerm}* to search by keyword.`
     );
+  }
+
+  async #sendExplorerResponse(session, remoteJid, payload) {
+    if (session?.sendAIRichCopyMenu) {
+      return await session.sendAIRichCopyMenu(remoteJid, payload);
+    }
+    if (session?.sendInteractiveMessage) {
+      return await session.sendInteractiveMessage(remoteJid, payload);
+    }
+    return await this.#sendReply(session, remoteJid, payload?.text || '');
   }
 
   async #sendReply(session, remoteJid, text) {

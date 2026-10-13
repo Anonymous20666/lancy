@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import pino from 'pino';
-import { NEWSLETTER_MEDIA_PATH_MAP } from 'plogme';
+import { NEWSLETTER_MEDIA_PATH_MAP, prepareUnifiedResponseMessage, generateWAMessageFromContent, proto, generateMessageIDV2 } from 'plogme';
 import { logger } from '../core/logger.js';
 import { friendlyDisconnectReason } from '../core/errors.js';
 import { ensureSessionDir, tightenFile } from '../utils/paths.js';
@@ -506,6 +506,108 @@ export class WASession extends EventEmitter {
     const result = await this.sock.sendMessage(jid, { text });
     this.stats.messagesSent++;
     return result;
+  }
+
+  /**
+   * Send an advanced Meta AI / GenAI style rich response with copy-to-clipboard buttons.
+   * Renders genuine circular copy buttons directly AT THE FRONT (alignment: 'START') of each menu text line.
+   * Uses plogme's prepareUnifiedResponseMessage with GenAIAddonActionLayoutViewModel sections,
+   * emitting the rich envelope along with the protocol MESSAGE_EDIT to trigger official WhatsApp client rendering.
+   * Gracefully falls back to interactive nativeFlow or clean markdown code blocks if unsupported.
+   */
+  async sendAIRichCopyMenu(jid, { text, copyItems = [], alignment = 'START', nativeFlow = [], footer = '' }) {
+    this.#assertOnline();
+    try {
+      if (Array.isArray(copyItems) && copyItems.length > 0) {
+        const sections = [
+          {
+            __typename: 'GenAIUnifiedResponseSection',
+            view_model: {
+              __typename: 'GenAISingleLayoutViewModel',
+              primitive: {
+                __typename: 'GenAIMarkdownTextUXPrimitive',
+                text: String(text || ''),
+                inline_entities: []
+              }
+            }
+          },
+          ...copyItems.map((item) => {
+            const copyVal = typeof item === 'string' ? item : (item.copy || item.text);
+            const align = (typeof item === 'object' && item.alignment) ? item.alignment : alignment;
+            return {
+              __typename: 'GenAIUnifiedResponseSection',
+              view_model: {
+                __typename: 'GenAIAddonActionLayoutViewModel',
+                addon_action_type: 'COPY_TO_CLIPBOARD',
+                addon_action_alignment: align || 'START',
+                primitives: [
+                  {
+                    __typename: 'GenAIMarkdownTextUXPrimitive',
+                    text: String(copyVal),
+                    inline_entities: []
+                  }
+                ]
+              }
+            };
+          })
+        ];
+
+        const wrapped = prepareUnifiedResponseMessage({ sections });
+        const userJid = this.sock.user?.id || this.sock.authState?.creds?.me?.id;
+        const msgId = generateMessageIDV2?.(userJid) || undefined;
+        const fullMsg = await generateWAMessageFromContent(jid, wrapped, {
+          logger: this.log,
+          userJid,
+          messageId: msgId
+        });
+
+        await this.sock.relayMessage(jid, fullMsg.message, { messageId: fullMsg.key.id });
+
+        try {
+          const editContent = proto.Message.fromObject({
+            botForwardedMessage: {
+              message: {
+                protocolMessage: {
+                  key: {
+                    remoteJid: jid,
+                    fromMe: true,
+                    id: fullMsg.key.id
+                  },
+                  type: proto.Message.ProtocolMessage.Type.MESSAGE_EDIT,
+                  editedMessage: fullMsg.message
+                }
+              }
+            }
+          });
+          const editMsg = await generateWAMessageFromContent(jid, editContent, {
+            logger: this.log,
+            userJid,
+            messageId: generateMessageIDV2?.(userJid || jid) || undefined
+          });
+          await this.sock.relayMessage(jid, editMsg.message, { messageId: editMsg.key.id });
+        } catch (editErr) {
+          this.log.debug({ err: editErr?.message }, 'rich edit relay skipped or failed; base message was sent');
+        }
+
+        this.stats.messagesSent++;
+        return fullMsg;
+      }
+
+      // If no copyItems, fall back to sendInteractiveMessage or sendText
+      if (nativeFlow?.length) {
+        return await this.sendInteractiveMessage(jid, { text, footer, nativeFlow });
+      }
+      return await this.sendText(jid, text);
+    } catch (err) {
+      this.log.warn({ err: err?.message, jid }, 'sendAIRichCopyMenu failed, falling back to nativeFlow or text');
+      if (nativeFlow?.length) {
+        return await this.sendInteractiveMessage(jid, { text, footer, nativeFlow });
+      }
+      const copyList = (copyItems || [])
+        .map((it) => `• \`${typeof it === 'string' ? it : (it.copy || it.text)}\``)
+        .join('\n');
+      return await this.sendText(jid, `${text}\n\n📋 *Copy Actions:*\n${copyList}`);
+    }
   }
 
   /**

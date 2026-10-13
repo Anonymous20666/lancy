@@ -155,6 +155,47 @@ test('WASession.sendInteractiveMessage delivers nativeFlow and supports fallback
   assert.ok(payloadsSent[1].payload.text.includes('PLOG-RCH-001'));
 });
 
+test('WASession.sendAIRichCopyMenu delivers GenAI copy buttons at front and supports fallback', async () => {
+  const relays = [];
+  const session = new WASession({
+    sessionId: 'wa_sess_rich_copy',
+    name: 'RichCopySession',
+    phone: '2348012345678'
+  });
+  session.status = 'online';
+  session.sock = {
+    user: { id: '2348012345678@s.whatsapp.net' },
+    relayMessage: async (jid, message, options) => {
+      relays.push({ jid, message, options });
+      return { key: { id: options.messageId || 'relay_123' } };
+    }
+  };
+
+  const payload = PlogmeRenderer.renderMasterMenu({ p: '.' });
+  assert.ok(Array.isArray(payload.copyItems));
+  assert.ok(payload.copyItems.length >= 6);
+  assert.equal(payload.copyItems[0].alignment, 'START');
+
+  await session.sendAIRichCopyMenu('2348012345678@s.whatsapp.net', payload);
+  assert.ok(relays.length >= 1);
+  const baseMsg = relays[0].message;
+  assert.ok(baseMsg.botForwardedMessage.message.richResponseMessage);
+
+  // Test fallback when relay fails
+  session.sock.relayMessage = async () => {
+    throw new Error('Rich messages disallowed');
+  };
+  let fallbackSent = null;
+  session.sendInteractiveMessage = async (jid, p) => {
+    fallbackSent = p;
+    return { key: { id: 'fallback_ok' } };
+  };
+
+  await session.sendAIRichCopyMenu('2348012345678@s.whatsapp.net', payload);
+  assert.ok(fallbackSent);
+  assert.ok(fallbackSent.nativeFlow.length >= 3);
+});
+
 test('InboundHandler .tmenu: owner-only security, single-message master menu, categories, and test lab', async () => {
   const db = new Database(':memory:');
   const interactiveSends = [];
@@ -167,6 +208,10 @@ test('InboundHandler .tmenu: owner-only security, single-message master menu, ca
   });
   session.status = 'online';
   session.jid = '2348012345678@s.whatsapp.net';
+  session.sendAIRichCopyMenu = async (jid, p) => {
+    interactiveSends.push({ jid, ...p });
+    return { key: { id: 'airich_' + Date.now() } };
+  };
   session.sendInteractiveMessage = async (jid, p) => {
     interactiveSends.push({ jid, ...p });
     return { key: { id: 'interactive_' + Date.now() } };

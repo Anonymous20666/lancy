@@ -33,11 +33,25 @@ ${catLines}
 • *${p}tmenu <id>* — Inspect feature spec (e.g. *${p}tmenu PLOG-RCH-001*)
 • *${p}tmenu search <query>* — Find API (e.g. *${p}tmenu search poll*)
 • *${p}tmenu test <id>* — Execute Test Lab (e.g. *${p}tmenu test PLOG-RCH-001*)
-• *${p}tmenu audit* — Full coverage & symbol breakdown ♡`;
+• *${p}tmenu audit* — Full coverage & symbol breakdown ♡
 
-    const footer = 'Plogme 2.0.7 • Tap native buttons below to copy code directly';
+💡 *Tip:* Circular copy buttons are attached at the FRONT of each command below. Tap any to copy!`;
 
-    // Real Native Copy Buttons (cta_copy)
+    const footer = 'Plogme 2.0.7 • GenAI Copy Buttons at Front';
+
+    // GenAI Rich Copy Items rendered with circular copy buttons at FRONT (alignment: START)
+    const copyItems = [
+      { text: `${p}tmenu`, copy: `${p}tmenu`, alignment: 'START' },
+      { text: `${p}tmenu rich`, copy: `${p}tmenu rich`, alignment: 'START' },
+      { text: `${p}tmenu media`, copy: `${p}tmenu media`, alignment: 'START' },
+      { text: `${p}tmenu polls`, copy: `${p}tmenu polls`, alignment: 'START' },
+      { text: `${p}tmenu PLOG-RCH-001`, copy: `${p}tmenu PLOG-RCH-001`, alignment: 'START' },
+      { text: `${p}tmenu test PLOG-RCH-001`, copy: `${p}tmenu test PLOG-RCH-001`, alignment: 'START' },
+      { text: `${p}tmenu search poll`, copy: `${p}tmenu search poll`, alignment: 'START' },
+      { text: `${p}tmenu audit`, copy: `${p}tmenu audit`, alignment: 'START' }
+    ];
+
+    // Real Native Copy Buttons fallback (cta_copy)
     const nativeFlow = [
       { text: '📋 Copy Ref ID', copy: 'PLOG-RCH-001' },
       { text: '📋 Copy Signature', copy: 'sock.sendMessage(jid, { text: string, nativeFlow: Array<{ text, copy }> })' },
@@ -45,7 +59,7 @@ ${catLines}
       { text: '📋 Copy AI Prompt', copy: 'Implement WhatsApp native copy buttons using plogme 2.0.7 sock.sendMessage(jid, { text, nativeFlow: [{ text, copy }] }).' }
     ];
 
-    return { text, footer, nativeFlow };
+    return { text, footer, copyItems, alignment: 'START', nativeFlow };
   }
 
   /**
@@ -77,7 +91,17 @@ ${featureLines}
 
     const footer = `Plogme 2.0.7 • Category: ${category.name}`;
 
-    // Provide copy buttons for the primary feature in this category
+    // GenAI Rich Copy Items at FRONT for all features in category
+    const copyItems = [
+      ...features.map((f) => ({
+        text: `${p}tmenu ${f.id}`,
+        copy: `${p}tmenu ${f.id}`,
+        alignment: 'START'
+      })),
+      { text: `${p}tmenu`, copy: `${p}tmenu`, alignment: 'START' }
+    ];
+
+    // Provide copy buttons fallback for the primary feature in this category
     const topFeature = features[0];
     const nativeFlow = topFeature?.copyActions?.map((ca) => ({
       text: ca.label,
@@ -87,7 +111,7 @@ ${featureLines}
       { text: '📋 Copy Prefix', copy: category.prefix }
     ];
 
-    return { text, footer, nativeFlow };
+    return { text, footer, copyItems, alignment: 'START', nativeFlow };
   }
 
   /**
@@ -135,7 +159,15 @@ ${feature.workingCode}
 • Run test: *${p}tmenu test ${feature.id}*
 • Back to menu: *${p}tmenu* ♡`;
 
-    const footer = `Plogme 2.0.7 • [${feature.id}] Tap buttons to copy code`;
+    const footer = `Plogme 2.0.7 • [${feature.id}] GenAI Copy Buttons at Front`;
+
+    // GenAI Rich Copy Items at FRONT for quick copy-paste
+    const copyItems = [
+      { text: feature.id, copy: feature.id, alignment: 'START' },
+      { text: `${p}tmenu test ${feature.id}`, copy: `${p}tmenu test ${feature.id}`, alignment: 'START' },
+      { text: feature.signature, copy: feature.signature, alignment: 'START' },
+      { text: feature.workingCode, copy: feature.workingCode, alignment: 'START' }
+    ];
 
     const nativeFlow = feature.copyActions?.map((ca) => ({
       text: ca.label,
@@ -146,7 +178,7 @@ ${feature.workingCode}
       { text: '📋 Copy Working Code', copy: feature.workingCode }
     ];
 
-    return { text, footer, nativeFlow };
+    return { text, footer, copyItems, alignment: 'START', nativeFlow };
   }
 
   /**
@@ -162,7 +194,8 @@ ${feature.workingCode}
 💡 *Tips:*
 • Try broad terms like *poll*, *media*, *copy*, *group*, *channel*, or *react*
 • Or browse categories directly with *${p}tmenu* ♡`;
-      return { text, footer: 'Plogme Explorer • Search', nativeFlow: [{ text: '📋 Back to Menu', copy: `${p}tmenu` }] };
+      const copyItems = [{ text: `${p}tmenu`, copy: `${p}tmenu`, alignment: 'START' }];
+      return { text, footer: 'Plogme Explorer • Search', copyItems, alignment: 'START', nativeFlow: [{ text: '📋 Back to Menu', copy: `${p}tmenu` }] };
     }
 
     const resultLines = results.slice(0, 8).map((f, i) => {
@@ -178,6 +211,15 @@ ${resultLines}
 💡 Send *${p}tmenu <id>* to view full signature and code! ♡`;
 
     const footer = `Plogme Explorer • ${results.length} results for "${query}"`;
+    const copyItems = [
+      ...results.slice(0, 6).map((f) => ({
+        text: `${p}tmenu ${f.id}`,
+        copy: `${p}tmenu ${f.id}`,
+        alignment: 'START'
+      })),
+      { text: `${p}tmenu`, copy: `${p}tmenu`, alignment: 'START' }
+    ];
+
     const top = results[0];
     const nativeFlow = [
       { text: `📋 Copy Top Ref ID`, copy: top.id },
@@ -185,7 +227,7 @@ ${resultLines}
       { text: `📋 Copy Top Code`, copy: top.workingCode }
     ];
 
-    return { text, footer, nativeFlow };
+    return { text, footer, copyItems, alignment: 'START', nativeFlow };
   }
 
   /**
@@ -213,12 +255,18 @@ ${outcome.error ? `\n⚠️ *Error:* \`${outcome.error}\`` : ''}
 • Back to Menu: *${p}tmenu* ♡`;
 
     const footer = `Plogme Test Lab • ${outcome.status} in ${outcome.durationMs}ms`;
+    const copyItems = [
+      { text: `${p}tmenu test ${outcome.refId}`, copy: `${p}tmenu test ${outcome.refId}`, alignment: 'START' },
+      { text: `${p}tmenu ${outcome.refId}`, copy: `${p}tmenu ${outcome.refId}`, alignment: 'START' },
+      { text: `${p}tmenu`, copy: `${p}tmenu`, alignment: 'START' }
+    ];
+
     const nativeFlow = [
       { text: '📋 Copy Test Ref ID', copy: outcome.refId },
       { text: '📋 Copy Test Command', copy: `${p}tmenu test ${outcome.refId}` }
     ];
 
-    return { text, footer, nativeFlow };
+    return { text, footer, copyItems, alignment: 'START', nativeFlow };
   }
 
   /**
@@ -250,12 +298,18 @@ ${catStats}
 💡 Send *${p}tmenu* to explore the interactive catalogue! ♡`;
 
     const footer = `Plogme 2.0.7 • Full Audit Summary`;
+    const copyItems = [
+      { text: `${p}tmenu`, copy: `${p}tmenu`, alignment: 'START' },
+      { text: `${p}tmenu rich`, copy: `${p}tmenu rich`, alignment: 'START' },
+      { text: `plogme@${summary.version}`, copy: `plogme@${summary.version}`, alignment: 'START' }
+    ];
+
     const nativeFlow = [
       { text: '📋 Copy Audit Version', copy: `plogme@${summary.version}` },
       { text: '📋 Copy Total Exports', copy: `${summary.totalExports} exports` },
       { text: '📋 Copy Menu Command', copy: `${p}tmenu` }
     ];
 
-    return { text, footer, nativeFlow };
+    return { text, footer, copyItems, alignment: 'START', nativeFlow };
   }
 }
