@@ -310,6 +310,7 @@ export class StateMachine extends EventEmitter {
 
   #ctx(key, record) {
     return {
+      ...(record.context || {}),
       tgId: key,
       state: record.state,
       context: record.context,

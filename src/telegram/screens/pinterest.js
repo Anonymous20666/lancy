@@ -230,9 +230,23 @@ export function createPinterestScreen({ app }) {
   }
 
   async function runSearch(sctx, query, targetGoal = null) {
-    const mode = sctx.context.mode ?? 'normal';
-    const rawGoal = targetGoal ?? sctx.context.goal ?? null;
-    const isContinuous = rawGoal === 'continuous' || targetGoal === 'continuous' || sctx.context.goal === 'continuous';
+    query = query || sctx?.context?.query || sctx?.query || '';
+    let mode = sctx?.context?.mode ?? sctx?.mode ?? 'normal';
+    if (!query && sctx?.tgId) {
+      const last = app.pinterest?.db?.get?.(
+        'SELECT query, mode FROM pinterest_searches WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+        Number(sctx.tgId)
+      );
+      if (last?.query) {
+        query = last.query;
+        if (!mode || mode === 'normal') mode = last.mode || 'normal';
+      }
+    }
+    if (!query) {
+      return askQuery(sctx, mode || 'normal');
+    }
+    const rawGoal = targetGoal ?? sctx?.context?.goal ?? sctx?.goal ?? null;
+    const isContinuous = rawGoal === 'continuous' || targetGoal === 'continuous' || sctx?.context?.goal === 'continuous' || sctx?.goal === 'continuous';
     const depth = isContinuous ? 'continuous' : (app.settings.get('pinterest.searchDepth') ?? 'deep');
     const goal = isContinuous ? 10 : (mode === 'videos' ? Math.min(20, Math.max(1, Number(rawGoal) || 20)) : (Number(rawGoal) > 0 ? Number(rawGoal) : 60));
     const userId = Number(sctx.tgId);
@@ -786,7 +800,7 @@ export function createPinterestScreen({ app }) {
 
         const isGroup = Boolean(sctx.isGroup || message.chat?.type === 'group' || message.chat?.type === 'supergroup' || (sctx.chatId && Number(sctx.chatId) < 0));
 
-        if (sctx.context.stage === 'historySearch') {
+        if (sctx.context?.stage === 'historySearch') {
           if (!isGroup && message.message_id) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
           }
@@ -794,12 +808,13 @@ export function createPinterestScreen({ app }) {
           return true;
         }
 
-        if (sctx.context.stage === 'count') {
+        if (sctx.context?.stage === 'count') {
+          const effectiveQuery = sctx.context?.query || sctx.query;
           if (/\b(continuous|infinite|explore|unlimited)\b/i.test(text)) {
             if (!isGroup && message.message_id) {
               await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
             }
-            await runSearch(sctx, sctx.context.query, 'continuous');
+            await runSearch(sctx, effectiveQuery, 'continuous');
             return true;
           }
           const parsed = parseInt(text, 10);
@@ -808,7 +823,7 @@ export function createPinterestScreen({ app }) {
             if (!isGroup && message.message_id) {
               await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
             }
-            await runSearch(sctx, sctx.context.query, capped);
+            await runSearch(sctx, effectiveQuery, capped);
             return true;
           }
         }
@@ -927,8 +942,21 @@ export function createPinterestScreen({ app }) {
           const rawCount = args[0];
           const count = rawCount === 'continuous' ? 'continuous' : Number(rawCount);
           const sctx = ctx.sm.ctxFor(ctx.tgId);
-          const mode = args[1] || sctx.mode || 'normal';
-          const query = args[2] || sctx.query || '';
+          let mode = args[1] || sctx.context?.mode || sctx.mode || 'normal';
+          let query = args[2] || sctx.context?.query || sctx.query || '';
+          if (!query && ctx.tgId) {
+            const lastSearch = app.pinterest?.db?.get?.(
+              'SELECT query, mode FROM pinterest_searches WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+              Number(ctx.tgId)
+            );
+            if (lastSearch?.query) {
+              query = lastSearch.query;
+              if (!args[1] && lastSearch.mode) mode = lastSearch.mode;
+            }
+          }
+          if (!query) {
+            return askQuery(ctx, mode);
+          }
           const clickedMsgId = ctx.query?.message?.message_id;
           if (clickedMsgId) {
             sctx.screenMessageId = clickedMsgId;
@@ -941,8 +969,21 @@ export function createPinterestScreen({ app }) {
         }
         case 'customCount': {
           const sctx = ctx.sm.ctxFor(ctx.tgId);
-          const mode = args[0] || sctx.mode || 'normal';
-          const query = args[1] || sctx.query || '';
+          let mode = args[0] || sctx.context?.mode || sctx.mode || 'normal';
+          let query = args[1] || sctx.context?.query || sctx.query || '';
+          if (!query && ctx.tgId) {
+            const lastSearch = app.pinterest?.db?.get?.(
+              'SELECT query, mode FROM pinterest_searches WHERE user_id = ? ORDER BY id DESC LIMIT 1',
+              Number(ctx.tgId)
+            );
+            if (lastSearch?.query) {
+              query = lastSearch.query;
+              if (!args[0] && lastSearch.mode) mode = lastSearch.mode;
+            }
+          }
+          if (!query) {
+            return askQuery(ctx, mode);
+          }
           return askCustomCount(ctx, query, mode);
         }
         case 'results':
