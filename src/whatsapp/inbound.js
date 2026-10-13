@@ -113,18 +113,32 @@ export class InboundHandler {
       return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
-    // 3. .tmenu test <ref_id> -> Execute Test Lab
-    if (subLower === 'test') {
+    // 3. .tmenu test <ref_id> / .tmenu send <ref_id> -> Execute Test Lab and SEND REAL LIVE MESSAGE!
+    if (['test', 'send', 'run', 'live', 'demo'].includes(subLower)) {
       const refId = parts[2] ? parts[2].toUpperCase() : null;
       if (!refId) {
         return await this.#sendReply(
           session,
           remoteJid,
-          `✕ Please specify a feature ID to test: *${p}tmenu test <ref_id>*\nExample: *${p}tmenu test PLOG-RCH-001*`
+          `✕ Please specify a feature ID to test: *${p}tmenu test <ref_id>*\n\n🔥 *Live Demonstrations:*
+• *${p}tmenu test PLOG-MED-001* — Real live image
+• *${p}tmenu test PLOG-MED-002* — Real live playable video
+• *${p}tmenu test PLOG-MED-003* — Real multi-media album
+• *${p}tmenu test PLOG-MED-004* — Real document attachment
+• *${p}tmenu test PLOG-STK-001* — Real 512x512 WebP sticker
+• *${p}tmenu test PLOG-POL-001* — Real interactive WhatsApp poll
+• *${p}tmenu test PLOG-RCH-001* — Real native copy buttons
+• *${p}tmenu test PLOG-RCH-002* — Real GenAI copy button at front
+• *${p}tmenu test PLOG-MSG-003* — Real live message edit in-place
+• *${p}tmenu test PLOG-MSG-005* — Real live emoji reaction`
         );
       }
-      const isLive = parts.includes('--live');
-      const outcome = await lab.runTest(refId, { session, chatJid: remoteJid, isLive });
+      const outcome = await lab.runTest(refId, {
+        session,
+        chatJid: remoteJid,
+        isLive: true,
+        triggerMessage: m
+      });
       const payload = PlogmeRenderer.renderTestResult(outcome, { p });
       return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
@@ -144,9 +158,20 @@ export class InboundHandler {
       return await this.#sendExplorerResponse(session, remoteJid, payload);
     }
 
-    // 5. Check if sub matches a specific feature ID (e.g. .tmenu PLOG-RCH-001)
+    // 5. Check if sub matches a specific feature ID (e.g. .tmenu PLOG-RCH-001 [test])
     const feature = registry.getFeature(sub);
     if (feature) {
+      const action = (parts[2] || '').toLowerCase();
+      if (['test', 'send', 'run', 'live', 'demo'].includes(action)) {
+        const outcome = await lab.runTest(feature.id, {
+          session,
+          chatJid: remoteJid,
+          isLive: true,
+          triggerMessage: m
+        });
+        const payload = PlogmeRenderer.renderTestResult(outcome, { p });
+        return await this.#sendExplorerResponse(session, remoteJid, payload);
+      }
       const payload = PlogmeRenderer.renderFeatureView(feature, { p });
       return await this.#sendExplorerResponse(session, remoteJid, payload);
     }

@@ -115,6 +115,64 @@ test('PlogmeTestLab executes local verification tests without errors or leaks', 
   assert.ok(res5.details.includes('isJidGroup'));
 });
 
+test('PlogmeTestLab executes real live payloads (image, video, sticker, poll, document, edit, reaction)', async () => {
+  const sentPayloads = [];
+  const fakeSession = {
+    status: 'online',
+    sock: {
+      sendMessage: async (jid, content, options) => {
+        sentPayloads.push({ jid, content, options });
+        return { key: { id: 'sent_' + Date.now(), remoteJid: jid } };
+      }
+    },
+    sendInteractiveMessage: async (jid, p) => {
+      sentPayloads.push({ jid, content: p });
+      return { key: { id: 'inter_' + Date.now() } };
+    },
+    sendAIRichCopyMenu: async (jid, p) => {
+      sentPayloads.push({ jid, content: p });
+      return { key: { id: 'airich_' + Date.now() } };
+    }
+  };
+  const testJid = '2348012345678@s.whatsapp.net';
+
+  // 1. Live Image
+  const imgRes = await lab.runTest('PLOG-MED-001', { session: fakeSession, chatJid: testJid, isLive: true });
+  assert.equal(imgRes.status, 'PASS');
+  assert.equal(imgRes.testType, 'LIVE');
+  assert.ok(sentPayloads.some((p) => Buffer.isBuffer(p.content.image)));
+
+  // 2. Live Video
+  const vidRes = await lab.runTest('PLOG-MED-002', { session: fakeSession, chatJid: testJid, isLive: true });
+  assert.equal(vidRes.status, 'PASS');
+  assert.ok(sentPayloads.some((p) => Buffer.isBuffer(p.content.video)));
+
+  // 3. Live Sticker
+  const stkRes = await lab.runTest('PLOG-STK-001', { session: fakeSession, chatJid: testJid, isLive: true });
+  assert.equal(stkRes.status, 'PASS');
+  assert.ok(sentPayloads.some((p) => Buffer.isBuffer(p.content.sticker)));
+
+  // 4. Live Poll
+  const polRes = await lab.runTest('PLOG-POL-001', { session: fakeSession, chatJid: testJid, isLive: true });
+  assert.equal(polRes.status, 'PASS');
+  assert.ok(sentPayloads.some((p) => p.content.poll && p.content.poll.values.length >= 3));
+
+  // 5. Live Document
+  const docRes = await lab.runTest('PLOG-MED-004', { session: fakeSession, chatJid: testJid, isLive: true });
+  assert.equal(docRes.status, 'PASS');
+  assert.ok(sentPayloads.some((p) => Buffer.isBuffer(p.content.document)));
+
+  // 6. Live Reaction
+  const reactRes = await lab.runTest('PLOG-MSG-005', {
+    session: fakeSession,
+    chatJid: testJid,
+    isLive: true,
+    triggerMessage: { key: { id: 'msg_target_123', remoteJid: testJid } }
+  });
+  assert.equal(reactRes.status, 'PASS');
+  assert.ok(sentPayloads.some((p) => p.content.react && p.content.react.text === '🚀'));
+});
+
 test('WASession.sendInteractiveMessage delivers nativeFlow and supports fallback', async () => {
   const payloadsSent = [];
   const session = new WASession({
@@ -293,7 +351,7 @@ test('InboundHandler .tmenu: owner-only security, single-message master menu, ca
   assert.equal(interactiveSends.length, 4);
   assert.ok(interactiveSends[3].text.includes('SEARCH: "poll"'));
 
-  // 6. Owner .tmenu test PLOG-RCH-001 -> executes test lab
+  // 6. Owner .tmenu test PLOG-RCH-001 -> executes test lab and delivers real live message!
   await handler.handle({
     session,
     message: {
@@ -303,8 +361,10 @@ test('InboundHandler .tmenu: owner-only security, single-message master menu, ca
     command: '.tmenu',
     text: '.tmenu test PLOG-RCH-001'
   });
-  assert.equal(interactiveSends.length, 5);
-  assert.ok(interactiveSends[4].text.includes('TEST LAB: [PLOG-RCH-001] ✅'));
+  // 1 additional for live interactiveMessage payload + 1 for test report card = 6 total
+  assert.equal(interactiveSends.length, 6);
+  assert.ok(interactiveSends[4].text.includes('PLOGME TEST: NATIVE COPY BUTTONS'));
+  assert.ok(interactiveSends[5].text.includes('TEST LAB: [PLOG-RCH-001] ✅'));
 
   // 7. Owner .tmenu audit -> full audit report
   await handler.handle({
@@ -316,8 +376,8 @@ test('InboundHandler .tmenu: owner-only security, single-message master menu, ca
     command: '.tmenu',
     text: '.tmenu audit'
   });
-  assert.equal(interactiveSends.length, 6);
-  assert.ok(interactiveSends[5].text.includes('PLOGME 2.0.7 AUDIT REPORT'));
+  assert.equal(interactiveSends.length, 7);
+  assert.ok(interactiveSends[6].text.includes('PLOGME 2.0.7 AUDIT REPORT'));
 
   // 8. Public .menu remains 100% secret (no mention of .tmenu)
   await handler.handle({
