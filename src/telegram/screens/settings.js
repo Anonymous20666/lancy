@@ -3,6 +3,7 @@ import { navButtons, kvTable, banner, ACCENT, SPARK } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { DEFAULT_SETTINGS, RESTART_REQUIRED_PATHS, flattenSettings } from '../../config/defaults.js';
 import { truncate } from '../../utils/text.js';
+import { getCloneForceJoinChannels, getGlobalForceJoinChannels } from '../forceJoin.js';
 
 /**
  * Settings screen — the COMPLETE configuration system, organized by
@@ -148,6 +149,149 @@ export function createSettingsScreen({ app }) {
   }
 
   async function openMenu(ctx) {
+    const userId = Number(ctx.tgId);
+    const isMain = (app.settings.get('general.ownerIds') ?? []).map(Number).includes(userId) || Boolean(ctx.controller?.isMainOwner?.(userId));
+    const botContext = ctx.bot || ctx.controller?.botContext || app.telegram?.controller?.botContext || null;
+    const isClone = Boolean(ctx.isClone || botContext?.isClone);
+    const botId = Number(ctx.botId || botContext?.botId || 0);
+    const cloneOwnerId = Number(botContext?.ownerId || botContext?.ownerTgId || 0);
+    const isCloneOwner = isClone && cloneOwnerId > 0 && userId === cloneOwnerId;
+    const botUsername = ctx.botUsername || botContext?.botUsername || 'bot';
+
+    // ── 1. CLONED BOT CONTEXT ──
+    if (isClone) {
+      if (!isCloneOwner && !isMain) {
+        const b = new RichMessageBuilder();
+        b.paragraph(rt.bold(banner([
+          `𓆩♡𓆪 @${botUsername.toUpperCase()} 𓆩♡𓆪`,
+          'bot settings'
+        ])));
+        b.divider();
+        b.blockquote(`🌸 Settings and force-join configuration for @${botUsername} are reserved for the bot owner ♡`);
+        b.divider();
+        b.buttons([
+          richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+        ]);
+        b.validate();
+        return editOrSend(ctx, b.toJSON());
+      }
+
+      await ctx.sm.transition(ctx.tgId, States.SETTINGS, {
+        context: { isCloneSettings: true, botId },
+        chatId: ctx.chatId,
+        screenMessageId: ctx.messageId
+      });
+
+      const cloneFj = getCloneForceJoinChannels(app.db, botId);
+      const globalFj = getGlobalForceJoinChannels(app.db);
+
+      const b = new RichMessageBuilder();
+      b.paragraph(rt.bold(banner([
+        `𓆩♡𓆪 @${botUsername.toUpperCase()} SETTINGS 𓆩♡𓆪`,
+        'force-join channels & bot control ♡'
+      ])));
+      b.divider();
+      b.blockquote(
+        `🤖 CLONED BOT CONTROLS:\n` +
+        `• Set up Force-Join so members must join your channel or group before chatting with @${botUsername}!\n` +
+        `• Users who haven't joined will be prompted with a join link and instant verification button.`
+      );
+      b.divider();
+      b.heading('🔒 FORCE-JOIN STATUS', 3);
+      b.table(kvTable([
+        ['🤖 Bot', `@${botUsername}`],
+        ['👑 Owner', isCloneOwner ? 'You' : 'Studio Owner'],
+        ['🔒 Force-Join', cloneFj.length > 0 ? `✓ ${cloneFj.length} Channel(s) Active` : 'Off (Tap below to add)'],
+        ['🌐 Global Network', `${globalFj.length} Channel(s) Enforced`]
+      ]), { compact: true });
+      b.divider();
+
+      // ONLY their force join button shows!
+      b.buttons([
+        richButton.callback('🔒 Force-Join Channels', `fj_open:${botId}`, { style: 'success' })
+      ]);
+
+      if (isMain) {
+        b.buttons([
+          richButton.callback('👑 Studio Global Settings', encodeCallback(id, 'global_menu'), { style: 'primary' })
+        ]);
+      }
+
+      b.buttons([
+        richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+      ]);
+      b.footer(rt.italic(`managed with love by @${botUsername} ♡`));
+      b.validate();
+      return editOrSend(ctx, b.toJSON());
+    }
+
+    // ── 2. MAIN BOT CONTEXT ──
+    const ownedClones = !isMain ? (app.multiBotManager?.getBotsForOwner(userId) ?? []) : [];
+
+    // Cloners opening settings on main bot:
+    if (!isMain && ownedClones.length > 0) {
+      await ctx.sm.transition(ctx.tgId, States.SETTINGS, {
+        context: { isCloneOwnerMenu: true },
+        chatId: ctx.chatId,
+        screenMessageId: ctx.messageId
+      });
+
+      const b = new RichMessageBuilder();
+      b.paragraph(rt.bold(banner([
+        '𓆩♡𓆪 MY BOTS SETTINGS 𓆩♡𓆪',
+        'force-join channels & bot control ♡'
+      ])));
+      b.divider();
+      b.blockquote(
+        '🤖 CLONER DASHBOARD:\n' +
+        '• Manage your cloned bots force-join channels below!\n' +
+        '• Users must join your configured channels before using your bot.'
+      );
+      b.divider();
+
+      b.heading('📢 YOUR CLONED BOTS', 3);
+      for (const bot of ownedClones) {
+        const botFj = getCloneForceJoinChannels(app.db, bot.id);
+        const fjStatus = botFj.length > 0 ? `(${botFj.length} active)` : '(off)';
+        b.buttons([
+          richButton.callback(`🔒 @${bot.bot_username} Force-Join ${fjStatus}`, `fj_open:${bot.id}`, { style: 'success' })
+        ]);
+      }
+      b.buttons([
+        richButton.callback('🤖 Manage Cloned Bots', encodeCallback('clone', 'open'), { style: 'primary' }),
+        richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+      ]);
+      b.footer(rt.italic('instant real-time channel enforcement ♡'));
+      b.validate();
+      return editOrSend(ctx, b.toJSON());
+    }
+
+    // Non-owners without clones:
+    if (!isMain) {
+      const b = new RichMessageBuilder();
+      b.paragraph(rt.bold(banner([
+        '𓆩♡𓆪 SETTINGS & STUDIO 𓆩♡𓆪',
+        'restricted access'
+      ])));
+      b.divider();
+      b.blockquote(
+        '🌸 Studio Settings & configuration are reserved for Bot Administrators ♡\n\n' +
+        '💡 To launch your own bot with custom force-join channels and branding, use /clone! ♡'
+      );
+      b.divider();
+      b.buttons([
+        richButton.callback('🤖 Clone Your Own Bot', encodeCallback('clone', 'open'), { style: 'primary' }),
+        richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+      ]);
+      b.validate();
+      return editOrSend(ctx, b.toJSON());
+    }
+
+    // ── 3. GENERAL STUDIO OWNER GLOBAL SETTINGS MENU ──
+    return openGlobalMenu(ctx);
+  }
+
+  async function openGlobalMenu(ctx) {
     await ctx.sm.transition(ctx.tgId, States.SETTINGS, {
       context: {},
       chatId: ctx.chatId,
@@ -169,17 +313,15 @@ export function createSettingsScreen({ app }) {
       b.buttons([richButton.callback('✓ I Restarted', encodeCallback(id, 'restartAck'), { style: 'success' })]);
       b.divider();
     }
-    if (ctx.controller?.isOwner?.(ctx.tgId) || (app.settings.get('general.ownerIds') ?? []).map(Number).includes(Number(ctx.tgId))) {
-      b.buttons([
-        richButton.callback('🔒 Global Force-Join (All Bots)', 'fj_open:global', { style: 'success' }),
-        richButton.callback('👑 Manage Team Admins', encodeCallback(id, 'adminList'), { style: 'primary' })
-      ]);
-      b.divider();
-    }
+    b.buttons([
+      richButton.callback('🔒 Global Force-Join (All Bots)', 'fj_open:global', { style: 'success' }),
+      richButton.callback('👑 Manage Team Admins', encodeCallback(id, 'adminList'), { style: 'primary' })
+    ]);
+    b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));
     b.footer(rt.italic('secrets like tokens are never shown here ♡'));
     b.validate();
-    await editOrSend(ctx, b.toJSON());
+    return editOrSend(ctx, b.toJSON());
   }
 
   async function openCategory(ctx, category) {
@@ -343,6 +485,11 @@ export function createSettingsScreen({ app }) {
 
         // Handle Admin Allocation ID submission
         if (sctx.context?.adminAdd) {
+          const isMain = (app.settings.get('general.ownerIds') ?? []).map(Number).includes(Number(sctx.tgId));
+          if (!isMain) {
+            await sctx.reset({ reason: 'unauthorized' });
+            return app.telegram.api.sendMessage(chatId, '♡ Only the General Studio Owner can allocate admins ♡');
+          }
           const targetId = Number(message.text?.trim());
           if (!targetId || isNaN(targetId) || targetId <= 0) {
             return app.telegram.api.sendMessage(chatId, '♡ Invalid Telegram ID. Please provide numeric ID (e.g. 8831887192) ♡');
@@ -369,6 +516,12 @@ export function createSettingsScreen({ app }) {
         const path = pendingEdits.get(sctx.tgId);
         if (!path || !message.text) return false;
         pendingEdits.delete(sctx.tgId);
+
+        const isMain = (app.settings.get('general.ownerIds') ?? []).map(Number).includes(Number(sctx.tgId));
+        if (!isMain) {
+          await sctx.reset({ reason: 'unauthorized' });
+          return app.telegram.api.sendMessage(chatId, '♡ Only the General Studio Owner can modify global settings ♡');
+        }
 
         let value = parseValue(message.text);
         if (path === 'stickers.packNameTemplate') {
@@ -456,16 +609,34 @@ export function createSettingsScreen({ app }) {
       await openMenu(ctx);
     },
     async handle(ctx, action, args) {
+      const userId = Number(ctx.tgId);
+      const isMain = (app.settings.get('general.ownerIds') ?? []).map(Number).includes(userId) || Boolean(ctx.controller?.isMainOwner?.(userId));
+
       switch (action) {
         case 'open':
           return openMenu(ctx);
+        case 'global_menu':
+          if (!isMain) return openMenu(ctx);
+          return openGlobalMenu(ctx);
         case 'adminList':
+          if (!isMain) {
+            await ctx.reply?.('<blockquote>🔒 Only the General Studio Owner can manage team administrators ♡</blockquote>', { parse_mode: 'HTML' });
+            return openMenu(ctx);
+          }
           return openAdminList(ctx);
         case 'adminAddAsk':
+          if (!isMain) {
+            await ctx.reply?.('<blockquote>🔒 Only the General Studio Owner can allocate team administrators ♡</blockquote>', { parse_mode: 'HTML' });
+            return openMenu(ctx);
+          }
           return adminAddAsk(ctx);
         case 'adminRemove': {
+          if (!isMain) {
+            await ctx.reply?.('<blockquote>🔒 Only the General Studio Owner can remove team administrators ♡</blockquote>', { parse_mode: 'HTML' });
+            return openMenu(ctx);
+          }
           const targetId = Number(args[0]);
-          if (targetId && (ctx.controller?.isOwner?.(ctx.tgId) || (app.settings.get('general.ownerIds') ?? []).map(Number).includes(Number(ctx.tgId)))) {
+          if (targetId) {
             const adminIds = (app.settings.get('telegram.adminIds') ?? []).map(Number).filter((x) => x !== targetId);
             await app.settings.set('telegram.adminIds', adminIds);
             app.db.run('UPDATE users SET is_admin = 0 WHERE tg_id = ?', targetId);
@@ -473,10 +644,19 @@ export function createSettingsScreen({ app }) {
           return openAdminList(ctx);
         }
         case 'category':
+          if (!isMain) {
+            await ctx.reply?.('<blockquote>🔒 Only the General Studio Owner can configure system categories ♡</blockquote>', { parse_mode: 'HTML' });
+            return openMenu(ctx);
+          }
           return openCategory(ctx, args[0]);
         case 'edit':
+          if (!isMain) {
+            await ctx.reply?.('<blockquote>🔒 Only the General Studio Owner can edit system settings ♡</blockquote>', { parse_mode: 'HTML' });
+            return openMenu(ctx);
+          }
           return askValue(ctx, args[0]);
         case 'restartAck':
+          if (!isMain) return openMenu(ctx);
           ctx.settings.clearRestartFlags?.();
           return ctx.reply('♡ noted — restart me when you are ready ♡');
         case 'back':

@@ -8,6 +8,7 @@ import { MultiBotManager } from '../src/telegram/multiBotManager.js';
 import { t, getLanguageName, SUPPORTED_LANGUAGES } from '../src/core/i18n.js';
 import { createDashboardScreen } from '../src/telegram/screens/dashboard.js';
 import { createDownloaderScreen } from '../src/telegram/screens/downloader.js';
+import { createSettingsScreen } from '../src/telegram/screens/settings.js';
 
 test('i18n: translations, fallback and parameter substitution work across all languages', () => {
   // 1. All supported languages exist
@@ -1025,6 +1026,192 @@ test('Pagination: moreSlide cleanly replaces target message without leaving dupl
 
   // Verify the target message 888 was deleted so NO duplicate message was dropped!
   assert.ok(deletedMsgIds.includes(888), 'Target message 888 was cleanly deleted to avoid dropping extra messages');
+
+  db.close();
+});
+
+test('Cloned Bot Settings: clone owner sees ONLY their force-join channels button and NEVER sees Manage Team Admins, Global Force-Join, or system categories', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db, { env: { OWNER_IDS: '8831887192' } });
+  const sm = new StateMachine();
+
+  const clonerId = 12345;
+  const botId = 77;
+  const cloneBotUsername = 'MyCustomClone_bot';
+
+  // Insert cloned bot record
+  db.run(
+    `INSERT INTO cloned_bots (id, token, bot_name, bot_username, owner_tg_id, status)
+     VALUES (?, ?, ?, ?, ?, 'active')`,
+    botId, '123456789:ABCdefGHIjklMNOpqrsTUVwxyz12345678', 'MyCustomClone', cloneBotUsername, clonerId
+  );
+
+  let sentPayload = null;
+  const fakeApi = {
+    sendRichMessage: async (chatId, rich) => {
+      sentPayload = rich;
+      return { message_id: 991 };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      sentPayload = rich;
+      return { message_id: msgId };
+    },
+    sendMessage: async (chatId, text) => {
+      return { message_id: 992, text };
+    }
+  };
+
+  const fakeController = {
+    botContext: {
+      isClone: true,
+      botId,
+      ownerId: clonerId,
+      botUsername: cloneBotUsername
+    },
+    isCloneOwner: (id) => Number(id) === clonerId,
+    isMainOwner: (id) => Number(id) === 8831887192,
+    isOwner: (id) => Number(id) === clonerId || Number(id) === 8831887192
+  };
+
+  const app = {
+    db,
+    settings,
+    telegram: {
+      api: fakeApi,
+      controller: fakeController
+    }
+  };
+
+  const settingsScreen = createSettingsScreen({ app });
+  settingsScreen.registerStateHandlers(sm);
+
+  // 1. Cloner opens settings in their cloned bot
+  const clonerCtx = {
+    tgId: clonerId,
+    chatId: clonerId,
+    api: fakeApi,
+    db,
+    settings,
+    sm,
+    isClone: true,
+    botId,
+    botUsername: cloneBotUsername,
+    controller: fakeController,
+    editScreen: (rich) => { sentPayload = rich; return Promise.resolve({ message_id: 991 }); }
+  };
+
+  await settingsScreen.open(clonerCtx);
+  assert.ok(sentPayload, 'Payload must be returned');
+
+  // Flatten all buttons in the rendered rich message
+  const allButtons = [];
+  if (Array.isArray(sentPayload.blocks)) {
+    for (const block of sentPayload.blocks) {
+      if (Array.isArray(block.buttons)) {
+        for (const row of block.buttons) {
+          if (Array.isArray(row)) {
+            for (const btn of row) allButtons.push(btn);
+          } else {
+            allButtons.push(row);
+          }
+        }
+      }
+    }
+  }
+
+  // Verify: "fj_open:77" ("🔒 Force-Join Channels") IS present
+  const hasCloneFjButton = allButtons.some((b) => b.callback_data === `fj_open:${botId}`);
+  assert.ok(hasCloneFjButton, 'Clone owner must see their own force-join channels button');
+
+  // Verify: "Manage Team Admins" (adminList) is NEVER present
+  const hasManageTeam = allButtons.some((b) => b.callback_data?.includes('adminList'));
+  assert.equal(hasManageTeam, false, 'Clone owner must NEVER see Manage Team Admins');
+
+  // Verify: "Global Force-Join" is NEVER present
+  const hasGlobalFj = allButtons.some((b) => b.callback_data === 'fj_open:global');
+  assert.equal(hasGlobalFj, false, 'Clone owner must NEVER see Global Force-Join');
+
+  // Verify: system categories (General, Telegram, WhatsApp, Security, etc.) are NEVER present
+  const hasCategories = allButtons.some((b) => b.callback_data?.includes('category'));
+  assert.equal(hasCategories, false, 'Clone owner must NEVER see global configuration categories');
+
+  // 2. Cloner attempts to invoke 'adminList' directly via callback -> must be BLOCKED
+  let repliedText = '';
+  const hackCtx = {
+    ...clonerCtx,
+    reply: (txt) => { repliedText = txt; return Promise.resolve(); }
+  };
+  await settingsScreen.handle(hackCtx, 'adminList', []);
+  assert.match(repliedText, /Only the General Studio Owner/i, 'Direct access to adminList must be rejected');
+
+  // 3. Regular follower on the cloned bot opens settings -> must be DENIED
+  const followerCtx = {
+    ...clonerCtx,
+    tgId: 444444,
+    chatId: 444444
+  };
+  sentPayload = null;
+  await settingsScreen.open(followerCtx);
+  const followerButtons = [];
+  if (Array.isArray(sentPayload?.blocks)) {
+    for (const block of sentPayload.blocks) {
+      if (Array.isArray(block.buttons)) {
+        for (const row of block.buttons) {
+          if (Array.isArray(row)) {
+            for (const btn of row) followerButtons.push(btn);
+          } else {
+            followerButtons.push(row);
+          }
+        }
+      }
+    }
+  }
+  const followerHasFj = followerButtons.some((b) => b.callback_data === `fj_open:${botId}`);
+  assert.equal(followerHasFj, false, 'Regular follower must NOT see force-join configuration button');
+
+  // 4. General Studio Owner on main bot opens settings -> sees full admin menu
+  const mainOwnerCtx = {
+    tgId: 8831887192,
+    chatId: 8831887192,
+    api: fakeApi,
+    db,
+    settings,
+    sm,
+    isClone: false,
+    botId: 0,
+    botUsername: 'Lancy_easy_bot',
+    controller: {
+      botContext: { isClone: false, botId: 0, botUsername: 'Lancy_easy_bot' },
+      isCloneOwner: () => false,
+      isMainOwner: (id) => Number(id) === 8831887192,
+      isOwner: (id) => Number(id) === 8831887192
+    },
+    editScreen: (rich) => { sentPayload = rich; return Promise.resolve({ message_id: 991 }); }
+  };
+
+  sentPayload = null;
+  await settingsScreen.open(mainOwnerCtx);
+  const ownerButtons = [];
+  if (Array.isArray(sentPayload?.blocks)) {
+    for (const block of sentPayload.blocks) {
+      if (Array.isArray(block.buttons)) {
+        for (const row of block.buttons) {
+          if (Array.isArray(row)) {
+            for (const btn of row) ownerButtons.push(btn);
+          } else {
+            ownerButtons.push(row);
+          }
+        }
+      }
+    }
+  }
+  const ownerHasTeam = ownerButtons.some((b) => b.callback_data?.includes('adminList'));
+  const ownerHasGlobalFj = ownerButtons.some((b) => b.callback_data === 'fj_open:global');
+  const ownerHasCategories = ownerButtons.some((b) => b.callback_data?.includes('category'));
+
+  assert.ok(ownerHasTeam, 'Main owner must see Manage Team Admins');
+  assert.ok(ownerHasGlobalFj, 'Main owner must see Global Force-Join');
+  assert.ok(ownerHasCategories, 'Main owner must see system configuration categories');
 
   db.close();
 });

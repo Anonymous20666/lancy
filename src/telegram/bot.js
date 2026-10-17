@@ -263,10 +263,17 @@ export class TelegramController extends EventEmitter {
     return { ok: false, role: 'stranger' };
   }
 
+  isCloneOwner(tgId) {
+    const id = Number(tgId);
+    if (!this.botContext?.isClone) return false;
+    const ownerId = Number(this.botContext.ownerId || this.botContext.ownerTgId || 0);
+    return ownerId > 0 && id === ownerId;
+  }
+
   isOwner(tgId) {
     const id = Number(tgId);
-    if (this.botContext?.isClone && this.botContext.ownerId) {
-      return id === Number(this.botContext.ownerId) || this.isMainOwner(id);
+    if (this.botContext?.isClone) {
+      return this.isCloneOwner(id) || this.isMainOwner(id);
     }
     return this.isMainOwner(id);
   }
@@ -3457,14 +3464,15 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/reloadcommands' || command === '/reload_commands') {
-        const isOwner = this.isOwner(tgId);
-        if (!isOwner) {
+        const isMain = this.isMainOwner(tgId);
+        const isClone = this.isCloneOwner(tgId);
+        if (!isMain && !isClone) {
           await this.api.sendMessage(chatId, `<blockquote>✕ Only bot owners or admins can hot-reload commands ♡</blockquote>`, { parse_mode: 'HTML' });
           return;
         }
 
         let report = '';
-        if (this.app?.multiBotManager) {
+        if (this.app?.multiBotManager && isMain) {
           const results = await this.app.multiBotManager.hotReloadAllCommands();
           const succeeded = results.filter((r) => r.success).length;
           report = `🌸 Hot-reloaded command suggestions across <b>${succeeded}</b> / <b>${results.length}</b> bots! ♡`;
@@ -3848,8 +3856,8 @@ export class TelegramController extends EventEmitter {
         return;
       }
       if (command === '/addadmin' || command === '/allocateadmin') {
-        if (!this.isOwner(tgId)) {
-          await this.api.sendMessage(chatId, '♡ Only the General Owner can allocate new admins ♡');
+        if (!this.isMainOwner(tgId)) {
+          await this.api.sendMessage(chatId, '♡ Only the General Studio Owner can allocate new admins ♡');
           return;
         }
         const targetId = Number(rest[0]);
@@ -3880,8 +3888,8 @@ export class TelegramController extends EventEmitter {
         return;
       }
       if (command === '/deladmin' || command === '/removeadmin') {
-        if (!this.isOwner(tgId)) {
-          await this.api.sendMessage(chatId, '<blockquote>♡ Only the General Owner can remove admins ♡</blockquote>', { parse_mode: 'HTML' });
+        if (!this.isMainOwner(tgId)) {
+          await this.api.sendMessage(chatId, '<blockquote>♡ Only the General Studio Owner can remove admins ♡</blockquote>', { parse_mode: 'HTML' });
           return;
         }
         const targetId = Number(rest[0]);
@@ -3898,8 +3906,8 @@ export class TelegramController extends EventEmitter {
         return;
       }
       if (command === '/admins') {
-        if (!this.isOwner(tgId) && !(this.settings.get('telegram.adminIds') ?? []).map(Number).includes(Number(tgId))) {
-          await this.api.sendMessage(chatId, '<blockquote>♡ Only administrators can view the team roster ♡</blockquote>', { parse_mode: 'HTML' });
+        if (!this.isMainOwner(tgId) && !(this.settings.get('telegram.adminIds') ?? []).map(Number).includes(Number(tgId))) {
+          await this.api.sendMessage(chatId, '<blockquote>♡ Only studio administrators can view the team roster ♡</blockquote>', { parse_mode: 'HTML' });
           return;
         }
         const owners = (this.settings.get('general.ownerIds') ?? []).map(Number);
@@ -4878,7 +4886,8 @@ export class TelegramController extends EventEmitter {
 
     const isMain = this.isMainOwner(userId);
     const isCloneBot = Boolean(this.botContext?.isClone);
-    const isThisCloneOwner = isCloneBot && String(this.botContext?.ownerTgId) === String(userId);
+    const cloneOwnerId = Number(this.botContext?.ownerId || this.botContext?.ownerTgId || 0);
+    const isThisCloneOwner = isCloneBot && cloneOwnerId > 0 && cloneOwnerId === Number(userId);
 
     // Check if user owns any cloned bots even when messaging main bot
     const ownedClones = this.db?.all(
@@ -5205,7 +5214,7 @@ export class TelegramController extends EventEmitter {
       if (this.db?.setChatPrefix) {
         this.db.setChatPrefix(chatId, newPrefix);
       }
-      if (args[1]?.toLowerCase() === 'global' && this.isOwner(tgId)) {
+      if (args[1]?.toLowerCase() === 'global' && this.isMainOwner(tgId)) {
         this.settings?.set?.('telegram.prefix', newPrefix);
       }
 

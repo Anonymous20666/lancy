@@ -204,10 +204,32 @@ ${stickerSection}
         richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' }),
         richButton.callback('📅 Auto Post', encodeCallback('autopost', 'open'), { style: 'success' })
       ]);
-      b.buttons([
-        richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open')),
-        richButton.callback('⚙ Settings', encodeCallback('settings', 'open'))
-      ]);
+      const isClone = Boolean(ctx.isClone || ctx.controller?.botContext?.isClone || app.telegram?.controller?.botContext?.isClone);
+      const botContext = ctx.bot || ctx.controller?.botContext || app.telegram?.controller?.botContext || null;
+      const cloneOwnerId = Number(botContext?.ownerId || botContext?.ownerTgId || 0);
+      const isCloneOwner = isClone && cloneOwnerId > 0 && Number(ctx.tgId) === cloneOwnerId;
+      const isMainOwner = (settings.get('general.ownerIds') ?? []).map(Number).includes(Number(ctx.tgId)) || Boolean(ctx.controller?.isMainOwner?.(ctx.tgId));
+      const hasClones = !isClone && (app.multiBotManager?.getBotsForOwner(ctx.tgId)?.length > 0);
+
+      if (isClone) {
+        if (isCloneOwner || isMainOwner) {
+          b.buttons([
+            richButton.callback('⚙ Settings & Force-Join', encodeCallback('settings', 'open'), { style: 'success' })
+          ]);
+        }
+      } else {
+        if (isMainOwner || hasClones) {
+          b.buttons([
+            richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open')),
+            richButton.callback('⚙ Settings', encodeCallback('settings', 'open'))
+          ]);
+        } else {
+          b.buttons([
+            richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open'))
+          ]);
+        }
+      }
+
       b.buttons([
         richButton.callback('🌐 Language', encodeCallback(id, 'language')),
         richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
