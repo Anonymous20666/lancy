@@ -10,15 +10,17 @@ import { createPinterestScreen } from '../src/telegram/screens/pinterest.js';
 import { createStickersScreen } from '../src/telegram/screens/stickers.js';
 import { richTextToString } from '../src/telegram/rich.js';
 
-test('AI Assistant: strictly responds in DM (private chat), NEVER in group chats (GC)', async () => {
+test('AI Assistant: responds in Group Chat when tagged, quoted, or called by name, and ignores untagged group chatter', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
   settings.values.general.ownerIds = [1001];
 
   let assistantCalled = false;
+  let receivedText = '';
   const mockAssistant = {
-    handleMessage: async () => {
+    handleMessage: async ({ text }) => {
       assistantCalled = true;
+      receivedText = text;
     }
   };
 
@@ -38,7 +40,7 @@ test('AI Assistant: strictly responds in DM (private chat), NEVER in group chats
   });
   controller.botUsername = 'Lancy_easy_bot';
 
-  // 1. Group Chat mention: AI must NEVER respond in GC!
+  // 1. Group Chat untagged message between members: AI must NOT respond!
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 1,
@@ -46,20 +48,60 @@ test('AI Assistant: strictly responds in DM (private chat), NEVER in group chats
       message_id: 201,
       from: { id: 1001, first_name: 'Alex' },
       chat: { id: -100555, type: 'supergroup' },
-      text: '@Lancy_easy_bot write me a poem'
+      text: 'hey everyone what are we playing today?'
     }
   });
-  assert.equal(assistantCalled, false, 'AI assistant must NOT respond in group chats');
+  assert.equal(assistantCalled, false, 'AI assistant must NOT respond to random untagged group chatter');
 
-  // 2. DM (private chat) mention: AI responds in DM!
+  // 2. Group Chat tagged with @botUsername: AI responds!
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 2,
     message: {
       message_id: 202,
       from: { id: 1001, first_name: 'Alex' },
-      chat: { id: 1001, type: 'private' },
+      chat: { id: -100555, type: 'supergroup' },
       text: '@Lancy_easy_bot write me a poem'
+    }
+  });
+  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when tagged');
+
+  // 3. Group Chat called by name ("lancy ..."): AI responds!
+  assistantCalled = false;
+  await controller.handleUpdate({
+    update_id: 3,
+    message: {
+      message_id: 203,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: -100555, type: 'supergroup' },
+      text: 'lancy play starboy'
+    }
+  });
+  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when called by name');
+
+  // 4. Group Chat quoting / replying to the bot: AI responds!
+  assistantCalled = false;
+  await controller.handleUpdate({
+    update_id: 4,
+    message: {
+      message_id: 204,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: -100555, type: 'supergroup' },
+      reply_to_message: { from: { id: 100, is_bot: true, username: 'Lancy_easy_bot' } },
+      text: 'give me another one'
+    }
+  });
+  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when quoted');
+
+  // 5. DM (private chat): AI responds in DM directly!
+  assistantCalled = false;
+  await controller.handleUpdate({
+    update_id: 5,
+    message: {
+      message_id: 205,
+      from: { id: 1001, first_name: 'Alex' },
+      chat: { id: 1001, type: 'private' },
+      text: 'play starboy'
     }
   });
   assert.equal(assistantCalled, true, 'AI assistant responds in private DM');

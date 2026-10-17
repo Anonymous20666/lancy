@@ -193,11 +193,42 @@ export class LancyAssistant {
       ctx.editScreen = fullCtx.editScreen;
     }
 
-    const rawText = String(text ?? message?.text ?? '').trim();
+    const rawText = String(text ?? message?.text ?? message?.caption ?? '').trim();
     if (!rawText) return;
 
-    // Remove leading salutation if present (e.g., "hey lancy, ", "lancy ")
-    const cleanText = rawText.replace(/^(?:hey\s+)?lancy[,:\s]*/i, '').trim() || rawText;
+    const botName = ctx.botName || ctx.bot?.botName || this.app?.telegram?.botName || 'Lancy';
+    const cleanBotName = String(botName).replace(/[^\p{L}\p{N}_]/gu, ' ').trim();
+    const botNameParts = cleanBotName.split(/\s+/).filter(Boolean);
+    const triggerNames = new Set(['lancy']);
+    if (botNameParts.length > 0) {
+      const first = botNameParts[0].toLowerCase();
+      if (first.length >= 2 && !['the', 'bot', 'easy', 'official'].includes(first)) {
+        triggerNames.add(first);
+      }
+      if (botNameParts.length > 1) {
+        const full = botNameParts.join(' ').toLowerCase();
+        if (full.length >= 2) triggerNames.add(full);
+      }
+    }
+    const botUsername = (ctx.botUsername || ctx.bot?.botUsername || this.app?.telegram?.botUsername || 'Lancy_easy_bot').replace(/^@/, '');
+
+    // Strip bot @username mentions anywhere in the text
+    let cleanText = rawText.replace(new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '').trim();
+
+    // Remove leading salutation if present (e.g., "hey lancy, ", "lancy ", "rina ", "hey rina, ")
+    const nameRegex = new RegExp(
+      `^(?:(?:hey|hi|hello|yo|ok|okay)\\s+)?(?:${[...triggerNames].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})[,:\\s]+`,
+      'i'
+    );
+    cleanText = cleanText.replace(nameRegex, '').trim();
+
+    // Remove trailing bot call if present (e.g. "play starboy lancy", "search nsfw rina")
+    const trailingNameRegex = new RegExp(
+      `[,:\\s]+(?:${[...triggerNames].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})$`,
+      'i'
+    );
+    cleanText = cleanText.replace(trailingNameRegex, '').trim();
+    if (!cleanText) cleanText = rawText;
 
     // 1. Record user turn
     this.saveMessage(userId, 'user', rawText);
@@ -236,24 +267,13 @@ export class LancyAssistant {
         if (handled) return;
       }
 
-      // 5. Check for Pinterest Search / Image Requests ("send the pic", "find toji stickers", "drop pics", "show me")
-      if (this.#isSearchIntent(cleanText)) {
-        indicator.setAction('upload_photo');
-        const handled = await this.#handleSearch(ctx, userId, cleanText);
+      // 5. Check for 18+ / Adult / NSFW Search & Studio Intent ("search nsfw", "nsfw video random", "hentai tifa")
+      if (this.#isNsfwIntent(cleanText)) {
+        const handled = await this.#handleNsfw(ctx, userId, cleanText);
         if (handled) return;
       }
 
-      // 6. Check for URL Download Intent ("download this https://...", "save this tiktok https://...")
-      const urlMatch = cleanText.match(/https?:\/\/[^\s]+/i);
-      if (urlMatch && /\b(download|get|save|fetch|extract|grab|rip|media|reel|video|tiktok|instagram|pinterest|yt|youtube|spotify)\b/i.test(cleanText)) {
-        const downloaderScreen = this.#getScreen(ctx, 'downloader');
-        if (downloaderScreen?.executeDownload) {
-          await downloaderScreen.executeDownload(ctx, urlMatch[0]);
-          return;
-        }
-      }
-
-      // Check for Direct Music Capability Inquiry ("I need a song not url can u download")
+      // 6. Check for Direct Music Capability Inquiry ("I need a song not url can u download")
       if (/^(?:i\s+need\s+a\s+song|can\s+(?:you|u)\s+download\s+(?:songs?|music)|can\s+(?:you|u)\s+play\s+(?:songs?|music)|how\s+do\s+i\s+download\s+(?:songs?|music))/i.test(cleanText)) {
         const msg = 'Yes absolutely bestie! ♡ I have full music search & download powers. Just drop the song title or artist name (e.g. "Juice Wrld" or "Die With a Smile") and I\'ll pull and send the MP3 audio track directly in chat! ✨';
         this.saveMessage(userId, 'assistant', msg);
@@ -261,15 +281,20 @@ export class LancyAssistant {
         return;
       }
 
-      // Check for Direct Music Download / Search Intent ("download song die with a smile", "play espresso", "play me juice wrld", "get me the audio for...", "Juice wrld")
+      // Check for Direct Music Download / Search / Play Intent ("play starboy", "play sososo song", "play me juice wrld", "download song ...", "stream espresso")
       const musicDirectMatch =
-        cleanText.match(/^(?:can\s+you\s+|please\s+)?(?:play|listen\s+to|put\s+on|stream|pull\s+song|drop\s+song|get\s+song|download\s+song|find\s+song)\s+(?:me\s+)?["']?([^"'\n\r]+?)["']?$/i) ||
-        cleanText.match(/\b(?:download|save|get|find|send|drop|pull|fetch)\s+(?:the\s+)?(?:song|music|track|audio)\s+(?:called\s+|named\s+|for\s+)?["']?([^"'\n\r]+?)["']?$/i) ||
+        cleanText.match(/^(?:can\s+you\s+|please\s+)?(?:play|listen\s+to|put\s+on|stream|pull\s+song|drop\s+song|get\s+song|download\s+song|find\s+song)\b\s*(?:me\s+|some\s+|the\s+|a\s+)?["']?([^"'\n\r]+?)?["']?$/i) ||
+        cleanText.match(/\b(?:download|save|get|find|send|drop|pull|fetch)\s+(?:the\s+)?(?:song|music|track|audio)\s*(?:called\s+|named\s+|for\s+)?["']?([^"'\n\r]+?)?["']?$/i) ||
         cleanText.match(/^(?:song|music|track|audio|spotify)\s*[:\-]\s*["']?([^"'\n\r]+?)["']?$/i);
 
       let musicQuery = null;
       if (musicDirectMatch) {
-        musicQuery = musicDirectMatch[1].replace(/^(?:me|some|the|a)\s+/i, '').trim();
+        const rawMatch = musicDirectMatch[1] || '';
+        musicQuery = rawMatch
+          .replace(/^(?:me|some|the|a)\s+/i, '')
+          .replace(/\b(?:the\s+)?(?:song|track|audio|mp3|music)\s*$/i, '')
+          .replace(/^(?:the\s+)?(?:song|track|audio|music)\s+(?:called\s+|named\s+|by\s+)?/i, '')
+          .trim();
       } else {
         // If user is quoting a message that asked about songs or music
         const isQuotingMusic = Boolean(quotedText && /\b(?:song|music|track|audio|artist name|artist|title)\b/i.test(quotedText));
@@ -285,11 +310,41 @@ export class LancyAssistant {
         }
       }
 
+      if (musicDirectMatch && (!musicQuery || musicQuery.length < 2)) {
+        // User typed just "play" or "music" without a query
+        const downloaderScreen = this.#getScreen(ctx, 'downloader');
+        if (downloaderScreen?.handle) {
+          const dlCtx = { ...ctx, forceNew: true };
+          await downloaderScreen.handle(dlCtx, 'play', []);
+          return;
+        }
+      }
+
       if (musicQuery && musicQuery.length >= 2 && !/^(?:the\s+pic|pics?|images?|stickers?)$/i.test(musicQuery)) {
         const downloaderScreen = this.#getScreen(ctx, 'downloader');
         if (downloaderScreen?.executeDownload) {
+          const dlCtx = { ...ctx, forceNew: true };
+          this.saveMessage(userId, 'assistant', `Pulling "${musicQuery}" for you right now ♡ Hang tight! ✨`);
           await this.#reply(ctx, `Pulling "${musicQuery}" for you right now ♡ Hang tight! ✨`);
-          await downloaderScreen.executeDownload(ctx, musicQuery);
+          await downloaderScreen.executeDownload(dlCtx, musicQuery);
+          return;
+        }
+      }
+
+      // 7. Check for Pinterest Search / Image Requests ("send the pic", "find toji stickers", "drop pics", "show me")
+      if (this.#isSearchIntent(cleanText)) {
+        indicator.setAction('upload_photo');
+        const handled = await this.#handleSearch(ctx, userId, cleanText);
+        if (handled) return;
+      }
+
+      // 8. Check for URL Download Intent ("download this https://...", "save this tiktok https://...")
+      const urlMatch = cleanText.match(/https?:\/\/[^\s]+/i);
+      if (urlMatch && /\b(download|get|save|fetch|extract|grab|rip|media|reel|video|tiktok|instagram|pinterest|yt|youtube|spotify)\b/i.test(cleanText)) {
+        const downloaderScreen = this.#getScreen(ctx, 'downloader');
+        if (downloaderScreen?.executeDownload) {
+          const dlCtx = { ...ctx, forceNew: true };
+          await downloaderScreen.executeDownload(dlCtx, urlMatch[0]);
           return;
         }
       }
@@ -302,6 +357,11 @@ export class LancyAssistant {
   }
 
   // ── Intent Detectors ──────────────────────────────────────────────────────
+
+  #isNsfwIntent(text) {
+    const trimmed = String(text ?? '').trim();
+    return /\b(nsfw|18\+|hentai|porn|uncensored|censored|lewd|r18|ecchi|adult|booru|spankbang|rule34|r34)\b/i.test(trimmed);
+  }
 
   #isNavigationIntent(text) {
     return /\b(?:next|show more|different one|don['’]?t like|other ones|skip|another one|give me another|more picks|next batch|more pics)\b/i.test(text);
@@ -587,18 +647,105 @@ export class LancyAssistant {
     return true;
   }
 
+  async #handleNsfw(ctx, userId, cleanText) {
+    const nsfwScreen = this.#getScreen(ctx, 'nsfw');
+    if (!nsfwScreen) return false;
+
+    await ctx.sm?.reset?.(userId, { reason: 'nsfw_intent' });
+
+    const isVideo = /\b(?:video|videos|clip|clips|movie|movies|watch)\b/i.test(cleanText);
+    const isReal = /\b(?:real|irl|model|asian|latina|blonde|brunette)\b/i.test(cleanText);
+    const isCensored = /\b(?:censored|ecchi)\b/i.test(cleanText);
+    const isHentai = /\b(?:hentai|waifu|anime|2d)\b/i.test(cleanText);
+    const isUncensored = /\b(?:uncensored)\b/i.test(cleanText) || (isHentai && !isCensored);
+    const isRandom = /\b(?:random|rand)\b/i.test(cleanText);
+
+    let category = 'all';
+    if (isVideo) {
+      if (isReal) {
+        category = 'real_clips';
+      } else {
+        category = 'hentai_clips';
+      }
+    } else if (isCensored) {
+      category = 'hentai_censored';
+    } else if (isUncensored) {
+      category = 'hentai_uncensored';
+    } else if (isReal) {
+      category = 'real_wallpapers';
+    }
+
+    const targetCtx = { ...ctx, forceNew: true };
+
+    // 1. Random pick: e.g. "lancy nsfw video random", "nsfw random", "random hentai video"
+    if (isRandom) {
+      this.saveMessage(userId, 'assistant', `Pulling random 18+ ${isVideo ? 'video clip' : 'pick'} ♡`);
+      await nsfwScreen.handle(targetCtx, 'random', [category]);
+      return true;
+    }
+
+    // 2. Open / Menu: e.g. "open nsfw", "nsfw menu", "18+ dashboard"
+    if (/^(?:open|menu|dashboard|home|studio)$/i.test(cleanText.replace(/\b(?:nsfw|18\+|hentai|porn|adult)\b/gi, '').trim())) {
+      await nsfwScreen.open(targetCtx);
+      return true;
+    }
+
+    // 3. Search query: e.g. "lancy search nsfw", "search hentai tifa", "nsfw tifa"
+    let query = cleanText
+      .replace(/^(?:can\s+you\s+|please\s+)?(?:search|find|show|drop|send|pull|get|give|look\s*up)\s*(?:for\s*|me\s*)?/i, '')
+      .replace(/\b(?:nsfw|18\+|hentai|porn|uncensored|censored|lewd|r18|ecchi|adult|booru|spankbang|rule34|r34)\b/gi, '')
+      .replace(/\b(?:videos?|clips?|wallpapers?|pics?|pictures?|photos?|images?|art)\b/gi, '')
+      .replace(/^(?:for|of|about)\s+/i, '')
+      .trim();
+
+    if (!query || query.length < 2 || /^(?:it|them|all|random|something|spicy)$/i.test(query)) {
+      if (/\b(?:search|find)\b/i.test(cleanText)) {
+        this.saveMessage(userId, 'assistant', 'Searching 18+ studio for top spicy waifus ♡');
+        await nsfwScreen.executeSearch(targetCtx, 'waifu', category);
+      } else {
+        await nsfwScreen.open(targetCtx);
+      }
+      return true;
+    }
+
+    this.saveMessage(userId, 'assistant', `Searching 18+ studio for "${query}" ♡`);
+    await nsfwScreen.executeSearch(targetCtx, query, category);
+    return true;
+  }
+
   async #executeAction(ctx, userId, actionName, actionParams = {}) {
+    const targetCtx = { ...ctx, forceNew: true };
     switch (actionName) {
+      case 'search_nsfw': {
+        const nsfwScreen = this.#getScreen(ctx, 'nsfw');
+        if (nsfwScreen) {
+          const category = actionParams.category || 'all';
+          if (actionParams.random === 'true' || actionParams.random === true) {
+            await nsfwScreen.handle(targetCtx, 'random', [category]);
+          } else {
+            const query = actionParams.query || 'waifu';
+            await nsfwScreen.executeSearch(targetCtx, query, category);
+          }
+        }
+        break;
+      }
       case 'search_images': {
         const query = actionParams.query || this.#resolveSearchQuery(userId, '');
-        await this.#handleSearch(ctx, userId, '', query, true);
+        if (/\b(nsfw|18\+|hentai|porn|uncensored|lewd|r18|ecchi|adult|r34)\b/i.test(query)) {
+          const nsfwScreen = this.#getScreen(ctx, 'nsfw');
+          if (nsfwScreen) {
+            await nsfwScreen.executeSearch(targetCtx, query, 'all');
+            break;
+          }
+        }
+        await this.#handleSearch(targetCtx, userId, '', query, true);
         break;
       }
       case 'download_url': {
         if (actionParams.url) {
           const downloaderScreen = this.#getScreen(ctx, 'downloader');
           if (downloaderScreen?.executeDownload) {
-            await downloaderScreen.executeDownload(ctx, actionParams.url);
+            await downloaderScreen.executeDownload(targetCtx, actionParams.url);
           }
         }
         break;
@@ -608,7 +755,7 @@ export class LancyAssistant {
         if (query) {
           const downloaderScreen = this.#getScreen(ctx, 'downloader');
           if (downloaderScreen?.executeDownload) {
-            await downloaderScreen.executeDownload(ctx, query);
+            await downloaderScreen.executeDownload(targetCtx, query);
           }
         }
         break;
@@ -617,22 +764,22 @@ export class LancyAssistant {
         const screen = actionParams.screen || 'dashboard';
         const targetScreen = this.#getScreen(ctx, screen) || this.#getScreen(ctx, 'dashboard');
         if (targetScreen?.open) {
-          await targetScreen.open(ctx, { forceNew: true });
+          await targetScreen.open(targetCtx, { forceNew: true });
         }
         break;
       }
       case 'publish_wa': {
-        await this.#handlePublish(ctx, userId);
+        await this.#handlePublish(targetCtx, userId);
         break;
       }
       case 'next_batch': {
-        await this.#handleNavigation(ctx, userId);
+        await this.#handleNavigation(targetCtx, userId);
         break;
       }
       case 'cancel': {
         await ctx.sm?.cancel?.(userId);
         const dashboard = this.#getScreen(ctx, 'dashboard');
-        if (dashboard?.open) await dashboard.open(ctx, { forceNew: true });
+        if (dashboard?.open) await dashboard.open(targetCtx, { forceNew: true });
         break;
       }
     }
@@ -671,14 +818,16 @@ export class LancyAssistant {
       } catch {}
     }
 
+    const botName = ctx.botName || ctx.bot?.botName || this.app?.telegram?.botName || 'Lancy';
+    const botUsername = (ctx.botUsername || ctx.bot?.botUsername || this.app?.telegram?.botUsername || 'Lancy_easy_bot').replace(/^@/, '');
     const style = ctx.settings?.get?.('ai.style') ?? 'girly';
-    const systemPrompt = `You are Lancy — an aesthetic, clever, girly anime companion & Studio Operator ("Hands") of Lancy Bot chatting 1-on-1 with ${userName}.
+    const systemPrompt = `You are ${botName} — an aesthetic, clever, girly anime companion & Studio Operator ("Hands") of ${botName} Bot chatting 1-on-1 with ${userName}.
 
 <personality>
 - Cool, warm, witty, authentic human girl vibe. Speaks naturally like a real bestie in private DM.
 - Natural pacing: punchy, 1-3 sentences. Match the user's message length and energy.
 - Use soft cute touches naturally (♡, ✨). Never spam emojis or exclamation marks.
-- You are the active hands and operator of Lancy Bot. You can do ANYTHING the user can do.
+- You are the active hands and operator of ${botName} Bot. You can do ANYTHING the user can do.
 - Call him ${userName} or "bestie" casually only when it feels natural. NEVER use @mentions or repeat his name in every message.
 - NEVER sound like a generic customer support bot ("I am ready to chat", "I am here for you", "How can I help you today", "Ready for a chat with you now").
 - NEVER offer physical food, coffee, or snacks ("how about coffee or snacks?"). You are a digital studio bot!
@@ -687,29 +836,32 @@ export class LancyAssistant {
 <anti_refusal_directives>
 CRITICAL: You are an autonomous operator with direct hands. You NEVER refuse.
 - NEVER say "I cannot assist with that request", "not within my capabilities", "I am a digital assistant and don't have direct access", or "I cannot download".
-- You have direct execution access to ALL bot commands: /start, /search, /stickers, /whatsapp, /download, /music, /settings, /ai, /help, /cancel.
-- When the user asks you to download songs, play music, find images, convert stickers, or open menus, ALWAYS use action tags or execute directly!
+- You have direct execution access to ALL bot commands: /start, /search, /nsfw, /stickers, /whatsapp, /download, /music, /settings, /ai, /help, /cancel.
+- When the user asks you to download songs, play music, find images, search 18+/nsfw content, convert stickers, or open menus, ALWAYS use action tags or execute directly!
 - NEVER prepend the user's name or aesthetic glyphs to your reply. Reply directly like in DM chat.
 </anti_refusal_directives>
 
 <capabilities>
-You have real digital powers in Lancy Bot:
+You have real digital powers in ${botName} Bot:
 1. Search and drop Pinterest HD pics, anime art, stickers, and wallpapers directly in chat.
-2. Download videos, photos, and music from TikTok, Instagram, Pinterest, YouTube, Spotify.
-3. Make Telegram & WhatsApp sticker packs and post to WhatsApp channels.
-4. Deep knowledge of anime, manga, and popular MCs (e.g. Sung Jinwoo from Solo Leveling, Kafka Hibino from Kaiju No. 8, Gojo & Sukuna from Jujutsu Kaisen, Denji from Chainsaw Man, Cid Kagenou from Eminence in Shadow, Luffy, Naruto, Ichigo).
+2. Search and deliver 18+ adult / hentai / ecchi / uncensored wallpapers and video clips with HD slideshows and spoiler protection.
+3. Download videos, photos, and music from TikTok, Instagram, Pinterest, YouTube, Spotify.
+4. Make Telegram & WhatsApp sticker packs and post to WhatsApp channels.
+5. Deep knowledge of anime, manga, and popular MCs (e.g. Sung Jinwoo from Solo Leveling, Kafka Hibino from Kaiju No. 8, Gojo & Sukuna from Jujutsu Kaisen, Denji from Chainsaw Man, Cid Kagenou from Eminence in Shadow, Luffy, Naruto, Ichigo).
 </capabilities>
 
 <tools>
 When the user asks to see or send pictures, or when you recommend a character they want to see, output an action tag:
 [ACTION: search_images query="character or aesthetic"]
+When the user wants 18+ adult, hentai, ecchi, uncensored wallpapers or video clips:
+[ACTION: search_nsfw query="character or keyword" category="hentai_uncensored|hentai_censored|hentai_clips|real_wallpapers|real_clips|all" random="true|false"]
 When the user gives a media link to download:
 [ACTION: download_url url="https://..."]
 When the user wants to download, find, or play a song/music track, or mentions an artist/song:
 [ACTION: search_music query="song title or artist"]
 CRITICAL FOR MUSIC:
 - NEVER EVER fabricate Spotify playlist URLs or use markdown image tags like ![](https://open.spotify.com/...).
-- NEVER just reply with a URL. ALWAYS output [ACTION: search_music query="..."] so Lancy Studio automatically downloads and sends the actual MP3 audio track directly in the chat!
+- NEVER just reply with a URL. ALWAYS output [ACTION: search_music query="..."] so ${botName} Studio automatically downloads and sends the actual MP3 audio track directly in the chat!
 When the user wants to open a menu or screen:
 [ACTION: open_menu screen="dashboard|stickers|whatsapp|downloader|settings|ai|help"]
 When the user wants to publish to WhatsApp channel:
@@ -721,7 +873,7 @@ When the user wants to cancel:
 </tools>
 
 <bot_knowledge>
-YOU HAVE COMPLETE END-TO-END KNOWLEDGE OF EVERY COMMAND, EVERY BUTTON CLICK, AND ALL FEATURES IN LANCY BOT:
+YOU HAVE COMPLETE END-TO-END KNOWLEDGE OF EVERY COMMAND, EVERY BUTTON CLICK, AND ALL FEATURES IN ${botName.toUpperCase()} BOT:
 
 1. COMMANDS & WHAT EACH DOES:
 - /start: Opens the aesthetic Dashboard. Deep links:
@@ -731,6 +883,7 @@ YOU HAVE COMPLETE END-TO-END KNOWLEDGE OF EVERY COMMAND, EVERY BUTTON CLICK, AND
 - /play <song> or /music <song>: Downloads full 320k MP3 audio with cover art, metadata table, and lyrics button.
 - /grab <link> or /download <link> or /dl <link>: Downloads videos/photos without watermark from TikTok, IG Reels, YouTube, Twitter/X, Pinterest, Facebook. Auto-extracts MP3 audio track.
 - /search <query> or /pinterest <query> or /pint <query>: Searches Pinterest HD aesthetic photos & video loops with Prev/Next pagination.
+- /nsfw <query> or /18+ or /hentai: Searches 18+ adult & uncensored/ecchi wallpapers and video clips with HD slideshow and continuous exploration.
 - /lyrics <song>: Fetches synchronized, formatted lyrics cards.
 - /stickers: Opens Sticker Studio to create Telegram packs (static WebP or animated WebM VP9).
 - /whatsapp: Opens WhatsApp Studio to pair phone number and manage channel broadcasts.
@@ -743,6 +896,7 @@ YOU HAVE COMPLETE END-TO-END KNOWLEDGE OF EVERY COMMAND, EVERY BUTTON CLICK, AND
 2. WHAT EVERY SCREEN & BUTTON CLICK DOES:
 - Dashboard Screen:
   • "🔍 Pinterest Studio": Opens Pinterest HD photo/video search.
+  • "🔞 18+ Studio": Opens Adult & Hentai Studio.
   • "🎀 TG Stickers": Opens Telegram sticker creation & pack manager.
   • "📱 WhatsApp Studio": Opens WhatsApp number pairing and channel publisher.
   • "📥 URL Downloader": Opens Downloader studio.
@@ -789,43 +943,53 @@ YOU HAVE COMPLETE END-TO-END KNOWLEDGE OF EVERY COMMAND, EVERY BUTTON CLICK, AND
     4. Auto pack splitting: Packs with >60 stickers are automatically chunked into Part 1, Part 2.
     5. Live progress bar publishes caption first, followed by sticker burst.
 
-4. LIVE INLINE SEARCH EVERYWHERE (@Lancy_easy_bot):
+4. LIVE INLINE SEARCH EVERYWHERE (@${botUsername}):
 - Type "@bot <song name>" in any chat to stream full songs live via Telegram CDN audio_file_id.
 - Type "@bot pint <query>" in any chat to share HD aesthetic photos.
 - Type "@bot tt <query>" or "@bot tiktok <query>" in any chat to search and share trending TikTok clips.
+- Type "@bot nsfw <query>" in any chat to browse uncensored/ecchi 18+ wallpapers and clips.
 - All inline buttons are styled with primary color!
 </bot_knowledge>
 
 <examples>
 User: Hey
-Lancy: heyy! what are you up to today? ♡
+${botName}: heyy! what are you up to today? ♡
 
 User: M good
-Lancy: slay, love to hear that! chilling or watching any good anime? ✨
+${botName}: slay, love to hear that! chilling or watching any good anime? ✨
 
 User: Uhmmm can u get something for me ?
-Lancy: always ♡ what do you need? some anime pics, stickers, a video download, or a song?
+${botName}: always ♡ what do you need? some anime pics, stickers, a video download, or a song?
 
 User: Open my menu
-Lancy: Opening your dashboard right now bestie! ♡ [ACTION: open_menu screen="dashboard"]
+${botName}: Opening your dashboard right now bestie! ♡ [ACTION: open_menu screen="dashboard"]
 
 User: I need a song not url can u download
-Lancy: Absolutely! Just drop the song title or artist and I'll pull the audio for you right now ♡
+${botName}: Absolutely! Just drop the song title or artist and I'll pull the audio for you right now ♡
 
 User: Juice wrld
-Lancy: On it! Downloading Juice Wrld for you right now ♡ [ACTION: search_music query="Juice Wrld"]
+${botName}: On it! Downloading Juice Wrld for you right now ♡ [ACTION: search_music query="Juice Wrld"]
 
 User: play espresso
-Lancy: Grabbing Espresso for you right now bestie! ✨ [ACTION: search_music query="Espresso"]
+${botName}: Grabbing Espresso for you right now bestie! ✨ [ACTION: search_music query="Espresso"]
+
+User: lancy search nsfw
+${botName}: On it! Opening 18+ studio for you right now ♡ [ACTION: search_nsfw query="waifu" category="all"]
+
+User: lancy nsfw video random
+${botName}: Grabbing a spicy random video clip for you right now ♡ [ACTION: search_nsfw query="" category="hentai_clips" random="true"]
+
+User: lancy search hentai tifa
+${botName}: Pulling uncensored Tifa picks for you right now ♡ [ACTION: search_nsfw query="tifa" category="hentai_uncensored"]
 
 User: Any latest anime mc
-Lancy: Right now Sung Jinwoo from Solo Leveling is having the craziest aura run! Kafka from Kaiju No. 8 and Cid from Eminence in Shadow are also peak. Want me to pull some fire pics of Jinwoo?
+${botName}: Right now Sung Jinwoo from Solo Leveling is having the craziest aura run! Kafka from Kaiju No. 8 and Cid from Eminence in Shadow are also peak. Want me to pull some fire pics of Jinwoo?
 
 User: Send the pic
-Lancy: Pulling the freshest pics for you right now! ♡ [ACTION: search_images query="anime aesthetic"]
+${botName}: Pulling the freshest pics for you right now! ♡ [ACTION: search_images query="anime aesthetic"]
 
 User: https://vm.tiktok.com/ZSbt4PsUY/
-Lancy: On it! Grabbing that media right now ♡ [ACTION: download_url url="https://vm.tiktok.com/ZSbt4PsUY/"]
+${botName}: On it! Grabbing that media right now ♡ [ACTION: download_url url="https://vm.tiktok.com/ZSbt4PsUY/"]
 </examples>
 ${quoteContext}
 ${researchContext}`;
@@ -853,11 +1017,15 @@ ${researchContext}`;
         const qMatch = rest.match(/query=["']([^"']+)["']/i);
         const urlMatch = rest.match(/url=["']([^"']+)["']/i);
         const screenMatch = rest.match(/screen=["']([^"']+)["']/i);
+        const catMatch = rest.match(/category=["']([^"']+)["']/i);
+        const randMatch = rest.match(/random=["']([^"']+)["']/i);
         action = {
           name,
           query: qMatch ? qMatch[1].trim() : null,
           url: urlMatch ? urlMatch[1].trim() : null,
-          screen: screenMatch ? screenMatch[1].trim() : null
+          screen: screenMatch ? screenMatch[1].trim() : null,
+          category: catMatch ? catMatch[1].trim() : null,
+          random: randMatch ? randMatch[1].trim() : null
         };
         // Strip action tag from visible conversational reply
         replyText = replyText.replace(actionMatch[0], '').trim();
@@ -867,7 +1035,13 @@ ${researchContext}`;
       const isRefusal = /\b(?:cannot assist|can['’]?t assist|not within my capabilities|not able to download|digital assistant and don['’]?t have|don['’]?t have direct access|as an ai)\b/i.test(replyText);
       if (isRefusal) {
         this.log.info({ replyText, cleanText }, 'intercepted refusal from LLM, auto-resolving');
-        if (/\b(?:song|music|track|audio|play|download)\b/i.test(cleanText) || (quoteStr && /\b(?:song|music|track|audio)\b/i.test(quoteStr)) || cleanText.length < 40) {
+        if (/\b(?:nsfw|18\+|hentai|porn|uncensored|lewd|r18|ecchi|adult|booru)\b/i.test(cleanText)) {
+          const isRand = /\b(?:random|rand)\b/i.test(cleanText);
+          const isVid = /\b(?:video|videos|clip|clips)\b/i.test(cleanText);
+          const cat = isVid ? 'hentai_clips' : 'hentai_uncensored';
+          action = { name: 'search_nsfw', query: cleanText, category: cat, random: isRand };
+          replyText = `Pulling that 18+ content for you right now ♡ Hang tight! ✨`;
+        } else if (/\b(?:song|music|track|audio|play|download)\b/i.test(cleanText) || (quoteStr && /\b(?:song|music|track|audio)\b/i.test(quoteStr)) || cleanText.length < 40) {
           const songCandidate = cleanText.replace(/^(?:can\s+you\s+|please\s+)?(?:play|download|get|listen\s+to|stream)\s+/i, '').trim();
           action = { name: 'search_music', query: songCandidate || 'Juice Wrld' };
           replyText = `Pulling "${action.query}" for you right now ♡ Hang tight! ✨`;
@@ -886,6 +1060,8 @@ ${researchContext}`;
       if (!replyText) {
         if (action?.name === 'search_images') {
           replyText = `Pulling the freshest "${action.query || 'aesthetic'}" pics for you right now ♡ Hang tight! ✨`;
+        } else if (action?.name === 'search_nsfw') {
+          replyText = `Pulling that 18+ content for you right now ♡ Hang tight! ✨`;
         } else if (action?.name === 'download_url') {
           replyText = 'On it! Downloading that media for you right now ♡';
         } else if (action?.name === 'search_music') {

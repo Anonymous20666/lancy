@@ -4306,19 +4306,34 @@ export class TelegramController extends EventEmitter {
       const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
       const isPrivate = !isGroup;
 
+      const botName = this.botName || this.botContext?.botName || 'Lancy';
+      const cleanBotName = String(botName).replace(/[^\p{L}\p{N}_]/gu, ' ').trim();
+      const botNameParts = cleanBotName.split(/\s+/).filter(Boolean);
+      const nameTriggers = new Set(['lancy']);
+      if (botNameParts.length > 0) {
+        const first = botNameParts[0].toLowerCase();
+        if (first.length >= 2 && !['the', 'bot', 'easy', 'official'].includes(first)) {
+          nameTriggers.add(first);
+        }
+      }
+
+      const botUsername = (this.botUsername || this.botContext?.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
       const replyMsgFrom = message.reply_to_message?.from;
-      const isReplyToBot = Boolean(
+      const isReplyToThisBot = Boolean(
         message.reply_to_message && (
-          !replyMsgFrom ||
-          replyMsgFrom.is_bot ||
-          (this.api.me?.id && replyMsgFrom.id === this.api.me.id) ||
-          (this.botUsername && replyMsgFrom.username?.toLowerCase() === this.botUsername.toLowerCase())
+          (this.api.me?.id && replyMsgFrom?.id === this.api.me.id) ||
+          (botUsername && replyMsgFrom?.username && replyMsgFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
+          (isPrivate && (replyMsgFrom?.is_bot || !replyMsgFrom || (replyMsgFrom?.id && replyMsgFrom.id !== Number(tgId))))
         )
       );
-      const botUsername = (this.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
+      const isReplyToBot = isReplyToThisBot;
+
+      const nameRegex = new RegExp(`\\b(?:${[...nameTriggers].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'i');
+      const isNameTriggered = Boolean(text && nameRegex.test(text));
+
       const isTag = Boolean(
-        /\blancy\b/i.test(text) ||
-        (botUsername && new RegExp(`@?${botUsername}\\b`, 'i').test(text))
+        isNameTriggered ||
+        (botUsername && new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text))
       );
 
       // Check if user uploaded/sent a video, audio file, or voice note for music recognition:
@@ -4387,22 +4402,12 @@ export class TelegramController extends EventEmitter {
             }
           }
 
-          // AI assistant: ONLY responds in private DM (never in group chat!)
+          // AI assistant: responds in private DM and in group chat when tagged, quoted, or called by name
           const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
-          if (isPrivate && enabled && this.app?.assistant) {
-            const replyFrom = message.reply_to_message?.from;
-            const isQuote = Boolean(
-              message.reply_to_message && (
-                !replyFrom ||
-                replyFrom.is_bot ||
-                (this.api.me?.id && replyFrom.id === this.api.me.id) ||
-                (botUsername && replyFrom.username && replyFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
-                (replyFrom.id && replyFrom.id !== Number(tgId))
-              )
-            );
-            const shouldReply = isQuote || isTag;
+          if (enabled && this.app?.assistant) {
+            const shouldReply = isPrivate || isReplyToThisBot || isTag || isNameTriggered;
             if (shouldReply) {
-              const aiCtx = this.#ctx(tgId, { message });
+              const aiCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot: isReplyToThisBot, isTag, forceNew: true });
               await this.app.assistant.handleMessage({ ctx: aiCtx, message, text });
             }
           }
