@@ -9,6 +9,7 @@ import { t, getLanguageName, SUPPORTED_LANGUAGES } from '../src/core/i18n.js';
 import { createDashboardScreen } from '../src/telegram/screens/dashboard.js';
 import { createDownloaderScreen } from '../src/telegram/screens/downloader.js';
 import { createSettingsScreen } from '../src/telegram/screens/settings.js';
+import { setGlobalForceJoinChannels } from '../src/telegram/forceJoin.js';
 
 test('i18n: translations, fallback and parameter substitution work across all languages', () => {
   // 1. All supported languages exist
@@ -1215,4 +1216,114 @@ test('Cloned Bot Settings: clone owner sees ONLY their force-join channels butto
 
   db.close();
 });
+
+test('Force-Join: NEVER enforced in group chats (gc), strictly active in private DM only', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db, { env: { OWNER_IDS: '8831887192' } });
+  const sm = new StateMachine();
+
+  const sentMsgs = [];
+  const fakeApi = {
+    getMe: async () => ({ id: 99999999, is_bot: true, first_name: 'Lancy', username: 'Lancy_easy_bot' }),
+    sendMessage: async (chatId, text, opts) => {
+      sentMsgs.push({ chatId, text, opts });
+      return { message_id: 100 + sentMsgs.length };
+    },
+    sendRichMessage: async (chatId, rich) => {
+      sentMsgs.push({ chatId, rich });
+      return { message_id: 200 + sentMsgs.length };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      sentMsgs.push({ chatId, rich, msgId });
+      return { message_id: msgId };
+    },
+    answerCallbackQuery: async (id, opts) => opts,
+    setMyCommands: async () => true,
+    deleteMessage: async () => true,
+    getChatMember: async (cId, uId) => ({ status: 'left' })
+  };
+
+  // Configure active global force-join channels
+  setGlobalForceJoinChannels(db, [{ id: -100555555, title: 'VIP Community', username: 'vip_comm', inviteLink: 'https://t.me/vip_comm' }]);
+  await settings.set('security.publicAccess', true);
+
+  const bot = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: { db, settings }
+  });
+
+  const testUserId = 777111; // normal user, has NOT joined VIP Community
+
+  // 1. In a group chat (chatId = -100123456789), user sends /play
+  // Force-join MUST NOT intercept or block the user in group chat!
+  sentMsgs.length = 0;
+  await bot.handleUpdate({
+    update_id: 1,
+    message: {
+      message_id: 10,
+      from: { id: testUserId, first_name: 'Alex' },
+      chat: { id: -100123456789, type: 'supergroup' },
+      text: '/play Burna Boy'
+    }
+  });
+
+  const sentGateInGroup = sentMsgs.some((m) => m.rich?.blocks?.some?.((b) => JSON.stringify(b).includes('MEMBERSHIP REQUIRED')));
+  assert.equal(sentGateInGroup, false, 'Force-join gate must NEVER be sent to group chat');
+
+  // 2. In a group chat, user clicks a callback button
+  // Force-join MUST NOT intercept callback in group chat!
+  sentMsgs.length = 0;
+  await bot.handleUpdate({
+    update_id: 2,
+    callback_query: {
+      id: 'cb_123',
+      from: { id: testUserId, first_name: 'Alex' },
+      message: {
+        message_id: 20,
+        chat: { id: -100123456789, type: 'supergroup' }
+      },
+      data: 'game_ans:0'
+    }
+  });
+
+  const cbGateInGroup = sentMsgs.some((m) => m.rich?.blocks?.some?.((b) => JSON.stringify(b).includes('MEMBERSHIP REQUIRED')));
+  assert.equal(cbGateInGroup, false, 'Force-join gate must NEVER intercept callbacks in group chat');
+
+  // 3. In private DM (chatId = testUserId), user sends /play
+  // Force-join MUST intercept the unverified user and send gate rich message!
+  sentMsgs.length = 0;
+  await bot.handleUpdate({
+    update_id: 3,
+    message: {
+      message_id: 30,
+      from: { id: testUserId, first_name: 'Alex' },
+      chat: { id: testUserId, type: 'private' },
+      text: '/play Burna Boy'
+    }
+  });
+
+  const sentGateInDm = sentMsgs.some((m) => m.rich?.blocks?.some?.((b) => JSON.stringify(b).includes('MEMBERSHIP REQUIRED')));
+  assert.ok(sentGateInDm, 'Force-join gate MUST intercept unverified user in private DM');
+
+  // 4. In group chat, user attempts /forcejoin command -> directed to DM
+  sentMsgs.length = 0;
+  await bot.handleUpdate({
+    update_id: 4,
+    message: {
+      message_id: 40,
+      from: { id: testUserId, first_name: 'Alex' },
+      chat: { id: -100123456789, type: 'supergroup' },
+      text: '/forcejoin'
+    }
+  });
+
+  const dmOnlyNotice = sentMsgs.some((m) => m.text?.includes('only available in private DM'));
+  assert.ok(dmOnlyNotice, '/forcejoin in group chat must give DM-only notice');
+
+  db.close();
+});
+
 

@@ -3118,8 +3118,9 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      // Smart Dual-Tier Force-Join Gate on callbacks (owners bypass)
-      if (!this.isOwner(query.from.id) && !this.isMainOwner(query.from.id)) {
+      // Smart Dual-Tier Force-Join Gate on callbacks in private DM only (never in group chats, owners bypass)
+      const isGroupCallback = (query.message?.chat?.type === 'group' || query.message?.chat?.type === 'supergroup') || Number(query.message?.chat?.id) < 0;
+      if (!isGroupCallback && !this.isOwner(query.from.id) && !this.isMainOwner(query.from.id)) {
         const allowedByFj = await this.#enforceForceJoin(query.from, query.message?.chat?.id, { query });
         if (!allowedByFj) return;
       }
@@ -3296,9 +3297,8 @@ export class TelegramController extends EventEmitter {
       }
     }
 
-    // Smart Dual-Tier Force-Join Gate for commands & private DM actions (owners bypass)
-    const isCommandOrPrivate = text.startsWith('/') || !isGroup;
-    if (isCommandOrPrivate && !this.isOwner(tgId) && !this.isMainOwner(tgId)) {
+    // Smart Dual-Tier Force-Join Gate for private DM actions only (never for group chats, owners bypass)
+    if (!isGroup && !this.isOwner(tgId) && !this.isMainOwner(tgId)) {
       const allowedByFj = await this.#enforceForceJoin(message.from, chatId, { message });
       if (!allowedByFj) return;
     }
@@ -3313,6 +3313,19 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/forcejoin' || command === '/fsub' || command === '/forcesub') {
+        if (isGroup) {
+          const notice = await this.api.sendMessage(
+            chatId,
+            `<blockquote>🌸 The <b>FORCEJOIN</b> feature is only available in private DM with the bot ♡</blockquote>`,
+            { parse_mode: 'HTML' }
+          );
+          if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+            setTimeout(() => {
+              this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+            }, 10000)?.unref?.();
+          }
+          return;
+        }
         await this.handleForceJoinCommand(message, rest);
         return;
       }
@@ -3498,9 +3511,7 @@ export class TelegramController extends EventEmitter {
         }
       };
 
-      const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
-
-      if (isGroup && (command === '/whatsapp' || command === '/ai' || command === '/admins' || command === '/settings' || command === '/addadmin' || command === '/deladmin')) {
+      if (isGroup && (command === '/whatsapp' || command === '/ai' || command === '/admins' || command === '/settings' || command === '/addadmin' || command === '/deladmin' || command === '/forcejoin' || command === '/fsub' || command === '/forcesub')) {
         const notice = await this.api.sendMessage(
           chatId,
           `<blockquote>🌸 The <b>${command.slice(1).toUpperCase()}</b> feature is only available in private DM with the bot ♡</blockquote>`,
@@ -4844,6 +4855,14 @@ export class TelegramController extends EventEmitter {
 
   async #enforceForceJoin(fromUser, chatId, { message = null, query = null } = {}) {
     if (!fromUser?.id || !chatId) return true;
+
+    // Force join is STRICTLY for private DM chats only — NEVER for group chats (gc)!
+    const chatType = query?.message?.chat?.type ?? message?.chat?.type;
+    const isGroup = (chatType === 'group' || chatType === 'supergroup') || Number(chatId) < 0;
+    if (isGroup) {
+      return true;
+    }
+
     // Never block the Main Owner or the Owner of this Cloned Bot so they can always manage their bot!
     if (this.isOwner(fromUser.id)) return true;
 
@@ -4883,6 +4902,16 @@ export class TelegramController extends EventEmitter {
     const chatId = message.chat?.id;
     const userId = message.from?.id;
     if (!chatId || !userId) return;
+
+    const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup') || Number(chatId) < 0;
+    if (isGroup) {
+      await this.api.sendMessage(
+        chatId,
+        `<blockquote>🌸 The <b>FORCEJOIN</b> feature is only available in private DM with the bot ♡</blockquote>`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+      return;
+    }
 
     const isMain = this.isMainOwner(userId);
     const isCloneBot = Boolean(this.botContext?.isClone);
