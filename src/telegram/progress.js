@@ -15,10 +15,11 @@ import { isPermissionError, recordChatPermissionRestriction, formatMediaRestrict
 const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests|flood wait dropped|FLOOD_WAIT/i;
 
 export class ProgressTracker {
-  constructor({ api, chatId, messageId = null, heartbeatMs = 1000, action = 'typing', log } = {}) {
+  constructor({ api, chatId, messageId = null, replyToMessageId = null, heartbeatMs = 1000, action = 'typing', log } = {}) {
     this.api = api;
     this.chatId = chatId;
     this.messageId = messageId;
+    this.replyToMessageId = replyToMessageId;
     this.heartbeatMs = heartbeatMs;
     this.action = action;
     this.log = log ?? logger().child({ module: 'progress' });
@@ -54,7 +55,10 @@ export class ProgressTracker {
         // Fall back to sending a new message if editing fails
       }
     }
-    const message = await this.api.sendRichMessage(this.chatId, richMessage);
+    const sendExtra = this.replyToMessageId
+      ? { reply_to_message_id: this.replyToMessageId, allow_sending_without_reply: true }
+      : {};
+    const message = await this.api.sendRichMessage(this.chatId, richMessage, sendExtra);
     if (prevMsgId && message?.message_id && message.message_id !== prevMsgId) {
       await this.api.call?.('deleteMessage', { chat_id: this.chatId, message_id: prevMsgId })?.catch?.(() => {});
     }
@@ -149,8 +153,11 @@ export class ProgressTracker {
   /** Final edit + unthrottle. Optional files for media-bearing final cards. */
   async finish(richMessage, files = null) {
     this.#stop();
+    const sendExtra = this.replyToMessageId
+      ? { reply_to_message_id: this.replyToMessageId, allow_sending_without_reply: true }
+      : {};
     if (!this.messageId) {
-      const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch(async (err) => {
+      const sent = await this.api.sendRichMessage(this.chatId, richMessage, sendExtra, files).catch(async (err) => {
         if (isPermissionError(err)) {
           return await this.#handlePermissionDenied();
         }
@@ -160,7 +167,7 @@ export class ProgressTracker {
       return sent;
     }
     try {
-      const res = await this.api.editMessageRich(this.chatId, this.messageId, richMessage, {}, files);
+      const res = await this.api.editMessageRich(this.chatId, this.messageId, richMessage, sendExtra, files);
       this.lastRender = JSON.stringify(richMessage);
       return res;
     } catch (error) {
@@ -170,7 +177,7 @@ export class ProgressTracker {
       }
       // Message vanished (user deleted it) or could not be edited with media → send a fresh one.
       const prevMsgId = this.messageId;
-      const sent = await this.api.sendRichMessage(this.chatId, richMessage, {}, files).catch(async (err) => {
+      const sent = await this.api.sendRichMessage(this.chatId, richMessage, sendExtra, files).catch(async (err) => {
         this.log.warn({ err }, 'final progress edit failed');
         if (isPermissionError(err)) {
           return await this.#handlePermissionDenied();

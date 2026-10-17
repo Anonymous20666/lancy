@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { parseDurationToSeconds } from '../utils/time.js';
 import { optimizeVideoForTelegram, getCookieArgs, getAudioDurationSeconds } from './downloader.js';
+import { resolveAndDownloadAudio } from './musicResolver.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -227,28 +228,49 @@ export class VideoStreamingServer {
         const cookieArgs = getCookieArgs();
         const tempPath = join(this.audioCacheDir, `temp_full_${trackId}_${Date.now()}.mp3`);
 
+        // Multi-source full-track resolution (YouTube exact-id -> Audius full
+        // stream), duration-validated >= 45s so previews can never leak through.
         let downloaded = false;
         try {
-          await execFileAsync('yt-dlp', [
-            '--no-warnings',
-            '--no-playlist',
-            ...cookieArgs,
-            '-N', '4',
-            '--max-filesize', '50M',
-            '--js-runtimes', 'node:/usr/bin/node',
-            '-f', 'ba/b',
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '2',
-            '-o', tempPath,
-            isYouTubeId ? `https://www.youtube.com/watch?v=${trackId}` : `ytsearch1:${searchQuery}`
-          ], { timeout: 45000 });
-
-          if (existsSync(tempPath) && statSync(tempPath).size > 10000) {
-            downloaded = true;
+          const resolved = await resolveAndDownloadAudio({
+            query: searchQuery,
+            trackId: isYouTubeId ? trackId : null,
+            tempPath,
+            minSeconds: 45,
+          });
+          downloaded = resolved.ok;
+          if (resolved.ok) {
+            meta = meta ?? (resolved.meta?.title ? { title: resolved.meta.title, artist: resolved.meta.artist ?? 'Music' } : meta);
+          } else {
+            this.log?.warn?.({ trackId, searchQuery }, 'multi-source resolver exhausted; falling back to ytsearch1');
           }
-        } catch (dlErr) {
-          this.log?.warn?.({ err: dlErr?.message, trackId }, 'yt-dlp direct audio download failed, attempting mediaDownloader fallback');
+        } catch (rErr) {
+          this.log?.warn?.({ err: rErr?.message, trackId }, 'music resolver crashed; falling back');
+        }
+
+        if (!downloaded) {
+          try {
+            await execFileAsync('yt-dlp', [
+              '--no-warnings',
+              '--no-playlist',
+              ...cookieArgs,
+              '-N', '4',
+              '--max-filesize', '50M',
+              '--js-runtimes', 'node:/usr/bin/node',
+              '-f', 'ba/b',
+              '-x',
+              '--audio-format', 'mp3',
+              '--audio-quality', '2',
+              '-o', tempPath,
+              isYouTubeId ? `https://www.youtube.com/watch?v=${trackId}` : `ytsearch1:${searchQuery}`
+            ], { timeout: 45000 });
+
+            if (existsSync(tempPath) && statSync(tempPath).size > 10000) {
+              downloaded = true;
+            }
+          } catch (dlErr) {
+            this.log?.warn?.({ err: dlErr?.message, trackId }, 'yt-dlp direct audio download failed, attempting mediaDownloader fallback');
+          }
         }
 
         if (!downloaded && this.app?.mediaDownloader) {

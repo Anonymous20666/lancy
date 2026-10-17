@@ -112,9 +112,11 @@ export class TelegramAPI {
           throw err;
         }
         const wait = Math.min(30, Number(data.parameters.retry_after) + 1);
+        err._floodAttempts = (params.__floodAttempts ?? 0);
+        if (err._floodAttempts >= 2) { throw err; }
         this.log.warn({ method, wait }, 'flood wait — backing off');
         await sleep(wait * 1000);
-        return this.call(method, params, { files, timeoutMs, dropOnFloodWait });
+        return this.call(method, { ...params, __floodAttempts: err._floodAttempts + 1 }, { files, timeoutMs, dropOnFloodWait });
       }
       throw err;
     }

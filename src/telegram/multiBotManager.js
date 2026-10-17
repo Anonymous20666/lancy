@@ -148,7 +148,9 @@ export class MultiBotManager {
       botName: botRecord.bot_name || me.first_name || 'Lancy',
       botUsername: me.username,
       ownerId: Number(botRecord.owner_tg_id),
-      isClone: true
+      isClone: true,
+      mainApi: this.app.telegram?.api || null,
+      mainBotUsername: this.app.telegram?.botUsername || 'Lancy_easy_bot'
     };
 
     // Create a clone-scoped application proxy so all screens reference this clone's API and controller

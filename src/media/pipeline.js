@@ -31,8 +31,30 @@ export class MediaPipeline {
     this.tmpRoot = ensureDir(settings?.get('media.temporaryStorage') ?? join(process.env.DATA_DIR ?? './data', 'tmp'));
   }
 
-  /** Download a URL with size cap, timeout and retries. Returns a Buffer. */
+  #inFlight = 0;
+  #waiters = [];
+  #acquire() {
+    const max = this.settings?.get('performance.maxConcurrentDownloads') ?? 2;
+    if (this.#inFlight < max) { this.#inFlight++; return Promise.resolve(); }
+    return new Promise((resolve) => this.#waiters.push(resolve));
+  }
+  #release() {
+    this.#inFlight--;
+    const next = this.#waiters.shift();
+    if (next) { this.#inFlight++; next(); }
+  }
+
+  /** Download a URL with size cap, timeout, retries and a global concurrency cap. Returns a Buffer. */
   async download(url, { maxBytes, timeoutMs = 30000, signal } = {}) {
+    await this.#acquire();
+    try {
+      return await this.#downloadInner(url, { maxBytes, timeoutMs, signal });
+    } finally {
+      this.#release();
+    }
+  }
+
+  async #downloadInner(url, { maxBytes, timeoutMs = 30000, signal } = {}) {
     const cap = maxBytes ?? this.settings?.get('media.maxDownloadBytes') ?? 60 * 1024 * 1024;
     if (url && /\.m3u8(\?|$)/i.test(url)) {
       return this.#downloadHls(url, { maxBytes: cap, timeoutMs, signal });

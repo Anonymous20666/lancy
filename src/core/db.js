@@ -118,6 +118,44 @@ export class Database {
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_tg_channels_user ON tg_channels(added_by);
+
+        CREATE TABLE IF NOT EXISTS game_seen_items (
+          chat_id INTEGER NOT NULL,
+          mode TEXT NOT NULL,
+          item_id TEXT NOT NULL,
+          seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (chat_id, mode, item_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_game_seen_chat_mode ON game_seen_items(chat_id, mode);
+
+        CREATE TABLE IF NOT EXISTS game_daily_streaks (
+          user_id INTEGER PRIMARY KEY,
+          first_name TEXT,
+          username TEXT,
+          current_streak INTEGER NOT NULL DEFAULT 0,
+          best_streak INTEGER NOT NULL DEFAULT 0,
+          total_daily_wins INTEGER NOT NULL DEFAULT 0,
+          last_completed_date TEXT,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS pokemon_captures (
+          user_id INTEGER NOT NULL,
+          pokemon_id INTEGER NOT NULL,
+          pokemon_name TEXT NOT NULL,
+          types TEXT NOT NULL DEFAULT 'Normal',
+          is_shiny INTEGER NOT NULL DEFAULT 0,
+          best_cp INTEGER NOT NULL DEFAULT 500,
+          captures_count INTEGER NOT NULL DEFAULT 1,
+          first_name TEXT,
+          username TEXT,
+          chat_id INTEGER,
+          first_caught_at TEXT NOT NULL DEFAULT (datetime('now')),
+          last_caught_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (user_id, pokemon_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pokemon_captures_user ON pokemon_captures(user_id, best_cp DESC);
+        CREATE INDEX IF NOT EXISTS idx_pokemon_captures_chat ON pokemon_captures(chat_id);
       `);
     } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
@@ -365,6 +403,262 @@ export class Database {
       );
     } catch (err) {
       logger().warn({ err, chatId }, 'failed to fetch game leaderboard');
+      return [];
+    }
+  }
+
+  getGlobalGameLeaderboard(limit = 10) {
+    try {
+      return this.all(
+        `SELECT user_id,
+                MAX(first_name) as first_name,
+                MAX(username) as username,
+                SUM(score) as score,
+                SUM(games_won) as games_won,
+                SUM(correct_answers) as correct_answers,
+                MIN(fastest_ms) as fastest_ms,
+                MAX(best_streak) as best_streak
+         FROM game_scores
+         GROUP BY user_id
+         ORDER BY score DESC
+         LIMIT ?`,
+        Number(limit)
+      );
+    } catch (err) {
+      logger().warn({ err }, 'failed to fetch global game leaderboard');
+      return [];
+    }
+  }
+
+  getSeenGameItems(chatId, mode) {
+    if (!chatId || !mode) return new Set();
+    try {
+      const rows = this.all(
+        'SELECT item_id FROM game_seen_items WHERE chat_id = ? AND mode = ? ORDER BY seen_at DESC LIMIT 600',
+        Number(chatId),
+        String(mode)
+      );
+      return new Set(rows.map((r) => String(r.item_id)));
+    } catch {
+      return new Set();
+    }
+  }
+
+  markGameItemSeen(chatId, mode, itemId) {
+    if (!chatId || !mode || !itemId) return;
+    try {
+      this.run(
+        `INSERT INTO game_seen_items (chat_id, mode, item_id, seen_at)
+         VALUES (?, ?, ?, datetime('now'))
+         ON CONFLICT(chat_id, mode, item_id) DO UPDATE SET seen_at = datetime('now')`,
+        Number(chatId),
+        String(mode),
+        String(itemId)
+      );
+    } catch {}
+  }
+
+  clearSeenGameItems(chatId, mode) {
+    if (!chatId || !mode) return;
+    try {
+      this.run('DELETE FROM game_seen_items WHERE chat_id = ? AND mode = ?', Number(chatId), String(mode));
+    } catch {}
+  }
+
+  getDailyStreak(userId) {
+    if (!userId) return { current_streak: 0, best_streak: 0, total_daily_wins: 0, last_completed_date: null };
+    try {
+      const row = this.get('SELECT * FROM game_daily_streaks WHERE user_id = ?', Number(userId));
+      return row || { current_streak: 0, best_streak: 0, total_daily_wins: 0, last_completed_date: null };
+    } catch {
+      return { current_streak: 0, best_streak: 0, total_daily_wins: 0, last_completed_date: null };
+    }
+  }
+
+  recordDailyCompletion(user, dateStr) {
+    if (!user?.id || !dateStr) return { streak: 1, alreadyDone: false };
+    try {
+      const existing = this.get('SELECT * FROM game_daily_streaks WHERE user_id = ?', Number(user.id));
+      if (existing?.last_completed_date === dateStr) {
+        return { streak: existing.current_streak || 1, bestStreak: existing.best_streak || 1, alreadyDone: true };
+      }
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      const isConsecutive = existing?.last_completed_date === yesterday;
+      const newStreak = isConsecutive ? (Number(existing?.current_streak || 0) + 1) : 1;
+      const newBest = Math.max(Number(existing?.best_streak || 0), newStreak);
+      const totalWins = Number(existing?.total_daily_wins || 0) + 1;
+
+      this.run(
+        `INSERT INTO game_daily_streaks (user_id, first_name, username, current_streak, best_streak, total_daily_wins, last_completed_date, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(user_id) DO UPDATE SET
+           first_name = COALESCE(excluded.first_name, game_daily_streaks.first_name),
+           username = COALESCE(excluded.username, game_daily_streaks.username),
+           current_streak = excluded.current_streak,
+           best_streak = excluded.best_streak,
+           total_daily_wins = excluded.total_daily_wins,
+           last_completed_date = excluded.last_completed_date,
+           updated_at = datetime('now')`,
+        Number(user.id),
+        user.first_name || 'Player',
+        user.username || null,
+        newStreak,
+        newBest,
+        totalWins,
+        String(dateStr)
+      );
+      return { streak: newStreak, bestStreak: newBest, alreadyDone: false };
+    } catch (err) {
+      logger().warn({ err, userId: user?.id }, 'failed to record daily completion');
+      return { streak: 1, bestStreak: 1, alreadyDone: false };
+    }
+  }
+
+  getDailyStreakLeaderboard(limit = 10) {
+    try {
+      return this.all(
+        `SELECT user_id, first_name, username, current_streak, best_streak, total_daily_wins, last_completed_date
+         FROM game_daily_streaks
+         ORDER BY current_streak DESC, best_streak DESC, total_daily_wins DESC
+         LIMIT ?`,
+        Number(limit)
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  recordPokemonCapture({ user, chatId = null, pokemonId, pokemonName, types = 'Normal', isShiny = false, cp = 500 } = {}) {
+    if (!user?.id || !pokemonId || !pokemonName) return null;
+    try {
+      const uid = Number(user.id);
+      const pid = Number(pokemonId);
+      const shinyInt = isShiny ? 1 : 0;
+      const rolledCp = Math.max(100, Number(cp) || 500);
+      const existing = this.get(
+        'SELECT * FROM pokemon_captures WHERE user_id = ? AND pokemon_id = ?',
+        uid,
+        pid
+      );
+      const isNewDexEntry = !existing;
+      const newBestCp = existing ? Math.max(Number(existing.best_cp || 0), rolledCp) : rolledCp;
+      const newShiny = existing ? Math.max(Number(existing.is_shiny || 0), shinyInt) : shinyInt;
+      const newCount = existing ? Number(existing.captures_count || 0) + 1 : 1;
+
+      this.run(
+        `INSERT INTO pokemon_captures
+          (user_id, pokemon_id, pokemon_name, types, is_shiny, best_cp, captures_count, first_name, username, chat_id, first_caught_at, last_caught_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, datetime('now'), datetime('now'))
+         ON CONFLICT(user_id, pokemon_id) DO UPDATE SET
+           pokemon_name = excluded.pokemon_name,
+           types = excluded.types,
+           is_shiny = MAX(pokemon_captures.is_shiny, excluded.is_shiny),
+           best_cp = MAX(pokemon_captures.best_cp, excluded.best_cp),
+           captures_count = pokemon_captures.captures_count + 1,
+           first_name = COALESCE(excluded.first_name, pokemon_captures.first_name),
+           username = COALESCE(excluded.username, pokemon_captures.username),
+           chat_id = COALESCE(excluded.chat_id, pokemon_captures.chat_id),
+           last_caught_at = datetime('now')`,
+        uid,
+        pid,
+        String(pokemonName),
+        Array.isArray(types) ? types.join(' / ') : String(types || 'Normal'),
+        shinyInt,
+        rolledCp,
+        user.first_name || 'Trainer',
+        user.username || null,
+        chatId ? Number(chatId) : null
+      );
+
+      return {
+        isNewDexEntry,
+        bestCp: newBestCp,
+        rolledCp,
+        isShiny: Boolean(newShiny),
+        capturesCount: newCount
+      };
+    } catch (err) {
+      logger().warn({ err, userId: user?.id, pokemonId }, 'failed to record pokemon capture');
+      return null;
+    }
+  }
+
+  getUserPokedex(userId, limit = 15) {
+    if (!userId) return [];
+    try {
+      return this.all(
+        `SELECT * FROM pokemon_captures
+         WHERE user_id = ?
+         ORDER BY is_shiny DESC, best_cp DESC, captures_count DESC
+         LIMIT ?`,
+        Number(userId),
+        Number(limit)
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  getUserPokedexStats(userId) {
+    if (!userId) {
+      return { uniqueCount: 0, totalCaptured: 0, shinyCount: 0, topPokemon: null, rankTitle: '🎒 Rookie Trainer' };
+    }
+    try {
+      const summary = this.get(
+        `SELECT
+           COUNT(*) AS unique_count,
+           COALESCE(SUM(captures_count), 0) AS total_captured,
+           COALESCE(SUM(CASE WHEN is_shiny = 1 THEN 1 ELSE 0 END), 0) AS shiny_count
+         FROM pokemon_captures
+         WHERE user_id = ?`,
+        Number(userId)
+      );
+      const topPokemon = this.get(
+        `SELECT * FROM pokemon_captures
+         WHERE user_id = ?
+         ORDER BY best_cp DESC, is_shiny DESC
+         LIMIT 1`,
+        Number(userId)
+      );
+      const u = Number(summary?.unique_count || 0);
+      const rankTitle =
+        u >= 100 ? '👑 Pokémon Grand Master'
+        : u >= 50 ? '🏆 League Champion'
+        : u >= 25 ? '⚜️ Elite Four'
+        : u >= 10 ? '🥇 Gym Leader'
+        : u >= 3 ? '⚡ Ace Trainer'
+        : '🎒 Rookie Trainer';
+
+      return {
+        uniqueCount: u,
+        totalCaptured: Number(summary?.total_captured || 0),
+        shinyCount: Number(summary?.shiny_count || 0),
+        topPokemon: topPokemon || null,
+        rankTitle
+      };
+    } catch {
+      return { uniqueCount: 0, totalCaptured: 0, shinyCount: 0, topPokemon: null, rankTitle: '🎒 Rookie Trainer' };
+    }
+  }
+
+  getGroupPokedexLeaderboard(chatId, limit = 10) {
+    try {
+      return this.all(
+        `SELECT
+           user_id,
+           MAX(first_name) AS first_name,
+           MAX(username) AS username,
+           COUNT(*) AS unique_dex,
+           SUM(captures_count) AS total_caught,
+           SUM(CASE WHEN is_shiny = 1 THEN 1 ELSE 0 END) AS shinies,
+           MAX(best_cp) AS max_cp
+         FROM pokemon_captures
+         GROUP BY user_id
+         ORDER BY unique_dex DESC, shinies DESC, max_cp DESC
+         LIMIT ?`,
+        Number(limit)
+      );
+    } catch {
       return [];
     }
   }

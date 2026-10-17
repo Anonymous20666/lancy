@@ -170,7 +170,10 @@ export function createSettingsScreen({ app }) {
       b.divider();
     }
     if (ctx.controller?.isOwner?.(ctx.tgId) || (app.settings.get('general.ownerIds') ?? []).map(Number).includes(Number(ctx.tgId))) {
-      b.buttons([richButton.callback('👑 Manage Team Admins', encodeCallback(id, 'adminList'), { style: 'primary' })]);
+      b.buttons([
+        richButton.callback('🔒 Global Force-Join (All Bots)', 'fj_open:global', { style: 'success' }),
+        richButton.callback('👑 Manage Team Admins', encodeCallback(id, 'adminList'), { style: 'primary' })
+      ]);
       b.divider();
     }
     b.buttons(navButtons(id, { back: false, home: true }));

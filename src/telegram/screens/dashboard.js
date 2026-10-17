@@ -170,20 +170,24 @@ ${stickerSection}
     // Primary navigation — grouped rows.
     b.heading('୨୧ quick actions', 3);
     if (isGroup) {
-      // In groups: WhatsApp and AI are omitted
+      // In groups: WhatsApp and AI are omitted; highlight Game Arena!
       b.buttons([
-        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
-        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
+        richButton.callback('🎮 Game Arena', 'game_hub:visual', { style: 'success' }),
+        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play'))
       ]);
       b.buttons([
-        richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open')),
+        richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('🏆 Leaderboard', 'game_lb:group'),
         richButton.callback('🌐 Language', encodeCallback(id, 'language'))
       ]);
       b.buttons([
         richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
       ]);
     } else {
-      // In private chat: Full dashboard with Clone Bot
+      // In private chat: Full dashboard with Game Arena & Clone Bot
       b.buttons([
         richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
         richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
@@ -193,18 +197,19 @@ ${stickerSection}
         richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
       ]);
       b.buttons([
+        richButton.callback('🎮 Game Arena', 'game_hub:visual', { style: 'success' }),
+        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open'))
+      ]);
+      b.buttons([
         richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' }),
         richButton.callback('📅 Auto Post', encodeCallback('autopost', 'open'), { style: 'success' })
       ]);
       b.buttons([
-        richButton.callback('📱 WhatsApp Studio', encodeCallback('whatsapp', 'open')),
-        richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open'))
+        richButton.callback('🤖 Clone Bot', encodeCallback('clone', 'open')),
+        richButton.callback('⚙ Settings', encodeCallback('settings', 'open'))
       ]);
       b.buttons([
-        richButton.callback('⚙ Settings', encodeCallback('settings', 'open')),
-        richButton.callback('🌐 Language', encodeCallback(id, 'language'))
-      ]);
-      b.buttons([
+        richButton.callback('🌐 Language', encodeCallback(id, 'language')),
         richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
       ]);
     }

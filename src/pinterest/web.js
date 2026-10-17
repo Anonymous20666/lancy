@@ -25,11 +25,15 @@ const SEARCH_URL = 'https://www.pinterest.com/search/pins/';
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
+let cachedPinterestCookies = '';
+let cachedPinterestCookiesAt = 0;
+const COOKIE_TTL_MS = 10 * 60 * 1000; // 10 minutes
+
 export class PinterestWebProvider extends PinterestProvider {
   constructor(opts = {}) {
     super({ name: 'web', ...opts });
     this.timeoutMs = opts.timeoutMs ?? 20000;
-    this.maxPages = opts.maxPages ?? 10;
+    this.maxPages = opts.maxPages ?? 15;
   }
 
   get label() {
@@ -96,16 +100,22 @@ export class PinterestWebProvider extends PinterestProvider {
       'Referer': `${BASE_URL}/`
     };
 
-    let cookieHeader = '';
-    try {
-      const warmupRes = await fetch(`${BASE_URL}${source_url}`, {
-        headers: baseHeaders,
-        signal
-      });
-      const rawCookies = warmupRes.headers.getSetCookie ? warmupRes.headers.getSetCookie() : [warmupRes.headers.get('set-cookie')].filter(Boolean);
-      cookieHeader = rawCookies.map(c => c.split(';')[0]).join('; ');
-    } catch (e) {
-      if (e.name === 'AbortError') throw e;
+    let cookieHeader = cachedPinterestCookies;
+    if (!cookieHeader || (Date.now() - cachedPinterestCookiesAt > COOKIE_TTL_MS)) {
+      try {
+        const warmupRes = await fetch(`${BASE_URL}${source_url}`, {
+          headers: baseHeaders,
+          signal
+        });
+        const rawCookies = warmupRes.headers.getSetCookie ? warmupRes.headers.getSetCookie() : [warmupRes.headers.get('set-cookie')].filter(Boolean);
+        cookieHeader = rawCookies.map(c => c.split(';')[0]).join('; ');
+        if (cookieHeader) {
+          cachedPinterestCookies = cookieHeader;
+          cachedPinterestCookiesAt = Date.now();
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') throw e;
+      }
     }
 
     // NOTE: the whole payload is URL-encoded once below — never pre-encode
@@ -128,7 +138,23 @@ export class PinterestWebProvider extends PinterestProvider {
     const headers = { ...baseHeaders };
     if (cookieHeader) headers['Cookie'] = cookieHeader;
 
-    const apiRes = await fetch(apiUrl, { headers, signal });
+    let apiRes = await fetch(apiUrl, { headers, signal });
+    if (!apiRes.ok && cachedPinterestCookies) {
+      // Refresh cookie once if expired
+      cachedPinterestCookies = '';
+      cachedPinterestCookiesAt = 0;
+      try {
+        const warmupRes = await fetch(`${BASE_URL}${source_url}`, { headers: baseHeaders, signal });
+        const rawCookies = warmupRes.headers.getSetCookie ? warmupRes.headers.getSetCookie() : [warmupRes.headers.get('set-cookie')].filter(Boolean);
+        cookieHeader = rawCookies.map(c => c.split(';')[0]).join('; ');
+        if (cookieHeader) {
+          cachedPinterestCookies = cookieHeader;
+          cachedPinterestCookiesAt = Date.now();
+          headers['Cookie'] = cookieHeader;
+          apiRes = await fetch(apiUrl, { headers, signal });
+        }
+      } catch {}
+    }
     if (!apiRes.ok) return null;
 
     const json = await apiRes.json().catch(() => null);

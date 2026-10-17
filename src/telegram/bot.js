@@ -16,6 +16,16 @@ import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
 import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from './permissions.js';
 import { GameEngine } from '../games/engine.js';
+import {
+  invalidateForceJoinCache,
+  setGlobalForceJoinChannels,
+  setCloneForceJoinChannels,
+  resolveAndAddForceJoinChannel,
+  removeForceJoinChannel,
+  checkUserForceJoin,
+  buildForceJoinGateRich,
+  buildForceJoinManagerRich
+} from './forceJoin.js';
 
 const execFileAsync = promisify(execFile);
 export const inlineSearchCache = new Map();
@@ -80,17 +90,74 @@ export class TelegramController extends EventEmitter {
     this.app = app; // the composed application (services)
     this.botContext = botContext || { botId: 0, botName: 'Lancy', isClone: false };
     this.botName = this.botContext.botName;
+    this.mainApi = this.botContext?.mainApi || this.app?.telegram?.api || this.api;
     this.log = log ?? logger().child({ module: 'telegram' });
     this.offset = 0;
     this.running = false;
     this.abort = null;
     this.globalCallbacks = new Map(); // action -> handler (state-agnostic)
-    this.userScreenMessage = new Map(); // tgId -> { chatId, messageId }
+    this.userScreenMessage = new Map(); // `${chatId}:${tgId}` or tgId -> { chatId, messageId }
+    this.activeUserTasks = new Map(); // tgId -> count of active heavy downloads
     this.mediaDeliveryMessageIds = new Set(); // messageId -> boolean
     this.pendingAudioCaches = new Set(); // query -> boolean
     this.pendingVideoCaches = new Set(); // videoId -> boolean
     this.audioMetadataMap = new Map(); // trackId -> { id, title, artist, album, cover, previewUrl }
     this.gameEngine = new GameEngine({ api: this.api, db: this.db, log: this.log });
+    this.#registerForceJoinStateHandler();
+  }
+
+  getScreenMsg(chatId, tgId) {
+    const compositeKey = `${chatId}:${tgId}`;
+    const byChat = this.userScreenMessage.get(compositeKey);
+    if (byChat?.messageId) return byChat;
+    const byUser = this.userScreenMessage.get(String(tgId));
+    if (byUser && String(byUser.chatId) === String(chatId)) return byUser;
+    return null;
+  }
+
+  setScreenMsg(chatId, tgId, messageId) {
+    if (!chatId || !tgId || !messageId) return;
+    const entry = { chatId, messageId };
+    this.userScreenMessage.set(`${chatId}:${tgId}`, entry);
+    this.userScreenMessage.set(String(tgId), entry);
+  }
+
+  /**
+   * Per-user fairness concurrency guard for heavy media/download requests in busy groups.
+   * Allows up to 2 concurrent downloads per individual user while allowing unlimited
+   * different group members to run their requests in parallel without blocking each other.
+   */
+  async acquireUserTaskSlot(tgId, chatId, replyToMessageId = null, isGroup = false) {
+    const key = String(tgId || 'anon');
+    const current = this.activeUserTasks.get(key) || 0;
+    const maxPerUser = 2;
+    if (current >= maxPerUser) {
+      if (chatId) {
+        const notice = await this.api.sendMessage(
+          chatId,
+          `<blockquote>⏳ <b>Hold on a sec!</b> You already have ${current} active downloads running in parallel.\nPlease wait a few seconds for one to finish before starting another ♡</blockquote>`,
+          {
+            parse_mode: 'HTML',
+            ...(isGroup && replyToMessageId ? { reply_to_message_id: replyToMessageId, allow_sending_without_reply: true } : {})
+          }
+        ).catch(() => null);
+        if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+          setTimeout(() => {
+            this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+          }, 8000)?.unref?.();
+        }
+      }
+      return false;
+    }
+    this.activeUserTasks.set(key, current + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const next = (this.activeUserTasks.get(key) || 1) - 1;
+      if (next <= 0) this.activeUserTasks.delete(key);
+      else this.activeUserTasks.set(key, next);
+    };
   }
 
   getInlineAudioMetadata(trackId) {
@@ -199,8 +266,13 @@ export class TelegramController extends EventEmitter {
   isOwner(tgId) {
     const id = Number(tgId);
     if (this.botContext?.isClone && this.botContext.ownerId) {
-      return id === Number(this.botContext.ownerId);
+      return id === Number(this.botContext.ownerId) || this.isMainOwner(id);
     }
+    return this.isMainOwner(id);
+  }
+
+  isMainOwner(tgId) {
+    const id = Number(tgId);
     return (this.settings.get('general.ownerIds') ?? []).map(Number).includes(id);
   }
 
@@ -231,10 +303,29 @@ export class TelegramController extends EventEmitter {
     const botName = this.botContext?.botName || 'Lancy';
 
     const groupCommands = [
-      { command: 'game', description: '🎮 Play Flags, Cars, Characters & AI Quiz in chat' },
+      { command: 'start', description: `✦ Open ${botName} group companion menu` },
+      { command: 'menu', description: `✦ Open ${botName} companion dashboard` },
+      { command: 'help', description: '୨୧ Bot commands & feature guide' },
+      { command: 'game', description: '🎮 Open 16+ Live Games Arena Hub' },
+      { command: 'grid', description: '🔠 Play 8×8 Word Grid (Find 10 Hidden Words)' },
+      { command: 'wordgrid', description: '🔠 Play 8×8 Word Grid Challenge' },
+      { command: 'pokemon', description: '⚡ Catch wild & Shiny Pokémon in chat' },
+      { command: 'pokebattle', description: '⚔️ 1v1 Pokémon Stadium Duel' },
+      { command: 'pokedex', description: '📖 View your personal Pokédex & Trainer Passport' },
+      { command: 'afro', description: '🔥 Guess the Naija / Afrobeats Hit Song' },
+      { command: 'songgame', description: '🎧 Guess the Song (Live 30s Audio Clip)' },
+      { command: 'lyricgame', description: '🎤 Finish the Lyrics Challenge' },
+      { command: 'anime', description: '🥷 Guess the Popular Anime Character' },
+      { command: 'flags', description: '🌍 Guess the Country Flag' },
+      { command: 'logos', description: '🏎️ Guess the Brand / Car Logo' },
+      { command: 'trivia', description: '🧠 Live Speed Trivia Battle' },
+      { command: 'scramble', description: '🔤 Word Scramble Challenge' },
+      { command: 'emoji', description: '🧩 Emoji Puzzle Quiz' },
+      { command: 'riddle', description: '🕵️ Riddles & Brain Teasers' },
+      { command: 'ttt', description: '❌⭕ 1v1 Tic-Tac-Toe Board Game' },
+      { command: 'connect4', description: '🔴🟡 1v1 Connect Four Board Game' },
+      { command: 'rps', description: '🪨📄✂️ 1v1 Rock Paper Scissors Duel' },
       { command: 'topleaderboard', description: '🏆 Group trivia & game hall of fame' },
-      { command: 'hidetag', description: '📢 Invisibly mention all group members in one message (admins only)' },
-      { command: 'tagall', description: '📢 Tag all group members in one clean message' },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
@@ -244,16 +335,24 @@ export class TelegramController extends EventEmitter {
       { command: 'recognize', description: '🎙️ Shazam / identify song from audio or video' },
       { command: 'pfp', description: '👥 Grab aesthetic matching PFP albums from Pinterest' },
       { command: 'matching', description: '👥 Grab 2-piece & multi-slide matching avatars' },
-      { command: 'start', description: `✦ Open ${botName} group companion menu` },
+      { command: 'hidetag', description: '📢 Invisibly mention all group members in one message (admins only)' },
+      { command: 'tagall', description: '📢 Tag all group members in one clean message' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
-      { command: 'help', description: '୨୧ Bot commands & feature guide' },
       { command: 'cancel', description: '✕ Cancel current active operation' }
     ];
 
     const privateCommands = [
-      { command: 'game', description: '🎮 Play Flags, Cars, Characters & AI Quiz' },
-      { command: 'topleaderboard', description: '🏆 Trivia & game hall of fame' },
       { command: 'start', description: `✦ Open ${botName} aesthetic dashboard` },
+      { command: 'menu', description: `✦ Open ${botName} aesthetic dashboard` },
+      { command: 'help', description: '୨୧ Complete studio guide' },
+      { command: 'game', description: '🎮 Open 16+ Live Games Arena Hub' },
+      { command: 'grid', description: '🔠 Play 8×8 Word Grid (Find 10 Hidden Words)' },
+      { command: 'pokemon', description: '⚡ Catch wild & Shiny Pokémon' },
+      { command: 'pokedex', description: '📖 View your personal Pokédex & Trainer Passport' },
+      { command: 'afro', description: '🔥 Guess the Naija / Afrobeats Hit Song' },
+      { command: 'songgame', description: '🎧 Guess the Song (Live 30s Audio Clip)' },
+      { command: 'anime', description: '🥷 Guess the Popular Anime Character' },
+      { command: 'topleaderboard', description: '🏆 Trivia & game hall of fame' },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
@@ -266,6 +365,7 @@ export class TelegramController extends EventEmitter {
       { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
       { command: 'postchannel', description: '📢 Post sticker pack to Telegram channel' },
       { command: 'autopost', description: '📅 Schedule automated sticker drops' },
+      { command: 'forcejoin', description: '🔒 Configure Force-Join channels & groups' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       ...(isClone ? [] : [
         { command: 'whatsapp', description: '📱 WhatsApp publishing & channels' },
@@ -274,7 +374,6 @@ export class TelegramController extends EventEmitter {
       ]),
       { command: 'rmbot', description: '🗑 Remove or delete a cloned bot' },
       { command: 'settings', description: '⚙ Studio configuration' },
-      { command: 'help', description: '୨୧ Complete studio guide' },
       { command: 'admins', description: '👥 Team admins & workspaces' },
       { command: 'cancel', description: '✕ Cancel current active operation' }
     ];
@@ -347,15 +446,19 @@ export class TelegramController extends EventEmitter {
   #handleChatMemberUpdated(chatMember) {
     if (!chatMember?.chat?.id) return;
     const chatId = chatMember.chat.id;
+    const newUser = chatMember.new_chat_member?.user;
+    const newStatus = chatMember.new_chat_member?.status;
+
+    if (newUser?.id) {
+      invalidateForceJoinCache(newUser.id);
+    }
+
     const isGroup = Boolean(chatMember.chat.type === 'group' || chatMember.chat.type === 'supergroup');
     if (!isGroup) return;
 
     if (chatMember.from && !chatMember.from.is_bot) {
       this.db.recordGroupMember(chatId, chatMember.from);
     }
-
-    const newUser = chatMember.new_chat_member?.user;
-    const newStatus = chatMember.new_chat_member?.status;
 
     if (newUser && !newUser.is_bot) {
       if (['member', 'administrator', 'restricted', 'creator'].includes(newStatus)) {
@@ -1327,19 +1430,47 @@ export class TelegramController extends EventEmitter {
         cleanTopic,
         `${cleanTopic} aesthetic`,
         `${cleanTopic} wallpaper`,
-        `${cleanTopic} art`,
-        `${cleanTopic} dark`,
         `${cleanTopic} hd 4k`,
-        `${cleanTopic} photography`
+        `${cleanTopic} icon pfp`,
+        `${cleanTopic} art`,
+        `${cleanTopic} dark aesthetic`,
+        `${cleanTopic} photography`,
+        `${cleanTopic} edit`,
+        `${cleanTopic} ultra hd`
       ];
 
       const provider = this.app?.pinterest?.provider || new PinterestWebProvider();
+      const PAGE_SIZE = 25;
 
-      // Ensure we have enough items in the pool for the requested offset + 15
-      while (cached.items.length < (numOffset + 15) && cached.combosTried < combos.length) {
+      // On initial search (pool empty), fetch the first 2 query combos in parallel for instant deep results!
+      if (cached.items.length === 0 && cached.combosTried === 0) {
+        cached.combosTried = 2;
+        const [res0, res1] = await Promise.all([
+          provider.search({ query: combos[0] }).catch(() => null),
+          provider.search({ query: combos[1] }).catch(() => null)
+        ]);
+        if (res0?.bookmark) cached.bookmark = res0.bookmark;
+        const seen = new Set();
+        for (const res of [res0, res1]) {
+          for (const item of (res?.items || [])) {
+            const key = item.mediaUrl || item.pinId;
+            if (item.pinId && seenPins.has(item.pinId)) continue;
+            if (item.mediaUrl && seenUrls.has(item.mediaUrl)) continue;
+            if (key && !seen.has(key)) {
+              seen.add(key);
+              cached.items.push(item);
+            }
+          }
+        }
+      }
+
+      // Ensure we have enough items in the pool for the requested offset + PAGE_SIZE
+      while (cached.items.length < (numOffset + PAGE_SIZE) && cached.combosTried < combos.length) {
         let res = null;
-        if (cached.bookmark && cached.combosTried === 0) {
-          res = await provider.search({ query: cleanTopic, bookmark: cached.bookmark }).catch(() => null);
+        if (cached.bookmark) {
+          const bm = cached.bookmark;
+          cached.bookmark = null;
+          res = await provider.search({ query: cleanTopic, bookmark: bm }).catch(() => null);
         }
         if (!res?.items?.length) {
           const nextTerm = combos[cached.combosTried % combos.length];
@@ -1367,7 +1498,7 @@ export class TelegramController extends EventEmitter {
 
       if (cached.items.length === 0) return { results: [], nextOffset: '' };
 
-      const paged = cached.items.slice(numOffset, numOffset + 15);
+      const paged = cached.items.slice(numOffset, numOffset + PAGE_SIZE);
       const nextOffset = (numOffset + paged.length < cached.items.length || cached.combosTried < combos.length) && paged.length >= 8
         ? String(numOffset + paged.length)
         : '';
@@ -1711,11 +1842,12 @@ export class TelegramController extends EventEmitter {
         } catch {}
       }
 
-      // 2. Fast YouTube InnerTube Live Search (<100ms) - Primary Source for 100% Full Audio
-      if (!cached.externalFetched && cached.items.length < (offset + 15)) {
+      // 2. Fast YouTube InnerTube Wide Live Search (<120ms, NG + US + Official Audio) - Primary Source for 100% Full Audio
+      const PAGE_SIZE = 20;
+      if (!cached.externalFetched && cached.items.length < (offset + PAGE_SIZE)) {
         cached.externalFetched = true;
         try {
-          const ytItems = await searchYouTubeFast(cleanTopic).catch(() => []);
+          const ytItems = await searchYouTubeFast(cleanTopic, 'NG', { wide: true }).catch(() => []);
 
           if (Array.isArray(ytItems) && ytItems.length > 0) {
             for (const yt of ytItems) {
@@ -1785,7 +1917,6 @@ export class TelegramController extends EventEmitter {
 
       if (cached.items.length === 0) return { results: [], nextOffset: '' };
 
-      const PAGE_SIZE = 10;
       const paged = cached.items.slice(offset, offset + PAGE_SIZE);
       const nextOffset = (offset + paged.length < cached.items.length) && paged.length > 0
         ? String(offset + paged.length)
@@ -2213,11 +2344,154 @@ export class TelegramController extends EventEmitter {
         type: 'article',
         id: `cmd_game_${prefix}`,
         title: `🎮 ${prefix}game`,
-        description: 'Interactive trivia arena, flag challenge, cars & AI quiz ♡',
+        description: 'Open 16+ Live Games Arena Hub (Unlimited & Timed) ♡',
         thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
         thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
         input_message_content: {
           message_text: `${prefix}game`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_grid_${prefix}`,
+        title: `🔠 ${prefix}grid`,
+        description: 'Play 8×8 Word Grid — Find 10 Hidden Words Live ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}grid`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_pokemon_${prefix}`,
+        title: `⚡ ${prefix}pokemon`,
+        description: 'Catch Wild & Shiny Pokémon in Chat ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}pokemon`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_pokebattle_${prefix}`,
+        title: `⚔️ ${prefix}pokebattle`,
+        description: '1v1 Pokémon Stadium Duel ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}pokebattle`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_pokedex_${prefix}`,
+        title: `📖 ${prefix}pokedex`,
+        description: 'View Your Personal Pokédex & Trainer Passport ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}pokedex`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_afro_${prefix}`,
+        title: `🔥 ${prefix}afro`,
+        description: 'Guess the Naija / Afrobeats Hit Song ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        input_message_content: {
+          message_text: `${prefix}afro`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_songgame_${prefix}`,
+        title: `🎧 ${prefix}songgame`,
+        description: 'Guess the Song (Live 30s Audio Clip) ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        input_message_content: {
+          message_text: `${prefix}songgame`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_lyricgame_${prefix}`,
+        title: `🎤 ${prefix}lyricgame`,
+        description: 'Finish the Lyrics Challenge ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=150',
+        input_message_content: {
+          message_text: `${prefix}lyricgame`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_anime_${prefix}`,
+        title: `🥷 ${prefix}anime`,
+        description: 'Guess the Popular Anime Character ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        input_message_content: {
+          message_text: `${prefix}anime`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_flags_${prefix}`,
+        title: `🌍 ${prefix}flags`,
+        description: 'Guess the Country Flag Challenge ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}flags`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_logos_${prefix}`,
+        title: `🏎️ ${prefix}logos`,
+        description: 'Guess the Car / Brand Logo ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}logos`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_ttt_${prefix}`,
+        title: `❌⭕ ${prefix}ttt`,
+        description: '1v1 Tic-Tac-Toe Board Game ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}ttt`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_connect4_${prefix}`,
+        title: `🔴🟡 ${prefix}connect4`,
+        description: '1v1 Connect Four Board Game ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}connect4`
+        }
+      },
+      {
+        type: 'article',
+        id: `cmd_topleaderboard_${prefix}`,
+        title: `🏆 ${prefix}topleaderboard`,
+        description: 'Group Trivia & Game Hall of Fame ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1511512578047-dfb367046420?w=150',
+        input_message_content: {
+          message_text: `${prefix}topleaderboard`
         }
       },
       {
@@ -2827,6 +3101,17 @@ export class TelegramController extends EventEmitter {
     const data = query.data ?? '';
 
     try {
+      if (data === 'fj_verify' || data.startsWith('fj_')) {
+        await this.handleForceJoinCallback(query);
+        return;
+      }
+
+      // Smart Dual-Tier Force-Join Gate on callbacks (owners bypass)
+      if (!this.isOwner(query.from.id) && !this.isMainOwner(query.from.id)) {
+        const allowedByFj = await this.#enforceForceJoin(query.from, query.message?.chat?.id, { query });
+        if (!allowedByFj) return;
+      }
+
       if (data.startsWith('game_')) {
         await this.handleGameCallback(query);
         return;
@@ -2978,8 +3263,14 @@ export class TelegramController extends EventEmitter {
     } else if (isGroup && activePrefix !== '/' && !text.startsWith('/')) {
       // In a group chat where a custom prefix (e.g. 🎀) is set:
       // If someone attempts a command using another prefix (e.g. !play or .game), remind them of the group prefix.
-      const knownCommands = ['play', 'game', 'quiz', 'trivia', 'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel', 'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp'];
-      const matchPrefixAttempt = text.match(/^([^\w\s]{1,3})([a-z]+)(\s+.*)?$/i);
+      const knownCommands = [
+        'play', 'game', 'quiz', 'trivia', 'grid', 'wordgrid', 'pokemon', 'pokebattle', 'pokedex',
+        'afro', 'naija', 'songgame', 'lyricgame', 'anime', 'flags', 'logos', 'cars',
+        'scramble', 'emoji', 'riddle', 'ttt', 'tictactoe', 'connect4', 'rps', 'topleaderboard',
+        'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel',
+        'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp', 'forcejoin', 'fsub'
+      ];
+      const matchPrefixAttempt = text.match(/^([^\w\s]{1,3})([a-z0-9]+)(\s+.*)?$/i);
       if (matchPrefixAttempt) {
         const attemptedCmd = matchPrefixAttempt[2].toLowerCase();
         if (knownCommands.includes(attemptedCmd)) {
@@ -2993,12 +3284,24 @@ export class TelegramController extends EventEmitter {
       }
     }
 
+    // Smart Dual-Tier Force-Join Gate for commands & private DM actions (owners bypass)
+    const isCommandOrPrivate = text.startsWith('/') || !isGroup;
+    if (isCommandOrPrivate && !this.isOwner(tgId) && !this.isMainOwner(tgId)) {
+      const allowedByFj = await this.#enforceForceJoin(message.from, chatId, { message });
+      if (!allowedByFj) return;
+    }
+
     if (text.startsWith('/')) {
       const [cmd, ...rest] = text.split(/\s+/);
       const parts = cmd.split('@');
       const command = parts[0].toLowerCase();
       const targetBot = parts[1]?.toLowerCase();
       if (targetBot && this.botUsername && targetBot !== this.botUsername.toLowerCase()) {
+        return;
+      }
+
+      if (command === '/forcejoin' || command === '/fsub' || command === '/forcesub') {
+        await this.handleForceJoinCommand(message, rest);
         return;
       }
 
@@ -3012,7 +3315,7 @@ export class TelegramController extends EventEmitter {
         if (channelPostScreen) {
           const sent = await channelPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
           if (sent?.message_id) {
-            this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
+            this.setScreenMsg(chatId, tgId, sent.message_id);
             this.sm.update(tgId, { screenMessageId: sent.message_id });
             this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
           }
@@ -3025,7 +3328,7 @@ export class TelegramController extends EventEmitter {
         if (autoPostScreen) {
           const sent = await autoPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
           if (sent?.message_id) {
-            this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
+            this.setScreenMsg(chatId, tgId, sent.message_id);
             this.sm.update(tgId, { screenMessageId: sent.message_id });
             this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
           }
@@ -3033,8 +3336,98 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      if (command === '/game' || command === '/quiz' || command === '/guess' || command === '/trivia') {
+      if (command === '/game' || command === '/quiz' || command === '/guess') {
         await this.handleGameCommand(message, rest);
+        return;
+      }
+
+      if (command === '/trivia') {
+        await this.handleGameCommand(message, ['trivia', ...rest]);
+        return;
+      }
+
+      if (command === '/grid' || command === '/wordgrid' || command === '/wgrid') {
+        await this.handleGameCommand(message, ['wordgrid', ...rest]);
+        return;
+      }
+
+      if (command === '/pokemon' || command === '/poke' || command === '/pkmn') {
+        await this.handleGameCommand(message, ['pokemon', ...rest]);
+        return;
+      }
+
+      if (command === '/whosthatpokemon' || command === '/pksilhouette') {
+        await this.handleGameCommand(message, ['whosthatpokemon', ...rest]);
+        return;
+      }
+
+      if (command === '/pokebattle' || command === '/pokeduel' || command === '/pkduel') {
+        await this.handleGameCommand(message, ['pokebattle', ...rest]);
+        return;
+      }
+
+      if (command === '/pokedex' || command === '/dex') {
+        await this.handleGameCommand(message, ['pokedex', ...rest]);
+        return;
+      }
+
+      if (command === '/afro' || command === '/naija' || command === '/afrobeats') {
+        await this.handleGameCommand(message, ['afro', ...rest]);
+        return;
+      }
+
+      if (command === '/songgame' || command === '/guesssong' || command === '/beat') {
+        await this.handleGameCommand(message, ['song', ...rest]);
+        return;
+      }
+
+      if (command === '/lyricgame' || command === '/guesslyrics') {
+        await this.handleGameCommand(message, ['lyric', ...rest]);
+        return;
+      }
+
+      if (command === '/anime' || command === '/character' || command === '/characters') {
+        await this.handleGameCommand(message, ['characters', ...rest]);
+        return;
+      }
+
+      if (command === '/flags' || command === '/flag') {
+        await this.handleGameCommand(message, ['flags', ...rest]);
+        return;
+      }
+
+      if (command === '/logos' || command === '/logo' || command === '/cars' || command === '/car') {
+        await this.handleGameCommand(message, ['logos', ...rest]);
+        return;
+      }
+
+      if (command === '/scramble' || command === '/anagram') {
+        await this.handleGameCommand(message, ['scramble', ...rest]);
+        return;
+      }
+
+      if (command === '/emoji' || command === '/emojis') {
+        await this.handleGameCommand(message, ['emoji', ...rest]);
+        return;
+      }
+
+      if (command === '/riddle' || command === '/riddles' || command === '/teaser') {
+        await this.handleGameCommand(message, ['riddle', ...rest]);
+        return;
+      }
+
+      if (command === '/ttt' || command === '/tictactoe' || command === '/xo') {
+        await this.handleGameCommand(message, ['ttt', ...rest]);
+        return;
+      }
+
+      if (command === '/connect4' || command === '/c4') {
+        await this.handleGameCommand(message, ['connect4', ...rest]);
+        return;
+      }
+
+      if (command === '/rps' || command === '/rockpaperscissors') {
+        await this.handleGameCommand(message, ['rps', ...rest]);
         return;
       }
 
@@ -3071,7 +3464,7 @@ export class TelegramController extends EventEmitter {
 
       const updateScreenMsg = (sent) => {
         if (sent?.message_id) {
-          this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
+          this.setScreenMsg(chatId, tgId, sent.message_id);
           this.sm.update(tgId, { screenMessageId: sent.message_id });
           if (!this.botContext?.isClone) {
             this.db.run(
@@ -3200,7 +3593,7 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      if (command === '/start') {
+      if (command === '/start' || command === '/menu') {
         const startPayload = rest[0]?.trim();
         if (startPayload && /^play_/i.test(startPayload)) {
           const rawQuery = startPayload.replace(/^play_/i, '').replace(/_/g, ' ').trim();
@@ -3816,9 +4209,8 @@ export class TelegramController extends EventEmitter {
       sendRichMessage: (rich, extra = {}, files = null) => this.api.sendRichMessage(chatId, rich, extra, files),
       editScreen: async (rich, extra = {}, files = null) => {
         const activeScreenMsgId = queryMessage?.message_id ||
-          this.userScreenMessage.get(tgId)?.messageId ||
-          this.sm?.for(tgId)?.screenMessageId ||
-          this.sm?.context?.(tgId)?.screenMessageId;
+          this.getScreenMsg(chatId, tgId)?.messageId ||
+          (!isGroup ? (this.sm?.for(tgId)?.screenMessageId || this.sm?.context?.(tgId)?.screenMessageId) : null);
 
         const isTargetMedia = !isPagination && Boolean(
           (activeScreenMsgId && this.isMediaDeliveryMessageId(activeScreenMsgId)) ||
@@ -3831,9 +4223,12 @@ export class TelegramController extends EventEmitter {
         // If fromMedia, forceNew, navigating away from a delivered media message, or no existing screen message:
         // send a fresh rich message so the user never loses their video, photo, or audio!
         if (isMediaDelivery || !activeScreenMsgId) {
-          const sent = await this.api.sendRichMessage(chatId, rich, extra, files);
+          const sendExtra = (isGroup && directMessage?.message_id && !extra?.reply_to_message_id)
+            ? { ...extra, reply_to_message_id: directMessage.message_id, allow_sending_without_reply: true }
+            : extra;
+          const sent = await this.api.sendRichMessage(chatId, rich, sendExtra, files);
           if (sent?.message_id) {
-            this.userScreenMessage.set(tgId, { chatId, messageId: sent.message_id });
+            this.setScreenMsg(chatId, tgId, sent.message_id);
             this.sm?.update?.(tgId, { screenMessageId: sent.message_id });
             if (!this.botContext?.isClone) {
               this.db.run(
@@ -3851,7 +4246,7 @@ export class TelegramController extends EventEmitter {
 
         try {
           const res = await this.api.editMessageRich(targetChatId, targetMsgId, rich, extra, files);
-          this.userScreenMessage.set(tgId, { chatId: targetChatId, messageId: targetMsgId });
+          this.setScreenMsg(targetChatId, tgId, targetMsgId);
           this.sm?.update?.(tgId, { screenMessageId: targetMsgId });
           return res ?? { message_id: targetMsgId };
         } catch (error) {
@@ -3864,7 +4259,7 @@ export class TelegramController extends EventEmitter {
             if (targetMsgId && sent.message_id !== targetMsgId) {
               await this.api.call?.('deleteMessage', { chat_id: targetChatId, message_id: targetMsgId })?.catch?.(() => {});
             }
-            this.userScreenMessage.set(tgId, { chatId: targetChatId, messageId: sent.message_id });
+            this.setScreenMsg(targetChatId, tgId, sent.message_id);
             this.sm?.update?.(tgId, { screenMessageId: sent.message_id });
             if (!this.botContext?.isClone) {
               this.db.run(
@@ -4112,146 +4507,529 @@ export class TelegramController extends EventEmitter {
 
   async handleGameCommand(message, rest = []) {
     const chatId = message.chat.id;
-    const subCmd = rest[0]?.toLowerCase();
+    const subCmd = rest[0]?.toLowerCase()?.trim();
 
-    if (subCmd === 'stop') {
+    if (subCmd === 'stop' || subCmd === 'end') {
       const res = await this.gameEngine.stopGame(chatId, { user: message.from });
       if (!res.ok) {
-        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+        const b = new RichMessageBuilder();
+        b.blockquote(res.error);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
       }
       return;
     }
 
-    if (subCmd === 'skip') {
+    if (subCmd === 'skip' || subCmd === 'next') {
       const res = await this.gameEngine.skipRound(chatId);
       if (!res.ok) {
-        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+        const b = new RichMessageBuilder();
+        b.blockquote(res.error);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
       }
       return;
     }
 
-    if (subCmd === 'hint') {
+    if (subCmd === 'hint' || subCmd === 'clue') {
       const res = await this.gameEngine.giveHint(chatId);
       if (!res.ok) {
-        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+        const b = new RichMessageBuilder();
+        b.blockquote(res.error);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
       }
       return;
     }
 
-    if (subCmd === 'top' || subCmd === 'leaderboard') {
-      await this.handleGameLeaderboard(message);
+    if (subCmd === 'top' || subCmd === 'leaderboard' || subCmd === 'global' || subCmd === 'streaks') {
+      const scope = subCmd === 'global' ? 'global' : subCmd === 'streaks' ? 'streaks' : 'group';
+      await this.handleGameLeaderboard(message, scope);
       return;
     }
 
-    if (['flags', 'flag', 'cars', 'car', 'characters', 'character', 'mixed', 'ai', 'poll'].includes(subCmd)) {
-      const modeMap = {
-        flag: 'flags', flags: 'flags',
-        car: 'cars', cars: 'cars',
-        character: 'characters', characters: 'characters',
-        mixed: 'mixed', ai: 'mixed', poll: 'mixed'
+    if (subCmd === 'pokedex' || subCmd === 'dex') {
+      const richDex = this.gameEngine.buildUserPokedexRich(chatId, message.from);
+      await this.api.sendRichMessage(chatId, richDex).catch(() => {});
+      return;
+    }
+
+    if (subCmd === 'maxmiss' || subCmd === 'miss' || subCmd === 'autostop' || subCmd === 'fail') {
+      const val = Number(rest[1]);
+      if (!Number.isFinite(val) || val < 1 || val > 25) {
+        const b = new RichMessageBuilder();
+        b.blockquote(`🛑 Current auto-stop limit: ${this.gameEngine.getPreferredMaxMiss(chatId)} unanswered rounds.\nUsage: /game maxmiss <1-25> (default: 5)`);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+        return;
+      }
+      const updated = this.gameEngine.setPreferredMaxMiss(chatId, val);
+      const b = new RichMessageBuilder();
+      b.blockquote(`✅ Auto-stop unanswered limit updated to ${updated} missed rounds!`);
+      await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+      return;
+    }
+
+    if (subCmd === 'unlimited' || subCmd === 'inf' || subCmd === 'infinite') {
+      this.gameEngine.setPreferredRounds(chatId, 0);
+      const richHub = this.gameEngine.buildHubRichMessage(chatId, 'visual');
+      await this.api.sendRichMessage(chatId, richHub).catch(() => {});
+      return;
+    }
+
+    if (subCmd === 'afro' || subCmd === 'naija' || subCmd === 'afrobeats') {
+      this.gameEngine.setPreferredMusicCategory(chatId, 'afro');
+      const res = await this.gameEngine.startGame(chatId, {
+        mode: 'song',
+        musicCategory: 'afro',
+        startedBy: message.from
+      });
+      if (!res.ok) {
+        const b = new RichMessageBuilder();
+        b.blockquote(res.error);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+      }
+      return;
+    }
+
+    const directModes = [
+      'pokemon', 'poke', 'pkmn', 'pokeworld', 'whosthatpokemon', 'pksilhouette',
+      'pokebattle', 'pokeduel', 'pkduel',
+      'wordgrid', 'wgrid', 'wordsearch', 'tilegrid', 'picgrid',
+      'flags', 'flag', 'cars', 'car', 'logos', 'logo',
+      'characters', 'character', 'anime', 'silhouette', 'whosthat',
+      'song', 'music', 'audio', 'beat',
+      'grid', 'gridquiz', 'picture', 'pic', 'photo', 'blur',
+      'emoji', 'emojis', 'scramble', 'word', 'anagram',
+      'riddle', 'riddles', 'teaser', 'trivia', 'quiz', 'poll', 'ai',
+      'lyric', 'lyrics', 'quote', 'daily', 'challenge', 'mixed',
+      'ttt', 'tictactoe', 'xo', 'connect4', 'c4',
+      'rps', 'rockpaperscissors', 'number', 'vault', 'highlow', 'hl'
+    ];
+
+    if (subCmd && directModes.includes(subCmd)) {
+      const arg1 = String(rest[1] || '').toLowerCase().trim();
+      const musicCatMap = {
+        afro: 'afro', naija: 'afro', afrobeats: 'afro', ng: 'afro',
+        pop: 'pop', global: 'pop',
+        rap: 'rap', hiphop: 'rap', rnb: 'rap',
+        all: 'all', mix: 'all'
       };
-      const mode = modeMap[subCmd] || 'flags';
-      const rounds = Number(rest[1]) || 5;
-      const difficulty = rest[2] || 'ALL';
+      const musicCatArg = musicCatMap[arg1] || null;
+      if (musicCatArg) {
+        this.gameEngine.setPreferredMusicCategory(chatId, musicCatArg);
+      }
+      const roundsArg = musicCatArg ? String(rest[2] || '').toLowerCase().trim() : arg1;
+      const rounds = (roundsArg === 'unlimited' || roundsArg === 'inf' || roundsArg === '0')
+        ? 0
+        : (Number.isFinite(Number(roundsArg)) && Number(roundsArg) > 0 ? Number(roundsArg) : null);
+      const arg2Num = Number(musicCatArg ? rest[3] : rest[2]);
+      const maxUnanswered = Number.isFinite(arg2Num) && arg2Num >= 1 ? arg2Num : null;
+      const difficulty = (!maxUnanswered && !musicCatArg && rest[2]) ? rest[2] : 'ALL';
 
       const res = await this.gameEngine.startGame(chatId, {
-        mode,
+        mode: subCmd,
         totalRounds: rounds,
+        maxUnanswered,
         difficulty,
+        musicCategory: musicCatArg || undefined,
         startedBy: message.from
       });
 
       if (!res.ok) {
-        await this.api.sendMessage(chatId, `<blockquote>${escapeHtml(res.error)}</blockquote>`, { parse_mode: 'HTML' });
+        const b = new RichMessageBuilder();
+        b.blockquote(res.error);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
       }
       return;
     }
 
-    // Default: Launcher Menu with interactive buttons
-    const menuHtml = `୨୧ ━━━ 𓆩♡𓆪 <b>LANCY GAME ARENA</b> 𓆩♡𓆪 ━━━ ୨୧
-    ₊˚⊹♡  <i>interactive group trivia & guessing</i>  ♡  ˙ᵕ˙
-
-<blockquote>🎮 <b>Choose your battle mode:</b>
-• <b>🌍 Guess the Flag</b>: Country flags (Easy, Medium & Hard)
-• <b>🚘 Guess the Car</b>: 100+ iconic emblems & exotic badges
-• <b>👀 Guess the Character</b>: Anime legends, celebrities & heroes
-• <b>🧠 Mixed AI Quiz</b>: Fresh trivia generated live by AI
-
-⚡ <b>How it works:</b>
-Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in chat—first correct answer snipes the points! ♡</blockquote>`;
-
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: '🌍 Guess the Flag', callback_data: 'game_start:flags' },
-          { text: '🚘 Guess the Car', callback_data: 'game_start:cars' }
-        ],
-        [
-          { text: '👀 Guess the Character', callback_data: 'game_start:characters' },
-          { text: '🧠 Mixed AI Quiz', callback_data: 'game_start:mixed' }
-        ],
-        [
-          { text: '🏆 Group Leaderboard', callback_data: 'game_leaderboard' }
-        ]
-      ]
-    };
-
-    await this.api.sendMessage(chatId, menuHtml, {
-      parse_mode: 'HTML',
-      reply_markup: keyboard
+    // Default: Open the 100% Bot API 10.3 Rich Message 4-Tab Game Hub!
+    const tabMap = { visual: 'visual', mind: 'mind', pvp: 'pvp', board: 'pvp' };
+    const initialTab = tabMap[subCmd] || 'visual';
+    const richHub = this.gameEngine.buildHubRichMessage(chatId, initialTab);
+    await this.api.sendRichMessage(chatId, richHub).catch((err) => {
+      this.log.error?.({ err, chatId }, 'failed to send game hub rich message');
     });
   }
 
-  async handleGameLeaderboard(message) {
+  async handleGameLeaderboard(message, scope = 'group') {
     const chatId = message.chat.id;
-    const top = this.db?.getGameLeaderboard ? this.db.getGameLeaderboard(chatId, 10) : [];
-
-    let text = `୨୧ ━━━ 𓆩♡𓆪 <b>GAME ARENA LEADERBOARD</b> 𓆩♡𓆪 ━━━ ୨୧
-    ₊˚⊹♡  <i>hall of fame • top trivia snipers</i>  ♡  ˙ᵕ˙\n\n<blockquote>`;
-
-    if (!top.length) {
-      text += `No games have been played in this chat yet!\nStart one now with <code>/game</code>! ♡</blockquote>`;
-    } else {
-      const medals = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
-      top.forEach((p, idx) => {
-        const medal = medals[idx] || `#${idx + 1}`;
-        const name = escapeHtml(p.username ? `@${p.username}` : (p.first_name || 'Player'));
-        const speed = p.fastest_ms ? ` • ⚡ ${(p.fastest_ms / 1000).toFixed(1)}s` : '';
-        const streak = p.best_streak >= 2 ? ` • 🔥 x${p.best_streak}` : '';
-        text += `${medal} <b>${name}</b> — <b>${p.score} XP</b> (${p.correct_answers} correct${speed}${streak})\n`;
-      });
-      text += `</blockquote>`;
-    }
-
-    await this.api.sendMessage(chatId, text, { parse_mode: 'HTML' });
+    const richLb = this.gameEngine.buildLeaderboardRichMessage(chatId, scope);
+    await this.api.sendRichMessage(chatId, richLb).catch((err) => {
+      this.log.error?.({ err, chatId }, 'failed to send game leaderboard rich message');
+    });
   }
 
   async handleGameCallback(query) {
-    const chatId = query.message?.chat?.id;
-    const data = query.data;
-    if (!chatId) {
-      await this.api.answerCallbackQuery(query.id);
-      return;
-    }
+    await this.gameEngine.handleCallback(query);
+  }
 
-    if (data === 'game_leaderboard') {
-      await this.api.answerCallbackQuery(query.id);
-      await this.handleGameLeaderboard(query.message);
-      return;
-    }
+  // ── Smart Dual-Tier Force-Join System (Main Owner + Cloner) ──
 
-    if (data.startsWith('game_start:')) {
-      const mode = data.split(':')[1] || 'flags';
-      await this.api.answerCallbackQuery(query.id, { text: `Starting ${mode.toUpperCase()} game! ♡` });
-      await this.gameEngine.startGame(chatId, {
-        mode,
-        totalRounds: 5,
-        startedBy: query.from
+  #registerForceJoinStateHandler() {
+    this.sm.register(States.FORCE_JOIN_ADD_INPUT, {
+      onMessage: async (sctx, message) => {
+        const chatId = message?.chat?.id || sctx.chatId;
+        const userId = message?.from?.id || sctx.tgId;
+        const scope = String(sctx.context?.scope || sctx.scope || (this.botContext?.isClone ? this.botContext.botId : 'global'));
+        const isGlobal = scope === 'global';
+        const targetBotId = isGlobal ? 0 : Number(scope);
+
+        // Verify permission
+        const mainBotUsername = this.botContext?.mainBotUsername || 'Lancy_easy_bot';
+        let targetApi = this.api;
+        let targetBotUsername = this.botContext?.botUsername || 'Lancy_easy_bot';
+
+        if (isGlobal) {
+          if (!this.isMainOwner(userId)) {
+            await this.sm.reset(userId);
+            return true;
+          }
+          targetApi = this.mainApi || this.api;
+          targetBotUsername = mainBotUsername;
+        } else {
+          const botRec = this.db?.get('SELECT * FROM cloned_bots WHERE id = ?', targetBotId);
+          if (!botRec || (String(botRec.owner_tg_id) !== String(userId) && !this.isMainOwner(userId))) {
+            await this.sm.reset(userId);
+            return true;
+          }
+          if (this.botContext?.isClone && Number(this.botContext?.botId) === targetBotId) {
+            targetApi = this.api;
+            targetBotUsername = this.botContext.botUsername || botRec.bot_username || 'bot';
+          } else {
+            const instance = this.multiBotManager?.instances?.get(targetBotId);
+            targetApi = instance?.api || this.api;
+            targetBotUsername = botRec.bot_username || 'bot';
+          }
+        }
+
+        const rawText = String(message?.text || message?.caption || '').trim();
+        const forwardedChat = message?.forward_origin?.chat || message?.forward_from_chat || null;
+
+        try {
+          const { entry } = await resolveAndAddForceJoinChannel({
+            db: this.db,
+            api: targetApi,
+            rawInput: rawText,
+            forwardedChat,
+            isGlobal,
+            botId: targetBotId,
+            botUsername: targetBotUsername
+          });
+
+          await this.sm.reset(userId);
+
+          const confirmB = new RichMessageBuilder();
+          confirmB.blockquote(
+            `✅ Added "${entry.title}" (${entry.username ? `@${entry.username}` : entry.id}) to ${
+              isGlobal ? 'Global Network Force-Join' : `@${targetBotUsername} Force-Join`
+            }!`
+          );
+          await this.api.sendRichMessage(chatId, confirmB.toJSON()).catch(() => {});
+
+          const panel = buildForceJoinManagerRich({
+            db: this.db,
+            isGlobal,
+            botId: targetBotId,
+            botUsername: targetBotUsername,
+            mainBotUsername,
+            canManageGlobal: this.isMainOwner(userId)
+          });
+          await this.api.sendRichMessage(chatId, panel).catch(() => {});
+        } catch (err) {
+          const errB = new RichMessageBuilder();
+          errB.blockquote(`⚠️ ${err?.message || 'Failed to add channel.'}\n\nSend another @channel / ID / forwarded message, or tap Cancel below.`);
+          errB.buttons([
+            richButton.callback('« Back to Force-Join', `fj_open:${scope}`)
+          ]);
+          await this.api.sendRichMessage(chatId, errB.toJSON()).catch(() => {});
+        }
+        return true;
+      }
+    });
+  }
+
+  async #enforceForceJoin(fromUser, chatId, { message = null, query = null } = {}) {
+    if (!fromUser?.id || !chatId) return true;
+    // Never block the Main Owner or the Owner of this Cloned Bot so they can always manage their bot!
+    if (this.isOwner(fromUser.id)) return true;
+
+    try {
+      const res = await checkUserForceJoin({
+        db: this.db,
+        mainApi: this.mainApi || this.api,
+        botApi: this.api,
+        isClone: Boolean(this.botContext?.isClone),
+        botId: Number(this.botContext?.botId || 0),
+        userId: fromUser.id
       });
+
+      if (res.ok) return true;
+
+      const gateRich = buildForceJoinGateRich({
+        botName: this.botName || 'Lancy',
+        missing: res.missing
+      });
+
+      if (query) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: '🔒 Please join our required channel(s) first to unlock the bot!',
+          show_alert: true
+        }).catch(() => {});
+      }
+
+      await this.api.sendRichMessage(chatId, gateRich).catch(() => {});
+      return false;
+    } catch (err) {
+      this.log.warn?.({ err, userId: fromUser.id }, 'force join check error (failing open)');
+      return true;
+    }
+  }
+
+  async handleForceJoinCommand(message, rest = []) {
+    const chatId = message.chat?.id;
+    const userId = message.from?.id;
+    if (!chatId || !userId) return;
+
+    const isMain = this.isMainOwner(userId);
+    const isCloneBot = Boolean(this.botContext?.isClone);
+    const isThisCloneOwner = isCloneBot && String(this.botContext?.ownerTgId) === String(userId);
+
+    // Check if user owns any cloned bots even when messaging main bot
+    const ownedClones = this.db?.all(
+      "SELECT * FROM cloned_bots WHERE owner_tg_id = ? AND status != 'deleted' ORDER BY id DESC",
+      String(userId)
+    ) || [];
+
+    if (!isMain && !isThisCloneOwner && ownedClones.length === 0) {
+      const b = new RichMessageBuilder();
+      b.blockquote('🔒 Only the Bot Owner or Cloned Bot Owners can configure Force-Join channels!\nClone your own bot with /clone to set up your own Force-Join channel ♡');
+      await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
       return;
     }
 
-    await this.api.answerCallbackQuery(query.id);
+    const sub = String(rest[0] || '').toLowerCase().trim();
+    const isGlobalScope = isMain && (!isCloneBot || sub === 'global' || sub === 'main');
+    const targetBotId = isGlobalScope
+      ? 0
+      : (isCloneBot ? Number(this.botContext.botId) : Number(ownedClones[0]?.id || 0));
+    const targetBotUsername = isGlobalScope
+      ? (this.botContext?.mainBotUsername || this.botContext?.botUsername || 'Lancy_easy_bot')
+      : (isCloneBot ? this.botContext.botUsername : (ownedClones[0]?.bot_username || 'bot'));
+    const mainBotUsername = this.botContext?.mainBotUsername || 'Lancy_easy_bot';
+
+    if (sub === 'add' && rest[1]) {
+      try {
+        const targetApi = isGlobalScope ? (this.mainApi || this.api) : this.api;
+        const { entry } = await resolveAndAddForceJoinChannel({
+          db: this.db,
+          api: targetApi,
+          rawInput: rest.slice(1).join(' '),
+          isGlobal: isGlobalScope,
+          botId: targetBotId,
+          botUsername: targetBotUsername
+        });
+        const b = new RichMessageBuilder();
+        b.blockquote(`✅ Added "${entry.title}" to ${isGlobalScope ? 'Global Network' : `@${targetBotUsername}`} Force-Join!`);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+      } catch (err) {
+        const b = new RichMessageBuilder();
+        b.blockquote(`⚠️ ${err?.message || 'Could not add channel.'}`);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+        return;
+      }
+    } else if ((sub === 'remove' || sub === 'del' || sub === 'delete') && rest[1]) {
+      removeForceJoinChannel({
+        db: this.db,
+        chatIdToRemove: rest[1],
+        isGlobal: isGlobalScope,
+        botId: targetBotId
+      });
+    } else if (sub === 'clear') {
+      if (isGlobalScope) setGlobalForceJoinChannels(this.db, []);
+      else setCloneForceJoinChannels(this.db, targetBotId, []);
+    }
+
+    const panel = buildForceJoinManagerRich({
+      db: this.db,
+      isGlobal: isGlobalScope,
+      botId: targetBotId,
+      botUsername: targetBotUsername,
+      mainBotUsername,
+      canManageGlobal: isMain
+    });
+    await this.api.sendRichMessage(chatId, panel).catch(() => {});
+  }
+
+  async handleForceJoinCallback(query) {
+    const data = String(query.data || '');
+    const chatId = query.message?.chat?.id;
+    const messageId = query.message?.message_id;
+    const userId = query.from?.id;
+    if (!chatId || !userId) return;
+
+    if (data === 'fj_verify') {
+      const res = await checkUserForceJoin({
+        db: this.db,
+        mainApi: this.mainApi || this.api,
+        botApi: this.api,
+        isClone: Boolean(this.botContext?.isClone),
+        botId: Number(this.botContext?.botId || 0),
+        userId,
+        bypassCache: true
+      });
+
+      if (res.ok) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: '🎉 Verified! Welcome in — all bot features are now unlocked ♡',
+          show_alert: true
+        }).catch(() => {});
+        if (messageId) {
+          await this.api.deleteMessage(chatId, messageId).catch(() => {});
+        }
+        const b = new RichMessageBuilder();
+        b.heading('🎉 VERIFICATION COMPLETE', 1);
+        b.paragraph(rt.bold(`Thank you for joining! You now have full access to ${this.botName || 'Lancy'} ♡`));
+        b.buttons([
+          richButton.callback('🏠 Open Dashboard', 'l1:dashboard:open', { style: 'success' }),
+          richButton.callback('🎮 Play Games', 'game_hub:visual', { style: 'primary' })
+        ]);
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+      } else {
+        const missingNames = res.missing.map((c) => c.title).join(', ');
+        await this.api.answerCallbackQuery(query.id, {
+          text: `❌ You haven't joined: ${missingNames}. Please join first and tap Verify again!`,
+          show_alert: true
+        }).catch(() => {});
+        const gateRich = buildForceJoinGateRich({
+          botName: this.botName || 'Lancy',
+          missing: res.missing
+        });
+        if (messageId) {
+          await this.api.editMessageRich(chatId, messageId, gateRich).catch(() => {});
+        }
+      }
+      return;
+    }
+
+    const parts = data.split(':');
+    const action = parts[0];
+    const scope = parts[1] || (this.botContext?.isClone ? String(this.botContext.botId) : 'global');
+    const isGlobal = scope === 'global';
+    const targetBotId = isGlobal ? 0 : Number(scope);
+    const mainBotUsername = this.botContext?.mainBotUsername || 'Lancy_easy_bot';
+
+    // Permission check for management callbacks
+    let targetBotUsername = this.botContext?.botUsername || 'Lancy_easy_bot';
+    if (isGlobal) {
+      if (!this.isMainOwner(userId)) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: '🔒 Only the Main Bot Owner can manage Global Force-Join!',
+          show_alert: true
+        }).catch(() => {});
+        return;
+      }
+      targetBotUsername = mainBotUsername;
+    } else {
+      const botRec = this.db?.get('SELECT * FROM cloned_bots WHERE id = ?', targetBotId);
+      if (!botRec || (String(botRec.owner_tg_id) !== String(userId) && !this.isMainOwner(userId))) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: '🔒 Only the owner of this cloned bot can manage its Force-Join channels!',
+          show_alert: true
+        }).catch(() => {});
+        return;
+      }
+      targetBotUsername = botRec.bot_username || targetBotUsername;
+    }
+
+    // Reset state if opening/modifying force join panel
+    await this.sm.reset(userId).catch(() => {});
+
+    if (action === 'fj_open') {
+      await this.api.answerCallbackQuery(query.id).catch(() => {});
+      const panel = buildForceJoinManagerRich({
+        db: this.db,
+        isGlobal,
+        botId: targetBotId,
+        botUsername: targetBotUsername,
+        mainBotUsername,
+        canManageGlobal: this.isMainOwner(userId)
+      });
+      if (messageId) {
+        await this.api.editMessageRich(chatId, messageId, panel).catch(async () => {
+          await this.api.sendRichMessage(chatId, panel).catch(() => {});
+        });
+      } else {
+        await this.api.sendRichMessage(chatId, panel).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === 'fj_add') {
+      await this.api.answerCallbackQuery(query.id).catch(() => {});
+      await this.sm.transition(userId, States.FORCE_JOIN_ADD_INPUT, {
+        context: { scope },
+        chatId,
+        screenMessageId: messageId
+      });
+
+      const b = new RichMessageBuilder();
+      b.heading(isGlobal ? '➕ ADD GLOBAL FORCE-JOIN CHANNEL' : `➕ ADD CHANNEL FOR @${targetBotUsername.toUpperCase()}`, 2);
+      b.blockquote(
+        `Step 1: Add @${targetBotUsername} as an Admin in your Channel or Group.\n` +
+        `Step 2: Send the channel @username (e.g. @MyChannel), Chat ID (e.g. -100123456789), or forward any message from your channel here!\n` +
+        `(Tip: For private channels, you can also send "-100123456789 https://t.me/+InviteLink")`
+      );
+      b.buttons([
+        richButton.callback('✕ Cancel', `fj_open:${scope}`, { style: 'danger' })
+      ]);
+      if (messageId) {
+        await this.api.editMessageRich(chatId, messageId, b.toJSON()).catch(async () => {
+          await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+        });
+      } else {
+        await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === 'fj_del') {
+      const chatIdToRemove = parts.slice(2).join(':');
+      removeForceJoinChannel({
+        db: this.db,
+        chatIdToRemove,
+        isGlobal,
+        botId: targetBotId
+      });
+      await this.api.answerCallbackQuery(query.id, { text: '🗑 Channel removed from Force-Join!' }).catch(() => {});
+      const panel = buildForceJoinManagerRich({
+        db: this.db,
+        isGlobal,
+        botId: targetBotId,
+        botUsername: targetBotUsername,
+        mainBotUsername,
+        canManageGlobal: this.isMainOwner(userId)
+      });
+      if (messageId) {
+        await this.api.editMessageRich(chatId, messageId, panel).catch(() => {});
+      }
+      return;
+    }
+
+    if (action === 'fj_clear') {
+      if (isGlobal) setGlobalForceJoinChannels(this.db, []);
+      else setCloneForceJoinChannels(this.db, targetBotId, []);
+      await this.api.answerCallbackQuery(query.id, { text: '🗑 Cleared all Force-Join channels!' }).catch(() => {});
+      const panel = buildForceJoinManagerRich({
+        db: this.db,
+        isGlobal,
+        botId: targetBotId,
+        botUsername: targetBotUsername,
+        mainBotUsername,
+        canManageGlobal: this.isMainOwner(userId)
+      });
+      if (messageId) {
+        await this.api.editMessageRich(chatId, messageId, panel).catch(() => {});
+      }
+      return;
+    }
   }
 
   async handleSetPrefix(message, args = []) {
@@ -4394,53 +5172,98 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
     const scopeLabel = isGroup ? 'Group' : 'Personal';
 
-    const cardHtml =
-      `𓆩♡𓆪 <b>COMMAND SUGGESTIONS (${prefix})</b> 𓆩♡𓆪\n` +
-      `₊˚⊹♡  <i>available studio commands</i>  ˙ᵕ˙\n\n` +
-      `<blockquote>🎀 <b>Active ${scopeLabel} Prefix:</b> <code>${prefix}</code>\n\n` +
-      `✨ <b>Quick Commands:</b>\n` +
-      `• <code>${prefix}game</code> — Trivia arena, flag quiz, cars & AI quiz\n` +
-      `• <code>${prefix}play &lt;song&gt;</code> — Stream 320k high-speed MP3 audio\n` +
-      `• <code>${prefix}grab &lt;link&gt;</code> — Download HD videos/music (TT/IG/YT/X)\n` +
-      `• <code>${prefix}pfp &lt;theme&gt;</code> — Matching PFP albums (duo/couple)\n` +
-      `• <code>${prefix}pint &lt;search&gt;</code> — Aesthetic Pinterest gallery\n` +
-      `• <code>${prefix}stickers</code> — Telegram sticker studio\n` +
-      `• <code>${prefix}postchannel</code> — Post sticker pack to Telegram channel\n` +
-      `• <code>${prefix}autopost</code> — Schedule automated sticker drops\n` +
-      `• <code>${prefix}menu</code> — Studio dashboard & settings\n` +
-      `• <code>${prefix}setprefix &lt;char&gt;</code> — Change command trigger prefix\n\n` +
-      `<i>💡 Tap any button below to run or open suggestions!</i> ♡</blockquote>`;
+    const b = new RichMessageBuilder();
+    b.heading(`𓆩♡𓆪 COMMAND SUGGESTIONS (${prefix}) 𓆩♡𓆪`, 1);
+    b.paragraph(rt.italic('₊˚⊹♡  available studio, group & live game commands  ˙ᵕ˙'));
+    b.divider();
+    b.table(kvTable([
+      [`🎀 ${scopeLabel} Prefix`, prefix],
+      [`🎮 ${prefix}game`, '16+ Live Games Hub (Unlimited & Timed)'],
+      [`🔠 ${prefix}grid`, '8×8 Word Grid (Find 10 Hidden Words)'],
+      [`⚡ ${prefix}pokemon`, 'Catch Wild & Shiny Pokémon in Chat'],
+      [`🔥 ${prefix}afro`, 'Guess the Naija / Afrobeats Hit Song'],
+      [`🥷 ${prefix}anime`, 'Guess the Popular Anime Character'],
+      [`🎵 ${prefix}play <song>`, 'Stream 320k high-speed MP3 audio'],
+      [`📥 ${prefix}grab <link>`, 'Download HD videos/music (TT/IG/YT/X)'],
+      [`👥 ${prefix}pfp <theme>`, 'Matching PFP albums (duo/couple)'],
+      [`🔍 ${prefix}pint <search>`, 'Aesthetic Pinterest HD gallery'],
+      [`🎀 ${prefix}stickers`, 'Telegram sticker studio'],
+      [`✨ ${prefix}menu`, 'Studio dashboard & settings']
+    ]), { compact: true });
+    b.expandableBlockquote(
+      `🕹️ ALL LIVE GAME SHORTCUTS (Tap to copy or run):\n` +
+      `• ${prefix}game — Open 4-Tab Game Arena Hub\n` +
+      `• ${prefix}grid / ${prefix}wordgrid — 8×8 Word Grid (Auto-Reposts on Hit)\n` +
+      `• ${prefix}pokemon — Catch Wild & Shiny Pokémon\n` +
+      `• ${prefix}pokebattle — 1v1 Pokémon Stadium Duel\n` +
+      `• ${prefix}pokedex — View Your Pokédex & Trainer Passport\n` +
+      `• ${prefix}afro — Guess the Naija / Afrobeats Hit Song\n` +
+      `• ${prefix}songgame — Guess the Song (30s Audio Clip)\n` +
+      `• ${prefix}lyricgame — Finish the Lyrics Challenge\n` +
+      `• ${prefix}anime — Guess the Popular Anime Character\n` +
+      `• ${prefix}flags — Guess the Country Flag\n` +
+      `• ${prefix}logos — Guess the Car / Brand Logo\n` +
+      `• ${prefix}trivia — Live Speed Trivia Battle\n` +
+      `• ${prefix}scramble — Word Scramble Challenge\n` +
+      `• ${prefix}emoji — Emoji Puzzle Quiz\n` +
+      `• ${prefix}riddle — Riddles & Brain Teasers\n` +
+      `• ${prefix}ttt / ${prefix}connect4 / ${prefix}rps — 1v1 PvP Duels\n` +
+      `• ${prefix}topleaderboard — Group Game Hall of Fame`
+    );
+    b.divider();
+    b.buttons([
+      richButton.callback(`🎮 ${prefix}game Hub`, 'game_hub:visual', { style: 'success' }),
+      richButton.callback(`🔠 ${prefix}grid`, 'game_start:wordgrid', { style: 'primary' }),
+      richButton.callback(`⚡ ${prefix}pokemon`, 'game_start:pokemon', { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback(`🔥 ${prefix}afro Song`, 'game_start:song', { style: 'primary' }),
+      richButton.switchInlineCurrent(`🎵 ${prefix}play`, `${prefix}play `, { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.switchInlineCurrent(`📥 ${prefix}grab`, `${prefix}grab `, { style: 'primary' }),
+      richButton.switchInlineCurrent(`👥 ${prefix}pfp`, `${prefix}pfp `, { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.switchInlineCurrent(`🔍 ${prefix}pint`, `${prefix}pint `, { style: 'primary' }),
+      richButton.callback(`🎀 ${prefix}menu`, encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.switchInlineCurrent('✨ All Command Suggestions ↗️', `${prefix}`, { style: 'primary' })
+    ]);
+    b.validate();
 
-    const keyboard = {
-      inline_keyboard: [
-        [
-          { text: `🎮 ${prefix}game`, callback_data: 'game_start:flags' },
-          { text: `🎵 ${prefix}play`, switch_inline_query_current_chat: `${prefix}play ` }
-        ],
-        [
-          { text: `📥 ${prefix}grab`, switch_inline_query_current_chat: `${prefix}grab ` },
-          { text: `👥 ${prefix}pfp`, switch_inline_query_current_chat: `${prefix}pfp ` }
-        ],
-        [
-          { text: `🔍 ${prefix}pint`, switch_inline_query_current_chat: `${prefix}pint ` },
-          { text: `🎀 ${prefix}menu`, callback_data: encodeCallback('dashboard', 'open') }
-        ],
-        [
-          { text: `✨ Suggestions ↗️`, switch_inline_query_current_chat: `${prefix}` }
-        ]
-      ]
-    };
-
-    return await this.api.sendMessage(chatId, cardHtml, {
-      parse_mode: 'HTML',
-      reply_markup: keyboard
-    });
+    return await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
   }
 
   async updateCommandsForChat(chatId, prefix = '/') {
     try {
+      if (prefix === '/') {
+        await this.api.call('deleteMyCommands', {
+          scope: { type: 'chat', chat_id: Number(chatId) }
+        }).catch(() => {});
+        return;
+      }
+
+      const botName = this.botContext?.botName || 'Lancy';
       const commands = [
-        { command: 'game', description: `[${prefix}game] Trivia arena & flag quiz` },
+        { command: 'start', description: `[${prefix}start] Open ${botName} companion menu` },
+        { command: 'menu', description: `[${prefix}menu] Open ${botName} dashboard` },
+        { command: 'help', description: `[${prefix}help] View command suggestions` },
+        { command: 'game', description: `[${prefix}game] 16+ Live Games Arena Hub` },
+        { command: 'grid', description: `[${prefix}grid] 8×8 Word Grid Challenge` },
+        { command: 'pokemon', description: `[${prefix}pokemon] Catch wild & Shiny Pokémon` },
+        { command: 'pokebattle', description: `[${prefix}pokebattle] 1v1 Pokémon Stadium Duel` },
+        { command: 'pokedex', description: `[${prefix}pokedex] Personal Pokédex & Passport` },
+        { command: 'afro', description: `[${prefix}afro] Guess the Naija / Afrobeats Song` },
+        { command: 'songgame', description: `[${prefix}songgame] Guess the Song (Audio Clip)` },
+        { command: 'lyricgame', description: `[${prefix}lyricgame] Finish the Lyrics Challenge` },
+        { command: 'anime', description: `[${prefix}anime] Guess the Anime Character` },
+        { command: 'flags', description: `[${prefix}flags] Guess the Country Flag` },
+        { command: 'logos', description: `[${prefix}logos] Guess the Car / Brand Logo` },
+        { command: 'ttt', description: `[${prefix}ttt] 1v1 Tic-Tac-Toe Board` },
+        { command: 'connect4', description: `[${prefix}connect4] 1v1 Connect Four Board` },
+        { command: 'topleaderboard', description: `[${prefix}topleaderboard] Game Hall of Fame` },
         { command: 'play', description: `[${prefix}play] Stream high-speed 320k MP3` },
         { command: 'grab', description: `[${prefix}grab] Download HD video/music` },
         { command: 'pfp', description: `[${prefix}pfp] Matching PFP albums` },
@@ -4448,18 +5271,12 @@ Fast 30s rounds with smart hints dropping at 20s and 10s! Anyone can reply in ch
         { command: 'stickers', description: `[${prefix}stickers] Telegram sticker studio` },
         { command: 'postchannel', description: `[${prefix}postchannel] Post pack to channel` },
         { command: 'autopost', description: `[${prefix}autopost] Schedule sticker drops` },
-        { command: 'menu', description: `[${prefix}menu] Open dashboard & settings` },
         { command: 'setprefix', description: `[${prefix}setprefix] Change command trigger prefix` },
-        { command: 'help', description: `[${prefix}help] View command suggestions` }
+        { command: 'cancel', description: `[${prefix}cancel] Cancel current active operation` }
       ];
       await this.api.call('setMyCommands', {
         commands,
         scope: { type: 'chat', chat_id: Number(chatId) }
-      }).catch(() => {});
-
-      await this.api.call('setChatMenuButton', {
-        chat_id: Number(chatId),
-        menu_button: { type: 'commands' }
       }).catch(() => {});
     } catch {}
   }

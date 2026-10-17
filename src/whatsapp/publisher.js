@@ -270,7 +270,7 @@ export class WhatsAppPublisher extends EventEmitter {
     };
 
     const retryCount = this.settings?.get('whatsapp.retryCount') ?? 3;
-    const delayBetween = this.settings?.get('whatsapp.publishingDelayMs') ?? 1200;
+    const delayBetween = this.settings?.get('whatsapp.publishingDelayMs') ?? 350;
     const api = telegramApi ?? this.telegramApi;
     const ffmpegPath = resolveFfmpegPath(this.settings?.get('media.ffmpegPath') ?? '');
     const sampleLimit = Math.min(5, Math.max(2, Number(this.settings?.get('whatsapp.sampleStickersCount') ?? 3)));

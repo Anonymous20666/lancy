@@ -151,6 +151,11 @@ export function createCloneScreen({ app }) {
     const userCount = app.db.get('SELECT COUNT(*) AS c FROM bot_users WHERE bot_id = ?', botRecord.id)?.c ?? 0;
     const runningBot = app.multiBotManager?.runningBots.get(botRecord.id);
     const supportsInline = runningBot?.controller?.supportsInline ?? false;
+    let fjCount = 0;
+    try {
+      const row = app.db.get('SELECT value_json FROM bot_settings WHERE key = ?', `force_join.clone_${botRecord.id}`);
+      if (row?.value_json) fjCount = (JSON.parse(row.value_json) || []).length;
+    } catch {}
 
     const b = new RichMessageBuilder();
     b.paragraph(rt.bold(banner([
@@ -163,6 +168,7 @@ export function createCloneScreen({ app }) {
       ['🏷 Bot Name', botRecord.bot_name],
       ['🤖 Username', `@${botRecord.bot_username}`],
       ['⚡ Status', `${statusDot(isOnline ? 'online' : 'offline')} ${botRecord.status.toUpperCase()}`],
+      ['🔒 Force-Join', fjCount > 0 ? `✓ ${fjCount} Channel(s) Active` : 'Off (Tap below to add)'],
       ['🔍 Live Search', supportsInline ? '✓ Enabled' : '⚠️ Disabled (needs /setinline)'],
       ['👥 Total Users', `${userCount} active users`],
       ['📅 Created', botRecord.created_at?.slice(0, 10) || 'Recently']
@@ -182,6 +188,10 @@ export function createCloneScreen({ app }) {
     b.buttons([
       richButton.url(`🚀 Open @${botRecord.bot_username}`, `https://t.me/${botRecord.bot_username}`),
       richButton.callback('📢 Broadcast Message', encodeCallback(id, 'broadcast', botRecord.id), { style: 'primary' })
+    ]);
+
+    b.buttons([
+      richButton.callback('🔒 Force-Join Channels', `fj_open:${botRecord.id}`, { style: 'success' })
     ]);
 
     const toggleText = isOnline ? '⏸ Pause Bot' : '▶ Resume Bot';

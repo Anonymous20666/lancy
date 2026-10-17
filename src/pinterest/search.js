@@ -81,7 +81,7 @@ export class DeepSearchPipeline extends EventEmitter {
     const maxPages = effectiveMode === 'videos'
       ? computedPages
       : (Number(requestedGoal) > 0 ? computedPages : Math.max(computedPages, this.settings?.get('pinterest.depthPages')?.[depth] ?? computedPages));
-    const maxConcurrent = Math.max(1, this.settings?.get('pinterest.maxConcurrentSearches') ?? 2);
+    const maxConcurrent = Math.max(6, this.settings?.get('pinterest.maxConcurrentSearches') ?? 6);
     const timeoutMs = (this.settings?.get('pinterest.searchTimeoutSeconds') ?? 30) * 1000;
 
     // Enhance video search queries with video intent so Pinterest returns actual video pins
@@ -141,7 +141,7 @@ export class DeepSearchPipeline extends EventEmitter {
 
     // 2–4. Search + paginate/expand. Keep going until we have enough
     // candidates to survive validation + dedupe down to the goal.
-    const maxCrawlPages = Math.max(maxPages, 20);
+    const maxCrawlPages = Math.max(maxPages, 25);
     while (pagesFetched < maxCrawlPages) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       const pageTimeout = AbortSignal.any ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)].filter(Boolean)) : signal;
@@ -173,7 +173,7 @@ export class DeepSearchPipeline extends EventEmitter {
         : mode === 'images'
         ? collected.filter((i) => i.type === 'image').length
         : collected.length;
-      const neededRaw = Math.ceil(goal * 1.4) + 10;
+      const neededRaw = Math.ceil(goal * 1.5) + 12;
       if (!bookmark || targetCount >= neededRaw) break;
     }
 
@@ -202,24 +202,37 @@ export class DeepSearchPipeline extends EventEmitter {
       } catch { /* non-fatal */ }
     }
 
-    // Deep fallback: if seen deduplication filtered early candidates and targetCount < goal, crawl topic variations
+    // Deep parallel fallback: if seen deduplication filtered early candidates and targetCount < goal, crawl topic variations concurrently
     const currentTargetCount = mode === 'videos'
       ? collected.filter((i) => i.type === 'video').length
       : mode === 'images'
       ? collected.filter((i) => i.type === 'image').length
       : collected.length;
-    if (currentTargetCount < goal && !signal?.aborted) {
-      const topicVariations = [
-        `${normalized} aesthetic`,
-        `${normalized} wallpaper`,
-        `${normalized} art`,
-        `${normalized} hd 4k`,
-        `${normalized} photography`
-      ];
-      for (const varTerm of topicVariations) {
-        if (collected.length >= goal * 2 || signal?.aborted) break;
-        try {
-          const varPage = await this.provider.search({ query: varTerm, signal });
+    if (currentTargetCount < goal * 1.3 && !signal?.aborted) {
+      const topicVariations = mode === 'videos'
+        ? [
+            `${normalized} edit 4k`,
+            `${normalized} amv clip`,
+            `${normalized} video aesthetic`,
+            `${normalized} tiktok edit`
+          ]
+        : [
+            `${normalized} aesthetic`,
+            `${normalized} wallpaper`,
+            `${normalized} hd 4k`,
+            `${normalized} art`,
+            `${normalized} icon pfp`,
+            `${normalized} dark aesthetic`,
+            `${normalized} photography`,
+            `${normalized} ultra hd`
+          ];
+      for (let i = 0; i < topicVariations.length; i += 3) {
+        if (collected.length >= goal * 2.2 || signal?.aborted) break;
+        const batch = topicVariations.slice(i, i + 3);
+        const batchPages = await Promise.all(
+          batch.map((varTerm) => this.provider.search({ query: varTerm, signal }).catch(() => null))
+        );
+        for (const varPage of batchPages) {
           for (const item of (varPage?.items ?? [])) {
             if (!seenPins.has(item.pinId) && !(item.mediaUrl && seenMediaUrls.has(item.mediaUrl))) {
               seenPins.add(item.pinId);
@@ -227,7 +240,7 @@ export class DeepSearchPipeline extends EventEmitter {
               collected.push({ ...item, searchId });
             }
           }
-        } catch {}
+        }
       }
     }
 

@@ -557,7 +557,7 @@ export function createDownloaderScreen({ app }) {
     return b.toJSON();
   }
 
-  function renderDownloadProgress({ stage, platform, url, elapsedMs = 0, current = 0, total = 0 }) {
+  function renderDownloadProgress({ stage, platform, url, elapsedMs = 0, current = 0, total = 0, requester = null }) {
     const b = new RichMessageBuilder();
     b.header('𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪', 1);
     b.paragraph(rt.italic('₊˚⊹♡  processing your media  ˙ᵕ˙'));
@@ -569,6 +569,7 @@ export function createDownloaderScreen({ app }) {
       `🔗 Link: ${truncate(url, 40)}\n` +
       (platform ? `📱 Platform: ${platform.toUpperCase()}\n` : '') +
       (total > 0 ? `📦 Items: ${current}/${total}\n` : '') +
+      (requester ? `👤 Requested by: ${requester}\n` : '') +
       `⏱ Elapsed: ${elapsedSec}s ♡`
     ));
     b.divider();
@@ -993,16 +994,24 @@ export function createDownloaderScreen({ app }) {
       }
     }
 
+    const ctrl = ctx.controller || app.telegram?.controller;
+    const releaseSlot = ctrl?.acquireUserTaskSlot
+      ? await ctrl.acquireUserTaskSlot(ctx.tgId, ctx.chatId, ctx.message?.message_id, isGroup)
+      : null;
+    if (releaseSlot === false) return;
+
     const screenMsgId = (isGroup || forceNew) ? null : (ctx.messageId ?? ctx.sm?.context(ctx.tgId)?.screenMessageId);
+    const requesterName = isGroup ? (ctx.user?.first_name || ctx.message?.from?.first_name || 'Member') : null;
     const tracker = new ProgressTracker({
       api: ctx.api || app.telegram.api,
       chatId: ctx.chatId,
       messageId: screenMsgId,
+      replyToMessageId: isGroup ? (ctx.message?.message_id || null) : null,
       heartbeatMs: 2000,
       action: 'typing'
     });
 
-    await tracker.live((state, { elapsedMs }) => renderDownloadProgress({ ...state, elapsedMs, url }), {
+    await tracker.live((state, { elapsedMs }) => renderDownloadProgress({ ...state, elapsedMs, url, requester: requesterName }), {
       stage: ctx.initialStage || 'Analyzing link & detecting platform…',
       platform: '',
       url
@@ -1250,6 +1259,8 @@ export function createDownloaderScreen({ app }) {
       b.validate();
       await tracker.finish(b.toJSON());
       await ctx.sm?.reset(ctx.tgId, { reason: 'download_error' });
+    } finally {
+      if (typeof releaseSlot === 'function') releaseSlot();
     }
   }
 
