@@ -128,6 +128,7 @@ export class MediaDownloader {
     if (/spotify\.com/.test(u)) return 'spotify';
     if (/reddit\.com|redd\.it/.test(u)) return 'reddit';
     if (/threads\.net/.test(u)) return 'threads';
+    if (/spankbang\.com/.test(u)) return 'spankbang';
     if (/\.(mp4|webm|mov|mkv)(\?|$)/i.test(u)) return 'direct-video';
     if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(u)) return 'direct-photo';
     if (/\.(mp3|m4a|wav|ogg|opus)(\?|$)/i.test(u)) return 'direct-audio';
@@ -173,6 +174,8 @@ export class MediaDownloader {
         return this.#downloadSpotify(rawUrl, { onProgress });
       case 'music-search':
         return this.#downloadMusicSearch(rawUrl, { onProgress });
+      case 'spankbang':
+        return this.#downloadSpankbang(rawUrl, { onProgress });
       case 'direct-video':
       case 'direct-photo':
       case 'direct-audio':
@@ -1707,6 +1710,31 @@ export class MediaDownloader {
       mediaItems,
       audioTrack
     };
+  }
+
+  /**
+   * Spankbang 18+ Video Downloader
+   */
+  async #downloadSpankbang(url, { onProgress }) {
+    onProgress?.('Extracting 18+ video stream… ♡');
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        signal: AbortSignal.timeout(10000)
+      });
+      const html = await res.text();
+      const mp4Match = html.match(/https:\/\/tbv\.sb-cd\.com\/t\/\d+\/[0-9a-z]+\/[0-9a-z]+\/td\.mp4/i);
+      const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].replace(/- SpankBang/i, '').trim() : '18+ Adult Video';
+      if (mp4Match) {
+        onProgress?.('Downloading video clip… ♡');
+        return this.#downloadDirect(mp4Match[0], { onProgress });
+      }
+      throw new Error('Could not extract direct stream for this video');
+    } catch (err) {
+      this.log.debug({ err: err?.message, url }, 'spankbang extraction fallback to universal');
+      return this.#downloadUniversal(url, { onProgress, platform: 'spankbang' });
+    }
   }
 
   /**

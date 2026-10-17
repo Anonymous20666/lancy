@@ -37,6 +37,9 @@ export function createPinterestScreen({ app }) {
       richButton.callback('👥 Matching PFP Albums', encodeCallback('downloader', 'pfp_menu'), { style: 'primary' }),
       richButton.callback('🕘 Search History', encodeCallback(id, 'history'), { style: 'primary' })
     ]);
+    b.buttons([
+      richButton.callback('🔞 18+ Adult & Hentai Studio', encodeCallback('nsfw', 'open'), { style: 'primary' })
+    ]);
     b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));
     b.footer(rt.italic(`depth: ${ctx.settings.get('pinterest.searchDepth')} • duplicates are always filtered ♡`));

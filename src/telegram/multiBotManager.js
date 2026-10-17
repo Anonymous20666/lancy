@@ -17,6 +17,7 @@ import { createDownloaderScreen } from './screens/downloader.js';
 import { createCloneScreen } from './screens/clone.js';
 import { createChannelPostScreen } from './screens/channelPost.js';
 import { createAutoPostScreen } from './screens/autoPost.js';
+import { createNsfwScreen } from './screens/nsfw.js';
 
 const SCREEN_FACTORIES = [
   createDashboardScreen,
@@ -29,7 +30,8 @@ const SCREEN_FACTORIES = [
   createDownloaderScreen,
   createCloneScreen,
   createChannelPostScreen,
-  createAutoPostScreen
+  createAutoPostScreen,
+  createNsfwScreen
 ];
 
 /**

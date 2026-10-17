@@ -26,12 +26,14 @@ import {
   buildForceJoinGateRich,
   buildForceJoinManagerRich
 } from './forceJoin.js';
+import { searchNsfw, NSFW_CATEGORIES } from '../wallpaper/nsfwSearch.js';
 
 const execFileAsync = promisify(execFile);
 export const inlineSearchCache = new Map();
 export const inlinePinterestCache = new Map();
 export const inlineTikTokCache = new Map();
 export const inlineMusicCache = new Map();
+export const inlineNsfwCache = new Map();
 export const inlineUrlCache = new Map();
 export const recentInlineSearchResults = new Map();
 
@@ -1768,6 +1770,115 @@ export class TelegramController extends EventEmitter {
     }
   }
 
+  async #fetchInlineNsfwSearch(queryTopic, offset = 0, userId = null) {
+    if (!queryTopic) return { results: [], nextOffset: '' };
+    try {
+      const botUser = this.botUsername || 'Lancy_easy_bot';
+      const cleanTopic = String(queryTopic || '').trim();
+      const numOffset = parseInt(offset, 10) || 0;
+      const page = Math.floor(numOffset / 10);
+
+      // Determine category from query if explicit
+      let category = NSFW_CATEGORIES.ALL;
+      if (/\b(uncensored|hentai\s*uncensored)\b/i.test(cleanTopic)) {
+        category = NSFW_CATEGORIES.HENTAI_UNCENSORED;
+      } else if (/\b(ecchi|censored)\b/i.test(cleanTopic)) {
+        category = NSFW_CATEGORIES.HENTAI_CENSORED;
+      } else if (/\b(video|videos|clip|movie)\b/i.test(cleanTopic)) {
+        category = NSFW_CATEGORIES.VIDEOS;
+      } else if (/\b(real|4k|baddie|amateur|gonewild|model)\b/i.test(cleanTopic)) {
+        category = NSFW_CATEGORIES.REAL_WALLPAPERS;
+      } else if (/\b(gif|animated)\b/i.test(cleanTopic)) {
+        category = NSFW_CATEGORIES.ANIMATED;
+      }
+
+      const searchRes = await searchNsfw({
+        query: cleanTopic,
+        category,
+        page,
+        limit: 10
+      });
+
+      const items = searchRes.results || [];
+      if (!items.length) return { results: [], nextOffset: '' };
+
+      const nextOffset = items.length >= 8 ? String(numOffset + items.length) : '';
+      const results = [];
+
+      for (let idx = 0; idx < items.length; idx++) {
+        const item = items[idx];
+        const resId = `nsfw_${page}_${idx}_${Date.now()}`;
+        const title = safeText(item.title || cleanTopic, 45);
+
+        if (item.type === 'video' && item.mediaUrl && /\.mp4(\?|$)/i.test(item.mediaUrl)) {
+          results.push({
+            type: 'video',
+            id: resId,
+            video_url: item.mediaUrl,
+            mime_type: 'video/mp4',
+            thumb_url: item.thumbUrl || item.mediaUrl,
+            thumbnail_url: item.thumbUrl || item.mediaUrl,
+            title: `🎬 18+ Video: ${title}`,
+            description: `${item.source || '18+ Adult Video'} • ${item.duration || 'HD'} ♡`,
+            caption: `🎬 <b>${escapeHtml(title)}</b>\n🔞 <i>${escapeHtml(item.source || '18+ Adult Video')}</i>\n✨ <i>Found via @${botUser} ♡</i>`,
+            parse_mode: 'HTML',
+            has_spoiler: true,
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `🔞 More "${safeText(cleanTopic, 12)}"`,
+                    switch_inline_query_current_chat: `nsfw ${safeInlineQueryString(cleanTopic, 20)}`,
+                    style: 'primary'
+                  },
+                  {
+                    text: '🎬 18+ Videos',
+                    switch_inline_query_current_chat: `nsfw video ${safeInlineQueryString(cleanTopic, 15)}`,
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          });
+        } else if (item.mediaUrl) {
+          results.push({
+            type: 'photo',
+            id: resId,
+            photo_url: item.mediaUrl,
+            thumb_url: item.thumbUrl || item.mediaUrl,
+            thumbnail_url: item.thumbUrl || item.mediaUrl,
+            title: `🔞 ${title}`,
+            description: `${item.source || '18+ HD Wallpaper'} ♡`,
+            caption: `🔞 <b>${escapeHtml(title)}</b>\n✨ <i>Found via @${botUser} ♡</i>`,
+            parse_mode: 'HTML',
+            has_spoiler: true,
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: `🔞 More "${safeText(cleanTopic, 12)}"`,
+                    switch_inline_query_current_chat: `nsfw ${safeInlineQueryString(cleanTopic, 20)}`,
+                    style: 'primary'
+                  },
+                  {
+                    text: '🌸 Hentai Ecchi',
+                    switch_inline_query_current_chat: `nsfw ecchi ${safeInlineQueryString(cleanTopic, 15)}`,
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          });
+        }
+      }
+
+      return { results, nextOffset };
+    } catch (err) {
+      this.log?.debug?.({ err: err?.message, queryTopic }, 'inline nsfw search failed');
+      return { results: [], nextOffset: '' };
+    }
+  }
+
   async #fetchInlineMusicSearch(queryTopic, offset = 0) {
     if (!queryTopic) return { results: [], nextOffset: '' };
     try {
@@ -2607,6 +2718,17 @@ export class TelegramController extends EventEmitter {
       },
       {
         type: 'article',
+        id: `cmd_nsfw_${prefix}`,
+        title: `🔞 ${prefix}nsfw <search>`,
+        description: 'Search 18+ adult & uncensored/ecchi hentai wallpapers and videos ♡',
+        thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+        input_message_content: {
+          message_text: `${prefix}nsfw `
+        }
+      },
+      {
+        type: 'article',
         id: `cmd_help_${prefix}`,
         title: `୨୧ ${prefix}help`,
         description: 'Display all commands & studio documentation ♡',
@@ -2736,6 +2858,29 @@ export class TelegramController extends EventEmitter {
                 ]
               ]
             }
+          },
+          {
+            type: 'article',
+            id: 'hint_nsfw',
+            title: '🔞 18+ Adult & Hentai Studio 🔞',
+            description: 'Type "nsfw <query>" or "18+ <query>" for uncensored wallpapers & adult clips ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🔞 <b>18+ Adult &amp; Hentai Studio</b>\nType <code>@${this.botUsername || 'bot'} nsfw &lt;query&gt;</code> to browse uncensored/ecchi anime wallpapers and adult videos with spoiler protection! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🔞 Search 18+ Studio',
+                    switch_inline_query_current_chat: 'nsfw ',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
           }
         ];
 
@@ -2794,6 +2939,187 @@ export class TelegramController extends EventEmitter {
           });
           return;
         }
+      }
+
+      // 3a. Check if 18+ / NSFW / Hentai search:
+      if (/^(nsfw|18\+|hentai|adult|ecchi|r18|porn)(?:\b|\s|$)/i.test(rawText)) {
+        const queryTopic = rawText.replace(/^(nsfw|18\+|hentai|adult|ecchi|r18|porn)\s*/i, '').trim();
+        if (!queryTopic) {
+          const suggestionCards = [
+            {
+              type: 'article',
+              id: 'sug_nsfw_uncensored',
+              title: '🔞 Hentai Uncensored Wallpapers',
+              description: 'Browse uncensored hentai anime HD art & 4K wallpapers ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1578632767115-351597cf2477?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1578632767115-351597cf2477?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🔞 <b>Uncensored Hentai 4K Wallpapers</b>\nType <code>@${this.botUsername || 'bot'} nsfw uncensored</code> to browse uncensored art! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🔞 Browse Uncensored Hentai',
+                      switch_inline_query_current_chat: 'nsfw uncensored ',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              type: 'article',
+              id: 'sug_nsfw_ecchi',
+              title: '🌸 Hentai Censored / Ecchi Art',
+              description: 'High-res soft ecchi & aesthetic anime wallpapers ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🌸 <b>Ecchi &amp; Censored Anime Wallpapers</b>\nType <code>@${this.botUsername || 'bot'} nsfw ecchi</code> to browse soft ecchi art! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🌸 Browse Ecchi Anime',
+                      switch_inline_query_current_chat: 'nsfw ecchi ',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              type: 'article',
+              id: 'sug_nsfw_videos',
+              title: '🎬 18+ Videos & Clips (MP4)',
+              description: 'Watch & send adult video previews with spoiler blur ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+              input_message_content: {
+                message_text: `<blockquote>🎬 <b>18+ Adult Video Clips</b>\nType <code>@${this.botUsername || 'bot'} nsfw video</code> to browse adult video previews! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '🎬 Browse 18+ Videos',
+                      switch_inline_query_current_chat: 'nsfw video ',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              type: 'article',
+              id: 'sug_nsfw_real',
+              title: '📸 Real Adult 18+ 4K Wallpapers',
+              description: 'Glamour, model, and amateur adult wallpapers in 4K ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150',
+              input_message_content: {
+                message_text: `<blockquote>📸 <b>Real Adult 18+ 4K Wallpapers</b>\nType <code>@${this.botUsername || 'bot'} nsfw real</code> to browse glamorous adult wallpapers! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '📸 Browse Real Adult 4K',
+                      switch_inline_query_current_chat: 'nsfw real ',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            },
+            {
+              type: 'article',
+              id: 'sug_nsfw_anim',
+              title: '💋 Animated Hentai Clips',
+              description: 'High-speed animated hentai GIFs & clips ♡',
+              thumb_url: 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=150',
+              thumbnail_url: 'https://images.unsplash.com/photo-1509198397868-475647b2a1e5?w=150',
+              input_message_content: {
+                message_text: `<blockquote>💋 <b>Animated Hentai Clips</b>\nType <code>@${this.botUsername || 'bot'} nsfw animated</code> to browse animated clips! ♡</blockquote>`,
+                parse_mode: 'HTML'
+              },
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    {
+                      text: '💋 Browse Animated Hentai',
+                      switch_inline_query_current_chat: 'nsfw animated ',
+                      style: 'primary'
+                    }
+                  ]
+                ]
+              }
+            }
+          ];
+
+          let trendingNsfw = [];
+          try {
+            const trend = await this.#fetchInlineNsfwSearch('genshin', 0, tgId);
+            if (trend?.results?.length) trendingNsfw = trend.results.slice(0, 8);
+          } catch {}
+
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: [...suggestionCards, ...trendingNsfw],
+            cache_time: 1,
+            is_personal: true
+          });
+          return;
+        }
+
+        const { results: nsfwResults, nextOffset } = await this.#fetchInlineNsfwSearch(queryTopic, offset, tgId);
+        if (nsfwResults && nsfwResults.length > 0) {
+          await this.api.call('answerInlineQuery', {
+            inline_query_id: qId,
+            results: nsfwResults,
+            next_offset: nextOffset,
+            cache_time: 1,
+            is_personal: true
+          });
+          return;
+        }
+
+        // Fallback card when 0 results found
+        await this.api.call('answerInlineQuery', {
+          inline_query_id: qId,
+          results: [{
+            type: 'article',
+            id: 'nsfw_none_' + Date.now(),
+            title: `🔞 No adult results for "${queryTopic}"`,
+            description: 'Try searching for an anime character like "genshin", "naruto", "tifa", or "model" ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1579783900882-c0d3dad7b119?w=150',
+            input_message_content: {
+              message_text: `<blockquote>🔞 <b>18+ Adult Studio</b>\nCould not find adult media for <code>${escapeHtml(queryTopic)}</code>.\nTry searching in chat with <code>/nsfw ${escapeHtml(queryTopic)}</code> for deep multi-provider extraction! ♡</blockquote>`,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  {
+                    text: '🔞 Try Another 18+ Search',
+                    switch_inline_query_current_chat: 'nsfw ',
+                    style: 'primary'
+                  }
+                ]
+              ]
+            }
+          }],
+          cache_time: 1,
+          is_personal: true
+        });
+        return;
       }
 
       // 3. Check if Pinterest / photo search:
@@ -3281,7 +3607,8 @@ export class TelegramController extends EventEmitter {
         'afro', 'naija', 'songgame', 'lyricgame', 'anime', 'flags', 'logos', 'cars',
         'scramble', 'emoji', 'riddle', 'ttt', 'tictactoe', 'connect4', 'rps', 'topleaderboard',
         'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel',
-        'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp', 'forcejoin', 'fsub'
+        'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp', 'forcejoin', 'fsub',
+        'nsfw', '18+', 'hentai', 'adult', 'ecchi', 'r18', 'porn'
       ];
       const matchPrefixAttempt = text.match(/^([^\w\s]{1,3})([a-z0-9]+)(\s+.*)?$/i);
       if (matchPrefixAttempt) {
@@ -3683,6 +4010,17 @@ export class TelegramController extends EventEmitter {
       }
       if (command === '/search' || command === '/pinterest' || command === '/pint') {
         const query = rest.join(' ').trim();
+        // If explicit adult search query, route seamlessly to 18+ studio
+        if (query && /\b(nsfw|18\+|hentai|porn|uncensored|lewd|r18|ecchi)\b/i.test(query)) {
+          await this.sm.reset(tgId, { reason: 'command' });
+          const nsfw = this.screens.get('nsfw');
+          const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+          if (nsfw?.executeSearch) {
+            const sent = await nsfw.executeSearch(ctx, query, 'all');
+            updateScreenMsg(sent);
+            return;
+          }
+        }
         await this.sm.reset(tgId, { reason: 'command' });
         const pinterest = this.screens.get('pinterest');
         const ctx = this.#ctx(tgId, { message }, { forceNew: true });
@@ -3691,6 +4029,20 @@ export class TelegramController extends EventEmitter {
           updateScreenMsg(sent);
         } else {
           const sent = await pinterest?.open(ctx);
+          updateScreenMsg(sent);
+        }
+        return;
+      }
+      if (command === '/nsfw' || command === '/18+' || command === '/hentai' || command === '/adult' || command === '/ecchi' || command === '/r18' || command === '/porn') {
+        const query = rest.join(' ').trim();
+        await this.sm.reset(tgId, { reason: 'command' });
+        const nsfw = this.screens.get('nsfw');
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        if (query && nsfw?.executeSearch) {
+          const sent = await nsfw.executeSearch(ctx, query, 'all');
+          updateScreenMsg(sent);
+        } else {
+          const sent = await nsfw?.open(ctx);
           updateScreenMsg(sent);
         }
         return;
