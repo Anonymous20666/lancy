@@ -273,3 +273,18 @@ test('TelegramController: /nsfw slash commands and live inline search routing', 
   assert.ok(queryAnswer.results.length > 0);
   assert.equal(queryAnswer.results[0].has_spoiler, true);
 });
+
+test('nsfwSearch: real adult category separation and preview rendering', async () => {
+  // Test real adult search with anime query does not label result as anime
+  const realRes = await searchNsfw({
+    query: 'chainsaw_man',
+    category: NSFW_CATEGORIES.REAL_WALLPAPERS,
+    limit: 3
+  });
+  assert.ok(realRes.results.length > 0);
+  assert.equal(realRes.category, NSFW_CATEGORIES.REAL_WALLPAPERS);
+  // Verify title is clean and not falsely claiming Nekobot model is chainsaw man
+  assert.ok(!realRes.results[0].title.includes('chainsaw_man'));
+  assert.equal(realRes.results[0].title, 'Real 18+ 4K Adult Wallpaper');
+});
+

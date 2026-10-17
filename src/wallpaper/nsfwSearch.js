@@ -242,9 +242,13 @@ async function fetchRealAdultWallpapers(query = '', page = 0, limit = 10, signal
   for (const s of settled) {
     if (s?.success && s?.message && !seenUrls.has(s.message)) {
       seenUrls.add(s.message);
+      const isModelKeyword = /model|asian|blonde|brunette|latina|baddie|glamour|fitness|goth|4k|boob|ass|amateur/i.test(cleanQ);
+      const title = cleanQ && isModelKeyword
+        ? `Real 18+ 4K Wallpaper (${cleanQ})`
+        : 'Real 18+ 4K Adult Wallpaper';
       results.push({
         id: `real_adult_${Math.random().toString(36).slice(2, 9)}`,
-        title: cleanQ ? `Real 18+ HD Wallpaper (${cleanQ})` : 'Real 18+ 4K HD Wallpaper',
+        title,
         type: 'photo',
         mediaUrl: s.message,
         thumbUrl: s.message,

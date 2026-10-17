@@ -5,6 +5,52 @@ import { ProgressTracker } from '../progress.js';
 import { searchNsfw, NSFW_CATEGORIES } from '../../wallpaper/nsfwSearch.js';
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice } from '../permissions.js';
+import { optimizePreviewImage } from '../../media/convert.js';
+import { logger } from '../../core/logger.js';
+
+const log = logger().child({ module: 'nsfw-screen' });
+
+async function fetchPreviewBuffers(items, max = 3) {
+  const previewBlocks = [];
+  const mediaFiles = {};
+  let idx = 0;
+
+  const topItems = (items || []).slice(0, max);
+  const promises = topItems.map(async (it) => {
+    if (!it.mediaUrl && !it.thumbUrl) return null;
+    const targetUrl = it.thumbUrl || it.mediaUrl;
+    try {
+      const res = await fetch(targetUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+        signal: AbortSignal.timeout(3500)
+      });
+      if (!res.ok) return null;
+      const arrayBuf = await res.arrayBuffer();
+      const rawBuf = Buffer.from(arrayBuf);
+      if (it.type === 'video') {
+        return { type: 'video', buffer: rawBuf, mime: 'video/mp4' };
+      }
+      const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1080, quality: 80 });
+      return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+    } catch {
+      return null;
+    }
+  });
+
+  const loaded = await Promise.all(promises);
+  for (const item of loaded) {
+    if (!item) continue;
+    const field = `${item.type}_${idx}`;
+    mediaFiles[field] = {
+      buffer: item.buffer,
+      filename: `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
+      contentType: item.mime
+    };
+    previewBlocks.push({ type: item.type, ref: `attach://${field}` });
+    idx++;
+  }
+  return { previewBlocks, mediaFiles };
+}
 
 export function createNsfwScreen({ app }) {
   const id = 'nsfw';
@@ -91,21 +137,26 @@ export function createNsfwScreen({ app }) {
       all: '18+ Adult & Hentai'
     };
 
+    const categoryExamples = {
+      [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'baddie'],
+      [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'genshin', 'makima', 'yor forger', 'marin kitagawa'],
+      [NSFW_CATEGORIES.HENTAI_CENSORED]: ['waifu', 'swimsuit', 'lingerie', 'genshin', 'honkai', 'anime girl'],
+      [NSFW_CATEGORIES.VIDEOS]: ['hentai', 'cosplay', 'asian', 'brunette', 'latina', 'glamour'],
+      [NSFW_CATEGORIES.ANIMATED]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
+      all: ['tifa', 'asian model', 'genshin', 'blonde', 'waifu', 'latina']
+    };
+
+    const examples = categoryExamples[category] || categoryExamples.all;
+    const exampleParts = [rt.text('examples: ')];
+    examples.forEach((ex, i) => {
+      if (i > 0) exampleParts.push(rt.text(', '));
+      exampleParts.push(rt.code(ex));
+    });
+
     const b = new RichMessageBuilder();
     b.header(`🔞 SEARCH ${categoryLabels[category]?.toUpperCase() || '18+ STUDIO'}`, 1);
     b.paragraph(rt.italic('send me what you want to search for ♡'));
-    b.paragraph(rt.concat(
-      rt.text('examples: '),
-      rt.code('naruto'),
-      rt.text(', '),
-      rt.code('genshin'),
-      rt.text(', '),
-      rt.code('tifa'),
-      rt.text(', '),
-      rt.code('asian model'),
-      rt.text(', '),
-      rt.code('blonde')
-    ));
+    b.paragraph(rt.concat(...exampleParts));
     b.divider();
     b.buttons([
       richButton.callback('🎲 Random Pick Instead', encodeCallback(id, 'random', category), { style: 'primary' })
@@ -297,10 +348,68 @@ export function createNsfwScreen({ app }) {
         richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
         richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
       ]);
+      // Fetch preview images so pictures are visibly embedded in the slideshow
+      let previewFiles = null;
+      try {
+        const { previewBlocks, mediaFiles } = await fetchPreviewBuffers(items, 3);
+        if (previewBlocks.length > 0) {
+          const slideItems = previewBlocks.map((p) => {
+            if (p.type === 'video') return block.video(p.ref);
+            return block.photo(p.ref);
+          });
+          b.slideshow(slideItems);
+          b.divider();
+          if (Object.keys(mediaFiles).length > 0) {
+            previewFiles = mediaFiles;
+          }
+        }
+      } catch (e) {
+        log.debug({ err: e?.message }, 'could not attach preview buffers');
+      }
+
       b.footer(rt.italic('୨୧ 18+ adult studio • multi-source HD delivery ♡'));
       b.validate();
 
-      await tracker.finish(b.toJSON());
+      await tracker.finish(b.toJSON(), previewFiles);
+
+      // Auto-deliver top pick directly into chat for random spicy pick
+      if (opts.isRandomPick && items[0]) {
+        const top = items[0];
+        const caption = `🔞 <b>${top.title || '18+ Spicy Pick'}</b>\n👤 <i>Delivered for ${requesterMention} ♡</i>`;
+        try {
+          if (top.type === 'video') {
+            await api.sendVideo(chatId, top.mediaUrl, {
+              caption,
+              parse_mode: 'HTML',
+              has_spoiler: Boolean(isGroup)
+            }).catch(async () => {
+              if (previewFiles?.['video_0']?.buffer) {
+                await api.sendVideo(chatId, previewFiles['video_0'].buffer, {
+                  caption,
+                  parse_mode: 'HTML',
+                  has_spoiler: Boolean(isGroup)
+                });
+              }
+            });
+          } else {
+            await api.sendPhoto(chatId, top.mediaUrl, {
+              caption,
+              parse_mode: 'HTML',
+              has_spoiler: Boolean(isGroup)
+            }).catch(async () => {
+              if (previewFiles?.['photo_0']?.buffer) {
+                await api.sendPhoto(chatId, previewFiles['photo_0'].buffer, {
+                  caption,
+                  parse_mode: 'HTML',
+                  has_spoiler: Boolean(isGroup)
+                });
+              }
+            });
+          }
+        } catch (deliveryErr) {
+          log.debug({ err: deliveryErr?.message }, 'direct random pick delivery failed');
+        }
+      }
     } catch (err) {
       log.error({ err: err?.message, query }, 'nsfw search failed');
       const b = new RichMessageBuilder();
@@ -368,9 +477,23 @@ export function createNsfwScreen({ app }) {
         has_spoiler: Boolean(isGroupChat),
         reply_to_message_id: ctx.query?.message?.message_id
       }).catch(async () => {
-        // Fallback to document
-        await api.sendDocument(chatId, row.media_url, {
-          caption,
+        // Fallback: fetch buffer and upload directly
+        try {
+          const res = await fetch(row.media_url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            signal: AbortSignal.timeout(6000)
+          });
+          if (res.ok) {
+            const buf = Buffer.from(await res.arrayBuffer());
+            return await api.sendPhoto(chatId, buf, {
+              caption,
+              parse_mode: 'HTML',
+              has_spoiler: Boolean(isGroupChat),
+              reply_to_message_id: ctx.query?.message?.message_id
+            });
+          }
+        } catch {}
+        await api.sendMessage(chatId, `${caption}\n🔗 <a href="${row.media_url}">Open HD Wallpaper</a>`, {
           parse_mode: 'HTML',
           reply_to_message_id: ctx.query?.message?.message_id
         }).catch(() => {});
@@ -431,9 +554,17 @@ export function createNsfwScreen({ app }) {
           return askQuery(ctx, args[0] || 'all');
         case 'random': {
           const cat = args[0] || 'all';
-          const randomTags = ['genshin', 'naruto', 'one_piece', 'tsunade', 'tifa', 'honkai', 'chainsaw_man', 'bleach', 'waifu', 'baddie'];
-          const pick = randomTags[Math.floor(Math.random() * randomTags.length)];
-          return runSearch(ctx, pick, cat, 0);
+          const randomPools = {
+            [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'baddie', 'fitness model', 'goth girl'],
+            [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'raiden_shogun', 'makima', 'yor_forger', 'marin_kitagawa', '2b', 'yae_miko', 'r34'],
+            [NSFW_CATEGORIES.HENTAI_CENSORED]: ['waifu', 'swimsuit', 'lingerie', 'genshin_impact', 'honkai_star_rail', 'anime_girl'],
+            [NSFW_CATEGORIES.VIDEOS]: ['hentai', 'cosplay', 'asian', 'brunette', 'latina', 'baddie'],
+            [NSFW_CATEGORIES.ANIMATED]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
+            all: ['tifa', 'asian model', 'genshin', 'blonde', 'tsunade', 'brunette', 'latina', 'waifu']
+          };
+          const pool = randomPools[cat] || randomPools.all;
+          const pick = pool[Math.floor(Math.random() * pool.length)];
+          return runSearch(ctx, pick, cat, 0, { isRandomPick: true });
         }
         case 'page': {
           const targetPage = parseInt(args[0], 10) || 0;
