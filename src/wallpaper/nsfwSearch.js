@@ -85,26 +85,20 @@ async function fetchWallhaven(query = '', purity = '011', categories = '111', pa
 }
 
 /**
- * Fetch uncensored anime / hentai wallpapers from Wallhaven, Yande.re & Nekobot.
+ * Fetch uncensored anime / hentai wallpapers from Yande.re, TBIB & Wallhaven.
+ * Supports exact character lookups (Tifa, Makima, Tsunade, Yor, 2B, etc.) and tags (pussy, blowjob, etc.).
  */
 async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = null) {
   const cleanTag = sanitizeBooruTag(query);
   const results = [];
+  const seenUrls = new Set();
 
-  // 1. Fetch 4K Wallhaven explicit anime wallpapers
-  const whItems = await fetchWallhaven(query, '001', '010', page + 1, Math.min(8, limit), signal);
-  for (const it of whItems) {
-    it.category = NSFW_CATEGORIES.HENTAI_UNCENSORED;
-    results.push(it);
-  }
-
-  // 2. Try Yande.re explicit + sanitized tag
+  // 1. Try Yande.re explicit with wildcard matching for characters/tags
   try {
     const tags = ['rating:explicit'];
     if (cleanTag && cleanTag.length >= 2) {
-      tags.push(cleanTag);
-    } else {
-      tags.push('uncensored');
+      // Use wildcard to match any variant of the character name or tag (e.g. *tifa* -> tifa_lockhart)
+      tags.push(cleanTag.includes('*') ? cleanTag : `*${cleanTag}*`);
     }
     const url = `https://yande.re/post.json?limit=${Math.min(30, limit * 2)}&page=${page + 1}&tags=${encodeURIComponent(tags.join(' '))}`;
     const res = await fetch(url, {
@@ -116,10 +110,11 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
       if (Array.isArray(posts) && posts.length > 0) {
         for (const post of posts) {
           const mediaUrl = post.file_url || post.sample_url || post.jpeg_url;
-          if (mediaUrl) {
+          if (mediaUrl && !seenUrls.has(mediaUrl)) {
+            seenUrls.add(mediaUrl);
             results.push({
               id: `yandere_${post.id}`,
-              title: post.tags ? post.tags.slice(0, 50).replace(/_/g, ' ') : 'Uncensored Hentai Wallpaper',
+              title: post.tags ? post.tags.slice(0, 60).replace(/_/g, ' ') : `${cleanTag || 'Hentai'} Wallpaper`,
               type: 'photo',
               mediaUrl,
               thumbUrl: post.sample_url || post.jpeg_url || post.file_url || mediaUrl,
@@ -136,8 +131,94 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
     log.debug({ err: err?.message, query }, 'yandere uncensored fetch failed');
   }
 
-  // 2b. If specific tag had 0 results, fall back to general explicit on Yande.re
-  if (results.length === 0) {
+  // 2. TBIB (The Big ImageBoard) for additional character & tag coverage
+  if (cleanTag && cleanTag.length >= 2 && results.length < limit) {
+    try {
+      const tbibUrl = `https://tbib.org/index.php?page=dapi&s=post&q=index&json=1&limit=${Math.min(20, limit)}&pid=${page}&tags=${encodeURIComponent(cleanTag)}`;
+      const res = await fetch(tbibUrl, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: signal || AbortSignal.timeout(6000)
+      });
+      if (res.ok) {
+        const posts = await res.json();
+        if (Array.isArray(posts)) {
+          for (const post of posts) {
+            if (post.directory && post.image) {
+              const mediaUrl = `https://tbib.org/images/${post.directory}/${post.image}`;
+              if (!seenUrls.has(mediaUrl)) {
+                seenUrls.add(mediaUrl);
+                results.push({
+                  id: `tbib_${post.id}`,
+                  title: post.tags ? post.tags.slice(0, 60).replace(/_/g, ' ') : `${cleanTag} Wallpaper`,
+                  type: 'photo',
+                  mediaUrl,
+                  thumbUrl: mediaUrl,
+                  width: post.width || 1280,
+                  height: post.height || 720,
+                  category: NSFW_CATEGORIES.HENTAI_UNCENSORED,
+                  source: 'TBIB Anime Studio'
+                });
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      log.debug({ err: err?.message, query }, 'tbib fetch failed');
+    }
+  }
+
+  // 3. Wallhaven sketchy / ecchi anime wallpapers (purity 010 works without API key)
+  if (results.length < limit) {
+    const whItems = await fetchWallhaven(query, '010', '010', page + 1, Math.min(8, limit), signal);
+    for (const it of whItems) {
+      if (!seenUrls.has(it.mediaUrl)) {
+        seenUrls.add(it.mediaUrl);
+        it.category = NSFW_CATEGORIES.HENTAI_UNCENSORED;
+        results.push(it);
+      }
+    }
+  }
+
+  // 4. If query is explicit anatomy / action, supplement with Nekobot explicit hentai
+  if (results.length < limit && cleanTag && /pussy|boob|breast|ass|butt|paizuri|thigh|anal|bj|blowjob/i.test(cleanTag)) {
+    try {
+      let nekoType = 'hentai';
+      if (/paizuri/i.test(cleanTag)) nekoType = 'paizuri';
+      else if (/ass|butt/i.test(cleanTag)) nekoType = 'hass';
+      else if (/boob|breast/i.test(cleanTag)) nekoType = 'hboobs';
+      else if (/thigh/i.test(cleanTag)) nekoType = 'hthigh';
+      else if (/anal/i.test(cleanTag)) nekoType = 'hentai_anal';
+
+      const fetchCount = Math.min(6, limit - results.length);
+      const promises = Array.from({ length: fetchCount }, () =>
+        fetch(`https://nekobot.xyz/api/image?type=${nekoType}`, {
+          headers: { 'User-Agent': USER_AGENT },
+          signal: signal || AbortSignal.timeout(6000)
+        }).then(r => r.json()).catch(() => null)
+      );
+      const settled = await Promise.all(promises);
+      for (const s of settled) {
+        if (s?.success && s?.message && !seenUrls.has(s.message)) {
+          seenUrls.add(s.message);
+          results.push({
+            id: `neko_${Math.random().toString(36).slice(2, 9)}`,
+            title: `Hentai ${cleanTag} Wallpaper`,
+            type: 'photo',
+            mediaUrl: s.message,
+            thumbUrl: s.message,
+            width: 1920,
+            height: 1080,
+            category: NSFW_CATEGORIES.HENTAI_UNCENSORED,
+            source: 'Nekobot'
+          });
+        }
+      }
+    } catch {}
+  }
+
+  // 5. Fallback to general explicit ONLY when user didn't specify a query
+  if (results.length === 0 && !cleanTag) {
     try {
       const fallbackUrl = `https://yande.re/post.json?limit=${Math.min(20, limit)}&page=${page + 1}&tags=rating:explicit`;
       const fRes = await fetch(fallbackUrl, {
@@ -149,7 +230,8 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
         if (Array.isArray(posts)) {
           for (const post of posts) {
             const mediaUrl = post.file_url || post.sample_url || post.jpeg_url;
-            if (mediaUrl) {
+            if (mediaUrl && !seenUrls.has(mediaUrl)) {
+              seenUrls.add(mediaUrl);
               results.push({
                 id: `yandere_fb_${post.id}`,
                 title: post.tags ? post.tags.slice(0, 50).replace(/_/g, ' ') : 'Uncensored Hentai Wallpaper',
@@ -166,39 +248,6 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
         }
       }
     } catch {}
-  }
-
-  // 3. Supplement with Nekobot if needed
-  if (results.length < limit) {
-    try {
-      const types = ['hentai', 'paizuri', 'hass', 'hboobs'];
-      const pickType = types[Math.floor(Math.random() * types.length)];
-      const fetchCount = Math.min(6, limit - results.length);
-      const promises = Array.from({ length: fetchCount }, () =>
-        fetch(`https://nekobot.xyz/api/image?type=${pickType}`, {
-          headers: { 'User-Agent': USER_AGENT },
-          signal: signal || AbortSignal.timeout(6000)
-        }).then(r => r.json()).catch(() => null)
-      );
-      const settled = await Promise.all(promises);
-      for (const s of settled) {
-        if (s?.success && s?.message) {
-          results.push({
-            id: `neko_${Math.random().toString(36).slice(2, 9)}`,
-            title: `Hentai ${pickType.toUpperCase()} Wallpaper`,
-            type: 'photo',
-            mediaUrl: s.message,
-            thumbUrl: s.message,
-            width: 1920,
-            height: 1080,
-            category: NSFW_CATEGORIES.HENTAI_UNCENSORED,
-            source: 'Nekobot'
-          });
-        }
-      }
-    } catch (err) {
-      log.debug({ err: err?.message }, 'nekobot hentai fetch failed');
-    }
   }
 
   return results;
@@ -291,42 +340,50 @@ async function fetchHentaiCensored(query = '', page = 0, limit = 10, signal = nu
 
 /**
  * Fetch Real Adult 18+ 4K Wallpapers and Photos from Wallhaven & Nekobot.
- * Delivers glamour, boudoir, sensual, fitness, and adult model wallpapers.
+ * Delivers exact query matching (pussy, boobs, ass, amateur, models, etc.).
  */
 async function fetchRealAdultWallpapers(query = '', page = 0, limit = 10, signal = null) {
   const cleanQ = String(query || '').toLowerCase().trim();
   const results = [];
+  const seenUrls = new Set();
 
-  // 1. Fetch 4K Wallhaven general/people wallpapers (models, glamour, boudoir, sensual 4K adult photography)
-  const whQuery = cleanQ || 'model';
-  const whItems = await fetchWallhaven(whQuery, '011', '100', page + 1, Math.min(8, limit), signal);
-  for (const it of whItems) {
-    it.category = NSFW_CATEGORIES.REAL_WALLPAPERS;
-    it.title = cleanQ ? `4K Model Wallpaper (${cleanQ})` : '4K Adult Glamour Wallpaper';
-    results.push(it);
+  // Smart anatomical and demographic query routing for Nekobot
+  let nekoTypes = [];
+  if (/\b(pussy|vagina|cunt|slit)\b/i.test(cleanQ)) {
+    nekoTypes = ['pussy'];
+  } else if (/\b(boob|boobs|breast|breasts|tits|cleavage|nipple|nipples)\b/i.test(cleanQ)) {
+    nekoTypes = ['boobs'];
+  } else if (/\b(ass|booty|butt|buttocks)\b/i.test(cleanQ)) {
+    nekoTypes = ['ass'];
+  } else if (/\b(thigh|thighs|legs)\b/i.test(cleanQ)) {
+    nekoTypes = ['thigh'];
+  } else if (/\b(paizuri|boobjob)\b/i.test(cleanQ)) {
+    nekoTypes = ['paizuri'];
+  } else if (/\b(anal)\b/i.test(cleanQ)) {
+    nekoTypes = ['hentai_anal', 'ass'];
+  } else if (/\b(amateur|gonewild|nude|real)\b/i.test(cleanQ)) {
+    nekoTypes = ['gonewild', '4k'];
+  } else if (/\b(4k|hd|wallpaper|glamour|boudoir|fitness|model|asian|latina|blonde|brunette|baddie)\b/i.test(cleanQ)) {
+    nekoTypes = ['4k', 'gonewild'];
+  } else {
+    nekoTypes = ['4k', 'gonewild', 'boobs', 'ass'];
   }
 
-  // 2. Fetch Nekobot 4K Adult photos
-  let types = ['4k', 'gonewild', 'boobs', 'ass'];
-  if (/boob|breast|tits|cleavage/i.test(cleanQ)) types = ['boobs', '4k'];
-  else if (/ass|booty|butt/i.test(cleanQ)) types = ['ass', '4k'];
-  else if (/amateur|nude|real|girl|baddie|latina|asian|blonde|brunette|model/i.test(cleanQ)) types = ['gonewild', '4k'];
-
-  const countToFetch = Math.min(10, Math.max(limit, 6));
-  const promises = Array.from({ length: countToFetch }, (_, idx) => {
-    const t = types[idx % types.length];
+  // 1. Fetch exact matching photos from Nekobot
+  const fetchCount = Math.min(10, Math.max(limit, 6));
+  const promises = Array.from({ length: fetchCount }, (_, idx) => {
+    const t = nekoTypes[idx % nekoTypes.length];
     return fetch(`https://nekobot.xyz/api/image?type=${t}`, {
       headers: { 'User-Agent': USER_AGENT },
-      signal: signal || AbortSignal.timeout(7000)
+      signal: signal || AbortSignal.timeout(6500)
     }).then(r => r.json()).catch(() => null);
   });
 
   const settled = await Promise.all(promises);
-  const seenUrls = new Set(results.map(r => r.mediaUrl));
   for (const s of settled) {
     if (s?.success && s?.message && !seenUrls.has(s.message)) {
       seenUrls.add(s.message);
-      const isModelKeyword = /model|asian|blonde|brunette|latina|baddie|glamour|fitness|goth|4k|boob|ass|amateur/i.test(cleanQ);
+      const isModelKeyword = /model|asian|blonde|brunette|latina|baddie|glamour|fitness|goth|4k|boob|ass|amateur|pussy|vagina|thigh|anal|paizuri/i.test(cleanQ);
       const title = cleanQ && isModelKeyword
         ? `Real 18+ 4K Wallpaper (${cleanQ})`
         : 'Real 18+ 4K Adult Wallpaper';
@@ -344,17 +401,73 @@ async function fetchRealAdultWallpapers(query = '', page = 0, limit = 10, signal
     }
   }
 
+  // 2. Fetch 4K Wallhaven general/people wallpapers
+  const whQuery = cleanQ || 'model';
+  const whItems = await fetchWallhaven(whQuery, '010', '100', page + 1, Math.min(8, limit), signal);
+  for (const it of whItems) {
+    if (!seenUrls.has(it.mediaUrl)) {
+      seenUrls.add(it.mediaUrl);
+      it.category = NSFW_CATEGORIES.REAL_WALLPAPERS;
+      it.title = cleanQ ? `4K Model Wallpaper (${cleanQ})` : '4K Adult Glamour Wallpaper';
+      results.push(it);
+    }
+  }
+
   return results;
 }
 
 /**
- * Fetch 18+ Videos (Direct MP4 streams from Spankbang + XVideos fallback).
+ * Fetch 18+ Videos (Primary XVideos direct playable MP4 previews + SpankBang secondary).
  */
 async function fetch18PlusVideos(query = '', page = 0, limit = 10, category = NSFW_CATEGORIES.REAL_FULL_VIDEOS, signal = null) {
   const cleanQ = String(query || '').trim() || (category === NSFW_CATEGORIES.HENTAI_FULL_VIDEOS ? 'hentai' : 'trending');
   const results = [];
+  const seenUrls = new Set();
 
-  // 1. Spankbang direct MP4 video previews
+  // 1. XVideos - Direct MP4 Video Previews (via data-pvv attribute)
+  try {
+    const isHentai = category === NSFW_CATEGORIES.HENTAI_FULL_VIDEOS || /hentai|anime|3d/i.test(cleanQ);
+    const xvSearchTerm = isHentai && !/hentai/i.test(cleanQ) ? `${cleanQ} hentai` : cleanQ;
+    const xvUrl = `https://www.xvideos.com/?k=${encodeURIComponent(xvSearchTerm)}${page > 0 ? `&p=${page + 1}` : ''}`;
+    const res = await fetch(xvUrl, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: signal || AbortSignal.timeout(9000)
+    });
+    if (res.ok) {
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      $('.thumb-block').each((i, el) => {
+        const titleA = $(el).find('.thumb-under p.title a');
+        const title = titleA.attr('title') || titleA.text().trim() || '18+ Video';
+        const href = titleA.attr('href');
+        const img = $(el).find('.thumb img, img');
+        const thumb = img.attr('data-src') || img.attr('src');
+        const pvvUrl = img.attr('data-pvv') || $(el).attr('data-pvv');
+        const duration = $(el).find('.duration').text().trim();
+
+        // ONLY accept videos that have a genuine direct playable MP4 preview
+        if (href && pvvUrl && pvvUrl.endsWith('.mp4') && !seenUrls.has(pvvUrl)) {
+          seenUrls.add(pvvUrl);
+          results.push({
+            id: `xv_vid_${i}_${Date.now()}`,
+            title: title.slice(0, 70),
+            type: 'video',
+            mediaUrl: pvvUrl,
+            videoUrl: pvvUrl,
+            thumbUrl: thumb || pvvUrl,
+            pageUrl: `https://www.xvideos.com${href}`,
+            duration: duration || 'HD',
+            category,
+            source: 'XVideos Network'
+          });
+        }
+      });
+    }
+  } catch (err) {
+    log.debug({ err: err?.message, query }, 'xvideos fetch failed');
+  }
+
+  // 2. Spankbang Direct MP4 Video Previews (td.mp4)
   try {
     const spankbangUrl = `https://spankbang.com/s/${encodeURIComponent(cleanQ)}/${page > 0 ? `${page + 1}/` : ''}`;
     const res = await fetch(spankbangUrl, {
@@ -379,12 +492,14 @@ async function fetch18PlusVideos(query = '', page = 0, limit = 10, category = NS
         const title = img.attr('alt') || a.attr('title') || '18+ HD Video Clip';
         const thumb = img.attr('src') || img.attr('data-src');
         const mp4Url = dataId ? mp4Map.get(dataId) : null;
-        if (mp4Url && thumb) {
+        if (mp4Url && thumb && !seenUrls.has(mp4Url)) {
+          seenUrls.add(mp4Url);
           results.push({
             id: `sb_vid_${dataId || i}`,
-            title: title.slice(0, 60),
+            title: title.slice(0, 70),
             type: 'video',
             mediaUrl: mp4Url,
+            videoUrl: mp4Url,
             thumbUrl: thumb,
             pageUrl: href ? `https://spankbang.com${href}` : null,
             duration: $(el).find('.l, .duration').text().trim() || 'HD',
@@ -398,45 +513,19 @@ async function fetch18PlusVideos(query = '', page = 0, limit = 10, category = NS
     log.debug({ err: err?.message, query }, 'spankbang video fetch failed');
   }
 
-  // 2. Fallback to XVideos for additional titles and video representations
-  if (results.length < limit) {
-    try {
-      const xvUrl = `https://www.xvideos.com/?k=${encodeURIComponent(cleanQ)}${page > 0 ? `&p=${page + 1}` : ''}`;
-      const res = await fetch(xvUrl, {
-        headers: { 'User-Agent': USER_AGENT },
-        signal: signal || AbortSignal.timeout(8000)
-      });
-      if (res.ok) {
-        const html = await res.text();
-        const $ = cheerio.load(html);
-        $('.thumb-block').each((i, el) => {
-          const titleA = $(el).find('.thumb-under p.title a');
-          const title = titleA.attr('title') || titleA.text().trim() || '18+ Video';
-          const href = titleA.attr('href');
-          const img = $(el).find('.thumb img');
-          const thumb = img.attr('data-src') || img.attr('src');
-          const duration = $(el).find('.duration').text().trim();
-          if (href && thumb && !results.some(r => r.title === title)) {
-            results.push({
-              id: `xv_vid_${i}_${Date.now()}`,
-              title: title.slice(0, 60),
-              type: 'video',
-              mediaUrl: thumb,
-              thumbUrl: thumb,
-              pageUrl: `https://www.xvideos.com${href}`,
-              duration: duration || 'HD',
-              category,
-              source: 'XVideos Network'
-            });
-          }
-        });
-      }
-    } catch (err) {
-      log.debug({ err: err?.message, query }, 'xvideos fetch failed');
-    }
+  // Sort results by relevance to query keywords
+  const qWords = cleanQ.toLowerCase().split(/\s+/).filter(w => w.length >= 3 && !['video', 'videos', 'clip', 'clips', 'full'].includes(w));
+  if (qWords.length > 0) {
+    results.sort((a, b) => {
+      const aTitle = a.title.toLowerCase();
+      const bTitle = b.title.toLowerCase();
+      const aScore = qWords.reduce((acc, w) => acc + (aTitle.includes(w) ? 2 : 0), 0);
+      const bScore = qWords.reduce((acc, w) => acc + (bTitle.includes(w) ? 2 : 0), 0);
+      return bScore - aScore;
+    });
   }
 
-  return results.slice(0, limit * 2);
+  return results.slice(0, Math.max(limit * 2, 20));
 }
 
 /**

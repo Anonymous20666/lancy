@@ -548,3 +548,48 @@ test('18+ Studio E2E Parity with Pinterest: navigating back to menu from deliver
   assert.match(JSON.stringify(sentMessages[0].rich), /18\+ ADULT & HENTAI STUDIO/);
 });
 
+test('nsfwSearch: XVideos provides direct playable MP4 previews via data-pvv', async () => {
+  const vids = await searchNsfw({
+    query: 'pussy',
+    category: NSFW_CATEGORIES.REAL_FULL_VIDEOS,
+    limit: 5
+  });
+
+  assert.ok(Array.isArray(vids.results));
+  assert.ok(vids.results.length > 0, 'XVideos should return video results');
+  const first = vids.results[0];
+  assert.equal(first.type, 'video');
+  assert.ok(first.mediaUrl.startsWith('http'), 'mediaUrl must be an absolute URL');
+  assert.ok(first.mediaUrl.endsWith('.mp4'), 'mediaUrl must be a direct playable MP4 stream (data-pvv / td.mp4)');
+  assert.ok(first.thumbUrl.startsWith('http'), 'thumbUrl must be present for video poster');
+  assert.ok(first.thumbUrl !== first.mediaUrl || first.mediaUrl.endsWith('.mp4'));
+  // Check relevance: results should include pussy in title or query keyword
+  assert.match(first.title.toLowerCase(), /pussy|lesbian|cameltoe|girl|hd/);
+});
+
+test('nsfwSearch: smart query routing delivers accurate pussy photos and tifa hentai', async () => {
+  // 1. Pussy search in Real Wallpapers delivers real pussy photos from Nekobot
+  const pussyRes = await searchNsfw({
+    query: 'pussy',
+    category: NSFW_CATEGORIES.REAL_WALLPAPERS,
+    limit: 3
+  });
+  assert.ok(pussyRes.results.length > 0);
+  assert.equal(pussyRes.results[0].type, 'photo');
+  assert.ok(pussyRes.results[0].mediaUrl.startsWith('http'));
+  assert.equal(pussyRes.results[0].title, 'Real 18+ 4K Wallpaper (pussy)');
+
+  // 2. Tifa search in Uncensored Hentai delivers Tifa character art, not random picks
+  const tifaRes = await searchNsfw({
+    query: 'tifa',
+    category: NSFW_CATEGORIES.HENTAI_UNCENSORED,
+    limit: 3
+  });
+  assert.ok(tifaRes.results.length > 0);
+  assert.equal(tifaRes.results[0].type, 'photo');
+  assert.ok(tifaRes.results[0].mediaUrl.startsWith('http'));
+  // Check that title or tags include tifa
+  assert.match(tifaRes.results[0].title.toLowerCase(), /tifa|final fantasy/);
+});
+
+

@@ -20,24 +20,61 @@ async function fetchPreviewBuffers(items, max = 10) {
 
   const topItems = (items || []).slice(0, max);
   const promises = topItems.map(async (it) => {
-    // Pick the highest resolution preview URL (never 150px preview_url)
-    const targetUrl = it.thumbUrl || it.media_url || it.mediaUrl;
+    const isVideo = it.type === 'video';
+    // For videos, ALWAYS fetch genuine playable video stream (data-pvv / td.mp4 / direct mp4)
+    // NEVER prioritize thumbUrl over video stream!
+    const targetUrl = isVideo
+      ? (it.videoUrl || it.mediaUrl || it.media_url)
+      : (it.thumbUrl || it.media_url || it.mediaUrl);
     if (!targetUrl) return null;
     try {
       const res = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        signal: AbortSignal.timeout(4500)
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
+        signal: AbortSignal.timeout(7000)
       });
       if (!res.ok) return null;
       const arrayBuf = await res.arrayBuffer();
       const rawBuf = Buffer.from(arrayBuf);
-      if (it.type === 'video') {
+      if (rawBuf.length < 50) return null;
+
+      if (isVideo) {
+        // Inspect magic bytes:
+        // JPEG starts with 0xFF 0xD8
+        // PNG starts with 0x89 0x50 0x4E 0x47
+        // GIF starts with GIF8
+        const isImage = (rawBuf[0] === 0xff && rawBuf[1] === 0xd8) ||
+                        (rawBuf[0] === 0x89 && rawBuf[1] === 0x50) ||
+                        (rawBuf[0] === 0x47 && rawBuf[1] === 0x49 && rawBuf[2] === 0x46);
+
+        if (isImage) {
+          // If server returned an image instead of a video, deliver it as photo
+          // so Telegram mobile player never fails with "App was unable to play this video"
+          const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1280, quality: 88 });
+          return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+        }
+
+        // Genuine playable MP4 video!
         return { type: 'video', buffer: rawBuf, mime: 'video/mp4' };
       }
-      // Crisp 1280px HD optimization
+
+      // Crisp 1280px HD optimization for photos
       const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1280, quality: 88 });
       return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
     } catch {
+      // Fallback: If video download timed out or failed, try its preview thumbnail as photo
+      if (isVideo && it.thumbUrl && it.thumbUrl !== targetUrl) {
+        try {
+          const tRes = await fetch(it.thumbUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            signal: AbortSignal.timeout(4000)
+          });
+          if (tRes.ok) {
+            const tBuf = Buffer.from(await tRes.arrayBuffer());
+            const optBuf = await optimizePreviewImage(tBuf, { maxDimension: 1280, quality: 88 });
+            return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+          }
+        } catch {}
+      }
       return null;
     }
   });
