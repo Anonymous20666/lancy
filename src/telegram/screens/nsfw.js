@@ -276,10 +276,16 @@ export function createNsfwScreen({ app }) {
 
   // ── Step 1: Ask Query ─────────────────────────────────────────────────────
   async function askQuery(ctx, category = 'all') {
-    const screenMsgId = ctx.messageId ?? ctx.query?.message?.message_id;
+    const screenMsgId = ctx.messageId ?? ctx.query?.message?.message_id ?? ctx.screenMessageId;
     const tgId = String(ctx.tgId);
     const sm = ctx.sm ?? ctx.machine;
-    if (sm) {
+    if (ctx.transition) {
+      await ctx.transition(States.NSFW_SEARCH_INPUT, {
+        context: { category, stage: 'query', screenMessageId: screenMsgId },
+        chatId: ctx.chatId,
+        screenMessageId: screenMsgId
+      });
+    } else if (sm) {
       await sm.transition(tgId, States.NSFW_SEARCH_INPUT, {
         context: { category, stage: 'query', screenMessageId: screenMsgId },
         chatId: ctx.chatId,
@@ -318,7 +324,7 @@ export function createNsfwScreen({ app }) {
 
     const b = new RichMessageBuilder();
     b.header(`🔞 SEARCH ${categoryLabels[category]?.toUpperCase() || '18+ STUDIO'}`, 1);
-    b.paragraph(rt.italic('send me what you want to search for ♡'));
+    b.paragraph(rt.italic('tell me what to search for ♡'));
     b.paragraph(rt.concat(...exampleParts));
     b.divider();
 
@@ -338,19 +344,35 @@ export function createNsfwScreen({ app }) {
     b.validate();
 
     const sent = await editOrSend(ctx, b.toJSON());
-    if (sent?.message_id && sm) {
-      sm.update(tgId, { screenMessageId: sent.message_id });
+    const effectiveMsgId = sent?.message_id || screenMsgId;
+    if (effectiveMsgId) {
+      ctx.messageId = effectiveMsgId;
+      ctx.screenMessageId = effectiveMsgId;
+      if (ctx.update) {
+        ctx.update({ category, stage: 'query', screenMessageId: effectiveMsgId });
+      } else if (sm) {
+        sm.update(tgId, { category, stage: 'query', screenMessageId: effectiveMsgId });
+      }
+      ctx.controller?.userScreenMessage?.set(tgId, { chatId: ctx.chatId, messageId: effectiveMsgId });
+      app.telegram?.controller?.userScreenMessage?.set(tgId, { chatId: ctx.chatId, messageId: effectiveMsgId });
     }
   }
 
   // ── Step 2: Ask Count Selection (Exact Pinterest UX) ──────────────────────
-  async function askCount(ctx, query, category = 'all') {
+  async function askCount(ctx, query, category = 'all', opts = {}) {
     const isVideo = category.includes('video') || category.includes('clip');
     const tgId = String(ctx.tgId);
     const sm = ctx.sm ?? ctx.machine;
+    const replyToMessageId = opts.replyToMessageId ?? null;
     const screenMsgId = ctx.messageId ?? ctx.screenMessageId ?? sm?.for(tgId)?.screenMessageId ?? sm?.context?.(tgId)?.screenMessageId;
 
-    if (sm) {
+    if (ctx.transition) {
+      await ctx.transition(States.NSFW_SEARCH_INPUT, {
+        context: { category, query, stage: 'count', screenMessageId: screenMsgId },
+        chatId: ctx.chatId,
+        screenMessageId: screenMsgId
+      });
+    } else if (sm) {
       await sm.transition(tgId, States.NSFW_SEARCH_INPUT, {
         context: { category, query, stage: 'count', screenMessageId: screenMsgId },
         chatId: ctx.chatId,
@@ -377,8 +399,7 @@ export function createNsfwScreen({ app }) {
         richButton.callback('20', encodeCallback(id, 'runCount', '20', category, query), { style: 'primary' })
       ]);
       b.buttons([
-        richButton.callback('🎬 More Videos (+10)', encodeCallback(id, 'runCount', '30', category, query), { style: 'primary' }),
-        richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', category, query), { style: 'primary' })
+        richButton.callback('🎬 More Videos (+10)', encodeCallback(id, 'runCount', '30', category, query), { style: 'primary' })
       ]);
     } else {
       b.buttons([
@@ -392,14 +413,83 @@ export function createNsfwScreen({ app }) {
         richButton.callback('80', encodeCallback(id, 'runCount', '80', category, query), { style: 'primary' }),
         richButton.callback('100', encodeCallback(id, 'runCount', '100', category, query), { style: 'primary' })
       ]);
-      b.buttons([
-        richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', category, query), { style: 'primary' })
-      ]);
     }
     b.buttons([
-      richButton.callback('« Back', encodeCallback(id, 'cat', category), { style: 'primary' }),
-      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+      richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', category, query), { style: 'primary' }),
+      richButton.callback('✎ Custom Count', encodeCallback(id, 'customCount', category, query), { style: 'primary' })
     ]);
+    b.buttons([
+      richButton.callback('« Back', encodeCallback(id, 'cat', category), { style: 'primary' })
+    ]);
+    b.divider();
+    b.buttons(navButtons(id, { back: false, home: true }));
+    b.validate();
+
+    const api = ctx.api || app.telegram.api;
+    const chatId = ctx.chatId ?? Number(tgId);
+    let sent;
+    if (replyToMessageId) {
+      sent = await api.sendRichMessage(chatId, b.toJSON(), {
+        reply_parameters: { message_id: replyToMessageId },
+        reply_to_message_id: replyToMessageId
+      });
+    } else {
+      sent = await editOrSend(ctx, b.toJSON());
+    }
+
+    const effectiveMsgId = sent?.message_id || screenMsgId;
+    if (effectiveMsgId) {
+      ctx.messageId = effectiveMsgId;
+      ctx.screenMessageId = effectiveMsgId;
+      if (ctx.transition) {
+        await ctx.transition(States.NSFW_SEARCH_INPUT, {
+          context: { category, query, stage: 'count', screenMessageId: effectiveMsgId },
+          chatId,
+          screenMessageId: effectiveMsgId
+        });
+      } else if (sm) {
+        await sm.transition(tgId, States.NSFW_SEARCH_INPUT, {
+          context: { category, query, stage: 'count', screenMessageId: effectiveMsgId },
+          chatId,
+          screenMessageId: effectiveMsgId
+        });
+      }
+      if (ctx.update) {
+        ctx.update({ category, query, stage: 'count', screenMessageId: effectiveMsgId });
+      } else if (sm) {
+        sm.update(tgId, { category, query, stage: 'count', screenMessageId: effectiveMsgId });
+      }
+      ctx.controller?.userScreenMessage?.set(tgId, { chatId, messageId: effectiveMsgId });
+      app.telegram?.controller?.userScreenMessage?.set(tgId, { chatId, messageId: effectiveMsgId });
+      ctx.db?.run?.(
+        'UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?',
+        effectiveMsgId, Number(tgId)
+      );
+    }
+  }
+
+  async function askCustomCount(ctx, category = 'all', query = '') {
+    const tgId = String(ctx.tgId);
+    const sm = ctx.sm ?? ctx.machine;
+    const screenMsgId = ctx.messageId ?? ctx.screenMessageId ?? sm?.for(tgId)?.screenMessageId ?? sm?.context?.(tgId)?.screenMessageId;
+    if (ctx.transition) {
+      await ctx.transition(States.NSFW_SEARCH_INPUT, {
+        context: { category, query, stage: 'count', screenMessageId: screenMsgId },
+        chatId: ctx.chatId,
+        screenMessageId: screenMsgId
+      });
+    } else if (sm) {
+      await sm.transition(tgId, States.NSFW_SEARCH_INPUT, {
+        context: { category, query, stage: 'count', screenMessageId: screenMsgId },
+        chatId: ctx.chatId,
+        screenMessageId: screenMsgId
+      });
+    }
+    const b = new RichMessageBuilder();
+    b.heading('✎ CUSTOM RESULT COUNT', 2);
+    b.paragraph(rt.italic(`send me the number of 18+ results you want for "${truncate(query, 24)}" (e.g. 50, 80, 100) ♡`));
+    b.divider();
+    b.buttons(navButtons(id, { cancel: true }));
     b.validate();
     await editOrSend(ctx, b.toJSON());
   }
@@ -483,27 +573,76 @@ export function createNsfwScreen({ app }) {
       ]);
     }
 
-    // Smart search suggestion buttons in pagination
+    // Smart search suggestion buttons in pagination (tagged from_media)
     const suggestions = CATEGORY_SUGGESTIONS[category] || CATEGORY_SUGGESTIONS.all;
     if (suggestions && suggestions.length >= 3) {
-      const filtered = suggestions.filter(s => s.toLowerCase() !== query.toLowerCase()).slice(0, 3);
+      const filtered = suggestions.filter(s => s.toLowerCase() !== (query || '').toLowerCase()).slice(0, 3);
       if (filtered.length > 0) {
         b.buttons(filtered.map(s =>
-          richButton.callback(s, encodeCallback(id, 'askCountDirect', s.replace(/^[^\w]+/, '').trim(), category), { style: 'primary' })
+          richButton.callback(s, encodeCallback(id, 'askCountDirect', s.replace(/^[^\w]+/, '').trim(), category, 'from_media'), { style: 'primary' })
         ));
       }
     }
 
-    // Action buttons
+    // Action buttons (tagged with from_media so navigating away never overwrites media results!)
     b.buttons([
-      richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(searchId)), { style: 'primary' }),
-      richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category), { style: 'primary' })
+      richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(searchId), 'from_media'), { style: 'primary' }),
+      richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category, 'from_media'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
-      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+      richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu', 'from_media'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
     ]);
     b.footer(rt.italic('୨୧ 18+ adult studio • multi-source HD delivery ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  function progressRich({ stage, category = 'all', query, goal = 20, elapsedMs = 0, ...p }) {
+    const b = new RichMessageBuilder();
+    b.paragraph(rt.bold(banner([
+      '𓆩♡𓆪 SEARCHING 18+ STUDIO 𓆩♡𓆪',
+      `"${truncate(query || 'Spicy Top Picks', 24)}"`
+    ])));
+    b.divider();
+    b.table([
+      [
+        { text: 'ʕ•ᴥ•ʔ Query', align: 'left', valign: 'middle' },
+        { text: rt.bold(truncate(query || 'Spicy Top Picks', 28)), align: 'right', valign: 'middle' }
+      ],
+      [
+        { text: '🔞 Category', align: 'left', valign: 'middle' },
+        { text: rt.bold(category), align: 'right', valign: 'middle' }
+      ],
+      [
+        { text: '୨୧ Target', align: 'left', valign: 'middle' },
+        { text: rt.bold(typeof goal === 'string' ? goal : `${goal} picks`), align: 'right', valign: 'middle' }
+      ]
+    ], { compact: true });
+    b.divider();
+
+    // Dynamic elapsed timer + ETA for responsive, lively feedback
+    const elapsedSec = Math.floor(elapsedMs / 1000);
+    const numericGoal = typeof goal === 'number' ? goal : 20;
+    const isVideo = category.includes('video') || category.includes('clip');
+    const totalWaitSec = Math.max(isVideo ? 18 : 10, Math.round(numericGoal * (isVideo ? 3.5 : 0.3)));
+    const countdownSec = Math.max(0, totalWaitSec - elapsedSec);
+    const waitDurationText = totalWaitSec >= 60 ? `Wait ~${Math.ceil(totalWaitSec / 60)}min` : `Wait ${totalWaitSec}s`;
+    const countdownText = countdownSec > 0 ? `${countdownSec}s remaining` : 'finishing up...';
+    const timeHeader = `⏳ ${waitDurationText} • ⏱ Countdown: ${countdownText} (elapsed ${String(elapsedSec).padStart(2, '0')}s)`;
+
+    let stepLabel = 'Connecting to sources...';
+    if (stage === 'searching') {
+      stepLabel = `Searching Wallhaven 4K, Yande.re, Nekobot & Spankbang...`;
+    } else if (stage === 'validating') {
+      stepLabel = `Validating HD streams (${p.valid ?? 0}/${numericGoal} picks)`;
+    } else if (stage === 'done') {
+      stepLabel = `Ready! Found ${p.results ?? 0} aesthetic picks`;
+    }
+
+    const miniLog = `${timeHeader}\n˙ᵕ˙ ${stepLabel} ♡`;
+    b.paragraph(miniLog);
+    b.footer(rt.italic('୨୧ live updates in-place • no waiting in the dark ˙ᵕ˙'));
     b.validate();
     return b.toJSON();
   }
@@ -520,6 +659,11 @@ export function createNsfwScreen({ app }) {
     const chatId = ctx.chatId ?? Number(tgId);
     const isGroup = Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || Number(chatId) < 0);
     const replyToId = opts.replyToMessageId || ctx.message?.message_id || null;
+
+    // Delete user input message to keep chat totally clean & un-spammy in DM
+    if (!isGroup && ctx.message?.message_id && app.settings?.get?.('telegram.messageCleanup')) {
+      await api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
+    }
 
     // Check media permissions in groups
     if (isGroup && api) {
@@ -549,21 +693,19 @@ export function createNsfwScreen({ app }) {
     const controller = new AbortController();
     activeSearches.set(tgId, controller);
 
-    const tracker = new ProgressTracker({ api, chatId, messageId: ctx.screenMessageId, heartbeatMs: 2000 });
-    const cleanDisplayQ = query ? `"${truncate(query, 24)}"` : 'Spicy Top Picks';
+    // Reuse existing screen message so it updates in-place with ticking heartbeat timer
+    const targetMsgId = ctx.screenMessageId || ctx.query?.message?.message_id || ctx.sm?.context?.(tgId)?.screenMessageId || null;
+    const tracker = new ProgressTracker({ api, chatId, messageId: targetMsgId, heartbeatMs: 2000 });
 
-    await tracker.live((state) => {
-      const b = new RichMessageBuilder();
-      b.paragraph(rt.bold(banner([
-        '🔞 SEARCHING 18+ STUDIO',
-        cleanDisplayQ
-      ])));
-      b.divider();
-      b.paragraph(`⏳ Searching Wallhaven 4K, Yande.re, Nekobot & Spankbang… ♡\n˙ᵕ˙ Category: ${category} • Goal: ${isContinuous ? 'Continuous ♾️' : `${goal} picks`}`);
-      b.footer(rt.italic('live multi-source deep search in progress ♡'));
-      b.validate();
-      return b.toJSON();
-    }, { stage: 'searching' });
+    await tracker.live((state, { elapsedMs }) => progressRich({
+      ...state,
+      elapsedMs,
+      category,
+      query,
+      goal: isContinuous ? 'Continuous ♾️' : `${goal} picks`
+    }), {
+      stage: 'searching', category, query, goal: isContinuous ? 'Continuous ♾️' : `${goal} picks`
+    });
 
     try {
       const searchRes = await searchNsfw({
@@ -583,16 +725,16 @@ export function createNsfwScreen({ app }) {
         b.paragraph(rt.text('try another term, or browse trending spicy picks!'));
         b.divider();
         b.buttons([
-          richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category), { style: 'primary' }),
-          richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' })
+          richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category, 'from_media'), { style: 'primary' }),
+          richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu', 'from_media'), { style: 'primary' })
         ]);
         b.buttons([
-          richButton.callback('🔍 Try Another Search', encodeCallback(id, 'cat', category), { style: 'primary' }),
-          richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+          richButton.callback('🔍 Try Another Search', encodeCallback(id, 'cat', category, 'from_media'), { style: 'primary' }),
+          richButton.callback('✦ Home', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
         ]);
         b.validate();
         await tracker.finish(b.toJSON());
-        return;
+        return { message_id: tracker.messageId };
       }
 
       // Record in DB for sticker pack creation & pagination
@@ -634,6 +776,13 @@ export function createNsfwScreen({ app }) {
 
       const files = previewBlocks.length > 0 ? mediaFiles : null;
       await tracker.finish(rich, files);
+
+      if (tracker.messageId) {
+        app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
+        app.telegram?.userScreenMessage?.set?.(tgId, { chatId, messageId: tracker.messageId });
+        ctx.sm?.update?.(tgId, { screenMessageId: tracker.messageId });
+        return { message_id: tracker.messageId };
+      }
     } catch (err) {
       log.error({ err: err?.message, query }, 'nsfw search failed');
       const b = new RichMessageBuilder();
@@ -641,11 +790,12 @@ export function createNsfwScreen({ app }) {
       b.paragraph(rt.bold(`something went wrong: ${err?.message || 'timeout'}`));
       b.divider();
       b.buttons([
-        richButton.callback('↺ Try Again', encodeCallback(id, 'cat', category), { style: 'primary' }),
-        richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+        richButton.callback('↺ Try Again', encodeCallback(id, 'cat', category, 'from_media'), { style: 'primary' }),
+        richButton.callback('✦ Home', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' })
       ]);
       b.validate();
       await tracker.finish(b.toJSON());
+      return { message_id: tracker.messageId };
     } finally {
       activeSearches.delete(tgId);
       releaseSlot?.();
@@ -654,6 +804,8 @@ export function createNsfwScreen({ app }) {
 
   // ── Step 5: In-Place Pagination Album Swapping ────────────────────────────
   async function showMoreAlbum(ctx, searchId, offset = 0, category = 'all') {
+    const api = ctx.api || app.telegram.api;
+    const chatId = ctx.chatId ?? Number(ctx.tgId);
     const numOffset = Math.max(0, Number(offset) || 0);
     const searchDbId = Number(searchId);
 
@@ -663,7 +815,7 @@ export function createNsfwScreen({ app }) {
       searchDbId, numOffset
     ) || [];
 
-    const totalMediaRow = app.pinterest?.db?.get?.(
+    let totalMediaRow = app.pinterest?.db?.get?.(
       `SELECT COUNT(*) as count FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0`,
       searchDbId
     );
@@ -696,11 +848,11 @@ export function createNsfwScreen({ app }) {
              ORDER BY quality_score DESC, id ASC LIMIT 10 OFFSET ?`,
             searchDbId, numOffset
           );
-          const updatedTotal = app.pinterest.db.get(
+          totalMediaRow = app.pinterest.db.get(
             `SELECT COUNT(*) as count FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0`,
             searchDbId
           );
-          totalMedia = updatedTotal?.count ?? 0;
+          totalMedia = totalMediaRow?.count ?? 0;
         }
       } catch {}
     }
@@ -715,9 +867,12 @@ export function createNsfwScreen({ app }) {
         const prevOffset = Math.max(0, numOffset - 10);
         endButtons.push(richButton.callback('← Prev Picks', encodeCallback(id, 'moreAlbum', String(searchId), String(prevOffset), category), { style: 'primary' }));
       }
-      endButtons.push(richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu'), { style: 'primary' }));
+      endButtons.push(richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu', 'from_media'), { style: 'primary' }));
       b.buttons(endButtons);
-      b.buttons(navButtons(id, { home: true }));
+      b.buttons([
+        richButton.callback('🔍 New Search', encodeCallback(id, 'cat', category, 'from_media'), { style: 'primary' })
+      ]);
+      b.buttons(navButtons(id, { home: true, fromMedia: true }));
       b.validate();
       await editOrSend(ctx, b.toJSON());
       return;
@@ -738,7 +893,38 @@ export function createNsfwScreen({ app }) {
       currentOffset: nextOffset
     });
     const files = previewBlocks.length > 0 ? mediaFiles : null;
-    await editOrSend(ctx, rich, files);
+
+    // Pinterest clean replacement pattern:
+    const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context?.(ctx.tgId)?.screenMessageId;
+    if (targetMsgId) {
+      try {
+        await api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+        return { message_id: targetMsgId };
+      } catch (err) {
+        const errMsg = String(err?.description ?? err?.message);
+        if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
+        // Edit in-place failed (e.g. Telegram Bot API rejects editing media attachments in-place)
+        // Clean replacement: send the new card and delete the old card so only ONE message exists!
+        const cardMsg = await api.sendRichMessage(chatId, rich, {}, files);
+        if (cardMsg?.message_id) {
+          if (targetMsgId && cardMsg.message_id !== targetMsgId) {
+            await api.deleteMessage(chatId, targetMsgId).catch(() => {});
+          }
+          app.telegram?.markMediaDeliveryMessage?.(cardMsg.message_id);
+          app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: cardMsg.message_id });
+          ctx.sm?.update?.(ctx.tgId, { screenMessageId: cardMsg.message_id });
+        }
+        return cardMsg;
+      }
+    } else {
+      const cardMsg = await api.sendRichMessage(chatId, rich, {}, files);
+      if (cardMsg?.message_id) {
+        app.telegram?.markMediaDeliveryMessage?.(cardMsg.message_id);
+        app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: cardMsg.message_id });
+        ctx.sm?.update?.(ctx.tgId, { screenMessageId: cardMsg.message_id });
+      }
+      return cardMsg;
+    }
   }
 
   function registerStateHandlers(sm) {
@@ -749,19 +935,45 @@ export function createNsfwScreen({ app }) {
 
         const isGroup = Boolean(sctx.isGroup || message.chat?.type === 'group' || message.chat?.type === 'supergroup' || (sctx.chatId && Number(sctx.chatId) < 0));
 
+        if (sctx.context?.stage === 'count') {
+          const effectiveQuery = sctx.context?.query || sctx.query;
+          const effectiveCategory = sctx.context?.category || 'all';
+          if (/\b(continuous|infinite|explore|unlimited)\b/i.test(text)) {
+            if (!isGroup && message.message_id) {
+              await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+            }
+            sctx.screenMessageId = sctx.context?.screenMessageId || sctx.screenMessageId;
+            await runSearch(sctx, effectiveQuery, effectiveCategory, 'continuous');
+            return true;
+          }
+          const parsed = parseInt(text, 10);
+          if (!isNaN(parsed) && parsed > 0) {
+            const capped = Math.min(200, parsed);
+            if (!isGroup && message.message_id) {
+              await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
+            }
+            sctx.screenMessageId = sctx.context?.screenMessageId || sctx.screenMessageId;
+            await runSearch(sctx, effectiveQuery, effectiveCategory, capped);
+            return true;
+          }
+        }
+
         if (isGroup) {
+          // In group chat: delete bot's prompt message so outdated message higher up in GC is removed
           const botPromptMsgId = message.reply_to_message?.message_id || sctx.screenMessageId || sctx.context?.screenMessageId;
           if (botPromptMsgId) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, botPromptMsgId).catch(() => {});
           }
+          // Do NOT delete the user's message; quote it for the amount selection card
+          await askCount(sctx, text, sctx.context?.category || 'all', { replyToMessageId: message.message_id });
         } else {
+          // In private chat: delete user's message to maintain clean in-place screen
           if (message.message_id) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
           }
+          await askCount(sctx, text, sctx.context?.category || 'all');
         }
-
-        // Exact Pinterest flow: route query into askCount
-        return askCount(sctx, text, sctx.context?.category || 'all');
+        return true;
       },
       onTimeout: async (sctx) => {
         await (sctx.api || app.telegram.api).sendMessage(sctx.chatId, '♡ 18+ search timed out — send a new query whenever you are ready.').catch(() => {});
@@ -805,15 +1017,22 @@ export function createNsfwScreen({ app }) {
           return askQuery(ctx, args[0] || 'all');
         case 'searchPrompt':
           return askQuery(ctx, args[0] || 'all');
+        case 'customCount': {
+          const category = args[0] || 'all';
+          const query = args[1] || ctx.sm?.context?.(ctx.tgId)?.query || '';
+          return askCustomCount(ctx, category, query);
+        }
         case 'askCountDirect': {
           const query = args[0] || '';
           const category = args[1] || 'all';
+          ctx.screenMessageId = ctx.query?.message?.message_id || ctx.messageId;
           return askCount(ctx, query, category);
         }
         case 'runCount': {
           const goal = args[0] || '10';
           const category = args[1] || 'all';
-          const query = args[2] || '';
+          const query = args[2] || ctx.sm?.context?.(ctx.tgId)?.query || '';
+          ctx.screenMessageId = ctx.query?.message?.message_id || ctx.messageId;
           return runSearch(ctx, query, category, goal);
         }
         case 'moreAlbum': {

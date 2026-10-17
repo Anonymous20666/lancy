@@ -8,6 +8,7 @@ import { createNsfwScreen } from '../src/telegram/screens/nsfw.js';
 import { createDashboardScreen } from '../src/telegram/screens/dashboard.js';
 import { createPinterestScreen } from '../src/telegram/screens/pinterest.js';
 import { searchNsfw, NSFW_CATEGORIES } from '../src/wallpaper/nsfwSearch.js';
+import { encodeCallback } from '../src/telegram/rich.js';
 
 test('nsfwSearch: multi-provider search returns valid wallpapers and media across categories', async () => {
   // 1. Uncensored Hentai
@@ -308,5 +309,242 @@ test('nsfwSearch: real adult category separation and preview rendering', async (
   // Verify title is clean and not falsely claiming Nekobot model is chainsaw man
   assert.ok(!realRes.results[0].title.includes('chainsaw_man'));
   assert.equal(realRes.results[0].title, 'Real 18+ 4K Adult Wallpaper');
+});
+
+test('18+ Studio E2E Parity with Pinterest: in-place edits, message deletions, and clean replacement on pagination failure', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine({ db });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pinterest_searches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      query TEXT NOT NULL,
+      normalized_query TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'normal',
+      depth TEXT NOT NULL DEFAULT 'deep',
+      result_count INTEGER NOT NULL DEFAULT 0,
+      duplicates_found INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS pinterest_media (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      search_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      pin_id TEXT,
+      media_url TEXT NOT NULL,
+      sha256 TEXT,
+      type TEXT NOT NULL DEFAULT 'photo',
+      mime TEXT,
+      quality_score REAL NOT NULL DEFAULT 1.0,
+      is_duplicate INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'valid',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  let deletedMessages = [];
+  let sentRichMessages = [];
+  let editedRichMessages = [];
+  let markedMediaDeliveryIds = [];
+  let nextMsgId = 1000;
+
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, opts, files) => {
+      const msgId = ++nextMsgId;
+      sentRichMessages.push({ chatId, msgId, rich, opts, files });
+      return { message_id: msgId, chat: { id: chatId } };
+    },
+    editMessageRich: async (chatId, msgId, rich, opts, files) => {
+      editedRichMessages.push({ chatId, msgId, rich, opts, files });
+      return { message_id: msgId, chat: { id: chatId } };
+    },
+    deleteMessage: async (chatId, messageId) => {
+      deletedMessages.push({ chatId, messageId });
+      return true;
+    },
+    sendMessage: async (chatId, text) => ({ message_id: ++nextMsgId, chat: { id: chatId } }),
+    answerCallbackQuery: async () => true
+  };
+
+  const app = {
+    telegram: {
+      api: mockApi,
+      markMediaDeliveryMessage: (id) => markedMediaDeliveryIds.push(id),
+      userScreenMessage: new Map()
+    },
+    settings,
+    pinterest: { db }
+  };
+
+  const nsfwScreen = createNsfwScreen({ app });
+  nsfwScreen.registerStateHandlers(sm);
+
+  // 1. Private DM flow: User enters query -> user input message is deleted, existing screen message is edited to count card
+  const dmUserId = 55555;
+  await sm.transition(dmUserId, States.NSFW_SEARCH_INPUT, {
+    context: { category: 'hentai_uncensored', stage: 'query', screenMessageId: 700 },
+    chatId: dmUserId,
+    screenMessageId: 700
+  });
+
+  const dmCtx = sm.ctxFor(dmUserId);
+  dmCtx.api = mockApi;
+  const dmMsg = {
+    message_id: 801,
+    chat: { id: dmUserId, type: 'private' },
+    from: { id: dmUserId },
+    text: 'tifa'
+  };
+
+  deletedMessages = [];
+  editedRichMessages = [];
+  const handledDm = await sm.handleMessage(dmUserId, dmMsg, { api: mockApi });
+  assert.equal(handledDm, true);
+  // User input message 801 was deleted
+  assert.equal(deletedMessages.some(d => d.messageId === 801), true);
+  // Screen message 700 was edited in-place to the count card
+  assert.equal(editedRichMessages.some(e => e.msgId === 700), true);
+
+  // 2. Group Chat flow: User replies to prompt in group -> bot deletes outdated prompt, quotes user message
+  const gcChatId = -100999999;
+  const gcUserId = 66666;
+  await sm.transition(gcUserId, States.NSFW_SEARCH_INPUT, {
+    context: { category: 'real_wallpapers', stage: 'query', screenMessageId: 750 },
+    chatId: gcChatId,
+    screenMessageId: 750
+  });
+
+  const gcCtx = sm.ctxFor(gcUserId);
+  gcCtx.api = mockApi;
+  const gcMsg = {
+    message_id: 802,
+    chat: { id: gcChatId, type: 'supergroup' },
+    from: { id: gcUserId },
+    reply_to_message: { message_id: 750 },
+    text: 'asian model'
+  };
+
+  deletedMessages = [];
+  sentRichMessages = [];
+  const handledGc = await sm.handleMessage(gcUserId, gcMsg, { api: mockApi });
+  assert.equal(handledGc, true);
+  // Old bot prompt 750 was deleted from GC
+  assert.equal(deletedMessages.some(d => d.messageId === 750), true);
+  // Sent count card quotes user message 802
+  assert.equal(sentRichMessages.some(s => s.opts?.reply_parameters?.message_id === 802 || s.opts?.reply_to_message_id === 802), true);
+
+  // 3. Album Pagination with Clean Replacement:
+  // Setup 25 media items for search 100
+  db.run(`INSERT INTO pinterest_searches (id, user_id, query, normalized_query, mode, result_count) VALUES (100, ${dmUserId}, 'tifa', 'tifa', 'nsfw', 25)`);
+  for (let i = 1; i <= 25; i++) {
+    db.run(
+      `INSERT INTO pinterest_media (search_id, user_id, media_url, sha256, type, quality_score, is_duplicate, status)
+       VALUES (100, ${dmUserId}, 'https://example.com/tifa_${i}.jpg', 'sha_${i}', 'photo', ${100 - i}, 0, 'valid')`
+    );
+  }
+
+  // 3a. In-place edit succeeds when API accepts it
+  editedRichMessages = [];
+  await nsfwScreen.handle({
+    tgId: dmUserId,
+    chatId: dmUserId,
+    messageId: 900,
+    api: mockApi,
+    sm
+  }, 'moreAlbum', ['100', '10', 'hentai_uncensored']);
+  assert.equal(editedRichMessages.some(e => e.msgId === 900), true);
+
+  // 3b. When Telegram Bot API rejects editing media attachments in-place:
+  // Clean replacement sends the new card AND deletes old message 900 so only 1 card exists!
+  mockApi.editMessageRich = async () => {
+    throw new Error('Telegram editMessageText: Bad Request: message can\'t be edited');
+  };
+
+  deletedMessages = [];
+  sentRichMessages = [];
+  await nsfwScreen.handle({
+    tgId: dmUserId,
+    chatId: dmUserId,
+    messageId: 900,
+    api: mockApi,
+    sm
+  }, 'moreAlbum', ['100', '20', 'hentai_uncensored']);
+
+  assert.equal(sentRichMessages.length, 1, 'Replacement card was sent');
+  assert.equal(deletedMessages.some(d => d.messageId === 900), true, 'Old card 900 was deleted to prevent duplicates');
+  assert.ok(markedMediaDeliveryIds.includes(sentRichMessages[0].msgId), 'New card is marked as media delivery');
+});
+
+test('18+ Studio E2E Parity with Pinterest: navigating back to menu from delivered media search never overwrites media card', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [12345];
+  settings.values.security.publicAccess = true;
+  settings.set('general.ownerIds', [12345]);
+  const sm = new StateMachine({ db });
+
+  let sentMessages = [];
+  let editedMessages = [];
+  let nextMsgId = 2000;
+
+  const mockApi = {
+    sendRichMessage: async (chatId, rich, opts, files) => {
+      const msgId = ++nextMsgId;
+      sentMessages.push({ chatId, msgId, rich, opts, files });
+      return { message_id: msgId, chat: { id: chatId } };
+    },
+    editMessageRich: async (chatId, messageId, rich, opts, files) => {
+      editedMessages.push({ chatId, messageId, rich, opts, files });
+      return { message_id: messageId, chat: { id: chatId } };
+    },
+    deleteMessage: async () => true,
+    answerCallbackQuery: async () => true,
+    call: async () => ({})
+  };
+
+  const app = {
+    telegram: { api: mockApi },
+    settings,
+    pinterest: { db }
+  };
+
+  const screens = new Map();
+  screens.set('dashboard', createDashboardScreen({ app }));
+  screens.set('nsfw', createNsfwScreen({ app }));
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: sm,
+    sm,
+    screens,
+    app
+  });
+
+  // Simulate delivered media card at message 2050
+  controller.markMediaDeliveryMessage(2050);
+
+  // User clicks "🔞 18+ Studio Menu" from the media card (has from_media)
+  await controller.handleUpdate({
+    update_id: 10,
+    callback_query: {
+      id: 'cb_menu_from_media',
+      from: { id: 12345, first_name: 'TestUser' },
+      message: { message_id: 2050, chat: { id: 12345, type: 'private' } },
+      data: encodeCallback('nsfw', 'menu', 'from_media')
+    }
+  });
+
+  // Verify that message 2050 was NOT edited or overwritten!
+  assert.equal(editedMessages.some(e => e.messageId === 2050), false, 'Media message 2050 MUST NOT be edited into a menu');
+  // Verify a fresh menu message was sent instead, preserving the media card above
+  assert.equal(sentMessages.length, 1, 'A fresh screen message was sent');
+  assert.match(JSON.stringify(sentMessages[0].rich), /18\+ ADULT & HENTAI STUDIO/);
 });
 
