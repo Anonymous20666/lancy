@@ -1,8 +1,8 @@
 import { RichMessageBuilder, rt, richButton, encodeCallback, block } from '../rich.js';
-import { navButtons, kvTable, ACCENT, SPARK, banner } from '../ui.js';
+import { navButtons, kvTable, banner } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { ProgressTracker } from '../progress.js';
-import { searchNsfw, NSFW_CATEGORIES } from '../../wallpaper/nsfwSearch.js';
+import { searchNsfw, NSFW_CATEGORIES, CATEGORY_SUGGESTIONS } from '../../wallpaper/nsfwSearch.js';
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice } from '../permissions.js';
 import { optimizePreviewImage } from '../../media/convert.js';
@@ -56,40 +56,197 @@ export function createNsfwScreen({ app }) {
   const id = 'nsfw';
   const activeSearches = new Map(); // tgId -> AbortController
 
+  // ── Main Menu ─────────────────────────────────────────────────────────────
   function renderMenu(ctx) {
     const isGroup = Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup');
     const b = new RichMessageBuilder();
     b.header('𓆩♡𓆪 18+ ADULT & HENTAI STUDIO 𓆩♡𓆪', 1);
-    b.paragraph(rt.italic('₊˚⊹♡ uncensored & ecchi anime, 4K adult wallpapers & live clips ˙ᵕ˙'));
+    b.paragraph(rt.italic('₊˚⊹♡ anime hentai, 4K adult wallpapers, aesthetic explicit art & videos ˙ᵕ˙'));
     b.divider();
 
     b.table(kvTable([
-      ['🔞 Uncensored Anime', 'Hentai 4K & character art'],
-      ['🌸 Censored / Ecchi', 'High-res soft & aesthetic art'],
-      ['🎬 18+ Videos', 'Direct MP4 previews & trailers'],
-      ['📸 Real Adult 18+', '4K glamorous & model wallpapers'],
+      ['🌸 Hentai Wallpapers', 'Censored / Ecchi & Uncensored 4K'],
+      ['🎬 Hentai Videos', 'Animated clips, spicy loops & full videos'],
+      ['📸 Adult Wallpapers', '4K glamour, boudoir, sensual models & art'],
+      ['🎥 Adult Videos', 'Video clips / previews & full streaming'],
       ['👥 Group Protection', isGroup ? 'Auto-Spoiler Enabled (Masked)' : 'Direct Delivery']
     ]), { compact: true });
     b.divider();
 
+    // Studio Submenu Launchers
     b.buttons([
-      richButton.callback('🔞 Hentai Uncensored', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' }),
-      richButton.callback('🌸 Hentai Censored / Ecchi', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_CENSORED), { style: 'primary' })
+      richButton.callback('🌸 Hentai Wallpapers', encodeCallback(id, 'sub', 'hentai_wallpapers'), { style: 'primary' }),
+      richButton.callback('🎬 Hentai Videos', encodeCallback(id, 'sub', 'hentai_videos'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🎬 18+ Videos (MP4)', encodeCallback(id, 'cat', NSFW_CATEGORIES.VIDEOS), { style: 'primary' }),
-      richButton.callback('📸 Real Adult 4K Wallpapers', encodeCallback(id, 'cat', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' })
+      richButton.callback('📸 Adult Wallpapers (4K)', encodeCallback(id, 'sub', 'real_wallpapers'), { style: 'primary' }),
+      richButton.callback('🎥 Adult Videos', encodeCallback(id, 'sub', 'real_videos'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('💋 Animated Hentai Clips', encodeCallback(id, 'cat', NSFW_CATEGORIES.ANIMATED), { style: 'primary' }),
-      richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', 'all'), { style: 'primary' })
-    ]);
-    b.buttons([
-      richButton.callback('🔍 Search by Keyword', encodeCallback(id, 'searchPrompt', 'all'), { style: 'primary' })
+      richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', 'all'), { style: 'primary' }),
+      richButton.callback('🔍 Universal 18+ Search', encodeCallback(id, 'searchPrompt', 'all'), { style: 'primary' })
     ]);
     b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));
-    b.footer(rt.italic('୨୧ group safe: explicit content in groups is masked with spoilers ♡'));
+    b.footer(rt.italic('୨୧ multi-source adult engine • Wallhaven 4K, Yande.re, Nekobot & Spankbang ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  // ── Submenu 1: Hentai Wallpapers ──────────────────────────────────────────
+  function renderHentaiWallpapersMenu(ctx) {
+    const b = new RichMessageBuilder();
+    b.header('𓆩♡𓆪 HENTAI WALLPAPERS 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡ choose your desired spice level for high-res anime wallpapers ♡ ˙ᵕ˙'));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🌸 Censored / Ecchi (Soft & Aesthetic)', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_CENSORED), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🔞 Uncensored (R-18 Explicit 4K)', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎲 Random Hentai Pick', encodeCallback(id, 'random', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' })
+    ]);
+    b.divider();
+
+    // Popular suggestions buttons
+    b.paragraph(rt.bold('✨ Trending Anime Characters:'));
+    b.buttons([
+      richButton.callback('🌸 Tifa', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'tifa'), { style: 'primary' }),
+      richButton.callback('🌸 Makima', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'makima'), { style: 'primary' }),
+      richButton.callback('🌸 Genshin', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'genshin'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🌸 Tsunade', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'tsunade'), { style: 'primary' }),
+      richButton.callback('🌸 Yor Forger', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'yor_forger'), { style: 'primary' }),
+      richButton.callback('🌸 2B', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, '2b'), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.buttons([
+      richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  // ── Submenu 2: Hentai Videos ──────────────────────────────────────────────
+  function renderHentaiVideosMenu(ctx) {
+    const b = new RichMessageBuilder();
+    b.header('𓆩♡𓆪 HENTAI VIDEOS & CLIPS 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡ animated clips, spicy loops, and full streaming anime videos ♡ ˙ᵕ˙'));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('💋 Animated Clips & Loops (GIF/MP4)', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_CLIPS), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎞 Full Hentai Videos & Episodes', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎲 Random Hentai Video Pick', encodeCallback(id, 'random', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS), { style: 'primary' })
+    ]);
+    b.divider();
+
+    // Popular suggestions buttons
+    b.paragraph(rt.bold('✨ Popular Video Searches:'));
+    b.buttons([
+      richButton.callback('🎞 Genshin', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, 'genshin'), { style: 'primary' }),
+      richButton.callback('🎞 Tifa 3D', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, 'tifa 3d'), { style: 'primary' }),
+      richButton.callback('🎞 OverFlow', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, 'overflow'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('💋 Blowjob Loop', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_CLIPS, 'blowjob'), { style: 'primary' }),
+      richButton.callback('💋 Ecchi Dance', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_CLIPS, 'dance'), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.buttons([
+      richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  // ── Submenu 3: Real Adult Wallpapers (NO censored wallpaper side!) ────────
+  function renderRealWallpapersMenu(ctx) {
+    const b = new RichMessageBuilder();
+    b.header('𓆩♡𓆪 REAL ADULT 4K WALLPAPERS 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡ 4K glamour, aesthetic boudoir, sensual models & explicit adult photography ♡ ˙ᵕ˙'));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🔍 Search 4K Wallpapers', encodeCallback(id, 'cat', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('🎲 Random 4K Adult Pick', encodeCallback(id, 'random', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' })
+    ]);
+    b.divider();
+
+    // Category / Style Suggestions
+    b.paragraph(rt.bold('📸 Explore Models & Aesthetic Styles:'));
+    b.buttons([
+      richButton.callback('📸 Asian Model', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'asian model'), { style: 'primary' }),
+      richButton.callback('📸 Latina', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'latina'), { style: 'primary' }),
+      richButton.callback('📸 Blonde', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'blonde'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('📸 Brunette', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'brunette'), { style: 'primary' }),
+      richButton.callback('📸 Glamour', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'glamour'), { style: 'primary' }),
+      richButton.callback('📸 Boudoir', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'boudoir'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('📸 Baddie', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'baddie'), { style: 'primary' }),
+      richButton.callback('📸 Fitness', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'fitness model'), { style: 'primary' }),
+      richButton.callback('📸 Aesthetic', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'aesthetic model'), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.buttons([
+      richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  // ── Submenu 4: Real Adult Videos (Clips + Full Videos) ─────────────────────
+  function renderRealVideosMenu(ctx) {
+    const b = new RichMessageBuilder();
+    b.header('𓆩♡𓆪 REAL ADULT VIDEOS & CLIPS 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic('₊˚⊹♡ direct playable MP4 previews, video clips, and full streaming videos ♡ ˙ᵕ˙'));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🎬 Video Clips & Previews (Fast MP4)', encodeCallback(id, 'cat', NSFW_CATEGORIES.REAL_CLIPS), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎞 Full Adult Videos & Streams', encodeCallback(id, 'cat', NSFW_CATEGORIES.REAL_FULL_VIDEOS), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎲 Random Spicy Video Pick', encodeCallback(id, 'random', NSFW_CATEGORIES.REAL_CLIPS), { style: 'primary' })
+    ]);
+    b.divider();
+
+    // Popular suggestions buttons
+    b.paragraph(rt.bold('✨ Trending Video Categories:'));
+    b.buttons([
+      richButton.callback('🎬 Asian Clip', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_CLIPS, 'asian'), { style: 'primary' }),
+      richButton.callback('🎬 Latina Clip', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_CLIPS, 'latina'), { style: 'primary' }),
+      richButton.callback('🎬 Glamour Teaser', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_CLIPS, 'glamour'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎞 Baddie Full', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_FULL_VIDEOS, 'baddie'), { style: 'primary' }),
+      richButton.callback('🎞 Brunette Full', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_FULL_VIDEOS, 'brunette'), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.buttons([
+      richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
     b.validate();
     return b.toJSON();
   }
@@ -129,20 +286,24 @@ export function createNsfwScreen({ app }) {
     }
 
     const categoryLabels = {
-      [NSFW_CATEGORIES.HENTAI_UNCENSORED]: 'Uncensored Hentai',
-      [NSFW_CATEGORIES.HENTAI_CENSORED]: 'Censored / Ecchi Anime',
+      [NSFW_CATEGORIES.HENTAI_CENSORED]: 'Censored / Ecchi Anime Wallpapers',
+      [NSFW_CATEGORIES.HENTAI_UNCENSORED]: 'Uncensored Hentai 4K Wallpapers',
+      [NSFW_CATEGORIES.HENTAI_CLIPS]: 'Animated Hentai Clips & Loops',
+      [NSFW_CATEGORIES.HENTAI_FULL_VIDEOS]: 'Hentai Videos & Episodes',
       [NSFW_CATEGORIES.REAL_WALLPAPERS]: 'Real Adult 4K Wallpapers',
-      [NSFW_CATEGORIES.VIDEOS]: '18+ Videos & Clips',
-      [NSFW_CATEGORIES.ANIMATED]: 'Animated Hentai GIFs',
-      all: '18+ Adult & Hentai'
+      [NSFW_CATEGORIES.REAL_CLIPS]: 'Real Adult Video Clips & Previews',
+      [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: 'Full Adult Videos',
+      all: '18+ Adult & Hentai Studio'
     };
 
     const categoryExamples = {
-      [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'baddie'],
-      [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'genshin', 'makima', 'yor forger', 'marin kitagawa'],
+      [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'boudoir', 'baddie'],
+      [NSFW_CATEGORIES.REAL_CLIPS]: ['asian', 'latina', 'brunette', 'teaser', 'glamour'],
+      [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['asian', 'latina', 'blonde', 'baddie', 'brunette'],
+      [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'genshin', 'makima', 'yor forger', '2b', 'marin'],
       [NSFW_CATEGORIES.HENTAI_CENSORED]: ['waifu', 'swimsuit', 'lingerie', 'genshin', 'honkai', 'anime girl'],
-      [NSFW_CATEGORIES.VIDEOS]: ['hentai', 'cosplay', 'asian', 'brunette', 'latina', 'glamour'],
-      [NSFW_CATEGORIES.ANIMATED]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
+      [NSFW_CATEGORIES.HENTAI_CLIPS]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
+      [NSFW_CATEGORIES.HENTAI_FULL_VIDEOS]: ['genshin', 'tifa 3d', 'overflow', 'naruto', 'cosplay'],
       all: ['tifa', 'asian model', 'genshin', 'blonde', 'waifu', 'latina']
     };
 
@@ -158,6 +319,16 @@ export function createNsfwScreen({ app }) {
     b.paragraph(rt.italic('send me what you want to search for ♡'));
     b.paragraph(rt.concat(...exampleParts));
     b.divider();
+
+    // Quick suggestion buttons on query prompt
+    const suggestions = CATEGORY_SUGGESTIONS[category] || CATEGORY_SUGGESTIONS.all;
+    if (suggestions && suggestions.length >= 3) {
+      b.paragraph(rt.bold('✨ Quick Pick or Tap Below:'));
+      b.buttons(suggestions.slice(0, 3).map(s =>
+        richButton.callback(s, encodeCallback(id, 'quickSearch', category, s.replace(/^[^\w]+/, '').trim()), { style: 'primary' })
+      ));
+    }
+
     b.buttons([
       richButton.callback('🎲 Random Pick Instead', encodeCallback(id, 'random', category), { style: 'primary' })
     ]);
@@ -217,8 +388,8 @@ export function createNsfwScreen({ app }) {
         cleanDisplayQ
       ])));
       b.divider();
-      b.paragraph(`⏳ Searching across adult providers… ♡\n˙ᵕ˙ Category: ${category} • Page: ${page + 1}`);
-      b.footer(rt.italic('live deep search in progress ♡'));
+      b.paragraph(`⏳ Searching Wallhaven 4K, Yande.re, Nekobot & Spankbang… ♡\n˙ᵕ˙ Category: ${category} • Page: ${page + 1}`);
+      b.footer(rt.italic('live multi-source deep search in progress ♡'));
       b.validate();
       return b.toJSON();
     }, { stage: 'searching' });
@@ -238,14 +409,14 @@ export function createNsfwScreen({ app }) {
         const b = new RichMessageBuilder();
         b.heading('🔞 NO RESULTS FOUND', 2);
         b.paragraph(rt.italic(`could not find any adult results for "${truncate(query, 24)}" ♡`));
-        b.paragraph(rt.text('try another anime character, or browse trending spicy picks!'));
+        b.paragraph(rt.text('try another term, or browse trending spicy picks!'));
         b.divider();
         b.buttons([
-          richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', 'all'), { style: 'primary' }),
-          richButton.callback('🔞 Hentai Uncensored', encodeCallback(id, 'cat', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' })
+          richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category), { style: 'primary' }),
+          richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' })
         ]);
         b.buttons([
-          richButton.callback('🔍 Try Another Search', encodeCallback(id, 'searchPrompt', category), { style: 'primary' }),
+          richButton.callback('🔍 Try Another Search', encodeCallback(id, 'cat', category), { style: 'primary' }),
           richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
         ]);
         b.validate();
@@ -287,7 +458,26 @@ export function createNsfwScreen({ app }) {
       ])));
       b.divider();
 
-      // Show top picks list
+      // Fetch preview images so pictures are visibly embedded in the slideshow
+      let previewFiles = null;
+      try {
+        const { previewBlocks, mediaFiles } = await fetchPreviewBuffers(items, 3);
+        if (previewBlocks.length > 0) {
+          const slideItems = previewBlocks.map((p) => {
+            if (p.type === 'video') return block.video(p.ref);
+            return block.photo(p.ref);
+          });
+          b.slideshow(slideItems);
+          b.divider();
+          if (Object.keys(mediaFiles).length > 0) {
+            previewFiles = mediaFiles;
+          }
+        }
+      } catch (e) {
+        log.debug({ err: e?.message }, 'could not attach preview buffers');
+      }
+
+      // Show top picks metadata table
       b.table([
         [
           { text: '👤 Requester', align: 'left', valign: 'middle' },
@@ -315,20 +505,19 @@ export function createNsfwScreen({ app }) {
 
       // Download / Media links notice
       if (isGroup) {
-        b.paragraph(rt.italic('🔒 In group chats, media can be sent with spoiler protection. Tap a pick below to send to chat or open in DM ♡'));
+        b.paragraph(rt.italic('🔒 In group chats, media is delivered with spoiler protection. Tap a pick below to send to chat or open in DM ♡'));
       }
 
-      // Interactive Action Buttons
       // Quick deliver buttons for top 3 items
       for (let i = 0; i < Math.min(3, items.length); i++) {
         const it = items[i];
         const icon = it.type === 'video' ? '🎬' : '🖼';
         b.buttons([
-          richButton.callback(`${icon} View Pick #${i + 1}`, encodeCallback(id, 'sendMedia', String(searchDbId), String(i), isGroup ? '1' : '0'), { style: 'primary' })
+          richButton.callback(`${icon} View / Send Pick #${i + 1}`, encodeCallback(id, 'sendMedia', String(searchDbId), String(i), isGroup ? '1' : '0'), { style: 'primary' })
         ]);
       }
 
-      // Pagination buttons
+      // Pagination navigation buttons
       const navRow = [];
       if (page > 0) {
         navRow.push(richButton.callback('← Prev Picks', encodeCallback(id, 'page', String(page - 1), category, query, tgId), { style: 'primary' }));
@@ -340,6 +529,19 @@ export function createNsfwScreen({ app }) {
         b.buttons(navRow);
       }
 
+      // ── Search Suggestions Buttons in Pagination ──────────────────────────
+      const suggestions = CATEGORY_SUGGESTIONS[category] || CATEGORY_SUGGESTIONS[searchRes.category] || CATEGORY_SUGGESTIONS.all;
+      if (suggestions && suggestions.length >= 3) {
+        const randomSuggestions = suggestions
+          .filter(s => s.toLowerCase() !== query.toLowerCase())
+          .slice(0, 3);
+        if (randomSuggestions.length > 0) {
+          b.buttons(randomSuggestions.map(s =>
+            richButton.callback(s, encodeCallback(id, 'quickSearch', category, s.replace(/^[^\w]+/, '').trim()), { style: 'primary' })
+          ));
+        }
+      }
+
       b.buttons([
         richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(searchDbId)), { style: 'primary' }),
         richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category), { style: 'primary' })
@@ -348,25 +550,6 @@ export function createNsfwScreen({ app }) {
         richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
         richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
       ]);
-      // Fetch preview images so pictures are visibly embedded in the slideshow
-      let previewFiles = null;
-      try {
-        const { previewBlocks, mediaFiles } = await fetchPreviewBuffers(items, 3);
-        if (previewBlocks.length > 0) {
-          const slideItems = previewBlocks.map((p) => {
-            if (p.type === 'video') return block.video(p.ref);
-            return block.photo(p.ref);
-          });
-          b.slideshow(slideItems);
-          b.divider();
-          if (Object.keys(mediaFiles).length > 0) {
-            previewFiles = mediaFiles;
-          }
-        }
-      } catch (e) {
-        log.debug({ err: e?.message }, 'could not attach preview buffers');
-      }
-
       b.footer(rt.italic('୨୧ 18+ adult studio • multi-source HD delivery ♡'));
       b.validate();
 
@@ -432,7 +615,6 @@ export function createNsfwScreen({ app }) {
     const api = ctx.api || app.telegram.api;
     const chatId = ctx.chatId;
     const idx = parseInt(itemIndex, 10) || 0;
-    const userId = ctx.tgId;
 
     let row = null;
     if (app.pinterest?.db) {
@@ -548,18 +730,38 @@ export function createNsfwScreen({ app }) {
         case 'open':
         case 'menu':
           return openMenu(ctx);
+        case 'sub': {
+          const subCategory = args[0] || '';
+          if (subCategory === 'hentai_wallpapers') {
+            return editOrSend(ctx, renderHentaiWallpapersMenu(ctx));
+          } else if (subCategory === 'hentai_videos') {
+            return editOrSend(ctx, renderHentaiVideosMenu(ctx));
+          } else if (subCategory === 'real_wallpapers') {
+            return editOrSend(ctx, renderRealWallpapersMenu(ctx));
+          } else if (subCategory === 'real_videos') {
+            return editOrSend(ctx, renderRealVideosMenu(ctx));
+          }
+          return openMenu(ctx);
+        }
         case 'cat':
           return askQuery(ctx, args[0] || 'all');
         case 'searchPrompt':
           return askQuery(ctx, args[0] || 'all');
+        case 'quickSearch': {
+          const cat = args[0] || 'all';
+          const query = args[1] || '';
+          return runSearch(ctx, query, cat, 0);
+        }
         case 'random': {
           const cat = args[0] || 'all';
           const randomPools = {
-            [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'baddie', 'fitness model', 'goth girl'],
+            [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'boudoir', 'baddie', 'fitness model'],
+            [NSFW_CATEGORIES.REAL_CLIPS]: ['asian clip', 'latina clip', 'teaser', 'glamour preview'],
+            [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['asian', 'latina', 'blonde', 'baddie', 'brunette'],
             [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'raiden_shogun', 'makima', 'yor_forger', 'marin_kitagawa', '2b', 'yae_miko', 'r34'],
             [NSFW_CATEGORIES.HENTAI_CENSORED]: ['waifu', 'swimsuit', 'lingerie', 'genshin_impact', 'honkai_star_rail', 'anime_girl'],
-            [NSFW_CATEGORIES.VIDEOS]: ['hentai', 'cosplay', 'asian', 'brunette', 'latina', 'baddie'],
-            [NSFW_CATEGORIES.ANIMATED]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
+            [NSFW_CATEGORIES.HENTAI_CLIPS]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
+            [NSFW_CATEGORIES.HENTAI_FULL_VIDEOS]: ['genshin hentai', 'tifa 3d', 'overflow', 'naruto hentai'],
             all: ['tifa', 'asian model', 'genshin', 'blonde', 'tsunade', 'brunette', 'latina', 'waifu']
           };
           const pool = randomPools[cat] || randomPools.all;

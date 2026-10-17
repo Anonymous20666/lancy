@@ -134,8 +134,25 @@ test('createNsfwScreen: screen interface, menu rendering and state registration'
   await nsfwScreen.open(ctx);
   assert.ok(sentRich);
   assert.match(JSON.stringify(sentRich), /18\+ ADULT & HENTAI STUDIO/);
-  assert.match(JSON.stringify(sentRich), /Hentai Uncensored/);
-  assert.match(JSON.stringify(sentRich), /18\+ Videos/);
+  assert.match(JSON.stringify(sentRich), /Hentai Wallpapers/);
+  assert.match(JSON.stringify(sentRich), /Adult Wallpapers/);
+
+  // Test opening Hentai Wallpapers submenu
+  await nsfwScreen.handle(ctx, 'sub', ['hentai_wallpapers']);
+  assert.match(JSON.stringify(sentRich), /HENTAI WALLPAPERS/);
+  assert.match(JSON.stringify(sentRich), /Censored \/ Ecchi/);
+  assert.match(JSON.stringify(sentRich), /Uncensored/);
+
+  // Test opening Real Adult Wallpapers submenu (no censored option)
+  await nsfwScreen.handle(ctx, 'sub', ['real_wallpapers']);
+  assert.match(JSON.stringify(sentRich), /REAL ADULT 4K WALLPAPERS/);
+  assert.ok(!JSON.stringify(sentRich).includes('Censored'));
+
+  // Test opening Real Adult Videos submenu (clips + full)
+  await nsfwScreen.handle(ctx, 'sub', ['real_videos']);
+  assert.match(JSON.stringify(sentRich), /REAL ADULT VIDEOS/);
+  assert.match(JSON.stringify(sentRich), /Video Clips & Previews/);
+  assert.match(JSON.stringify(sentRich), /Full Adult Videos/);
 
   // Test multi-user group chat callback acknowledgement
   let answeredToast = null;

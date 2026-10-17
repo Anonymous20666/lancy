@@ -10,11 +10,27 @@ const CACHE_TTL_MS = 10 * 60 * 1000; // 10 minutes
 
 export const NSFW_CATEGORIES = {
   ALL: 'all',
-  HENTAI_UNCENSORED: 'hentai_uncensored',
   HENTAI_CENSORED: 'hentai_censored',
+  HENTAI_UNCENSORED: 'hentai_uncensored',
+  HENTAI_CLIPS: 'hentai_clips',
+  HENTAI_FULL_VIDEOS: 'hentai_videos',
   REAL_WALLPAPERS: 'real_wallpapers',
-  VIDEOS: 'videos',
-  ANIMATED: 'animated'
+  REAL_CLIPS: 'real_clips',
+  REAL_FULL_VIDEOS: 'real_videos',
+  // Backward compatibility aliases
+  VIDEOS: 'real_videos',
+  ANIMATED: 'hentai_clips'
+};
+
+export const CATEGORY_SUGGESTIONS = {
+  [NSFW_CATEGORIES.HENTAI_CENSORED]: ['Waifu', 'Genshin', 'Swimsuit', 'Lingerie', 'Honkai', 'Anime Girl', 'Maid'],
+  [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['Tifa', 'Tsunade', 'Makima', 'Yor Forger', '2B', 'Marin', 'Raiden'],
+  [NSFW_CATEGORIES.HENTAI_CLIPS]: ['Blowjob', 'Dance', 'Pussy', 'Fuck', 'Anal', 'Ecchi Loop'],
+  [NSFW_CATEGORIES.HENTAI_FULL_VIDEOS]: ['Genshin Hentai', 'Tifa 3D', 'OverFlow', 'Naruto Hentai', 'Cosplay Hentai'],
+  [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['Asian Model', 'Latina', 'Brunette', 'Blonde', 'Glamour', 'Boudoir', 'Baddie', 'Fitness'],
+  [NSFW_CATEGORIES.REAL_CLIPS]: ['Teaser Clip', 'Asian Clip', 'Latina Clip', 'Glamour Preview', 'Baddie Teaser'],
+  [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['Asian', 'Latina', 'Brunette', 'Blonde', 'Baddie', 'Glamour'],
+  all: ['Tifa', 'Asian Model', 'Makima', 'Latina', 'Genshin', 'Glamour']
 };
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
@@ -27,13 +43,62 @@ function sanitizeBooruTag(q) {
 }
 
 /**
- * Fetch uncensored anime / hentai wallpapers from Yande.re & Nekobot.
+ * Fetch 4K/8K explicit & aesthetic wallpapers from Wallhaven API.
+ * @param {string} query - Search query
+ * @param {string} purity - '010' (sketchy/sensual/ecchi), '001' (NSFW explicit), or '011' (both)
+ * @param {string} categories - '010' (anime), '100' (general/people), or '111'
+ */
+async function fetchWallhaven(query = '', purity = '011', categories = '111', page = 1, limit = 10, signal = null) {
+  const results = [];
+  try {
+    const q = query ? encodeURIComponent(query) : '';
+    const sorting = query ? 'relevance' : 'toplist';
+    const url = `https://wallhaven.cc/api/v1/search?q=${q}&purity=${purity}&categories=${categories}&page=${page}&sorting=${sorting}`;
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENT },
+      signal: signal || AbortSignal.timeout(7000)
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (Array.isArray(data?.data)) {
+        for (const item of data.data) {
+          if (item?.path) {
+            results.push({
+              id: `wh_${item.id}`,
+              title: query ? `${query} • 4K Wallpaper` : `4K HD Wallpaper (${item.resolution || '4K'})`,
+              type: 'photo',
+              mediaUrl: item.path,
+              thumbUrl: item.thumbs?.large || item.thumbs?.small || item.path,
+              width: item.dimension_x || 3840,
+              height: item.dimension_y || 2160,
+              source: 'Wallhaven 4K Studio'
+            });
+          }
+          if (results.length >= limit) break;
+        }
+      }
+    }
+  } catch (err) {
+    log.debug({ err: err?.message, query }, 'wallhaven fetch failed');
+  }
+  return results;
+}
+
+/**
+ * Fetch uncensored anime / hentai wallpapers from Wallhaven, Yande.re & Nekobot.
  */
 async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = null) {
   const cleanTag = sanitizeBooruTag(query);
   const results = [];
 
-  // 1. Try Yande.re explicit + sanitized tag
+  // 1. Fetch 4K Wallhaven explicit anime wallpapers
+  const whItems = await fetchWallhaven(query, '001', '010', page + 1, Math.min(8, limit), signal);
+  for (const it of whItems) {
+    it.category = NSFW_CATEGORIES.HENTAI_UNCENSORED;
+    results.push(it);
+  }
+
+  // 2. Try Yande.re explicit + sanitized tag
   try {
     const tags = ['rating:explicit'];
     if (cleanTag && cleanTag.length >= 2) {
@@ -71,7 +136,7 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
     log.debug({ err: err?.message, query }, 'yandere uncensored fetch failed');
   }
 
-  // 1b. If specific tag had 0 results, fall back to general explicit on Yande.re
+  // 2b. If specific tag had 0 results, fall back to general explicit on Yande.re
   if (results.length === 0) {
     try {
       const fallbackUrl = `https://yande.re/post.json?limit=${Math.min(20, limit)}&page=${page + 1}&tags=rating:explicit`;
@@ -103,7 +168,7 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
     } catch {}
   }
 
-  // 2. Supplement with Nekobot if needed
+  // 3. Supplement with Nekobot if needed
   if (results.length < limit) {
     try {
       const types = ['hentai', 'paizuri', 'hass', 'hboobs'];
@@ -140,12 +205,20 @@ async function fetchHentaiUncensored(query = '', page = 0, limit = 10, signal = 
 }
 
 /**
- * Fetch censored / ecchi anime wallpapers from Yande.re.
+ * Fetch censored / ecchi anime wallpapers from Wallhaven & Yande.re.
  */
 async function fetchHentaiCensored(query = '', page = 0, limit = 10, signal = null) {
   const cleanTag = sanitizeBooruTag(query);
   const results = [];
 
+  // 1. Fetch 4K Wallhaven sensual / ecchi anime wallpapers (purity 010)
+  const whItems = await fetchWallhaven(query, '010', '010', page + 1, Math.min(8, limit), signal);
+  for (const it of whItems) {
+    it.category = NSFW_CATEGORIES.HENTAI_CENSORED;
+    results.push(it);
+  }
+
+  // 2. Fetch Yande.re rating:questionable
   try {
     const tags = ['rating:questionable'];
     if (cleanTag && cleanTag.length >= 2) {
@@ -217,18 +290,29 @@ async function fetchHentaiCensored(query = '', page = 0, limit = 10, signal = nu
 }
 
 /**
- * Fetch Real Adult 18+ 4K Wallpapers and Photos from Nekobot (4k, gonewild, boobs, ass).
+ * Fetch Real Adult 18+ 4K Wallpapers and Photos from Wallhaven & Nekobot.
+ * Delivers glamour, boudoir, sensual, fitness, and adult model wallpapers.
  */
 async function fetchRealAdultWallpapers(query = '', page = 0, limit = 10, signal = null) {
-  const cleanQ = String(query || '').toLowerCase();
+  const cleanQ = String(query || '').toLowerCase().trim();
   const results = [];
 
+  // 1. Fetch 4K Wallhaven general/people wallpapers (models, glamour, boudoir, sensual 4K adult photography)
+  const whQuery = cleanQ || 'model';
+  const whItems = await fetchWallhaven(whQuery, '011', '100', page + 1, Math.min(8, limit), signal);
+  for (const it of whItems) {
+    it.category = NSFW_CATEGORIES.REAL_WALLPAPERS;
+    it.title = cleanQ ? `4K Model Wallpaper (${cleanQ})` : '4K Adult Glamour Wallpaper';
+    results.push(it);
+  }
+
+  // 2. Fetch Nekobot 4K Adult photos
   let types = ['4k', 'gonewild', 'boobs', 'ass'];
   if (/boob|breast|tits|cleavage/i.test(cleanQ)) types = ['boobs', '4k'];
   else if (/ass|booty|butt/i.test(cleanQ)) types = ['ass', '4k'];
-  else if (/amateur|nude|real|girl/i.test(cleanQ)) types = ['gonewild', '4k'];
+  else if (/amateur|nude|real|girl|baddie|latina|asian|blonde|brunette|model/i.test(cleanQ)) types = ['gonewild', '4k'];
 
-  const countToFetch = Math.min(15, Math.max(limit, 8));
+  const countToFetch = Math.min(10, Math.max(limit, 6));
   const promises = Array.from({ length: countToFetch }, (_, idx) => {
     const t = types[idx % types.length];
     return fetch(`https://nekobot.xyz/api/image?type=${t}`, {
@@ -238,7 +322,7 @@ async function fetchRealAdultWallpapers(query = '', page = 0, limit = 10, signal
   });
 
   const settled = await Promise.all(promises);
-  const seenUrls = new Set();
+  const seenUrls = new Set(results.map(r => r.mediaUrl));
   for (const s of settled) {
     if (s?.success && s?.message && !seenUrls.has(s.message)) {
       seenUrls.add(s.message);
@@ -265,10 +349,9 @@ async function fetchRealAdultWallpapers(query = '', page = 0, limit = 10, signal
 
 /**
  * Fetch 18+ Videos (Direct MP4 streams from Spankbang + XVideos fallback).
- * Supports both Hentai & Real Adult videos.
  */
-async function fetch18PlusVideos(query = '', page = 0, limit = 10, signal = null) {
-  const cleanQ = String(query || '').trim() || 'trending';
+async function fetch18PlusVideos(query = '', page = 0, limit = 10, category = NSFW_CATEGORIES.REAL_FULL_VIDEOS, signal = null) {
+  const cleanQ = String(query || '').trim() || (category === NSFW_CATEGORIES.HENTAI_FULL_VIDEOS ? 'hentai' : 'trending');
   const results = [];
 
   // 1. Spankbang direct MP4 video previews
@@ -305,7 +388,7 @@ async function fetch18PlusVideos(query = '', page = 0, limit = 10, signal = null
             thumbUrl: thumb,
             pageUrl: href ? `https://spankbang.com${href}` : null,
             duration: $(el).find('.l, .duration').text().trim() || 'HD',
-            category: NSFW_CATEGORIES.VIDEOS,
+            category,
             source: '18+ Video Network'
           });
         }
@@ -338,11 +421,11 @@ async function fetch18PlusVideos(query = '', page = 0, limit = 10, signal = null
               id: `xv_vid_${i}_${Date.now()}`,
               title: title.slice(0, 60),
               type: 'video',
-              mediaUrl: thumb, // Thumbnail preview card
+              mediaUrl: thumb,
               thumbUrl: thumb,
               pageUrl: `https://www.xvideos.com${href}`,
               duration: duration || 'HD',
-              category: NSFW_CATEGORIES.VIDEOS,
+              category,
               source: 'XVideos Network'
             });
           }
@@ -392,12 +475,12 @@ async function fetchAnimatedHentai(query = '', page = 0, limit = 10, signal = nu
       results.push({
         id: `anim_${Math.random().toString(36).slice(2, 9)}`,
         title: cleanQ ? `Animated Hentai Clip (${cleanQ})` : 'Animated Hentai GIF Clip',
-        type: 'photo', // Telegram delivers GIF via photo/document or animated format
+        type: 'photo',
         mediaUrl: link,
         thumbUrl: link,
         width: 800,
         height: 600,
-        category: NSFW_CATEGORIES.ANIMATED,
+        category: NSFW_CATEGORIES.HENTAI_CLIPS,
         source: 'Anime Animation Studio'
       });
     }
@@ -410,7 +493,7 @@ async function fetchAnimatedHentai(query = '', page = 0, limit = 10, signal = nu
  * Unified Multi-Provider 18+ Search Engine.
  *
  * Implements:
- * - Smart query routing (hentai, uncensored, censored, real adult, video, animated)
+ * - Smart query routing (hentai wallpapers, hentai videos, real adult wallpapers, real adult videos)
  * - In-flight request deduplication for high-traffic group chats
  * - In-memory LRU caching with 10-minute TTL
  * - Safe error handling & zero-exception contract
@@ -433,7 +516,7 @@ export async function searchNsfw({ query = '', category = 'all', page = 0, limit
     return cached.data;
   }
 
-  // Deduplicate in-flight requests (coalesce concurrent requests from same or different group chats!)
+  // Deduplicate in-flight requests
   if (inFlightRequests.has(cacheKey)) {
     try {
       return await inFlightRequests.get(cacheKey);
@@ -447,13 +530,13 @@ export async function searchNsfw({ query = '', category = 'all', page = 0, limit
 
     // Smart category auto-detection when category is 'all'
     if (effectiveCategory === 'all' || !effectiveCategory) {
-      if (/\b(video|videos|clip|clips|movie|watch|trailer)\b/i.test(cleanQuery)) {
-        effectiveCategory = NSFW_CATEGORIES.VIDEOS;
-      } else if (/\b(real|amateur|gonewild|4k|baddie|model|blonde|latina|asian|boobs|ass)\b/i.test(cleanQuery)) {
+      if (/\b(clip|clips|gif|loop|animated)\b/i.test(cleanQuery)) {
+        effectiveCategory = NSFW_CATEGORIES.HENTAI_CLIPS;
+      } else if (/\b(video|videos|movie|watch|trailer|episode)\b/i.test(cleanQuery)) {
+        effectiveCategory = /hentai|anime/i.test(cleanQuery) ? NSFW_CATEGORIES.HENTAI_FULL_VIDEOS : NSFW_CATEGORIES.REAL_FULL_VIDEOS;
+      } else if (/\b(real|amateur|gonewild|4k|baddie|model|blonde|latina|asian|glamour|boudoir|fitness)\b/i.test(cleanQuery)) {
         effectiveCategory = NSFW_CATEGORIES.REAL_WALLPAPERS;
-      } else if (/\b(gif|animated|motion)\b/i.test(cleanQuery)) {
-        effectiveCategory = NSFW_CATEGORIES.ANIMATED;
-      } else if (/\b(ecchi|censored|soft|questionable)\b/i.test(cleanQuery)) {
+      } else if (/\b(ecchi|censored|soft|questionable|waifu|swimsuit|lingerie)\b/i.test(cleanQuery)) {
         effectiveCategory = NSFW_CATEGORIES.HENTAI_CENSORED;
       } else {
         effectiveCategory = NSFW_CATEGORIES.HENTAI_UNCENSORED;
@@ -472,18 +555,26 @@ export async function searchNsfw({ query = '', category = 'all', page = 0, limit
       case NSFW_CATEGORIES.REAL_WALLPAPERS:
         items = await fetchRealAdultWallpapers(cleanQuery, page, limit, signal);
         break;
-      case NSFW_CATEGORIES.VIDEOS:
-        items = await fetch18PlusVideos(cleanQuery, page, limit, signal);
-        break;
-      case NSFW_CATEGORIES.ANIMATED:
+      case NSFW_CATEGORIES.HENTAI_CLIPS:
+      case 'animated':
         items = await fetchAnimatedHentai(cleanQuery, page, limit, signal);
+        break;
+      case NSFW_CATEGORIES.HENTAI_FULL_VIDEOS:
+        items = await fetch18PlusVideos(cleanQuery ? `${cleanQuery} hentai` : 'hentai', page, limit, NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, signal);
+        break;
+      case NSFW_CATEGORIES.REAL_CLIPS:
+        items = await fetch18PlusVideos(cleanQuery ? `${cleanQuery} clip` : 'short clip', page, limit, NSFW_CATEGORIES.REAL_CLIPS, signal);
+        break;
+      case NSFW_CATEGORIES.REAL_FULL_VIDEOS:
+      case 'videos':
+        items = await fetch18PlusVideos(cleanQuery, page, limit, NSFW_CATEGORIES.REAL_FULL_VIDEOS, signal);
         break;
       default: {
         // Multi-source hybrid mix
         const [uncensored, realWallpapers, vids] = await Promise.all([
           fetchHentaiUncensored(cleanQuery, page, Math.ceil(limit / 2), signal).catch(() => []),
           fetchRealAdultWallpapers(cleanQuery, page, Math.ceil(limit / 4), signal).catch(() => []),
-          fetch18PlusVideos(cleanQuery, page, Math.ceil(limit / 4), signal).catch(() => [])
+          fetch18PlusVideos(cleanQuery, page, Math.ceil(limit / 4), NSFW_CATEGORIES.REAL_FULL_VIDEOS, signal).catch(() => [])
         ]);
         items = [...uncensored, ...realWallpapers, ...vids];
         break;
