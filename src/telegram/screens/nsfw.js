@@ -10,19 +10,23 @@ import { logger } from '../../core/logger.js';
 
 const log = logger().child({ module: 'nsfw-screen' });
 
-async function fetchPreviewBuffers(items, max = 3) {
+/**
+ * Fetch HD buffers for preview slideshow (1080p+ quality, no 150px thumbnails).
+ */
+async function fetchPreviewBuffers(items, max = 10) {
   const previewBlocks = [];
   const mediaFiles = {};
   let idx = 0;
 
   const topItems = (items || []).slice(0, max);
   const promises = topItems.map(async (it) => {
-    if (!it.mediaUrl && !it.thumbUrl) return null;
-    const targetUrl = it.thumbUrl || it.mediaUrl;
+    // Pick the highest resolution preview URL (never 150px preview_url)
+    const targetUrl = it.thumbUrl || it.media_url || it.mediaUrl;
+    if (!targetUrl) return null;
     try {
       const res = await fetch(targetUrl, {
         headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        signal: AbortSignal.timeout(3500)
+        signal: AbortSignal.timeout(4500)
       });
       if (!res.ok) return null;
       const arrayBuf = await res.arrayBuffer();
@@ -30,7 +34,8 @@ async function fetchPreviewBuffers(items, max = 3) {
       if (it.type === 'video') {
         return { type: 'video', buffer: rawBuf, mime: 'video/mp4' };
       }
-      const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1080, quality: 80 });
+      // Crisp 1280px HD optimization
+      const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1280, quality: 88 });
       return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
     } catch {
       return null;
@@ -111,17 +116,16 @@ export function createNsfwScreen({ app }) {
     ]);
     b.divider();
 
-    // Popular suggestions buttons
     b.paragraph(rt.bold('✨ Trending Anime Characters:'));
     b.buttons([
-      richButton.callback('🌸 Tifa', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'tifa'), { style: 'primary' }),
-      richButton.callback('🌸 Makima', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'makima'), { style: 'primary' }),
-      richButton.callback('🌸 Genshin', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'genshin'), { style: 'primary' })
+      richButton.callback('🌸 Tifa', encodeCallback(id, 'askCountDirect', 'tifa', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' }),
+      richButton.callback('🌸 Makima', encodeCallback(id, 'askCountDirect', 'makima', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' }),
+      richButton.callback('🌸 Genshin', encodeCallback(id, 'askCountDirect', 'genshin', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🌸 Tsunade', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'tsunade'), { style: 'primary' }),
-      richButton.callback('🌸 Yor Forger', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, 'yor_forger'), { style: 'primary' }),
-      richButton.callback('🌸 2B', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_UNCENSORED, '2b'), { style: 'primary' })
+      richButton.callback('🌸 Tsunade', encodeCallback(id, 'askCountDirect', 'tsunade', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' }),
+      richButton.callback('🌸 Yor Forger', encodeCallback(id, 'askCountDirect', 'yor_forger', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' }),
+      richButton.callback('🌸 2B', encodeCallback(id, 'askCountDirect', '2b', NSFW_CATEGORIES.HENTAI_UNCENSORED), { style: 'primary' })
     ]);
     b.divider();
 
@@ -151,16 +155,15 @@ export function createNsfwScreen({ app }) {
     ]);
     b.divider();
 
-    // Popular suggestions buttons
     b.paragraph(rt.bold('✨ Popular Video Searches:'));
     b.buttons([
-      richButton.callback('🎞 Genshin', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, 'genshin'), { style: 'primary' }),
-      richButton.callback('🎞 Tifa 3D', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, 'tifa 3d'), { style: 'primary' }),
-      richButton.callback('🎞 OverFlow', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS, 'overflow'), { style: 'primary' })
+      richButton.callback('🎞 Genshin', encodeCallback(id, 'askCountDirect', 'genshin', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS), { style: 'primary' }),
+      richButton.callback('🎞 Tifa 3D', encodeCallback(id, 'askCountDirect', 'tifa 3d', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS), { style: 'primary' }),
+      richButton.callback('🎞 OverFlow', encodeCallback(id, 'askCountDirect', 'overflow', NSFW_CATEGORIES.HENTAI_FULL_VIDEOS), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('💋 Blowjob Loop', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_CLIPS, 'blowjob'), { style: 'primary' }),
-      richButton.callback('💋 Ecchi Dance', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.HENTAI_CLIPS, 'dance'), { style: 'primary' })
+      richButton.callback('💋 Blowjob Loop', encodeCallback(id, 'askCountDirect', 'blowjob', NSFW_CATEGORIES.HENTAI_CLIPS), { style: 'primary' }),
+      richButton.callback('💋 Ecchi Dance', encodeCallback(id, 'askCountDirect', 'dance', NSFW_CATEGORIES.HENTAI_CLIPS), { style: 'primary' })
     ]);
     b.divider();
 
@@ -185,22 +188,21 @@ export function createNsfwScreen({ app }) {
     ]);
     b.divider();
 
-    // Category / Style Suggestions
     b.paragraph(rt.bold('📸 Explore Models & Aesthetic Styles:'));
     b.buttons([
-      richButton.callback('📸 Asian Model', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'asian model'), { style: 'primary' }),
-      richButton.callback('📸 Latina', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'latina'), { style: 'primary' }),
-      richButton.callback('📸 Blonde', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'blonde'), { style: 'primary' })
+      richButton.callback('📸 Asian Model', encodeCallback(id, 'askCountDirect', 'asian model', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('📸 Latina', encodeCallback(id, 'askCountDirect', 'latina', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('📸 Blonde', encodeCallback(id, 'askCountDirect', 'blonde', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('📸 Brunette', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'brunette'), { style: 'primary' }),
-      richButton.callback('📸 Glamour', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'glamour'), { style: 'primary' }),
-      richButton.callback('📸 Boudoir', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'boudoir'), { style: 'primary' })
+      richButton.callback('📸 Brunette', encodeCallback(id, 'askCountDirect', 'brunette', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('📸 Glamour', encodeCallback(id, 'askCountDirect', 'glamour', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('📸 Boudoir', encodeCallback(id, 'askCountDirect', 'boudoir', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('📸 Baddie', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'baddie'), { style: 'primary' }),
-      richButton.callback('📸 Fitness', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'fitness model'), { style: 'primary' }),
-      richButton.callback('📸 Aesthetic', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_WALLPAPERS, 'aesthetic model'), { style: 'primary' })
+      richButton.callback('📸 Baddie', encodeCallback(id, 'askCountDirect', 'baddie', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('📸 Fitness', encodeCallback(id, 'askCountDirect', 'fitness model', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' }),
+      richButton.callback('📸 Aesthetic', encodeCallback(id, 'askCountDirect', 'aesthetic model', NSFW_CATEGORIES.REAL_WALLPAPERS), { style: 'primary' })
     ]);
     b.divider();
 
@@ -230,16 +232,15 @@ export function createNsfwScreen({ app }) {
     ]);
     b.divider();
 
-    // Popular suggestions buttons
     b.paragraph(rt.bold('✨ Trending Video Categories:'));
     b.buttons([
-      richButton.callback('🎬 Asian Clip', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_CLIPS, 'asian'), { style: 'primary' }),
-      richButton.callback('🎬 Latina Clip', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_CLIPS, 'latina'), { style: 'primary' }),
-      richButton.callback('🎬 Glamour Teaser', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_CLIPS, 'glamour'), { style: 'primary' })
+      richButton.callback('🎬 Asian Clip', encodeCallback(id, 'askCountDirect', 'asian', NSFW_CATEGORIES.REAL_CLIPS), { style: 'primary' }),
+      richButton.callback('🎬 Latina Clip', encodeCallback(id, 'askCountDirect', 'latina', NSFW_CATEGORIES.REAL_CLIPS), { style: 'primary' }),
+      richButton.callback('🎬 Glamour Teaser', encodeCallback(id, 'askCountDirect', 'glamour', NSFW_CATEGORIES.REAL_CLIPS), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('🎞 Baddie Full', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_FULL_VIDEOS, 'baddie'), { style: 'primary' }),
-      richButton.callback('🎞 Brunette Full', encodeCallback(id, 'quickSearch', NSFW_CATEGORIES.REAL_FULL_VIDEOS, 'brunette'), { style: 'primary' })
+      richButton.callback('🎞 Baddie Full', encodeCallback(id, 'askCountDirect', 'baddie', NSFW_CATEGORIES.REAL_FULL_VIDEOS), { style: 'primary' }),
+      richButton.callback('🎞 Brunette Full', encodeCallback(id, 'askCountDirect', 'brunette', NSFW_CATEGORIES.REAL_FULL_VIDEOS), { style: 'primary' })
     ]);
     b.divider();
 
@@ -273,13 +274,14 @@ export function createNsfwScreen({ app }) {
     await editOrSend(ctx, renderMenu(ctx));
   }
 
+  // ── Step 1: Ask Query ─────────────────────────────────────────────────────
   async function askQuery(ctx, category = 'all') {
     const screenMsgId = ctx.messageId ?? ctx.query?.message?.message_id;
     const tgId = String(ctx.tgId);
     const sm = ctx.sm ?? ctx.machine;
     if (sm) {
       await sm.transition(tgId, States.NSFW_SEARCH_INPUT, {
-        context: { category, screenMessageId: screenMsgId },
+        context: { category, stage: 'query', screenMessageId: screenMsgId },
         chatId: ctx.chatId,
         screenMessageId: screenMsgId
       });
@@ -325,7 +327,7 @@ export function createNsfwScreen({ app }) {
     if (suggestions && suggestions.length >= 3) {
       b.paragraph(rt.bold('✨ Quick Pick or Tap Below:'));
       b.buttons(suggestions.slice(0, 3).map(s =>
-        richButton.callback(s, encodeCallback(id, 'quickSearch', category, s.replace(/^[^\w]+/, '').trim()), { style: 'primary' })
+        richButton.callback(s, encodeCallback(id, 'askCountDirect', s.replace(/^[^\w]+/, '').trim(), category), { style: 'primary' })
       ));
     }
 
@@ -341,7 +343,177 @@ export function createNsfwScreen({ app }) {
     }
   }
 
-  async function runSearch(ctx, query = '', category = 'all', page = 0, opts = {}) {
+  // ── Step 2: Ask Count Selection (Exact Pinterest UX) ──────────────────────
+  async function askCount(ctx, query, category = 'all') {
+    const isVideo = category.includes('video') || category.includes('clip');
+    const tgId = String(ctx.tgId);
+    const sm = ctx.sm ?? ctx.machine;
+    const screenMsgId = ctx.messageId ?? ctx.screenMessageId ?? sm?.for(tgId)?.screenMessageId ?? sm?.context?.(tgId)?.screenMessageId;
+
+    if (sm) {
+      await sm.transition(tgId, States.NSFW_SEARCH_INPUT, {
+        context: { category, query, stage: 'count', screenMessageId: screenMsgId },
+        chatId: ctx.chatId,
+        screenMessageId: screenMsgId
+      });
+    }
+
+    const b = new RichMessageBuilder();
+    b.heading(isVideo ? '🎬 VIDEO RESULT COUNT' : '✨ 18+ RESULT COUNT', 2);
+    b.paragraph(rt.italic(`how many aesthetic picks should I find for "${truncate(query, 24)}"? ♡`));
+    b.divider();
+    b.table(kvTable([
+      ['Query', truncate(query, 24)],
+      ['Category', category],
+      ['Quality', '4K / HD Quality Guaranteed']
+    ]), { compact: true });
+    b.divider();
+
+    if (isVideo) {
+      b.buttons([
+        richButton.callback('5', encodeCallback(id, 'runCount', '5', category, query), { style: 'primary' }),
+        richButton.callback('10', encodeCallback(id, 'runCount', '10', category, query), { style: 'primary' }),
+        richButton.callback('15', encodeCallback(id, 'runCount', '15', category, query), { style: 'primary' }),
+        richButton.callback('20', encodeCallback(id, 'runCount', '20', category, query), { style: 'primary' })
+      ]);
+      b.buttons([
+        richButton.callback('🎬 More Videos (+10)', encodeCallback(id, 'runCount', '30', category, query), { style: 'primary' }),
+        richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', category, query), { style: 'primary' })
+      ]);
+    } else {
+      b.buttons([
+        richButton.callback('10', encodeCallback(id, 'runCount', '10', category, query), { style: 'primary' }),
+        richButton.callback('20', encodeCallback(id, 'runCount', '20', category, query), { style: 'primary' }),
+        richButton.callback('30', encodeCallback(id, 'runCount', '30', category, query), { style: 'primary' }),
+        richButton.callback('50', encodeCallback(id, 'runCount', '50', category, query), { style: 'primary' })
+      ]);
+      b.buttons([
+        richButton.callback('60', encodeCallback(id, 'runCount', '60', category, query), { style: 'primary' }),
+        richButton.callback('80', encodeCallback(id, 'runCount', '80', category, query), { style: 'primary' }),
+        richButton.callback('100', encodeCallback(id, 'runCount', '100', category, query), { style: 'primary' })
+      ]);
+      b.buttons([
+        richButton.callback('♾️ Continuous Exploration', encodeCallback(id, 'runCount', 'continuous', category, query), { style: 'primary' })
+      ]);
+    }
+    b.buttons([
+      richButton.callback('« Back', encodeCallback(id, 'cat', category), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.validate();
+    await editOrSend(ctx, b.toJSON());
+  }
+
+  // ── Step 3: Render Clean Pinterest-Style Results ─────────────────────────
+  function renderResultsRich({ searchId, query, category, isContinuous, requestedGoal, totalImages, previewAttachments = [], startOffset = 0, currentOffset = 10 }) {
+    const b = new RichMessageBuilder();
+    const total = Math.max(Number(totalImages) || 0, previewAttachments.length);
+
+    const bannerLines = isContinuous
+      ? ['𓆩♡𓆪 CONTINUOUS SEARCH 𓆩♡𓆪', 'infinite exploration • duplicate-free spicy picks ˙ᵕ˙']
+      : ['𓆩♡𓆪 18+ SEARCH COMPLETED 𓆩♡𓆪', `found: ${total} HD picks`];
+    b.paragraph(rt.bold(banner(bannerLines)));
+    b.divider();
+
+    // The slideshow AT THE TOP IS the result! (Scrollable 10 HD slides)
+    if (previewAttachments && previewAttachments.length >= 1) {
+      const slideItems = previewAttachments.map((item) => {
+        if (typeof item === 'string') return block.photo(item);
+        if (item.type === 'video') return block.video(item.ref);
+        return block.photo(item.ref ?? item);
+      });
+      b.slideshow(slideItems);
+      b.divider();
+    }
+
+    // Clean, short metadata table (NO raw filenames/tags dump table!)
+    b.table([
+      [
+        { text: 'ʕ•ᴥ•ʔ Query', align: 'left', valign: 'middle' },
+        { text: rt.bold(truncate(query || 'Spicy Top Picks', 24)), align: 'right', valign: 'middle' }
+      ],
+      [
+        { text: isContinuous ? '˙ᵕ˙ Mode' : '˙ᵕ˙ Results', align: 'left', valign: 'middle' },
+        { text: rt.bold(isContinuous ? 'Continuous Exploration ♾️' : `${total} HD Picks`), align: 'right', valign: 'middle' }
+      ],
+      [
+        { text: '🔞 Category', align: 'left', valign: 'middle' },
+        { text: rt.bold(category), align: 'right', valign: 'middle' }
+      ]
+    ], { compact: true });
+    b.divider();
+
+    const previewCount = previewAttachments.length;
+    const start = Math.max(0, Number(startOffset) || 0);
+    const end = Math.min(total, start + (previewCount || 10));
+
+    b.paragraph(rt.concat(
+      rt.bold('₊˚⊹♡ scroll slideshow above to browse HD picks!'),
+      rt.text(`\nʕ•ᴥ•ʔ showing ${start + 1}–${end} of ${total} picks ♡`)
+    ));
+
+    // In-place pagination buttons
+    const hasPrev = start > 0;
+    const hasNext = isContinuous ? (total > currentOffset || total >= 10) : (total > currentOffset);
+
+    const prevOffset = Math.max(0, start - 10);
+    const prevBatchSize = start - prevOffset;
+    const nextOffset = currentOffset;
+    const nextBatchSize = Math.min(10, total - nextOffset);
+
+    if (hasPrev && hasNext) {
+      const prevRange = `(${prevOffset + 1}–${prevOffset + prevBatchSize})`;
+      const nextRange = isContinuous ? '(Explore More) →' : `(${nextOffset + 1}–${nextOffset + nextBatchSize}) →`;
+      const prevLabel = `← Prev ${prevRange}`;
+      const nextLabel = isContinuous ? '♾️ Next Picks (Explore More) →' : `Next ${nextRange}`;
+      b.buttons([
+        richButton.callback(prevLabel, encodeCallback(id, 'moreAlbum', String(searchId), String(prevOffset), category), { style: 'primary' }),
+        richButton.callback(nextLabel, encodeCallback(id, 'moreAlbum', String(searchId), String(nextOffset), category), { style: 'primary' })
+      ]);
+    } else if (hasNext) {
+      const nextRange = isContinuous ? '(Explore More) →' : `(${nextOffset + 1}–${nextOffset + nextBatchSize}) →`;
+      const nextLabel = isContinuous ? '♾️ Next Picks (Explore More) →' : `🖼 Next ${nextBatchSize} Picks ${nextRange}`;
+      b.buttons([
+        richButton.callback(nextLabel, encodeCallback(id, 'moreAlbum', String(searchId), String(nextOffset), category), { style: 'primary' })
+      ]);
+    } else if (hasPrev) {
+      const prevRange = `(${prevOffset + 1}–${prevOffset + prevBatchSize})`;
+      b.buttons([
+        richButton.callback(`← 🖼 Prev ${prevBatchSize} Picks ${prevRange}`, encodeCallback(id, 'moreAlbum', String(searchId), String(prevOffset), category), { style: 'primary' })
+      ]);
+    }
+
+    // Smart search suggestion buttons in pagination
+    const suggestions = CATEGORY_SUGGESTIONS[category] || CATEGORY_SUGGESTIONS.all;
+    if (suggestions && suggestions.length >= 3) {
+      const filtered = suggestions.filter(s => s.toLowerCase() !== query.toLowerCase()).slice(0, 3);
+      if (filtered.length > 0) {
+        b.buttons(filtered.map(s =>
+          richButton.callback(s, encodeCallback(id, 'askCountDirect', s.replace(/^[^\w]+/, '').trim(), category), { style: 'primary' })
+        ));
+      }
+    }
+
+    // Action buttons
+    b.buttons([
+      richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(searchId)), { style: 'primary' }),
+      richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.footer(rt.italic('୨୧ 18+ adult studio • multi-source HD delivery ♡'));
+    b.validate();
+    return b.toJSON();
+  }
+
+  // ── Step 4: Run Search with Chosen Goal / Count ───────────────────────────
+  async function runSearch(ctx, query = '', category = 'all', targetGoal = 10, opts = {}) {
+    const rawGoal = targetGoal ?? opts.goal ?? 10;
+    const isContinuous = rawGoal === 'continuous';
+    const goal = isContinuous ? 10 : (Number(rawGoal) > 0 ? Number(rawGoal) : 20);
+
     const tgId = String(ctx.tgId);
     const userId = Number(ctx.tgId);
     const api = ctx.api || app.telegram.api;
@@ -368,11 +540,10 @@ export function createNsfwScreen({ app }) {
       }
     }
 
-    // Fairness concurrency slot guard in group chats
     let releaseSlot = null;
     if (ctx.controller?.acquireUserTaskSlot) {
       releaseSlot = await ctx.controller.acquireUserTaskSlot(tgId, chatId, replyToId, isGroup);
-      if (!releaseSlot) return; // rate limit notice sent
+      if (!releaseSlot) return;
     }
 
     const controller = new AbortController();
@@ -388,7 +559,7 @@ export function createNsfwScreen({ app }) {
         cleanDisplayQ
       ])));
       b.divider();
-      b.paragraph(`⏳ Searching Wallhaven 4K, Yande.re, Nekobot & Spankbang… ♡\n˙ᵕ˙ Category: ${category} • Page: ${page + 1}`);
+      b.paragraph(`⏳ Searching Wallhaven 4K, Yande.re, Nekobot & Spankbang… ♡\n˙ᵕ˙ Category: ${category} • Goal: ${isContinuous ? 'Continuous ♾️' : `${goal} picks`}`);
       b.footer(rt.italic('live multi-source deep search in progress ♡'));
       b.validate();
       return b.toJSON();
@@ -398,8 +569,8 @@ export function createNsfwScreen({ app }) {
       const searchRes = await searchNsfw({
         query,
         category,
-        page,
-        limit: 10,
+        page: 0,
+        limit: Math.min(goal, 50),
         signal: controller.signal
       });
 
@@ -424,13 +595,13 @@ export function createNsfwScreen({ app }) {
         return;
       }
 
-      // Record in DB for no-duplicate history and sticker pack creation
+      // Record in DB for sticker pack creation & pagination
       let searchDbId = Date.now();
       try {
         if (app.pinterest?.db) {
           const ins = app.pinterest.db.run(
             'INSERT INTO pinterest_searches (user_id, query, normalized_query, mode, depth, result_count) VALUES (?, ?, ?, ?, ?, ?)',
-            userId, query || 'nsfw spicy', (query || 'nsfw').toLowerCase(), 'nsfw', 'deep', items.length
+            userId, query || 'nsfw spicy', (query || 'nsfw').toLowerCase(), 'nsfw', isContinuous ? 'continuous' : 'deep', items.length
           );
           if (ins?.lastInsertRowid) {
             searchDbId = Number(ins.lastInsertRowid);
@@ -447,152 +618,22 @@ export function createNsfwScreen({ app }) {
         log.debug({ err: dbErr?.message }, 'failed to record nsfw search in db');
       }
 
-      // Build Result Rich Message
-      const b = new RichMessageBuilder();
-      const requesterMention = ctx.user?.first_name || (tgId ? `User ${tgId}` : 'Bestie');
-      const headerTitle = query ? `🔞 18+ RESULTS: "${truncate(query, 20)}"` : '🔞 18+ SPICY PICKS';
+      // Fetch first 10 items in HD for the slideshow
+      const { previewBlocks, mediaFiles } = await fetchPreviewBuffers(items, 10);
+      const rich = renderResultsRich({
+        searchId: searchDbId,
+        query,
+        category: searchRes.category || category,
+        isContinuous,
+        requestedGoal: goal,
+        totalImages: items.length,
+        previewAttachments: previewBlocks,
+        startOffset: 0,
+        currentOffset: Math.min(10, items.length)
+      });
 
-      b.paragraph(rt.bold(banner([
-        headerTitle,
-        `found ${items.length} HD picks • page ${page + 1}`
-      ])));
-      b.divider();
-
-      // Fetch preview images so pictures are visibly embedded in the slideshow
-      let previewFiles = null;
-      try {
-        const { previewBlocks, mediaFiles } = await fetchPreviewBuffers(items, 3);
-        if (previewBlocks.length > 0) {
-          const slideItems = previewBlocks.map((p) => {
-            if (p.type === 'video') return block.video(p.ref);
-            return block.photo(p.ref);
-          });
-          b.slideshow(slideItems);
-          b.divider();
-          if (Object.keys(mediaFiles).length > 0) {
-            previewFiles = mediaFiles;
-          }
-        }
-      } catch (e) {
-        log.debug({ err: e?.message }, 'could not attach preview buffers');
-      }
-
-      // Show top picks metadata table
-      b.table([
-        [
-          { text: '👤 Requester', align: 'left', valign: 'middle' },
-          { text: rt.bold(truncate(requesterMention, 20)), align: 'right', valign: 'middle' }
-        ],
-        [
-          { text: '🔞 Category', align: 'left', valign: 'middle' },
-          { text: rt.bold(searchRes.category || category), align: 'right', valign: 'middle' }
-        ],
-        [
-          { text: '✨ Page', align: 'left', valign: 'middle' },
-          { text: rt.bold(`Page ${page + 1}`), align: 'right', valign: 'middle' }
-        ]
-      ], { compact: true });
-      b.divider();
-
-      // List of results with source & type
-      b.table(items.slice(0, 6).map((it, idx) => [
-        { text: `#${idx + 1}`, align: 'left', valign: 'middle' },
-        { text: it.type === 'video' ? '🎬' : '🔞', align: 'left', valign: 'middle' },
-        { text: truncate(it.title, 32), align: 'left', valign: 'middle' },
-        { text: it.duration || (it.width ? `${it.width}p` : 'HD'), align: 'right', valign: 'middle' }
-      ]), { compact: true });
-      b.divider();
-
-      // Download / Media links notice
-      if (isGroup) {
-        b.paragraph(rt.italic('🔒 In group chats, media is delivered with spoiler protection. Tap a pick below to send to chat or open in DM ♡'));
-      }
-
-      // Quick deliver buttons for top 3 items
-      for (let i = 0; i < Math.min(3, items.length); i++) {
-        const it = items[i];
-        const icon = it.type === 'video' ? '🎬' : '🖼';
-        b.buttons([
-          richButton.callback(`${icon} View / Send Pick #${i + 1}`, encodeCallback(id, 'sendMedia', String(searchDbId), String(i), isGroup ? '1' : '0'), { style: 'primary' })
-        ]);
-      }
-
-      // Pagination navigation buttons
-      const navRow = [];
-      if (page > 0) {
-        navRow.push(richButton.callback('← Prev Picks', encodeCallback(id, 'page', String(page - 1), category, query, tgId), { style: 'primary' }));
-      }
-      if (items.length >= 8) {
-        navRow.push(richButton.callback('Next Picks →', encodeCallback(id, 'page', String(page + 1), category, query, tgId), { style: 'primary' }));
-      }
-      if (navRow.length > 0) {
-        b.buttons(navRow);
-      }
-
-      // ── Search Suggestions Buttons in Pagination ──────────────────────────
-      const suggestions = CATEGORY_SUGGESTIONS[category] || CATEGORY_SUGGESTIONS[searchRes.category] || CATEGORY_SUGGESTIONS.all;
-      if (suggestions && suggestions.length >= 3) {
-        const randomSuggestions = suggestions
-          .filter(s => s.toLowerCase() !== query.toLowerCase())
-          .slice(0, 3);
-        if (randomSuggestions.length > 0) {
-          b.buttons(randomSuggestions.map(s =>
-            richButton.callback(s, encodeCallback(id, 'quickSearch', category, s.replace(/^[^\w]+/, '').trim()), { style: 'primary' })
-          ));
-        }
-      }
-
-      b.buttons([
-        richButton.callback('✨ Make Sticker Pack', encodeCallback('stickers', 'fromSearch', String(searchDbId)), { style: 'primary' }),
-        richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', category), { style: 'primary' })
-      ]);
-      b.buttons([
-        richButton.callback('🔞 18+ Studio Menu', encodeCallback(id, 'menu'), { style: 'primary' }),
-        richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
-      ]);
-      b.footer(rt.italic('୨୧ 18+ adult studio • multi-source HD delivery ♡'));
-      b.validate();
-
-      await tracker.finish(b.toJSON(), previewFiles);
-
-      // Auto-deliver top pick directly into chat for random spicy pick
-      if (opts.isRandomPick && items[0]) {
-        const top = items[0];
-        const caption = `🔞 <b>${top.title || '18+ Spicy Pick'}</b>\n👤 <i>Delivered for ${requesterMention} ♡</i>`;
-        try {
-          if (top.type === 'video') {
-            await api.sendVideo(chatId, top.mediaUrl, {
-              caption,
-              parse_mode: 'HTML',
-              has_spoiler: Boolean(isGroup)
-            }).catch(async () => {
-              if (previewFiles?.['video_0']?.buffer) {
-                await api.sendVideo(chatId, previewFiles['video_0'].buffer, {
-                  caption,
-                  parse_mode: 'HTML',
-                  has_spoiler: Boolean(isGroup)
-                });
-              }
-            });
-          } else {
-            await api.sendPhoto(chatId, top.mediaUrl, {
-              caption,
-              parse_mode: 'HTML',
-              has_spoiler: Boolean(isGroup)
-            }).catch(async () => {
-              if (previewFiles?.['photo_0']?.buffer) {
-                await api.sendPhoto(chatId, previewFiles['photo_0'].buffer, {
-                  caption,
-                  parse_mode: 'HTML',
-                  has_spoiler: Boolean(isGroup)
-                });
-              }
-            });
-          }
-        } catch (deliveryErr) {
-          log.debug({ err: deliveryErr?.message }, 'direct random pick delivery failed');
-        }
-      }
+      const files = previewBlocks.length > 0 ? mediaFiles : null;
+      await tracker.finish(rich, files);
     } catch (err) {
       log.error({ err: err?.message, query }, 'nsfw search failed');
       const b = new RichMessageBuilder();
@@ -611,76 +652,93 @@ export function createNsfwScreen({ app }) {
     }
   }
 
-  async function sendSpecificMedia(ctx, searchDbId, itemIndex, isGroupChat = false) {
-    const api = ctx.api || app.telegram.api;
-    const chatId = ctx.chatId;
-    const idx = parseInt(itemIndex, 10) || 0;
+  // ── Step 5: In-Place Pagination Album Swapping ────────────────────────────
+  async function showMoreAlbum(ctx, searchId, offset = 0, category = 'all') {
+    const numOffset = Math.max(0, Number(offset) || 0);
+    const searchDbId = Number(searchId);
 
-    let row = null;
-    if (app.pinterest?.db) {
-      const rows = app.pinterest.db.all(
-        'SELECT * FROM pinterest_media WHERE search_id = ? ORDER BY id ASC LIMIT 1 OFFSET ?',
-        Number(searchDbId), idx
-      );
-      row = rows?.[0];
+    let nextMedia = app.pinterest?.db?.all?.(
+      `SELECT * FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0
+       ORDER BY quality_score DESC, id ASC LIMIT 10 OFFSET ?`,
+      searchDbId, numOffset
+    ) || [];
+
+    const totalMediaRow = app.pinterest?.db?.get?.(
+      `SELECT COUNT(*) as count FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0`,
+      searchDbId
+    );
+    let totalMedia = totalMediaRow?.count ?? 0;
+
+    const searchRow = app.pinterest?.db?.get?.(
+      'SELECT * FROM pinterest_searches WHERE id = ?',
+      searchDbId
+    );
+
+    const isContinuous = searchRow?.depth === 'continuous';
+    if (!nextMedia.length && isContinuous && searchRow?.query) {
+      try {
+        const expansion = await searchNsfw({
+          query: searchRow.query,
+          category,
+          page: Math.floor(numOffset / 10),
+          limit: 10
+        });
+        if (expansion?.results?.length) {
+          for (const it of expansion.results) {
+            app.pinterest.db.run(
+              `INSERT INTO pinterest_media (search_id, user_id, media_url, type, width, height, quality_score, status, is_duplicate)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'valid', 0)`,
+              searchDbId, searchRow.user_id, it.mediaUrl, it.type, it.width || 1280, it.height || 720, 95
+            );
+          }
+          nextMedia = app.pinterest.db.all(
+            `SELECT * FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0
+             ORDER BY quality_score DESC, id ASC LIMIT 10 OFFSET ?`,
+            searchDbId, numOffset
+          );
+          const updatedTotal = app.pinterest.db.get(
+            `SELECT COUNT(*) as count FROM pinterest_media WHERE search_id = ? AND status = 'valid' AND is_duplicate = 0`,
+            searchDbId
+          );
+          totalMedia = updatedTotal?.count ?? 0;
+        }
+      } catch {}
     }
 
-    if (!row?.media_url) {
-      if (ctx.query?.id) {
-        await api.answerCallbackQuery(ctx.query.id, { text: 'Media expired or not found ♡', show_alert: true }).catch(() => {});
+    if (!nextMedia.length) {
+      const b = new RichMessageBuilder();
+      b.heading('🖼 ALL PICKS VIEWED', 2);
+      b.paragraph(rt.italic('all spicy picks in this search have already been browsed ♡'));
+      b.divider();
+      const endButtons = [];
+      if (numOffset > 0) {
+        const prevOffset = Math.max(0, numOffset - 10);
+        endButtons.push(richButton.callback('← Prev Picks', encodeCallback(id, 'moreAlbum', String(searchId), String(prevOffset), category), { style: 'primary' }));
       }
+      endButtons.push(richButton.callback('« Back to 18+ Menu', encodeCallback(id, 'menu'), { style: 'primary' }));
+      b.buttons(endButtons);
+      b.buttons(navButtons(id, { home: true }));
+      b.validate();
+      await editOrSend(ctx, b.toJSON());
       return;
     }
 
-    const clicker = ctx.query?.from?.first_name || 'Bestie';
-    if (ctx.query?.id) {
-      await api.answerCallbackQuery(ctx.query.id, { text: `Delivering pick #${idx + 1} for ${clicker} ♡` }).catch(() => {});
-    }
-
-    const caption = `🔞 <b>18+ Media Pick #${idx + 1}</b>\n👤 <i>Requested by ${clicker} ♡</i>`;
-
-    if (row.type === 'video' && /\.mp4(\?|$)/i.test(row.media_url)) {
-      await api.sendVideo(chatId, row.media_url, {
-        caption,
-        parse_mode: 'HTML',
-        has_spoiler: Boolean(isGroupChat),
-        reply_to_message_id: ctx.query?.message?.message_id
-      }).catch(async () => {
-        // Fallback to sending link
-        await api.sendMessage(chatId, `${caption}\n🔗 <a href="${row.media_url}">Watch Video Stream</a>`, {
-          parse_mode: 'HTML',
-          reply_to_message_id: ctx.query?.message?.message_id
-        }).catch(() => {});
-      });
-    } else {
-      await api.sendPhoto(chatId, row.media_url, {
-        caption,
-        parse_mode: 'HTML',
-        has_spoiler: Boolean(isGroupChat),
-        reply_to_message_id: ctx.query?.message?.message_id
-      }).catch(async () => {
-        // Fallback: fetch buffer and upload directly
-        try {
-          const res = await fetch(row.media_url, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-            signal: AbortSignal.timeout(6000)
-          });
-          if (res.ok) {
-            const buf = Buffer.from(await res.arrayBuffer());
-            return await api.sendPhoto(chatId, buf, {
-              caption,
-              parse_mode: 'HTML',
-              has_spoiler: Boolean(isGroupChat),
-              reply_to_message_id: ctx.query?.message?.message_id
-            });
-          }
-        } catch {}
-        await api.sendMessage(chatId, `${caption}\n🔗 <a href="${row.media_url}">Open HD Wallpaper</a>`, {
-          parse_mode: 'HTML',
-          reply_to_message_id: ctx.query?.message?.message_id
-        }).catch(() => {});
-      });
-    }
+    // Download next 10 HD slides
+    const { previewBlocks, mediaFiles } = await fetchPreviewBuffers(nextMedia, 10);
+    const nextOffset = numOffset + nextMedia.length;
+    const rich = renderResultsRich({
+      searchId: searchDbId,
+      query: searchRow?.query || '',
+      category,
+      isContinuous,
+      requestedGoal: searchRow?.result_count,
+      totalImages: totalMedia,
+      previewAttachments: previewBlocks,
+      startOffset: numOffset,
+      currentOffset: nextOffset
+    });
+    const files = previewBlocks.length > 0 ? mediaFiles : null;
+    await editOrSend(ctx, rich, files);
   }
 
   function registerStateHandlers(sm) {
@@ -696,14 +754,14 @@ export function createNsfwScreen({ app }) {
           if (botPromptMsgId) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, botPromptMsgId).catch(() => {});
           }
-          await runSearch(sctx, text, sctx.context?.category || 'all', 0, { replyToMessageId: message.message_id });
         } else {
           if (message.message_id) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
           }
-          await runSearch(sctx, text, sctx.context?.category || 'all', 0);
         }
-        return true;
+
+        // Exact Pinterest flow: route query into askCount
+        return askCount(sctx, text, sctx.context?.category || 'all');
       },
       onTimeout: async (sctx) => {
         await (sctx.api || app.telegram.api).sendMessage(sctx.chatId, '♡ 18+ search timed out — send a new query whenever you are ready.').catch(() => {});
@@ -719,7 +777,7 @@ export function createNsfwScreen({ app }) {
     id,
     registerStateHandlers,
     async executeSearch(ctx, query, category = 'all', page = 0) {
-      return runSearch(ctx, query, category, page);
+      return runSearch(ctx, query, category, 10);
     },
     async open(ctx) {
       await ctx.sm?.reset?.(ctx.tgId, { reason: 'navigate' });
@@ -747,10 +805,28 @@ export function createNsfwScreen({ app }) {
           return askQuery(ctx, args[0] || 'all');
         case 'searchPrompt':
           return askQuery(ctx, args[0] || 'all');
-        case 'quickSearch': {
-          const cat = args[0] || 'all';
-          const query = args[1] || '';
-          return runSearch(ctx, query, cat, 0);
+        case 'askCountDirect': {
+          const query = args[0] || '';
+          const category = args[1] || 'all';
+          return askCount(ctx, query, category);
+        }
+        case 'runCount': {
+          const goal = args[0] || '10';
+          const category = args[1] || 'all';
+          const query = args[2] || '';
+          return runSearch(ctx, query, category, goal);
+        }
+        case 'moreAlbum': {
+          const searchId = args[0];
+          const offset = parseInt(args[1], 10) || 0;
+          const category = args[2] || 'all';
+          const clickerName = ctx.query?.from?.first_name || 'User';
+          if (ctx.query?.id) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, {
+              text: `👤 ${clickerName} browsing picks ${offset + 1}–${offset + 10} ♡`
+            }).catch(() => {});
+          }
+          return showMoreAlbum(ctx, searchId, offset, category);
         }
         case 'random': {
           const cat = args[0] || 'all';
@@ -766,36 +842,7 @@ export function createNsfwScreen({ app }) {
           };
           const pool = randomPools[cat] || randomPools.all;
           const pick = pool[Math.floor(Math.random() * pool.length)];
-          return runSearch(ctx, pick, cat, 0, { isRandomPick: true });
-        }
-        case 'page': {
-          const targetPage = parseInt(args[0], 10) || 0;
-          const cat = args[1] || 'all';
-          const query = args[2] || '';
-          const originalUserId = args[3] || '';
-          const clickerId = String(ctx.tgId || '');
-          const clickerName = ctx.query?.from?.first_name || 'User';
-
-          // Multi-user group acknowledgement
-          if (ctx.query?.id) {
-            if (originalUserId && originalUserId !== clickerId) {
-              await ctx.api.answerCallbackQuery(ctx.query.id, {
-                text: `👤 ${clickerName} browsing page ${targetPage + 1} ♡`,
-                show_alert: false
-              }).catch(() => {});
-            } else {
-              await ctx.api.answerCallbackQuery(ctx.query.id, {
-                text: `Page ${targetPage + 1} ♡`
-              }).catch(() => {});
-            }
-          }
-          return runSearch(ctx, query, cat, targetPage);
-        }
-        case 'sendMedia': {
-          const searchDbId = args[0];
-          const itemIndex = args[1];
-          const isGroupChat = args[2] === '1';
-          return sendSpecificMedia(ctx, searchDbId, itemIndex, isGroupChat);
+          return runSearch(ctx, pick, cat, 10);
         }
         case 'back':
         case 'cancel':

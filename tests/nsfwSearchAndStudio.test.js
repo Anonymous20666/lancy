@@ -154,7 +154,12 @@ test('createNsfwScreen: screen interface, menu rendering and state registration'
   assert.match(JSON.stringify(sentRich), /Video Clips & Previews/);
   assert.match(JSON.stringify(sentRich), /Full Adult Videos/);
 
-  // Test multi-user group chat callback acknowledgement
+  // Test askCount selection screen
+  await nsfwScreen.handle(ctx, 'askCountDirect', ['tifa', 'hentai_uncensored']);
+  assert.match(JSON.stringify(sentRich), /18\+ RESULT COUNT/);
+  assert.match(JSON.stringify(sentRich), /Continuous Exploration/);
+
+  // Test multi-user group chat callback acknowledgement on album pagination
   let answeredToast = null;
   const mockApiWithToast = {
     ...mockApi,
@@ -177,10 +182,10 @@ test('createNsfwScreen: screen interface, menu rendering and state registration'
     user: { first_name: 'Alex' }
   };
 
-  // User B clicks pagination on User A's search
-  await nsfwScreen.handle(cbCtx, 'page', ['1', 'hentai_uncensored', 'naruto', '12345']);
+  // User B clicks pagination on search album
+  await nsfwScreen.handle(cbCtx, 'moreAlbum', ['12345', '10', 'hentai_uncensored']);
   assert.ok(answeredToast);
-  assert.match(answeredToast, /Alex browsing page 2/);
+  assert.match(answeredToast, /Alex browsing picks 11–20/);
 });
 
 test('TelegramController: /nsfw slash commands and live inline search routing', async () => {
