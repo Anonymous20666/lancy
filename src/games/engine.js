@@ -615,6 +615,8 @@ export class GameEngine extends EventEmitter {
       roundGuessMsgIds: [], // Wrong guess message IDs to auto-delete when round ends
       roundStartTime: null,
       wrongUsersThisRound: new Set(),
+      lastWinner: null,
+      lastActionNotice: null,
       timerHandle: null,
       hint1Timeout: null,
       hint2Timeout: null
@@ -788,9 +790,11 @@ export class GameEngine extends EventEmitter {
     // Clean up the active round card & wrong guesses
     await this.#cleanupFinishedRound(session, { deleteCard: true });
 
+    const stopper = user?.username ? `@${user.username}` : (user?.first_name || 'Player');
+
     // If players scored points in this round-based session, show the Victory Podium!
     if (session.scores && session.scores.size > 0) {
-      await this.#finishGame(session, { reason: `Stopped by ${user?.first_name || 'Player'}` });
+      await this.#finishGame(session, { reason: `Match ended by ${stopper}` });
       return { ok: true };
     }
 
@@ -799,7 +803,6 @@ export class GameEngine extends EventEmitter {
 
     const b = new RichMessageBuilder();
     b.heading(`${WINGS} MATCH ENDED ${WINGS}`, 2);
-    const stopper = user?.first_name || 'Player';
     b.blockquote(`🛑 ${session.mode.toUpperCase()} match ended by ${stopper}. Tap below to launch a new game anytime! ♡`);
     b.buttons([
       richButton.callback('🎮 Open Game Hub', 'game_hub:visual', { style: 'primary' }),
@@ -813,7 +816,7 @@ export class GameEngine extends EventEmitter {
   /**
    * Skips the current round in a round-based game, briefly reveals the answer, then deletes the skipped card.
    */
-  async skipRound(chatId) {
+  async skipRound(chatId, { user = null } = {}) {
     const cid = Number(chatId);
     const session = this.sessions.get(cid);
     if (!session || !session.currentQuestion) {
@@ -824,10 +827,14 @@ export class GameEngine extends EventEmitter {
     session.state = 'round_ended';
     const q = session.currentQuestion;
     const answer = q.displayName || q.name;
+    const clickerTag = user?.username ? `@${user.username}` : (user?.first_name || 'Player');
+
+    session.lastWinner = null;
+    session.lastActionNotice = `⏭️ Round skipped by ${clickerTag}`;
 
     await this.#updateRoundCard(session, {
       stage: 3,
-      bannerStatus: `⏭️ Round Skipped! Correct Answer: ${answer}`,
+      bannerStatus: `⏭️ Round Skipped by ${clickerTag}!\n✅ Correct Answer: ${answer}`,
       showControls: false
     });
 
@@ -841,7 +848,7 @@ export class GameEngine extends EventEmitter {
   /**
    * Drops an early hint (or uncovers extra grid tiles / unblurs image) in the active round.
    */
-  async giveHint(chatId) {
+  async giveHint(chatId, { user = null } = {}) {
     const cid = Number(chatId);
     const session = this.sessions.get(cid);
     if (!session || !session.currentQuestion || session.state !== 'in_round') {
@@ -854,9 +861,12 @@ export class GameEngine extends EventEmitter {
       this.#revealNextGridTiles(q, 2);
     }
 
+    const clickerTag = user?.username ? `@${user.username}` : (user?.first_name || 'Player');
+    session.lastActionNotice = `💡 Hint #${q.currentStage} unlocked by ${clickerTag}`;
+
     await this.#updateRoundCard(session, {
       stage: q.currentStage,
-      bannerStatus: `💡 Clue Unlocked! Check the hints table below ♡`
+      bannerStatus: `💡 Hint #${q.currentStage} unlocked by ${clickerTag}! Check clues below ♡`
     });
     return { ok: true };
   }
@@ -1015,6 +1025,13 @@ export class GameEngine extends EventEmitter {
     const winnerTag = fromUser.username ? `@${fromUser.username}` : (fromUser.first_name || 'Player');
     const reactionSec = (reactionMs / 1000).toFixed(1);
     const streakBadge = existing.streak >= 2 ? ` • 🔥 ${existing.streak}x Streak!` : '';
+
+    session.lastWinner = {
+      name: winnerTag,
+      points: pointsAwarded,
+      reactionSec
+    };
+    session.lastActionNotice = `🎉 Last round sniped by ${winnerTag} (+${pointsAwarded} XP in ${reactionSec}s)`;
 
     await this.#updateRoundCard(session, {
       stage: 3, // Full HD reveal!
@@ -1182,39 +1199,40 @@ export class GameEngine extends EventEmitter {
 
     if (data.startsWith('game_ctrl:') || data.startsWith('game_ctl:')) {
       const action = data.split(':')[1];
+      const clickerTag = fromUser?.username ? `@${fromUser.username}` : (fromUser?.first_name || 'Player');
       if (action === 'stop') {
-        await this.api.answerCallbackQuery(query.id, { text: 'Ending match...' });
+        await this.api.answerCallbackQuery(query.id, { text: `Ending match (${fromUser.first_name})...` });
         await this.stopGame(chatId, { user: fromUser });
         return;
       }
       if (action === 'skip') {
-        await this.api.answerCallbackQuery(query.id, { text: 'Skipping round...' });
-        await this.skipRound(chatId);
+        await this.api.answerCallbackQuery(query.id, { text: `Skipped by ${fromUser.first_name}! ⏭️` });
+        await this.skipRound(chatId, { user: fromUser });
         return;
       }
       if (action === 'hint') {
-        await this.api.answerCallbackQuery(query.id, { text: 'Clue unlocked! 💡' });
-        await this.giveHint(chatId);
+        await this.api.answerCallbackQuery(query.id, { text: `Hint unlocked by ${fromUser.first_name}! 💡` });
+        await this.giveHint(chatId, { user: fromUser });
         return;
       }
       if (action === 'shuffle' && session.currentQuestion?.roundMode === 'scramble') {
         session.currentQuestion.scrambledTiles = scrambleWordTiles(session.currentQuestion.name);
-        await this.api.answerCallbackQuery(query.id, { text: 'Letters reshuffled! 🔀' });
+        await this.api.answerCallbackQuery(query.id, { text: `Tiles reshuffled by ${fromUser.first_name}! 🔀` });
         await this.#updateRoundCard(session, {
           stage: session.currentQuestion.currentStage || 0,
-          bannerStatus: '🔀 Tiles reshuffled! Type the unscrambled word in chat ♡'
+          bannerStatus: `🔀 Tiles reshuffled by ${clickerTag}! Type the unscrambled word in chat ♡`
         });
         return;
       }
       if (action === 'gridtile' && session.currentQuestion?.roundMode === 'grid') {
         const revealed = this.#revealNextGridTiles(session.currentQuestion, 2);
         await this.api.answerCallbackQuery(query.id, {
-          text: revealed ? 'Unlocked 2 mystery tiles! 🧩' : 'All tiles are already uncovered!'
+          text: revealed ? `2 mystery tiles unlocked by ${fromUser.first_name}! 🧩` : 'All tiles are already uncovered!'
         });
         if (revealed) {
           await this.#updateRoundCard(session, {
             stage: session.currentQuestion.currentStage || 0,
-            bannerStatus: `🧩 ${session.currentQuestion.revealedTiles.length}/9 tiles uncovered! Snipe the answer in chat ♡`
+            bannerStatus: `🧩 ${session.currentQuestion.revealedTiles.length}/9 tiles uncovered by ${clickerTag}! Snipe the answer in chat ♡`
           });
         }
         return;
@@ -1250,14 +1268,19 @@ export class GameEngine extends EventEmitter {
 
       const pickedIdx = Number(data.split(':')[1]);
       const q = session.currentQuestion;
+      const userTag = fromUser?.username ? `@${fromUser.username}` : (fromUser?.first_name || 'Player');
       if (pickedIdx === q.correctIndex) {
-        await this.api.answerCallbackQuery(query.id, { text: '🎉 Bullseye! You sniped it!' });
+        await this.api.answerCallbackQuery(query.id, { text: `🎉 Bullseye, ${fromUser.first_name}! You sniped it!` });
         await this.#awardRoundWin(session, fromUser);
       } else {
         session.wrongUsersThisRound.add(uid);
         await this.api.answerCallbackQuery(query.id, {
-          text: `✕ Wrong answer! You're locked out for the rest of this round.`,
+          text: `✕ Wrong choice, ${fromUser.first_name}! You're locked out for this round.`,
           show_alert: true
+        });
+        await this.#updateRoundCard(session, {
+          stage: q.currentStage || 0,
+          bannerStatus: `⚠️ ${userTag} picked a wrong choice! Round is still open — tap or type to snipe!`
         });
       }
       return;
@@ -1775,6 +1798,8 @@ export class GameEngine extends EventEmitter {
     if (!st || st.type !== 'wordgrid') return;
     const action = data.split(':')[1];
 
+    const clickerTag = query.from?.username ? `@${query.from.username}` : (query.from?.first_name || 'Player');
+
     if (action === 'hint') {
       const unfound = st.words.filter((w) => !w.foundBy && (w.revealedChars || 1) < w.word.length - 1);
       if (!unfound.length) {
@@ -1786,7 +1811,8 @@ export class GameEngine extends EventEmitter {
       for (const entry of unfound.slice(0, 3)) {
         entry.revealedChars = (entry.revealedChars || 1) + 1;
       }
-      await this.api.answerCallbackQuery(query.id, { text: '💡 Revealed extra letters on the checklist!' });
+      st.lastFinderText = `💡 Extra letter clues unlocked by ${clickerTag}!`;
+      await this.api.answerCallbackQuery(query.id, { text: `Letter clues unlocked by ${query.from?.first_name || 'Player'}! 💡` });
       if ((session.chatMessagesSinceCard || 0) >= 2) {
         await this.#refreshWordGridCard(session);
       } else if (session.cardMessageId) {
@@ -1797,13 +1823,15 @@ export class GameEngine extends EventEmitter {
     }
 
     if (action === 'repost') {
-      await this.api.answerCallbackQuery(query.id, { text: '📌 Moving Word Grid to bottom of chat!' });
+      st.lastFinderText = `📌 Word Grid moved here by ${clickerTag}!`;
+      await this.api.answerCallbackQuery(query.id, { text: `Word Grid moved by ${query.from?.first_name || 'Player'}! 📌` });
       await this.#refreshWordGridCard(session);
       return;
     }
 
     if (action === 'next') {
-      await this.api.answerCallbackQuery(query.id, { text: 'Generating fresh 8×8 Word Grid! 🔄' });
+      st.lastFinderText = `🔄 New Word Grid launched by ${clickerTag}!`;
+      await this.api.answerCallbackQuery(query.id, { text: `New Word Grid launched by ${query.from?.first_name || 'Player'}! 🔄` });
       await this.#startNextWordGridBoard(session);
     }
   }
@@ -2016,6 +2044,8 @@ export class GameEngine extends EventEmitter {
       if (session.state !== 'in_round') return;
       session.state = 'round_ended';
       session.unansweredCount = (session.unansweredCount || 0) + 1;
+      session.lastWinner = null;
+      session.lastActionNotice = '⌛ Round timed out (unanswered)';
       const ans = question.displayName || question.name;
       const hasAutoStop = session.maxUnanswered > 0;
       const missInfo = hasAutoStop
@@ -2263,15 +2293,17 @@ export class GameEngine extends EventEmitter {
     }
 
     // 4. Live Status & Hints KV Table
-    const topLeader = Array.from(session.scores.values()).sort((a, b) => b.score - a.score)[0];
-    const leaderText = topLeader ? `👑 ${topLeader.name} (${topLeader.score} XP)` : 'Open Bounty (+100–225 XP)';
     const roundDisplay = session.totalRounds > 0
       ? `${session.currentRound} / ${session.totalRounds} (${q.difficulty || 'LIVE'})`
       : `Round #${session.currentRound} • ♾️ Unlimited`;
 
+    const statusText = session.lastWinner
+      ? `👑 ${session.lastWinner.name} (+${session.lastWinner.points} XP in ${session.lastWinner.reactionSec}s)`
+      : 'Open Bounty (+100–225 XP) • Waiting for first snipe!';
+
     const tableRows = [
       ['🎮 Round', roundDisplay],
-      ['🏆 Match Leader', leaderText]
+      ['🎯 Last Round Winner', statusText]
     ];
     if (session.maxUnanswered > 0) {
       tableRows.push(['🛑 Auto-Stop', `${session.unansweredCount || 0} / ${session.maxUnanswered} Missed`]);
@@ -2429,9 +2461,14 @@ export class GameEngine extends EventEmitter {
       ];
       b.table(podiumRows, { compact: true, bordered: true });
 
-      const highlights = [`👑 Champion: ${players[0].username ? '@' + players[0].username : players[0].name} (+${players[0].score} XP)`];
+      const champ = players[0];
+      const champTag = champ.username ? `@${champ.username}` : champ.name;
+      b.heading(`👑 MATCH GAME LEADER: ${champTag} (${champ.score} XP)`, 2);
+
+      const highlights = [`👑 Match Game Leader: ${champTag} (+${champ.score} XP • ${champ.correctCount} snipes)`];
       if (fastest) {
-        highlights.push(`⚡ Fastest Trigger: ${fastest.name} in ${(fastest.fastestMs / 1000).toFixed(1)}s`);
+        const fastestTag = fastest.username ? `@${fastest.username}` : fastest.name;
+        highlights.push(`⚡ Fastest Trigger: ${fastestTag} in ${(fastest.fastestMs / 1000).toFixed(1)}s`);
       }
       if (dailyStreakNotice) {
         highlights.push(dailyStreakNotice);

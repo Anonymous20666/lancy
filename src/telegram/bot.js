@@ -4535,7 +4535,7 @@ export class TelegramController extends EventEmitter {
     }
 
     if (subCmd === 'skip' || subCmd === 'next') {
-      const res = await this.gameEngine.skipRound(chatId);
+      const res = await this.gameEngine.skipRound(chatId, { user: message.from });
       if (!res.ok) {
         const b = new RichMessageBuilder();
         b.blockquote(res.error);
@@ -4545,7 +4545,7 @@ export class TelegramController extends EventEmitter {
     }
 
     if (subCmd === 'hint' || subCmd === 'clue') {
-      const res = await this.gameEngine.giveHint(chatId);
+      const res = await this.gameEngine.giveHint(chatId, { user: message.from });
       if (!res.ok) {
         const b = new RichMessageBuilder();
         b.blockquote(res.error);
