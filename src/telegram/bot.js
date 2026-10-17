@@ -317,7 +317,9 @@ export class TelegramController extends EventEmitter {
       { command: 'lyricgame', description: '🎤 Finish the Lyrics Challenge' },
       { command: 'anime', description: '🥷 Guess the Popular Anime Character' },
       { command: 'flags', description: '🌍 Guess the Country Flag' },
-      { command: 'logos', description: '🏎️ Guess the Brand / Car Logo' },
+      { command: 'cars', description: '🏎️ Guess the Car Logo (Supercars & Autos)' },
+      { command: 'logos', description: '🏢 Guess the Brand Logo (Fashion & Tech)' },
+      { command: 'icons', description: '📱 Guess the App & Gaming Icon' },
       { command: 'trivia', description: '🧠 Live Speed Trivia Battle' },
       { command: 'scramble', description: '🔤 Word Scramble Challenge' },
       { command: 'emoji', description: '🧩 Emoji Puzzle Quiz' },
@@ -352,6 +354,9 @@ export class TelegramController extends EventEmitter {
       { command: 'afro', description: '🔥 Guess the Naija / Afrobeats Hit Song' },
       { command: 'songgame', description: '🎧 Guess the Song (Live 30s Audio Clip)' },
       { command: 'anime', description: '🥷 Guess the Popular Anime Character' },
+      { command: 'cars', description: '🏎️ Guess the Car Logo (Supercars & Autos)' },
+      { command: 'logos', description: '🏢 Guess the Brand Logo (Fashion & Tech)' },
+      { command: 'icons', description: '📱 Guess the App & Gaming Icon' },
       { command: 'topleaderboard', description: '🏆 Trivia & game hall of fame' },
       { command: 'play', description: '🎵 Search, stream & download music / MP3' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
@@ -3396,8 +3401,18 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      if (command === '/logos' || command === '/logo' || command === '/cars' || command === '/car') {
+      if (command === '/cars' || command === '/car') {
+        await this.handleGameCommand(message, ['cars', ...rest]);
+        return;
+      }
+
+      if (command === '/logos' || command === '/logo') {
         await this.handleGameCommand(message, ['logos', ...rest]);
+        return;
+      }
+
+      if (command === '/icons' || command === '/icon') {
+        await this.handleGameCommand(message, ['icons', ...rest]);
         return;
       }
 
@@ -4592,7 +4607,7 @@ export class TelegramController extends EventEmitter {
       'pokemon', 'poke', 'pkmn', 'pokeworld', 'whosthatpokemon', 'pksilhouette',
       'pokebattle', 'pokeduel', 'pkduel',
       'wordgrid', 'wgrid', 'wordsearch', 'tilegrid', 'picgrid',
-      'flags', 'flag', 'cars', 'car', 'logos', 'logo',
+      'flags', 'flag', 'cars', 'car', 'logos', 'logo', 'icons', 'icon', 'logomix',
       'characters', 'character', 'anime', 'silhouette', 'whosthat',
       'song', 'music', 'audio', 'beat',
       'grid', 'gridquiz', 'picture', 'pic', 'photo', 'blur',
@@ -4604,6 +4619,55 @@ export class TelegramController extends EventEmitter {
     ];
 
     if (subCmd && directModes.includes(subCmd)) {
+      const modeAliasMap = {
+        car: 'cars',
+        cars: 'cars',
+        logo: 'logos',
+        logos: 'logos',
+        icon: 'icons',
+        icons: 'icons',
+        logomix: 'logomix',
+        flag: 'flags',
+        flags: 'flags',
+        characters: 'anime',
+        character: 'anime',
+        whosthat: 'anime',
+        poke: 'pokemon',
+        pkmn: 'pokemon',
+        pokeworld: 'pokemon',
+        pksilhouette: 'whosthatpokemon',
+        pokeduel: 'pokebattle',
+        pkduel: 'pokebattle',
+        wgrid: 'wordgrid',
+        wordsearch: 'wordgrid',
+        music: 'song',
+        audio: 'song',
+        beat: 'song',
+        gridquiz: 'grid',
+        pic: 'picture',
+        photo: 'picture',
+        blur: 'picture',
+        emojis: 'emoji',
+        word: 'scramble',
+        anagram: 'scramble',
+        riddles: 'riddles',
+        riddle: 'riddles',
+        teaser: 'riddles',
+        quiz: 'trivia',
+        poll: 'trivia',
+        ai: 'trivia',
+        lyric: 'lyrics',
+        quote: 'lyrics',
+        challenge: 'daily',
+        tictactoe: 'ttt',
+        xo: 'ttt',
+        c4: 'connect4',
+        rockpaperscissors: 'rps',
+        vault: 'number',
+        hl: 'highlow'
+      };
+      const resolvedMode = modeAliasMap[subCmd] || subCmd;
+
       const arg1 = String(rest[1] || '').toLowerCase().trim();
       const musicCatMap = {
         afro: 'afro', naija: 'afro', afrobeats: 'afro', ng: 'afro',
@@ -4624,7 +4688,7 @@ export class TelegramController extends EventEmitter {
       const difficulty = (!maxUnanswered && !musicCatArg && rest[2]) ? rest[2] : 'ALL';
 
       const res = await this.gameEngine.startGame(chatId, {
-        mode: subCmd,
+        mode: resolvedMode,
         totalRounds: rounds,
         maxUnanswered,
         difficulty,

@@ -1,5 +1,5 @@
 import { FLAGS } from '../data/flags.js';
-import { CARS } from '../data/cars.js';
+import { CAR_BRANDS, GLOBAL_BRANDS, APP_ICONS, ALL_VISUAL_BRANDS, CARS } from '../data/cars.js';
 import { getLiveAnimeCharacter } from './anime.js';
 
 let cachedRestCountries = null;
@@ -9,6 +9,37 @@ function maskPattern(name = '') {
     .split(/\s+/)
     .map((w) => (w.length <= 2 ? w[0] + '_' : w[0] + '_'.repeat(Math.min(6, w.length - 2)) + w[w.length - 1]))
     .join('  ');
+}
+
+/**
+ * Creates 4 balanced multiple-choice options with a shuffled order and correctIndex.
+ * Also appends option letter aliases ('a', 'b', 'c', 'd', 'option a', etc.) to allow typing the letter in chat.
+ */
+function createMultipleChoice(targetName, candidatePool, existingAliases = []) {
+  const cleanTarget = String(targetName).trim();
+  const distractors = candidatePool
+    .filter((n) => String(n).trim().toLowerCase() !== cleanTarget.toLowerCase())
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 3)
+    .map((n) => String(n).trim());
+
+  while (distractors.length < 3) {
+    distractors.push(`Option ${distractors.length + 1}`);
+  }
+
+  const options = [cleanTarget, ...distractors].sort(() => Math.random() - 0.5);
+  const correctIndex = options.indexOf(cleanTarget);
+  const letter = String.fromCharCode(65 + correctIndex).toLowerCase();
+
+  const aliases = Array.from(new Set([
+    ...existingAliases,
+    cleanTarget.toLowerCase(),
+    letter,
+    `option ${letter}`,
+    `${letter})`
+  ]));
+
+  return { options, correctIndex, aliases };
 }
 
 /**
@@ -70,58 +101,162 @@ async function ensureRestCountriesLoaded() {
 }
 
 /**
- * Returns a live, non-repetitive Flag question across 195+ sovereign nations.
+ * Returns a live Flag question with 4 interactive multiple-choice buttons across 195+ sovereign nations.
  */
 export async function getLiveFlagQuestion({ seenIds = new Set(), difficulty = 'ALL' } = {}) {
   const liveList = await ensureRestCountriesLoaded();
-  if (liveList && liveList.length > 0) {
-    let pool = liveList.filter((f) => !seenIds.has(f.id));
-    if (difficulty && difficulty !== 'ALL') {
-      const diffPool = pool.filter((f) => f.difficulty === difficulty);
-      if (diffPool.length > 0) pool = diffPool;
-    }
-    if (pool.length > 0) {
-      return pool[Math.floor(Math.random() * pool.length)];
-    }
-  }
+  const pool = (liveList && liveList.length > 0) ? liveList : FLAGS.map((f) => ({
+    id: `flag_${f.code.toLowerCase()}`,
+    name: f.name,
+    displayName: `${f.name} (${f.capital})`,
+    code: f.code.toLowerCase(),
+    difficulty: f.difficulty || 'MEDIUM',
+    imageUrl: `https://flagcdn.com/w640/${f.code.toLowerCase()}.png`,
+    hint1: `Continent: ${f.continent} • Letters: ${f.name.length}`,
+    hint2: `Capital City: ${f.capital} • Pattern: ${maskPattern(f.name)}`,
+    aliases: f.aliases || [f.name.toLowerCase()]
+  }));
 
-  // Fallback to static FLAGS dataset
-  let fb = FLAGS.filter((f) => !seenIds.has(`flag_${f.code}`));
-  if (!fb.length) fb = FLAGS;
-  const picked = fb[Math.floor(Math.random() * fb.length)];
+  let unseen = pool.filter((f) => !seenIds.has(f.id));
+  if (difficulty && difficulty !== 'ALL') {
+    const diffPool = unseen.filter((f) => f.difficulty === difficulty);
+    if (diffPool.length > 0) unseen = diffPool;
+  }
+  const candidatePool = unseen.length > 0 ? unseen : pool;
+  const picked = candidatePool[Math.floor(Math.random() * candidatePool.length)];
+
+  // Generate 4 country choices
+  const countryNames = pool.map((c) => c.name);
+  const mc = createMultipleChoice(picked.name, countryNames, picked.aliases);
+
   return {
-    id: `flag_${picked.code}`,
-    name: picked.name,
-    displayName: `${picked.name} (${picked.capital})`,
-    difficulty: picked.difficulty || 'MEDIUM',
-    imageUrl: `https://flagcdn.com/w640/${picked.code.toLowerCase()}.png`,
-    hint1: `Continent: ${picked.continent} • Letters: ${picked.name.length}`,
-    hint2: `Capital City: ${picked.capital} • Pattern: ${maskPattern(picked.name)}`,
-    aliases: picked.aliases || [picked.name.toLowerCase()]
+    ...picked,
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
   };
 }
 
 /**
- * Returns a non-repetitive, 100% pure-symbol Car & Global Brand Logo challenge (zero text leaks).
+ * Returns a dedicated Car Logo challenge (Ferrari, Porsche, Lamborghini, Tesla, BMW, etc.)
+ * with 4 interactive multiple-choice buttons and zero text leaks.
  */
-export async function getLiveLogoQuestion({ seenIds = new Set(), difficulty = 'ALL' } = {}) {
-  let pool = CARS.filter((c) => !seenIds.has(c.id || `car_${c.name}`));
+export async function getLiveCarLogoQuestion({ seenIds = new Set(), difficulty = 'ALL' } = {}) {
+  let pool = CAR_BRANDS.filter((c) => !seenIds.has(c.id));
   if (difficulty && difficulty !== 'ALL') {
     const diffPool = pool.filter((c) => c.difficulty === difficulty);
     if (diffPool.length > 0) pool = diffPool;
   }
-  if (!pool.length) pool = CARS;
+  if (!pool.length) pool = CAR_BRANDS;
   const picked = pool[Math.floor(Math.random() * pool.length)];
 
+  const carNames = CAR_BRANDS.map((c) => c.name);
+  const mc = createMultipleChoice(picked.name, carNames, picked.aliases);
+
   return {
-    id: picked.id || `car_${picked.name.toLowerCase()}`,
+    id: picked.id,
     name: picked.name,
-    displayName: `${picked.name} (${picked.category || picked.country}, est. ${picked.founded})`,
+    displayName: `${picked.name} (${picked.category}, est. ${picked.founded})`,
     difficulty: picked.difficulty || 'EASY',
     imageUrl: picked.imageUrl,
-    hint1: `${picked.category || 'Brand Symbol'} • Origin: ${picked.country} (est. ${picked.founded})`,
+    hint1: `${picked.category} • Origin: ${picked.country} (est. ${picked.founded})`,
     hint2: `Famous For: ${picked.famousModel} • Pattern: ${maskPattern(picked.name)}`,
-    aliases: picked.aliases || [picked.name.toLowerCase()]
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
+  };
+}
+
+/**
+ * Returns a dedicated Global Corporate/Fashion/Food Brand challenge (Apple, Nike, Starbucks, Adidas, etc.)
+ * with 4 interactive multiple-choice buttons.
+ */
+export async function getLiveBrandLogoQuestion({ seenIds = new Set(), difficulty = 'ALL' } = {}) {
+  let pool = GLOBAL_BRANDS.filter((c) => !seenIds.has(c.id));
+  if (difficulty && difficulty !== 'ALL') {
+    const diffPool = pool.filter((c) => c.difficulty === difficulty);
+    if (diffPool.length > 0) pool = diffPool;
+  }
+  if (!pool.length) pool = GLOBAL_BRANDS;
+  const picked = pool[Math.floor(Math.random() * pool.length)];
+
+  const brandNames = GLOBAL_BRANDS.map((c) => c.name);
+  const mc = createMultipleChoice(picked.name, brandNames, picked.aliases);
+
+  return {
+    id: picked.id,
+    name: picked.name,
+    displayName: `${picked.name} (${picked.category})`,
+    difficulty: picked.difficulty || 'EASY',
+    imageUrl: picked.imageUrl,
+    hint1: `${picked.category} • Origin: ${picked.country} (est. ${picked.founded})`,
+    hint2: `Famous For: ${picked.famousModel} • Pattern: ${maskPattern(picked.name)}`,
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
+  };
+}
+
+/**
+ * Returns a dedicated App & Tech Icon challenge (Discord, Spotify, TikTok, Netflix, Instagram, etc.)
+ * with 4 interactive multiple-choice buttons.
+ */
+export async function getLiveAppIconQuestion({ seenIds = new Set(), difficulty = 'ALL' } = {}) {
+  let pool = APP_ICONS.filter((c) => !seenIds.has(c.id));
+  if (difficulty && difficulty !== 'ALL') {
+    const diffPool = pool.filter((c) => c.difficulty === difficulty);
+    if (diffPool.length > 0) pool = diffPool;
+  }
+  if (!pool.length) pool = APP_ICONS;
+  const picked = pool[Math.floor(Math.random() * pool.length)];
+
+  const iconNames = APP_ICONS.map((c) => c.name);
+  const mc = createMultipleChoice(picked.name, iconNames, picked.aliases);
+
+  return {
+    id: picked.id,
+    name: picked.name,
+    displayName: `${picked.name} (${picked.category})`,
+    difficulty: picked.difficulty || 'EASY',
+    imageUrl: picked.imageUrl,
+    hint1: `${picked.category} • Platform: ${picked.country} (est. ${picked.founded})`,
+    hint2: `Features: ${picked.famousModel} • Pattern: ${maskPattern(picked.name)}`,
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
+  };
+}
+
+/**
+ * Mixed/Universal Brand & Symbol Question: pulls across Car Brands, Global Brands, and App Icons.
+ */
+export async function getLiveLogoQuestion({ seenIds = new Set(), difficulty = 'ALL', mode = 'mixed' } = {}) {
+  if (mode === 'cars') return getLiveCarLogoQuestion({ seenIds, difficulty });
+  if (mode === 'icons') return getLiveAppIconQuestion({ seenIds, difficulty });
+  if (mode === 'logos') return getLiveBrandLogoQuestion({ seenIds, difficulty });
+
+  let pool = ALL_VISUAL_BRANDS.filter((c) => !seenIds.has(c.id));
+  if (difficulty && difficulty !== 'ALL') {
+    const diffPool = pool.filter((c) => c.difficulty === difficulty);
+    if (diffPool.length > 0) pool = diffPool;
+  }
+  if (!pool.length) pool = ALL_VISUAL_BRANDS;
+  const picked = pool[Math.floor(Math.random() * pool.length)];
+
+  const allNames = ALL_VISUAL_BRANDS.map((c) => c.name);
+  const mc = createMultipleChoice(picked.name, allNames, picked.aliases);
+
+  return {
+    id: picked.id,
+    name: picked.name,
+    displayName: `${picked.name} (${picked.category})`,
+    difficulty: picked.difficulty || 'EASY',
+    imageUrl: picked.imageUrl,
+    hint1: `${picked.category} • ${picked.country} (est. ${picked.founded})`,
+    hint2: `Famous For: ${picked.famousModel} • Pattern: ${maskPattern(picked.name)}`,
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
   };
 }
 
@@ -168,8 +303,8 @@ async function fetchWikipediaSummaryImage(wikiTitle) {
 }
 
 /**
- * Fetches a live HD visual subject for Grid Quiz (3x3 Tile Reveal) or Picture Guessing (Pixel/Blur Uncover).
- * Alternates between Live Wikipedia HD Landmarks/Wildlife/Art and Live AniList Icons.
+ * Fetches a live HD visual subject for Grid Quiz (3x3 Tile Reveal) or Picture Guessing (Pixel/Blur Uncover)
+ * with 4 interactive multiple-choice buttons.
  */
 export async function getLiveVisualMystery({ seenIds = new Set(), mode = 'grid' } = {}) {
   const candidates = LIVE_WIKI_SUBJECTS.filter((s) => !seenIds.has(`vis_${s.wikiTitle}`));
@@ -180,6 +315,8 @@ export async function getLiveVisualMystery({ seenIds = new Set(), mode = 'grid' 
     for (const item of shuffled.slice(0, 3)) {
       const imgUrl = await fetchWikipediaSummaryImage(item.wikiTitle);
       if (imgUrl) {
+        const wikiNames = LIVE_WIKI_SUBJECTS.map((w) => w.name);
+        const mc = createMultipleChoice(item.name, wikiNames, item.aliases);
         return {
           id: `vis_${item.wikiTitle}`,
           name: item.name,
@@ -189,7 +326,9 @@ export async function getLiveVisualMystery({ seenIds = new Set(), mode = 'grid' 
           imageUrl: imgUrl,
           hint1: `Category: ${item.category} • ${item.clue1}`,
           hint2: `Name Pattern: ${maskPattern(item.name)}`,
-          aliases: item.aliases
+          options: mc.options,
+          correctIndex: mc.correctIndex,
+          aliases: mc.aliases
         };
       }
     }

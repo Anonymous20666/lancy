@@ -11,7 +11,14 @@ import {
 } from './visuals.js';
 import { getLiveAnimeCharacter } from './providers/anime.js';
 import { getLiveSongChallenge, getLiveLyricChallenge, MUSIC_CATEGORIES } from './providers/music.js';
-import { getLiveFlagQuestion, getLiveLogoQuestion, getLiveVisualMystery } from './providers/world.js';
+import {
+  getLiveFlagQuestion,
+  getLiveCarLogoQuestion,
+  getLiveBrandLogoQuestion,
+  getLiveAppIconQuestion,
+  getLiveLogoQuestion,
+  getLiveVisualMystery
+} from './providers/world.js';
 import {
   getLiveTriviaQuestion,
   getLiveEmojiQuiz,
@@ -114,8 +121,10 @@ export const GAME_MODE_META = {
   grid: { title: '3×3 MYSTERY PICTURE GRID', icon: '🧩', tab: 'visual' },
   picture: { title: 'PICTURE UNCOVER • HD BLUR', icon: '🖼️', tab: 'visual' },
   flags: { title: 'GUESS THE WORLD FLAG', icon: '🌍', tab: 'visual' },
-  logos: { title: 'GUESS THE BRAND & CAR SYMBOL', icon: '🚘', tab: 'visual' },
-  cars: { title: 'GUESS THE BRAND & CAR SYMBOL', icon: '🚘', tab: 'visual' },
+  cars: { title: 'GUESS THE CAR LOGO • SUPERCARS & AUTOS', icon: '🏎️', tab: 'visual' },
+  logos: { title: 'GUESS THE BRAND LOGO • FASHION & TECH', icon: '🏢', tab: 'visual' },
+  icons: { title: 'GUESS THE APP & TECH ICON', icon: '📱', tab: 'visual' },
+  logomix: { title: 'MIXED LOGO, CAR & ICON BLITZ', icon: '🚘', tab: 'visual' },
   emoji: { title: 'EMOJI QUIZ • DECODE THE VIBE', icon: '😎', tab: 'mind' },
   scramble: { title: 'WORD SCRAMBLE • ANAGRAM', icon: '🔤', tab: 'mind' },
   riddles: { title: 'RIDDLES & BRAIN TEASERS', icon: '🕵️', tab: 'mind' },
@@ -306,15 +315,11 @@ export class GameEngine extends EventEmitter {
       ]);
       b.buttons([
         richButton.callback(`🎵 Guess Song (${musicMeta.shortLabel})`, 'game_start:song', { style: 'success' }),
-        richButton.callback('🚘 Car & Brand Symbols', 'game_start:logos', { style: 'primary' })
-      ]);
-      b.buttons([
-        richButton.callback('🧩 3×3 Picture Grid', 'game_start:grid', { style: 'primary' }),
-        richButton.callback('🖼️ Picture Uncover', 'game_start:picture', { style: 'primary' })
+        richButton.callback('🏎️ Logos & Icons Studio →', 'game_sub:logos', { style: 'success' })
       ]);
       b.buttons([
         richButton.callback('🌍 Guess the Flag', 'game_start:flags', { style: 'primary' }),
-        richButton.callback('🕶️ Who\'s That Silhouette', 'game_start:silhouette', { style: 'primary' })
+        richButton.callback('🖼️ Picture & 3×3 Grid →', 'game_sub:picture', { style: 'primary' })
       ]);
       b.buttons([
         richButton.callback('📖 My Pokédex & Team', 'game_pokedex:me', { style: 'primary' }),
@@ -414,6 +419,51 @@ export class GameEngine extends EventEmitter {
     ]);
     b.footer(rt.italic('zero-spam: finished round cards auto-delete after reveal • only podiums stay ♡'));
 
+    b.validate();
+    return b.toJSON();
+  }
+
+  /**
+   * Builds the 100% Bot API 10.3 Rich Message Categorized Submenu (Logos Studio, Picture Studio).
+   */
+  buildSubmenuRichMessage(chatId, sub = 'logos') {
+    const cid = Number(chatId);
+    const b = new RichMessageBuilder();
+
+    if (sub === 'picture') {
+      b.heading(`${WINGS} PICTURE & GRID ARENA ${WINGS}`, 1);
+      b.paragraph(rt.italic('₊˚⊹♡  high-definition visual uncover & 3×3 mystery grids  ˙ᵕ˙'));
+      b.divider();
+      b.blockquote('Uncover famous world landmarks, exotic wildlife & masterpiece art tile-by-tile or pixel-by-pixel with interactive 4-choice buttons! ♡');
+      b.buttons([
+        richButton.callback('🧩 3×3 Mystery Picture Grid', 'game_start:grid', { style: 'success' }),
+        richButton.callback('🖼️ Picture Uncover (HD Blur)', 'game_start:picture', { style: 'success' })
+      ]);
+      b.buttons([
+        richButton.callback('« Back to Main Arena', 'game_hub:visual', { style: 'primary' })
+      ]);
+      b.footer(rt.italic('zero-spam: old cards auto-clean • tap any button to start! ♡'));
+      b.validate();
+      return b.toJSON();
+    }
+
+    // Default: 'logos' submenu (Car Logos, Brand Logos, App Icons, Mixed)
+    b.heading(`${WINGS} LOGOS, CARS & ICONS ARENA ${WINGS}`, 1);
+    b.paragraph(rt.italic('₊˚⊹♡  pure symbol sniping • zero text leaks • 4-choice buttons  ˙ᵕ˙'));
+    b.divider();
+    b.blockquote('Every visual symbol has been 100% verified to contain zero brand text! Pick your favorite category below ♡');
+    b.buttons([
+      richButton.callback('🏎️ Car Logos Only (Supercars & Autos)', 'game_start:cars', { style: 'success' }),
+      richButton.callback('🏢 Global Brands (Fashion & Tech)', 'game_start:logos', { style: 'success' })
+    ]);
+    b.buttons([
+      richButton.callback('📱 App & Gaming Icons (Gen-Z)', 'game_start:icons', { style: 'primary' }),
+      richButton.callback('🎲 Mixed Brand & Emblem Blitz', 'game_start:logomix', { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('« Back to Main Arena', 'game_hub:visual', { style: 'primary' })
+    ]);
+    b.footer(rt.italic('zero-spam: old cards auto-clean • tap any button to start! ♡'));
     b.validate();
     return b.toJSON();
   }
@@ -603,7 +653,10 @@ export class GameEngine extends EventEmitter {
       pokebattle: 'pokebattle', pokeduel: 'pokebattle', pkduel: 'pokebattle',
       wordgrid: 'wordgrid', wgrid: 'wordgrid', wordsearch: 'wordgrid',
       flag: 'flags', flags: 'flags',
-      car: 'logos', cars: 'logos', logo: 'logos', logos: 'logos',
+      car: 'cars', cars: 'cars',
+      logo: 'logos', logos: 'logos',
+      icon: 'icons', icons: 'icons',
+      logomix: 'logomix',
       character: 'anime', characters: 'anime', anime: 'anime',
       silhouette: 'silhouette', whosthat: 'silhouette',
       song: 'song', music: 'song', audio: 'song', beat: 'song',
@@ -867,6 +920,8 @@ export class GameEngine extends EventEmitter {
 
     // 3. Handle Round-Based Trivia/Visual/Pokémon/Audio/Word Sniping
     if (session.state !== 'in_round' || !session.currentQuestion) return false;
+    const fromUid = Number(message.from?.id);
+    if (fromUid && session.wrongUsersThisRound.has(fromUid)) return false;
 
     const aliases = session.currentQuestion.aliases || [];
     if (!isFuzzyMatch(rawText, aliases)) {
@@ -997,6 +1052,21 @@ export class GameEngine extends EventEmitter {
     if (data.startsWith('game_hub:')) {
       const tab = data.split(':')[1] || 'visual';
       const rich = this.buildHubRichMessage(chatId, tab);
+      await this.api.answerCallbackQuery(query.id);
+      if (messageId) {
+        await this.api.editMessageRich(chatId, messageId, rich).catch(async () => {
+          await this.api.sendRichMessage(chatId, rich).catch(() => {});
+        });
+      } else {
+        await this.api.sendRichMessage(chatId, rich).catch(() => {});
+      }
+      return;
+    }
+
+    // 1b. Submenu Navigation (Logos Studio, Picture Studio)
+    if (data.startsWith('game_sub:')) {
+      const sub = data.split(':')[1] || 'logos';
+      const rich = this.buildSubmenuRichMessage(chatId, sub);
       await this.api.answerCallbackQuery(query.id);
       if (messageId) {
         await this.api.editMessageRich(chatId, messageId, rich).catch(async () => {
@@ -1876,7 +1946,7 @@ export class GameEngine extends EventEmitter {
     // Determine effective mode for this round (supports 'mixed' and 'daily' 3-stage gauntlet!)
     let roundMode = session.mode;
     if (session.mode === 'mixed') {
-      const mixModes = ['pokemon', 'anime', 'flags', 'song', 'grid', 'picture', 'logos', 'emoji', 'scramble', 'riddles', 'trivia', 'lyrics'];
+      const mixModes = ['pokemon', 'anime', 'flags', 'song', 'cars', 'logos', 'icons', 'grid', 'picture', 'emoji', 'scramble', 'riddles', 'trivia', 'lyrics'];
       roundMode = mixModes[(session.currentRound - 1 + Math.floor(Math.random() * mixModes.length)) % mixModes.length];
     } else if (session.mode === 'daily') {
       const dailyStages = ['pokemon', 'song', 'trivia'];
@@ -2010,8 +2080,13 @@ export class GameEngine extends EventEmitter {
         return await getLiveVisualMystery(opts);
       case 'flags':
         return await getLiveFlagQuestion(opts);
-      case 'logos':
       case 'cars':
+        return await getLiveCarLogoQuestion(opts);
+      case 'logos':
+        return await getLiveBrandLogoQuestion(opts);
+      case 'icons':
+        return await getLiveAppIconQuestion(opts);
+      case 'logomix':
         return await getLiveLogoQuestion(opts);
       case 'emoji':
         return await getLiveEmojiQuiz(opts);
@@ -2101,16 +2176,32 @@ export class GameEngine extends EventEmitter {
           b.heading('✨ WILD SHINY ENCOUNTER! (3× XP + SHINY DEX)', 1);
         }
         b.heading(`📖 "${q.clueText}"`, 1);
-        b.paragraph(rt.bold('⚡ Type the Pokémon\'s name in chat to catch it!'));
+        b.paragraph(rt.bold('⚡ Tap a button or type the Pokémon\'s name!'));
+        if (Array.isArray(q.options) && q.options.length === 4) {
+          const optLines = q.options.map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)}) ${opt}`).join('   •   ');
+          b.paragraph(rt.bold(optLines));
+        }
       } else if (roundMode === 'emoji') {
         b.heading(`🎯 ${q.emojis}`, 1);
-        b.paragraph(rt.bold(`📂 Category: ${q.category || 'Vibe'} — Type the answer in chat!`));
+        b.paragraph(rt.bold(`📂 Category: ${q.category || 'Vibe'} — Tap a button or type in chat!`));
+        if (Array.isArray(q.options) && q.options.length === 4) {
+          const optLines = q.options.map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)}) ${opt}`).join('   •   ');
+          b.paragraph(rt.bold(optLines));
+        }
       } else if (roundMode === 'scramble') {
         b.heading(`🔤 ${q.scrambledTiles}`, 1);
-        b.paragraph(rt.bold(`📂 Category: ${q.category || 'Word'} (${(q.name || '').length} Letters) — Unscramble & type in chat!`));
+        b.paragraph(rt.bold(`📂 Category: ${q.category || 'Word'} (${(q.name || '').length} Letters) — Tap or type in chat!`));
+        if (Array.isArray(q.options) && q.options.length === 4) {
+          const optLines = q.options.map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)}) ${opt}`).join('   •   ');
+          b.paragraph(rt.bold(optLines));
+        }
       } else if (roundMode === 'riddles') {
         b.heading(`🕵️ "${q.riddleText}"`, 1);
-        b.paragraph(rt.bold('💡 Type your answer in chat!'));
+        b.paragraph(rt.bold('💡 Tap a button or type your answer in chat!'));
+        if (Array.isArray(q.options) && q.options.length === 4) {
+          const optLines = q.options.map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)}) ${opt}`).join('   •   ');
+          b.paragraph(rt.bold(optLines));
+        }
       } else if (roundMode === 'trivia') {
         b.heading(`❓ ${q.questionText}`, 1);
         const optLines = (q.options || [])
@@ -2140,14 +2231,26 @@ export class GameEngine extends EventEmitter {
       } else if (q.promptOverride) {
         b.heading(`❓ ${q.promptOverride}`, 1);
       } else {
-        const defaultPrompt = roundMode === 'anime'
-          ? '👀 WHO IS THIS ANIME CHARACTER? TYPE IN CHAT!'
-          : roundMode === 'flags'
-            ? '🌍 WHICH COUNTRY\'S FLAG IS THIS?'
-            : roundMode === 'logos' || roundMode === 'cars'
-              ? '🚘 WHICH BRAND / CAR SYMBOL IS THIS?'
-              : '❓ TYPE YOUR ANSWER IN CHAT TO SNIPE!';
+        const defaultPrompt = roundMode === 'cars'
+          ? '🏎️ WHICH CAR BRAND EMBLEM IS THIS? TAP OR TYPE!'
+          : roundMode === 'logos'
+            ? '🏢 WHICH GLOBAL BRAND IS THIS? TAP OR TYPE!'
+            : roundMode === 'icons'
+              ? '📱 WHICH APP / TECH ICON IS THIS? TAP OR TYPE!'
+              : roundMode === 'anime'
+                ? '👀 WHO IS THIS ANIME CHARACTER? TAP OR TYPE!'
+                : roundMode === 'flags'
+                  ? '🌍 WHICH COUNTRY\'S FLAG IS THIS? TAP OR TYPE!'
+                  : roundMode === 'grid' || roundMode === 'picture'
+                    ? '🖼️ WHAT IS THIS PICTURE? TAP OR TYPE!'
+                    : '❓ TAP A BUTTON OR TYPE IN CHAT!';
         b.heading(defaultPrompt, 1);
+        if (Array.isArray(q.options) && q.options.length === 4) {
+          const optLines = q.options
+            .map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)})  ${opt}`)
+            .join('   •   ');
+          b.paragraph(rt.bold(optLines));
+        }
       }
 
       // Highlight unlocked hints prominently in bold text above the table!

@@ -257,10 +257,25 @@ export async function getLivePokemonQuestion({ seenIds = new Set() } = {}) {
   const baseCp = Math.round(data.bst * (1.8 + Math.random() * 0.6) * (isShiny ? 1.35 : 1) * (data.isLegendary ? 1.2 : 1));
   const evoText = data.evolvesFrom ? `Evolves from ${data.evolvesFrom}` : data.isLegendary ? '🌟 Legendary / Mythical' : 'Base / Special Stage';
 
+  const allPokemonNames = FALLBACK_POKEMON.map((p) => p.name);
+  const distractors = allPokemonNames
+    .filter((n) => n.toLowerCase() !== data.name.toLowerCase())
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 3);
+  while (distractors.length < 3) {
+    distractors.push(`Wild Pokémon ${distractors.length + 1}`);
+  }
+  const options = [data.name, ...distractors].sort(() => Math.random() - 0.5);
+  const correctIndex = options.indexOf(data.name);
+  const letter = String.fromCharCode(65 + correctIndex).toLowerCase();
+
   const aliases = Array.from(new Set([
     data.name.toLowerCase(),
     data.slug.replace(/-/g, ' '),
-    data.name.toLowerCase().replace(/[^a-z0-9]/g, '')
+    data.name.toLowerCase().replace(/[^a-z0-9]/g, ''),
+    letter,
+    `option ${letter}`,
+    `${letter})`
   ]));
 
   return {
@@ -281,6 +296,8 @@ export async function getLivePokemonQuestion({ seenIds = new Set() } = {}) {
     hint1: `${typeBadges} • ${data.region} (#${String(data.pokemonId).padStart(3, '0')})`,
     clueText: data.flavor,
     hint2: `${evoText} • Stats: HP ${data.stats.hp} | ATK ${data.stats.atk} | SPD ${data.stats.spd} • Pattern: ${maskPokemonName(data.name)}`,
+    options,
+    correctIndex,
     aliases
   };
 }

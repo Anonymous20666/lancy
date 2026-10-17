@@ -143,8 +143,37 @@ async function fetchAniListPage(page = 1) {
   }
 }
 
+function createAnimeMultipleChoice(targetName, candidatePool, existingAliases = []) {
+  const cleanTarget = String(targetName).trim();
+  const distractors = candidatePool
+    .map((c) => (typeof c === 'string' ? c : c.name))
+    .filter((n) => String(n).trim().toLowerCase() !== cleanTarget.toLowerCase())
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 3)
+    .map((n) => String(n).trim());
+
+  while (distractors.length < 3) {
+    distractors.push(`Anime Hero ${distractors.length + 1}`);
+  }
+
+  const options = [cleanTarget, ...distractors].sort(() => Math.random() - 0.5);
+  const correctIndex = options.indexOf(cleanTarget);
+  const letter = String.fromCharCode(65 + correctIndex).toLowerCase();
+
+  const aliases = Array.from(new Set([
+    ...existingAliases,
+    cleanTarget.toLowerCase(),
+    letter,
+    `option ${letter}`,
+    `${letter})`
+  ]));
+
+  return { options, correctIndex, aliases };
+}
+
 /**
- * Returns a live, non-repetitive Popular Anime Character question (Top 150 All-Stars).
+ * Returns a live, non-repetitive Popular Anime Character question (Top 150 All-Stars)
+ * with 4 interactive multiple-choice buttons.
  */
 export async function getLiveAnimeCharacter({ seenIds = new Set(), difficulty = 'ALL' } = {}) {
   // Strictly pull from Pages 1..6 (Top 150 Most Popular Anime Characters Worldwide)
@@ -161,8 +190,17 @@ export async function getLiveAnimeCharacter({ seenIds = new Set(), difficulty = 
     if (diffFiltered.length > 0) candidates = diffFiltered;
   }
 
+  const pool = liveAnimeCache.size >= 10 ? Array.from(liveAnimeCache.values()) : CHARACTERS;
+
   if (candidates.length > 0) {
-    return candidates[Math.floor(Math.random() * candidates.length)];
+    const picked = candidates[Math.floor(Math.random() * candidates.length)];
+    const mc = createAnimeMultipleChoice(picked.name, pool, picked.aliases);
+    return {
+      ...picked,
+      options: mc.options,
+      correctIndex: mc.correctIndex,
+      aliases: mc.aliases
+    };
   }
 
   // Fallback to curated CHARACTERS if offline
@@ -170,6 +208,8 @@ export async function getLiveAnimeCharacter({ seenIds = new Set(), difficulty = 
   const chosen = (fallbackPool.length ? fallbackPool : CHARACTERS)[
     Math.floor(Math.random() * (fallbackPool.length || CHARACTERS.length))
   ];
+  const mc = createAnimeMultipleChoice(chosen.name, CHARACTERS, chosen.aliases || [chosen.name.toLowerCase()]);
+
   return {
     id: `cur_${chosen.name}`,
     name: chosen.name,
@@ -179,6 +219,8 @@ export async function getLiveAnimeCharacter({ seenIds = new Set(), difficulty = 
     imageUrl: chosen.imageUrl,
     hint1: `Franchise: ${chosen.universe} • ${chosen.clue1}`,
     hint2: `${chosen.clue2} • Pattern: ${buildNamePattern(chosen.name)}`,
-    aliases: chosen.aliases || [chosen.name.toLowerCase()]
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
   };
 }

@@ -19,6 +19,34 @@ function maskWord(str = '') {
     .join('  ');
 }
 
+function createMultipleChoice(targetName, candidatePool, existingAliases = []) {
+  const cleanTarget = String(targetName).trim();
+  const distractors = candidatePool
+    .map((c) => (typeof c === 'string' ? c : c?.name || c?.word || c?.answer || ''))
+    .filter((n) => String(n).trim().toLowerCase() !== cleanTarget.toLowerCase() && String(n).trim().length > 0)
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 3)
+    .map((n) => String(n).trim());
+
+  while (distractors.length < 3) {
+    distractors.push(`Choice ${distractors.length + 1}`);
+  }
+
+  const options = [cleanTarget, ...distractors].sort(() => Math.random() - 0.5);
+  const correctIndex = options.indexOf(cleanTarget);
+  const letter = String.fromCharCode(65 + correctIndex).toLowerCase();
+
+  const aliases = Array.from(new Set([
+    ...existingAliases,
+    cleanTarget.toLowerCase(),
+    letter,
+    `option ${letter}`,
+    `${letter})`
+  ]));
+
+  return { options, correctIndex, aliases };
+}
+
 export function scrambleWordTiles(word = '') {
   const clean = String(word).toUpperCase().replace(/[^A-Z]/g, '');
   if (clean.length <= 1) return clean;
@@ -185,6 +213,8 @@ export async function getLiveEmojiQuiz({ seenIds = new Set() } = {}) {
   const pool = unseen.length > 0 ? unseen : EMOJI_QUIZ_BANK;
   const picked = pool[Math.floor(Math.random() * pool.length)];
 
+  const mc = createMultipleChoice(picked.name, EMOJI_QUIZ_BANK, picked.aliases);
+
   return {
     id: picked.id,
     name: picked.name,
@@ -194,7 +224,9 @@ export async function getLiveEmojiQuiz({ seenIds = new Set() } = {}) {
     difficulty: 'MEDIUM',
     hint1: `Category: ${picked.category} • ${picked.hint}`,
     hint2: `Pattern: ${maskWord(picked.name)} (${picked.name.split(/\s+/).length} word${picked.name.includes(' ') ? 's' : ''})`,
-    aliases: picked.aliases
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
   };
 }
 
@@ -256,6 +288,8 @@ export async function getLiveWordScramble({ seenIds = new Set() } = {}) {
         const upper = picked.word.toUpperCase();
         const rawDef = String(picked.defs[0] || '').replace(/^[a-z]+\t/i, '').trim();
         const scrambled = scrambleWordTiles(upper);
+        const scrambleChoices = FALLBACK_SCRAMBLE_WORDS.map((w) => w.word);
+        const mc = createMultipleChoice(upper, scrambleChoices, [upper.toLowerCase()]);
 
         return {
           id: `scr_${upper.toLowerCase()}`,
@@ -266,7 +300,9 @@ export async function getLiveWordScramble({ seenIds = new Set() } = {}) {
           difficulty: upper.length >= 9 ? 'HARD' : 'MEDIUM',
           hint1: `Theme: ${chosenTopic.label} • Definition: ${rawDef.slice(0, 120)}`,
           hint2: `Starts with "${upper[0]}" and ends with "${upper[upper.length - 1]}" • Pattern: ${maskWord(upper)}`,
-          aliases: [upper.toLowerCase()]
+          options: mc.options,
+          correctIndex: mc.correctIndex,
+          aliases: mc.aliases
         };
       }
     }
@@ -276,6 +312,8 @@ export async function getLiveWordScramble({ seenIds = new Set() } = {}) {
   const item = (pool.length ? pool : FALLBACK_SCRAMBLE_WORDS)[
     Math.floor(Math.random() * (pool.length || FALLBACK_SCRAMBLE_WORDS.length))
   ];
+  const mcFallback = createMultipleChoice(item.word, FALLBACK_SCRAMBLE_WORDS.map((w) => w.word), [item.word.toLowerCase()]);
+
   return {
     id: `scr_${item.word.toLowerCase()}`,
     name: item.word,
@@ -285,7 +323,9 @@ export async function getLiveWordScramble({ seenIds = new Set() } = {}) {
     difficulty: 'MEDIUM',
     hint1: `Theme: ${item.category} • Definition: ${item.def}`,
     hint2: `Starts with "${item.word[0]}" and ends with "${item.word[item.word.length - 1]}" • Pattern: ${maskWord(item.word)}`,
-    aliases: [item.word.toLowerCase()]
+    options: mcFallback.options,
+    correctIndex: mcFallback.correctIndex,
+    aliases: mcFallback.aliases
   };
 }
 
@@ -311,6 +351,8 @@ const RIDDLE_VAULT = [
 ];
 
 export async function getLiveRiddle({ seenIds = new Set() } = {}) {
+  const riddleAnswers = RIDDLE_VAULT.map((r) => r.answer);
+
   // Try live Riddles API when possible, filtering for concise 1-2 word answers
   try {
     const controller = new AbortController();
@@ -326,6 +368,7 @@ export async function getLiveRiddle({ seenIds = new Set() } = {}) {
           .trim();
         const rId = `rid_live_${Buffer.from(cleanAns.toLowerCase()).toString('base64url').slice(0, 16)}`;
         if (cleanAns.split(/\s+/).length <= 2 && cleanAns.length >= 3 && cleanAns.length <= 18 && !seenIds.has(rId)) {
+          const mcLive = createMultipleChoice(cleanAns, riddleAnswers, [cleanAns.toLowerCase(), String(data.answer).toLowerCase().trim()]);
           return {
             id: rId,
             name: cleanAns,
@@ -334,7 +377,9 @@ export async function getLiveRiddle({ seenIds = new Set() } = {}) {
             difficulty: 'MEDIUM',
             hint1: `Answer has ${cleanAns.length} letters (${cleanAns.split(/\s+/).length} word)`,
             hint2: `Starts with "${cleanAns[0].toUpperCase()}" • Pattern: ${maskWord(cleanAns)}`,
-            aliases: [cleanAns.toLowerCase(), String(data.answer).toLowerCase().trim()]
+            options: mcLive.options,
+            correctIndex: mcLive.correctIndex,
+            aliases: mcLive.aliases
           };
         }
       }
@@ -345,6 +390,8 @@ export async function getLiveRiddle({ seenIds = new Set() } = {}) {
   const picked = (pool.length ? pool : RIDDLE_VAULT)[
     Math.floor(Math.random() * (pool.length || RIDDLE_VAULT.length))
   ];
+  const mc = createMultipleChoice(picked.answer, riddleAnswers, picked.aliases);
+
   return {
     id: picked.id,
     name: picked.answer,
@@ -353,6 +400,8 @@ export async function getLiveRiddle({ seenIds = new Set() } = {}) {
     difficulty: 'MEDIUM',
     hint1: `Clue: ${picked.hint}`,
     hint2: `Pattern: ${maskWord(picked.answer)} (${picked.answer.length} letters)`,
-    aliases: picked.aliases
+    options: mc.options,
+    correctIndex: mc.correctIndex,
+    aliases: mc.aliases
   };
 }
