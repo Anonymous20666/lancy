@@ -1112,9 +1112,18 @@ export class GameEngine extends EventEmitter {
     // 2. Preferred Round Count Toggle (0 = Unlimited default, 5, 10, 15)
     if (data.startsWith('game_rounds:')) {
       const parts = data.split(':');
-      const r = this.setPreferredRounds(chatId, Number(parts[1]));
+      const targetR = Number(parts[1]);
+      const prevR = this.getPreferredRounds(chatId);
       const tab = parts[2] || 'visual';
-      const label = r === 0 ? '♾️ Unlimited Rounds' : `${r} Rounds`;
+      const label = targetR === 0 ? '♾️ Unlimited Rounds' : `${targetR} Rounds`;
+      if (prevR === targetR) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: `You've already selected ${label} before!`,
+          show_alert: true
+        });
+        return;
+      }
+      const r = this.setPreferredRounds(chatId, targetR);
       await this.api.answerCallbackQuery(query.id, { text: `Match mode set to ${label}! ⚡` });
       const rich = this.buildHubRichMessage(chatId, tab);
       if (messageId) {
@@ -1126,8 +1135,17 @@ export class GameEngine extends EventEmitter {
     // 2b. Changeable Auto-Stop Unanswered Limit Toggle
     if (data.startsWith('game_maxmiss:')) {
       const parts = data.split(':');
-      const m = this.setPreferredMaxMiss(chatId, Number(parts[1]) || 5);
+      const targetM = Number(parts[1]) || 5;
+      const prevM = this.getPreferredMaxMiss(chatId);
       const tab = parts[2] || 'visual';
+      if (prevM === targetM) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: `You've already selected ${targetM} unanswered rounds limit before!`,
+          show_alert: true
+        });
+        return;
+      }
+      const m = this.setPreferredMaxMiss(chatId, targetM);
       await this.api.answerCallbackQuery(query.id, { text: `Auto-stop set to ${m} unanswered rounds! 🛑` });
       const rich = this.buildHubRichMessage(chatId, tab);
       if (messageId) {
@@ -1139,9 +1157,18 @@ export class GameEngine extends EventEmitter {
     // 2c. Music Category Selector Toggle (Naija/Afrobeats, Global Pop, Rap & R&B, All Mix)
     if (data.startsWith('game_mcat:')) {
       const parts = data.split(':');
-      const cat = this.setPreferredMusicCategory(chatId, parts[1] || 'afro');
+      const targetCat = parts[1] || 'afro';
+      const prevCat = this.getPreferredMusicCategory(chatId);
       const tab = parts[2] || 'visual';
-      const meta = MUSIC_CATEGORIES[cat] || MUSIC_CATEGORIES.afro;
+      const meta = MUSIC_CATEGORIES[targetCat] || MUSIC_CATEGORIES.afro;
+      if (prevCat === targetCat) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: `You've already selected ${meta.label} category before!`,
+          show_alert: true
+        });
+        return;
+      }
+      const cat = this.setPreferredMusicCategory(chatId, targetCat);
       await this.api.answerCallbackQuery(query.id, { text: `🎵 Music & Lyrics set to: ${meta.label}!` });
       const rich = this.buildHubRichMessage(chatId, tab);
       if (messageId) {
@@ -1193,7 +1220,10 @@ export class GameEngine extends EventEmitter {
     // 5. In-Round Controls (Hint, Skip, Stop, Reshuffle Scramble, Uncover Grid Tile, Multiple Choice Answer)
     const session = this.sessions.get(Number(chatId));
     if (!session) {
-      await this.api.answerCallbackQuery(query.id, { text: 'This match has already ended! Start a new one with /game ♡' });
+      await this.api.answerCallbackQuery(query.id, {
+        text: '✕ This match has already ended! Start a new one with /game ♡',
+        show_alert: true
+      });
       return;
     }
 
@@ -1254,13 +1284,16 @@ export class GameEngine extends EventEmitter {
     // 6. Multiple-Choice Button Sniping (Trivia, Lyrics, etc.)
     if (data.startsWith('game_ans:')) {
       if (session.state !== 'in_round' || !session.currentQuestion) {
-        await this.api.answerCallbackQuery(query.id, { text: 'Round already finished!' });
+        await this.api.answerCallbackQuery(query.id, {
+          text: '✕ Round already finished! Wait for the next round ♡',
+          show_alert: true
+        });
         return;
       }
       const uid = Number(fromUser.id);
       if (session.wrongUsersThisRound.has(uid)) {
         await this.api.answerCallbackQuery(query.id, {
-          text: '✕ You already locked in a wrong choice this round! Wait for the next round ♡',
+          text: "✕ You've already selected this before! You are locked out for this round ♡",
           show_alert: true
         });
         return;
@@ -1340,7 +1373,7 @@ export class GameEngine extends EventEmitter {
     if (action === 'move' && !state.winner) {
       const idx = Number(parts[2]);
       if (state.board[idx] !== null) {
-        await this.api.answerCallbackQuery(query.id, { text: 'That tile is already taken!' });
+        await this.api.answerCallbackQuery(query.id, { text: '✕ That tile is already taken! Pick an empty tile.', show_alert: true });
         return;
       }
 
@@ -1440,7 +1473,7 @@ export class GameEngine extends EventEmitter {
 
       const landedRow = dropConnectFourDisc(state, col);
       if (landedRow === -1) {
-        await this.api.answerCallbackQuery(query.id, { text: 'That column is full! Pick another column.' });
+        await this.api.answerCallbackQuery(query.id, { text: '✕ That column is full! Pick another column.', show_alert: true });
         return;
       }
 
@@ -1969,6 +2002,7 @@ export class GameEngine extends EventEmitter {
     session.currentRound += 1;
     session.wrongUsersThisRound.clear();
     session.roundGuessMsgIds = [];
+    session.chatMessagesSinceCard = 0;
     session.state = 'in_round';
 
     // Determine effective mode for this round (supports 'mixed' and 'daily' 3-stage gauntlet!)
@@ -1981,10 +2015,22 @@ export class GameEngine extends EventEmitter {
       roundMode = dailyStages[(session.currentRound - 1) % dailyStages.length];
     }
 
-    // Fetch live question from provider
-    const question = await this.#fetchQuestionForMode(session, roundMode);
+    // Fetch live question from provider with error-handling fallback
+    let question;
+    try {
+      question = await this.#fetchQuestionForMode(session, roundMode);
+    } catch (err) {
+      this.log.error?.({ err: err?.message, roundMode }, 'fetchQuestionForMode failed, falling back to trivia');
+      question = await getLiveTriviaQuestion({ seenIds: session.usedIds });
+      roundMode = 'trivia';
+    }
+    if (!question) {
+      question = await getLiveTriviaQuestion({ seenIds: session.usedIds });
+      roundMode = 'trivia';
+    }
     question.roundMode = roundMode;
     question.currentStage = 0;
+    this.#ensureQuestionOptions(question, roundMode);
 
     if (question.id) {
       session.usedIds.add(question.id);
@@ -2074,6 +2120,43 @@ export class GameEngine extends EventEmitter {
 
       void this.#runNextRound(session);
     }, 30_000);
+  }
+
+  #ensureQuestionOptions(q, roundMode) {
+    if (!q) return;
+    const cleanTarget = String(q.name || q.displayName || '').trim();
+    if (!cleanTarget) return;
+
+    if (!Array.isArray(q.options) || q.options.length < 2) {
+      const distractors = [
+        'Lancy Challenger',
+        'Mystery Champion',
+        'Apex Contender',
+        'Phantom Choice'
+      ].filter((d) => d.toLowerCase() !== cleanTarget.toLowerCase());
+      const all = [cleanTarget, ...distractors.slice(0, 3)].sort(() => Math.random() - 0.5);
+      q.options = all;
+      q.correctIndex = all.indexOf(cleanTarget);
+    } else {
+      if (q.correctIndex === undefined || q.correctIndex < 0 || q.correctIndex >= q.options.length) {
+        let idx = q.options.findIndex((opt) => String(opt).trim().toLowerCase() === cleanTarget.toLowerCase());
+        if (idx === -1) {
+          q.options[0] = cleanTarget;
+          idx = 0;
+        }
+        q.correctIndex = idx;
+      }
+    }
+
+    if (!Array.isArray(q.aliases)) q.aliases = [];
+    const letter = String.fromCharCode(65 + q.correctIndex).toLowerCase();
+    q.aliases.push(
+      cleanTarget.toLowerCase(),
+      letter,
+      `option ${letter}`,
+      `${letter})`,
+      `[${letter}]`
+    );
   }
 
   #revealNextGridTiles(question, count = 2) {
@@ -2260,6 +2343,12 @@ export class GameEngine extends EventEmitter {
         }
       } else if (q.promptOverride) {
         b.heading(`❓ ${q.promptOverride}`, 1);
+        if (Array.isArray(q.options) && q.options.length >= 2) {
+          const optLines = q.options
+            .map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)})  ${opt}`)
+            .join('   •   ');
+          b.paragraph(rt.bold(optLines));
+        }
       } else {
         const defaultPrompt = roundMode === 'cars'
           ? '🏎️ WHICH CAR BRAND EMBLEM IS THIS? TAP OR TYPE!'
@@ -2275,7 +2364,7 @@ export class GameEngine extends EventEmitter {
                     ? '🖼️ WHAT IS THIS PICTURE? TAP OR TYPE!'
                     : '❓ TAP A BUTTON OR TYPE IN CHAT!';
         b.heading(defaultPrompt, 1);
-        if (Array.isArray(q.options) && q.options.length === 4) {
+        if (Array.isArray(q.options) && q.options.length >= 2) {
           const optLines = q.options
             .map((opt, idx) => `🔹 ${String.fromCharCode(65 + idx)})  ${opt}`)
             .join('   •   ');
@@ -2325,15 +2414,17 @@ export class GameEngine extends EventEmitter {
 
     // 5. Interactive Action Buttons
     if (showControls && session.state === 'in_round') {
-      if (Array.isArray(q.options) && q.options.length === 4) {
-        b.buttons([
-          richButton.callback(`A) ${q.options[0].slice(0, 22)}`, 'game_ans:0', { style: 'primary' }),
-          richButton.callback(`B) ${q.options[1].slice(0, 22)}`, 'game_ans:1', { style: 'primary' })
-        ]);
-        b.buttons([
-          richButton.callback(`C) ${q.options[2].slice(0, 22)}`, 'game_ans:2', { style: 'primary' }),
-          richButton.callback(`D) ${q.options[3].slice(0, 22)}`, 'game_ans:3', { style: 'primary' })
-        ]);
+      if (Array.isArray(q.options) && q.options.length >= 2) {
+        for (let i = 0; i < q.options.length; i += 2) {
+          const row = [];
+          const l1 = String.fromCharCode(65 + i);
+          row.push(richButton.callback(`${l1}) ${String(q.options[i]).slice(0, 22)}`, `game_ans:${i}`, { style: 'primary' }));
+          if (i + 1 < q.options.length) {
+            const l2 = String.fromCharCode(65 + i + 1);
+            row.push(richButton.callback(`${l2}) ${String(q.options[i + 1]).slice(0, 22)}`, `game_ans:${i + 1}`, { style: 'primary' }));
+          }
+          b.buttons(row);
+        }
       }
 
       if (roundMode === 'grid') {
@@ -2393,7 +2484,20 @@ export class GameEngine extends EventEmitter {
           return;
         }
       }
-      await this.api.editMessageRich(session.chatId, session.cardMessageId, payload, {}, files);
+      const editRes = await this.api.editMessageRich(session.chatId, session.cardMessageId, payload, {}, files).catch(() => null);
+      if (!editRes && session.cardMessageId) {
+        // Fallback: if in-place edit was rejected by Telegram (e.g. editMessageText on messages with photo/audio attachment),
+        // delete old card and send fresh card so buttons and card state are never lost!
+        const oldCardId = session.cardMessageId;
+        const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(() => null);
+        if (sent?.message_id) {
+          session.cardMessageId = sent.message_id;
+          session.chatMessagesSinceCard = 0;
+          if (oldCardId && oldCardId !== sent.message_id) {
+            this.api.deleteMessage?.(session.chatId, oldCardId)?.catch?.(() => {});
+          }
+        }
+      }
     } catch (err) {
       this.log.debug?.({ err: err?.message, chatId: session.chatId }, 'round card edit skipped');
     }

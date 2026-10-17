@@ -319,9 +319,10 @@ export class TelegramAPI {
     return this.call('sendChatAction', { chat_id: chatId, action }).catch(() => {});
   }
 
-  answerCallbackQuery(id, { text, showAlert = false, url, cacheTime = 0 } = {}) {
+  answerCallbackQuery(id, { text, showAlert = false, show_alert = false, url, cacheTime = 0, cache_time = 0 } = {}) {
+    const isAlert = Boolean(show_alert || showAlert);
     return this.call('answerCallbackQuery', {
-      callback_query_id: id, text, show_alert: showAlert, url, cache_time: cacheTime
+      callback_query_id: id, text, show_alert: isAlert, url, cache_time: cache_time || cacheTime
     }).catch(() => {});
   }
 
