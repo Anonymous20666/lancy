@@ -4708,17 +4708,40 @@ export class TelegramController extends EventEmitter {
     const tabMap = { visual: 'visual', mind: 'mind', pvp: 'pvp', board: 'pvp' };
     const initialTab = tabMap[subCmd] || 'visual';
     const richHub = this.gameEngine.buildHubRichMessage(chatId, initialTab);
-    await this.api.sendRichMessage(chatId, richHub).catch((err) => {
-      this.log.error?.({ err, chatId }, 'failed to send game hub rich message');
-    });
+    if (typeof this.api.sendRichMessage === 'function') {
+      await this.api.sendRichMessage(chatId, richHub).catch((err) => {
+        this.log.error?.({ err, chatId }, 'failed to send game hub rich message');
+      });
+    } else if (typeof this.api.sendMessage === 'function') {
+      const inlineKeyboard = [];
+      for (const block of richHub?.blocks || []) {
+        if (block.type === 'buttons' && Array.isArray(block.buttons)) {
+          inlineKeyboard.push(
+            block.buttons.map((b) => ({
+              text: typeof b.text === 'string' ? b.text : (Array.isArray(b.text) ? b.text.map(t => typeof t === 'string' ? t : (t?.text || '')).join('') : String(b.text || '')),
+              callback_data: b.callback_data
+            }))
+          );
+        }
+      }
+      await this.api.sendMessage(chatId, '🎮 *LANCY GAME ARENA*\n\nChoose your game:', {
+        reply_markup: { inline_keyboard: inlineKeyboard.length > 0 ? inlineKeyboard : [[{ text: '🎮 Play', callback_data: 'game_start:mixed' }]] }
+      }).catch(() => {});
+    }
   }
 
   async handleGameLeaderboard(message, scope = 'group') {
     const chatId = message.chat.id;
     const richLb = this.gameEngine.buildLeaderboardRichMessage(chatId, scope);
-    await this.api.sendRichMessage(chatId, richLb).catch((err) => {
-      this.log.error?.({ err, chatId }, 'failed to send game leaderboard rich message');
-    });
+    if (typeof this.api.sendRichMessage === 'function') {
+      await this.api.sendRichMessage(chatId, richLb).catch((err) => {
+        this.log.error?.({ err, chatId }, 'failed to send game leaderboard rich message');
+      });
+    } else if (typeof this.api.sendMessage === 'function') {
+      await this.api.sendMessage(chatId, '🏆 *GAME ARENA LEADERBOARD*\n\nTop Players:', {
+        reply_markup: richLb?.reply_markup
+      }).catch(() => {});
+    }
   }
 
   async handleGameCallback(query) {
@@ -4728,6 +4751,7 @@ export class TelegramController extends EventEmitter {
   // ── Smart Dual-Tier Force-Join System (Main Owner + Cloner) ──
 
   #registerForceJoinStateHandler() {
+    if (!this.sm?.register) return;
     this.sm.register(States.FORCE_JOIN_ADD_INPUT, {
       onMessage: async (sctx, message) => {
         const chatId = message?.chat?.id || sctx.chatId;
@@ -5295,9 +5319,10 @@ export class TelegramController extends EventEmitter {
     b.buttons([
       richButton.switchInlineCurrent('✨ All Command Suggestions ↗️', `${prefix}`, { style: 'primary' })
     ]);
-    b.validate();
-
-    return await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+    if (typeof this.api.sendRichMessage === 'function') {
+      return await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+    }
+    return await this.api.sendMessage(chatId, 'Command Suggestions').catch(() => {});
   }
 
   async updateCommandsForChat(chatId, prefix = '/') {

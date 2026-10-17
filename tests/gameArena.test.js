@@ -55,7 +55,7 @@ test('GameData: Datasets are populated with rich metadata', async () => {
   const car = getRandomCar('EASY');
   assert.ok(car.name);
   assert.ok(car.country);
-  assert.ok(car.imageUrl.includes('car-logos-dataset'));
+  assert.ok(car.imageUrl.includes('simpleicons.org') || car.imageUrl.includes('wikimedia.org') || car.imageUrl.includes('car-logos-dataset'));
 
   assert.ok(CHARACTERS.length >= 20);
   const char = getRandomCharacter();

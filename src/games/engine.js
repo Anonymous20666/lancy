@@ -608,6 +608,7 @@ export class GameEngine extends EventEmitter {
       startedBy: startedBy || { id: 0, first_name: 'Player' },
       state: 'starting',
       scores: new Map(), // userId -> { id, name, username, score, streak, correctCount, fastestMs }
+      matchSeenIds: new Set(),
       usedIds: this.db?.getSeenGameItems ? this.db.getSeenGameItems(cid, normalizedMode) : new Set(),
       currentQuestion: null,
       boardState: null,
@@ -693,13 +694,6 @@ export class GameEngine extends EventEmitter {
       session.cardMessageId = null;
       this.api.deleteMessage?.(cid, oldCardId)?.catch?.(() => {});
     }
-
-    if (Array.isArray(session.roundGuessMsgIds) && session.roundGuessMsgIds.length > 0) {
-      const toDelete = session.roundGuessMsgIds.splice(0, session.roundGuessMsgIds.length);
-      for (const msgId of toDelete) {
-        this.api.deleteMessage?.(cid, msgId)?.catch?.(() => {});
-      }
-    }
   }
 
   /**
@@ -755,10 +749,12 @@ export class GameEngine extends EventEmitter {
     }
 
     if (richPayload) {
-      const sent = await this.api.sendRichMessage(session.chatId, richPayload).catch((err) => {
-        this.log.error?.({ err, chatId: session.chatId }, 'failed to send board rich message');
-        return null;
-      });
+      const sent = typeof this.api.sendRichMessage === 'function'
+        ? await this.api.sendRichMessage(session.chatId, richPayload).catch((err) => {
+            this.log.error?.({ err, chatId: session.chatId }, 'failed to send board rich message');
+            return null;
+          })
+        : await this.api.sendMessage(session.chatId, 'Board game started').catch(() => null);
       session.cardMessageId = sent?.message_id || null;
       this.#armBoardInactivityTimer(session, 180_000);
     }
@@ -809,7 +805,11 @@ export class GameEngine extends EventEmitter {
       richButton.callback('🏆 Leaderboard', 'game_lb:group', { style: 'primary' })
     ]);
 
-    await this.api.sendRichMessage(cid, b.toJSON()).catch(() => {});
+    if (typeof this.api.sendRichMessage === 'function') {
+      await this.api.sendRichMessage(cid, b.toJSON()).catch(() => {});
+    } else if (typeof this.api.sendMessage === 'function') {
+      await this.api.sendMessage(cid, `🛑 ${session.mode.toUpperCase()} match ended`).catch(() => {});
+    }
     return { ok: true };
   }
 
@@ -891,22 +891,8 @@ export class GameEngine extends EventEmitter {
       const isSingleWord = rawText.split(/\s+/).length === 1 && !rawText.startsWith('/');
       const matchedEntry = session.boardState.words.find((w) => !w.foundBy && w.word === upper);
       if (matchedEntry) {
-        // Delete the user's guess message after a brief moment because the fresh Word Grid card at the bottom
-        // displays the updated board + "✅ WORD (@user)" + "🎯 @user found WORD (+XP)"!
-        if (message.message_id) {
-          setTimeout(() => {
-            this.api.deleteMessage?.(cid, message.message_id)?.catch?.(() => {});
-          }, 900);
-        }
         await this.#processWordGridHit(session, message.from, matchedEntry);
         return true;
-      }
-      // If a user typed a short 3-8 letter single-word guess that isn't on the grid, auto-delete it after 1.5s to prevent spam
-      if (isSingleWord && upper.length >= 3 && upper.length <= 8 && message.message_id) {
-        session.roundGuessMsgIds.push(message.message_id);
-        setTimeout(() => {
-          this.api.deleteMessage?.(cid, message.message_id)?.catch?.(() => {});
-        }, 1800);
       }
       return false;
     }
@@ -916,12 +902,7 @@ export class GameEngine extends EventEmitter {
       if (/^\d{1,4}$/.test(rawText)) {
         const guess = Number(rawText);
         if (guess >= 1 && guess <= 1000) {
-          const isWin = guess === session.boardState.secret;
           await this.#processNumberVaultGuess(session, message.from, guess, { fromChat: true });
-          // Delete non-winning number guesses to keep group chat clean!
-          if (!isWin && message.message_id) {
-            this.api.deleteMessage?.(cid, message.message_id)?.catch?.(() => {});
-          }
           return true;
         }
       }
@@ -935,21 +916,10 @@ export class GameEngine extends EventEmitter {
 
     const aliases = session.currentQuestion.aliases || [];
     if (!isFuzzyMatch(rawText, aliases)) {
-      // Track short guess-like messages (1-4 words, <= 32 chars, no slash commands/URLs) so we can clean them up when round ends
-      if (
-        message.message_id &&
-        rawText.length >= 1 &&
-        rawText.length <= 32 &&
-        !rawText.startsWith('/') &&
-        !/https?:\/\//i.test(rawText) &&
-        rawText.split(/\s+/).length <= 4
-      ) {
-        session.roundGuessMsgIds.push(message.message_id);
-      }
       return false;
     }
 
-    // Correct answer! The winning message is NOT added to roundGuessMsgIds so it stays in chat!
+    // Correct answer! Winner is announced and awarded XP!
     await this.#awardRoundWin(session, message.from);
     return true;
   }
@@ -1035,7 +1005,7 @@ export class GameEngine extends EventEmitter {
 
     await this.#updateRoundCard(session, {
       stage: 3, // Full HD reveal!
-      bannerStatus: `🎉 SNIPED BY ${winnerTag} in ${reactionSec}s! (+${pointsAwarded} XP${streakBadge})\n✅ Answer: ${answerName}${catchBannerLine}`,
+      bannerStatus: `🏆 WINNER: SNIPED BY ${winnerTag} in ${reactionSec}s! (+${pointsAwarded} XP${streakBadge})\n✅ Answer: ${answerName}${catchBannerLine}`,
       showControls: false
     });
 
@@ -1606,7 +1576,9 @@ export class GameEngine extends EventEmitter {
     const rich = buildNumberVaultRich(state);
     if (fromChat || (session.chatMessagesSinceCard || 0) >= 2 || !session.cardMessageId) {
       const oldCardId = session.cardMessageId;
-      const sent = await this.api.sendRichMessage(session.chatId, rich).catch(() => null);
+      const sent = typeof this.api.sendRichMessage === 'function'
+        ? await this.api.sendRichMessage(session.chatId, rich).catch(() => null)
+        : await this.api.sendMessage(session.chatId, 'Number Vault Update').catch(() => null);
       if (sent?.message_id) {
         session.cardMessageId = sent.message_id;
         session.chatMessagesSinceCard = 0;
@@ -1615,7 +1587,15 @@ export class GameEngine extends EventEmitter {
         }
       }
     } else {
-      await this.api.editMessageRich(session.chatId, session.cardMessageId, rich).catch(() => {});
+      if (typeof this.api.editMessageRich === 'function') {
+        await this.api.editMessageRich(session.chatId, session.cardMessageId, rich).catch(() => {});
+      } else if (typeof this.api.editMessageText === 'function') {
+        await this.api.editMessageText({
+          chat_id: session.chatId,
+          message_id: session.cardMessageId,
+          text: 'Number Vault Update'
+        }).catch(() => {});
+      }
     }
   }
 
@@ -1685,10 +1665,12 @@ export class GameEngine extends EventEmitter {
     };
 
     const { payload, files } = await this.#buildWordGridRichMessage(session);
-    const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch((err) => {
-      this.log.error?.({ err, chatId: session.chatId }, 'failed to send word grid rich message');
-      return null;
-    });
+    const sent = typeof this.api.sendRichMessage === 'function'
+      ? await this.api.sendRichMessage(session.chatId, payload, {}, files).catch((err) => {
+          this.log.error?.({ err, chatId: session.chatId }, 'failed to send word grid rich message');
+          return null;
+        })
+      : await this.api.sendMessage(session.chatId, 'Word Grid').catch(() => null);
     session.cardMessageId = sent?.message_id || null;
     session.chatMessagesSinceCard = 0;
     this.#armBoardInactivityTimer(session, 240_000);
@@ -1702,26 +1684,22 @@ export class GameEngine extends EventEmitter {
     if (!this.sessions.has(session.chatId) || session.isStopped) return;
     const oldCardId = session.cardMessageId;
     const { payload, files } = await this.#buildWordGridRichMessage(session);
-    const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(async () => {
-      // Fallback to in-place edit if send failed
-      if (oldCardId) {
-        await this.api.editMessageRich(session.chatId, oldCardId, payload, {}, files).catch(() => {});
-        return { message_id: oldCardId };
-      }
-      return null;
-    });
+    const sent = typeof this.api.sendRichMessage === 'function'
+      ? await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(async () => {
+          // Fallback to in-place edit if send failed
+          if (oldCardId && typeof this.api.editMessageRich === 'function') {
+            await this.api.editMessageRich(session.chatId, oldCardId, payload, {}, files).catch(() => {});
+            return { message_id: oldCardId };
+          }
+          return null;
+        })
+      : await this.api.sendMessage(session.chatId, 'Word Grid').catch(() => null);
 
     if (sent?.message_id) {
       session.cardMessageId = sent.message_id;
       session.chatMessagesSinceCard = 0;
       if (oldCardId && oldCardId !== sent.message_id) {
         this.api.deleteMessage?.(session.chatId, oldCardId)?.catch?.(() => {});
-      }
-      if (Array.isArray(session.roundGuessMsgIds) && session.roundGuessMsgIds.length > 0) {
-        const toDel = session.roundGuessMsgIds.splice(0, session.roundGuessMsgIds.length);
-        for (const mid of toDel) {
-          this.api.deleteMessage?.(session.chatId, mid)?.catch?.(() => {});
-        }
       }
     }
   }
@@ -2034,6 +2012,7 @@ export class GameEngine extends EventEmitter {
 
     if (question.id) {
       session.usedIds.add(question.id);
+      session.matchSeenIds?.add?.(question.id);
       if (this.db?.markGameItemSeen) {
         this.db.markGameItemSeen(session.chatId, session.mode, question.id);
       }
@@ -2042,6 +2021,10 @@ export class GameEngine extends EventEmitter {
     // Pre-fetch image buffer once if this round has an imageUrl so progressive hints/unblur are instant!
     if (question.imageUrl) {
       question.rawImageBuffer = await fetchImageBuffer(question.imageUrl);
+      if (!question.rawImageBuffer) {
+        const fallbackUrl = question.imageUrl.replace(/\/[a-f0-9]{6}(\?|$)/i, '/ffffff$1');
+        question.rawImageBuffer = await fetchImageBuffer(fallbackUrl);
+      }
     }
     if (roundMode === 'grid') {
       question.revealedTiles = [4, Math.floor(Math.random() * 4) * 2];
@@ -2055,10 +2038,19 @@ export class GameEngine extends EventEmitter {
       bannerStatus: '⏱️ 30s Smart Timer • Type your answer in chat or use the buttons below! ♡'
     });
 
-    const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch((err) => {
-      this.log.error?.({ err, chatId: session.chatId, roundMode }, 'failed to send round rich message');
-      return null;
-    });
+    let sent = null;
+    if (typeof this.api.sendRichMessage === 'function') {
+      sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch((err) => {
+        this.log.error?.({ err, chatId: session.chatId, roundMode }, 'failed to send round rich message');
+        return null;
+      });
+    } else if (files?.media?.buffer && typeof this.api.sendPhoto === 'function') {
+      sent = await this.api.sendPhoto(session.chatId, files.media.buffer, {
+        caption: payload?.text || 'Round Start'
+      }).catch(() => null);
+    } else if (typeof this.api.sendMessage === 'function') {
+      sent = await this.api.sendMessage(session.chatId, payload?.text || 'Round Start').catch(() => null);
+    }
     session.cardMessageId = sent?.message_id || null;
 
     // Smart Hint 1 at 10s elapsed (20s remaining)
@@ -2171,8 +2163,10 @@ export class GameEngine extends EventEmitter {
   }
 
   async #fetchQuestionForMode(session, roundMode) {
+    if (!session.matchSeenIds) session.matchSeenIds = new Set();
     const opts = {
       seenIds: session.usedIds,
+      matchSeenIds: session.matchSeenIds,
       difficulty: session.difficulty,
       mode: roundMode,
       musicCategory: session.musicCategory || this.getPreferredMusicCategory(session.chatId)
@@ -2471,32 +2465,44 @@ export class GameEngine extends EventEmitter {
     if (!session.cardMessageId) return;
     try {
       const { payload, files } = await this.#buildRoundRichMessage(session, opts);
-      const isActiveRound = (opts?.stage ?? 0) < 3 && session.state === 'in_round';
-      if (isActiveRound && (session.chatMessagesSinceCard || 0) >= 4) {
-        const oldCardId = session.cardMessageId;
-        const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(() => null);
-        if (sent?.message_id) {
-          session.cardMessageId = sent.message_id;
-          session.chatMessagesSinceCard = 0;
-          if (oldCardId && oldCardId !== sent.message_id) {
-            this.api.deleteMessage?.(session.chatId, oldCardId)?.catch?.(() => {});
-          }
-          return;
-        }
-      }
-      const editRes = await this.api.editMessageRich(session.chatId, session.cardMessageId, payload, {}, files).catch(() => null);
-      if (!editRes && session.cardMessageId) {
-        // Fallback: if in-place edit was rejected by Telegram (e.g. editMessageText on messages with photo/audio attachment),
-        // delete old card and send fresh card so buttons and card state are never lost!
-        const oldCardId = session.cardMessageId;
-        const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(() => null);
-        if (sent?.message_id) {
-          session.cardMessageId = sent.message_id;
-          session.chatMessagesSinceCard = 0;
-          if (oldCardId && oldCardId !== sent.message_id) {
-            this.api.deleteMessage?.(session.chatId, oldCardId)?.catch?.(() => {});
+      if (typeof this.api.sendRichMessage === 'function') {
+        const isActiveRound = (opts?.stage ?? 0) < 3 && session.state === 'in_round';
+        if (isActiveRound && (session.chatMessagesSinceCard || 0) >= 4) {
+          const oldCardId = session.cardMessageId;
+          const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(() => null);
+          if (sent?.message_id) {
+            session.cardMessageId = sent.message_id;
+            session.chatMessagesSinceCard = 0;
+            if (oldCardId && oldCardId !== sent.message_id) {
+              this.api.deleteMessage?.(session.chatId, oldCardId)?.catch?.(() => {});
+            }
+            return;
           }
         }
+        const editRes = await this.api.editMessageRich(session.chatId, session.cardMessageId, payload, {}, files).catch(() => null);
+        if (!editRes && session.cardMessageId) {
+          const oldCardId = session.cardMessageId;
+          const sent = await this.api.sendRichMessage(session.chatId, payload, {}, files).catch(() => null);
+          if (sent?.message_id) {
+            session.cardMessageId = sent.message_id;
+            session.chatMessagesSinceCard = 0;
+            if (oldCardId && oldCardId !== sent.message_id) {
+              this.api.deleteMessage?.(session.chatId, oldCardId)?.catch?.(() => {});
+            }
+          }
+        }
+      } else if (typeof this.api.editMessageCaption === 'function') {
+        await this.api.editMessageCaption({
+          chat_id: session.chatId,
+          message_id: session.cardMessageId,
+          caption: opts?.bannerStatus || 'Round Update'
+        }).catch(() => {});
+      } else if (typeof this.api.editMessageText === 'function') {
+        await this.api.editMessageText({
+          chat_id: session.chatId,
+          message_id: session.cardMessageId,
+          text: opts?.bannerStatus || 'Round Update'
+        }).catch(() => {});
       }
     } catch (err) {
       this.log.debug?.({ err: err?.message, chatId: session.chatId }, 'round card edit skipped');
@@ -2594,9 +2600,13 @@ export class GameEngine extends EventEmitter {
     ]);
 
     b.validate();
-    await this.api.sendRichMessage(session.chatId, b.toJSON()).catch((err) => {
-      this.log.error?.({ err, chatId: session.chatId }, 'failed to send rich victory podium');
-    });
+    if (typeof this.api.sendRichMessage === 'function') {
+      await this.api.sendRichMessage(session.chatId, b.toJSON()).catch((err) => {
+        this.log.error?.({ err, chatId: session.chatId }, 'failed to send rich victory podium');
+      });
+    } else if (typeof this.api.sendMessage === 'function') {
+      await this.api.sendMessage(session.chatId, '🏆 VICTORY PODIUM').catch(() => {});
+    }
   }
 
   #clearSessionTimers(session) {
