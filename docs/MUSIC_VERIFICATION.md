@@ -1,72 +1,96 @@
-# Lancy music v2 — verification report
+# Lancy music v2 — implementation and verification
 
-## Release status
+## Release boundary
 
-Implemented in an isolated feature worktree against upstream `85ceca7`, excluding the unrelated preexisting dirty VPS edits. Branch: `engineering/lancy-music-v2-20261020`. Commit/push verification is recorded in the final delivery status; this report does **not** assert a production deployment.
+Feature branch: `engineering/lancy-music-v2-20261020`, based on upstream `85ceca7`. The first implementation commit, `2972805dec90f43236be92a4731bc309f0daf649`, was pushed and its remote reference independently matched. Follow-up lifecycle/UI hardening and this evidence report are on the same scoped branch. The final delivery status records its latest exact commit.
 
-The user approved a controlled live test, with the original service restored afterwards. SSH access was restored using a user-installed restricted temporary public key; no password or private key was requested in chat. The server's ED25519 fingerprint was checked against the fingerprint supplied by the user before reconnecting.
+The production checkout contains unrelated preexisting changes. They were **not** committed into the feature branch, reset, checked out over, or replaced. During the explicitly approved test window, only the identified Lancy service/bridge was paused; the original service was restored afterwards. A feature push is not a production deployment.
 
-## Latest verified evidence
+## Automated evidence
 
-| Check | Result |
+| Check | Latest result |
 |---|---|
-| Clean-source targeted Node suite, executed on VPS | **89 passed, 0 failed** |
-| Python bridge suite, executed on VPS | **18 passed, 0 failed** |
-| Installed-library/FFmpeg contracts | **Pass**: neutral audio; bass audio; video+audio+bass; video seek offset; empty idle stream conversion |
-| Installed Python pins | All six matched production: py-tgcalls 3.0.0, ntgcalls 3.0.4, pyrogrammod 2.4.1, aiohttp 3.14.5, python-dotenv 1.2.4, TgCrypto 1.2.5 |
-| Real Telegram owner-private music home | **Accepted and sent**, message ID 1834; not merely a mocked API |
-| Bot preflight | Valid main bot, approved test group resolves, bot has administrator/pin/manage-call rights; owner-private chat accessible |
-| Actual playback account membership | **Administrator** in the approved test group, confirmed with read-only MTProto |
-| Public Audius search | HTTP 200; availability, stream/download and gating fields inspected; no arbitrary commercial recording streamed |
-| App composition/shutdown | Isolated temporary data root constructed and stopped successfully, without Telegram startup |
-| Initial staging hygiene | 37 scoped files, no forbidden credential paths or token/private-key pattern hits; whitespace check passed |
-| Preserved production source | 22 preexisting tracked changes and 5 untracked entries retained; no production checkout/reset/source replacement |
-| Git push transport | Dry run authenticated successfully; no further Git credential required |
+| Targeted Node feature/routing/lifecycle suite on VPS | **91 passed, 0 failed** |
+| Python bridge suite on VPS | **18 passed, 0 failed** |
+| Full VPS regression | **463 total: 460 passed, 1 failed, 2 cancelled**, 45479 ms |
+| Installed-library / real FFmpeg probe | Neutral audio, bass audio, video+audio+bass, video seek offset and empty idle-stream conversion passed |
+| Installed Python versions | py-tgcalls 3.0.0; ntgcalls 3.0.4; pyrogrammod 2.4.1; aiohttp 3.14.5; python-dotenv 1.2.4; TgCrypto 1.2.5 |
+| Original preserved dirty-source baseline | 413 total: 401 passed, 9 failed, 3 cancelled |
 
-The final broad VPS run completed: **461 tests; 458 passed, 1 failed, 2 cancelled**, in 45495 ms. It is **not a completely green suite**. The sole assertion failure is the preexisting `/setprefix` group-suggestions expectation in `tests/channelPostAndPrefix.test.js`; two preexisting files hit the 45-second per-file bound: `inlineSearchAndHotReload.test.js` and `liveSearchAndNoDuplicates.test.js`. All three identities were also present in the preserved baseline.
+**The full suite is not completely green.** Its remaining assertion is the preexisting `/setprefix` group-suggestions expectation in `channelPostAndPrefix.test.js`. Two preexisting files hit the 45-second file bound: `inlineSearchAndHotReload.test.js` and `liveSearchAndNoDuplicates.test.js`. All three identities also failed/timed out in the preserved baseline. Other legacy external-search/download assertions varied by environment and passed on the VPS; different-tree/environment totals are not a same-tree performance comparison.
 
-The preserved original dirty-source baseline was **413 total: 401 passed, 9 failed, 3 cancelled**. A prior sandbox broad checkpoint had 459 total, 452 passed, 5 failed and 2 cancelled; its additional external media/adult-search/tray failures passed on the VPS. Different trees/environments and external-service outcomes mean these totals are not a same-tree performance comparison. The targeted feature suite and Python suite are independently green.
+Saved evidence: `targeted.log`, `python.log`, `full-regression.log`, `live-events.ndjson`, `live-results.json`, `operator-events.ndjson`, `live-node.log`, and `native-contract-probe.log`. The source archive is produced with `git archive`, excluding credentials, runtime data, dependencies and operator scripts.
 
-## Controlled live-test attempt: existing-call precondition correctly blocked
+## Genuine Telegram / native transport results
 
-1. Created a consistent isolated SQLite backup, with protected permissions. No production database was replaced. The test build reused the pinned installed dependencies in a separate worktree; no package upgrades were applied to production.
-2. Identified the actual supervisor as PM2 under `/data/pm2`, and only its `lancy-bot` service and exact old bridge PID were targeted. Unrelated services were untouched.
-3. Installed an independent restoration guard before pausing the original service. The old bridge's health reported one active call.
-4. After the old bridge exited, a **read-only native MTProto probe** found the account was an administrator but the group's `full_chat.call` was **absent**. Cached legacy bridge metadata was not proof of an active Telegram call.
-5. The test refused to create a call or launch a competing player. It immediately restored the original `lancy-bot` service; PM2 confirmed it online afterwards.
-6. No new audio/video test stream, player pin, or 600-second idle test was started. Only the earlier authorized owner-private home message was sent. The group was not left and no group call was discarded by the test.
+The approved group was resolved as `holysinnersgc`; the bot had required administrator/pin rights and its user-account playback session was a group administrator. Owner-private music home message 1834 was accepted by Telegram. The user session was checked at runtime, not assumed ready merely because an environment variable existed.
 
-**Minimal external action:** an administrator must start a voice chat in `holysinnersgc` and keep it open. Then the already-approved controlled test can join and leave that existing call. The diagnostic itself deliberately does not auto-create or replace a group/channel call.
+### Existing-call setup and preservation
 
-The discovered stale legacy-call condition also prompted a regression correction in the new bridge: a definitive native `NotInCallError` is no longer reported as an active cached call. Idempotent departure is confirmed, its stale record/lease cleared, and Node retains the queue with an honest ended-call state. Generic uncertain failures still retain their lease rather than handing a possibly live account to another destination.
+The old bridge initially claimed one cached active call, but native `GetFullChannel` returned no call and both native call-active flags were false. The first test therefore aborted and restored the original service rather than silently creating a call. After explicit separate user authorization, an operator-only script created **one** diagnostic voice chat. This setup script is not a bot feature, is outside the source branch, and does not enable automatic call creation.
 
-## Implemented and targeted-tested
+Before launching the test build, native checks confirmed that call existed. Its exact identity remained unchanged after the original bridge exited. The test build joined it with `GroupCallConfig(auto_start=False)`.
 
-- Canonical recording/provider identity; exact-source resolution; stream and download rights kept separate; no silent different-song fallback.
-- `/play` download selection; `/addq` cross-page multi-selection; `/vplay` real requested video+audio; canonical standalone and current-track lyrics.
-- Destination-local queues/locks and exclusive account leases; stable entry removal, repeat/history/skip; stale completion/callback deduplication; native-clock progress.
-- Ten-minute default idle policy, cancellation/leave races, pause not idle, isolated shutdown and bounded queue/history/destination/media resources. One thousand repeat transitions are tested; this is not a multi-day soak.
-- Owner-private encrypted account pool, explicit runtime health checks, allowlists, secure terminal helper, one-time migration without silent reimport, retirement of chat OTP/password collection.
-- Persistent dashboard views, authorization/rate checks, panel creation mutex, selection isolation and pin preconditions.
-- Strict title/artist/duration lyrics matching and ambiguity rejection, rights-conscious excerpts and opt-in player full text.
-- Group AI disabled except literal play replies to this bot. DM serialization/history forwarding, accurate capability prompts and explicit outage/tool errors.
-- Bounded native stream retries, uncertain-lease retention and parent-death cleanup attempts.
+After the test build left, a new independent native probe confirmed:
+- The **same** call still existed (`original_call_preserved: true`).
+- The playback account still belonged to the group as an administrator.
+- Lancy had not discarded the call or left the group.
+- PM2 confirmed the original `lancy-bot` service online again.
 
-The installed-library media probe caught a real filter-placement error missed by mocks. PyTgCalls 3.0.0 uses `--audio ---mid` for audio-only post-input FFmpeg parameters. The corrected generated audio/video decoder commands actually exited successfully on generated fixtures. This verifies media preparation, not Telegram transport or listener synchronization.
+### Live checks that passed
 
-## Still unverified / not implemented
+| Live check | Observed evidence |
+|---|---|
+| Join an existing call | Native play accepted; destination status playing; player message 7776 created |
+| Native time units/progress | Real native clock advanced from 3 to 5 seconds |
+| Pause | Native paused state with stable clock across observations |
+| Resume, volume and seek | Resumed; volume 50 confirmed; native position 26 after seeking to 25 |
+| Skip and previous | Correct generated recording IDs selected on the same call |
+| Persistent views | Queue, volume and player edited the same player-message ID |
+| Pinning | Telegram accepted pin and unpin of the test's own player panel |
+| Video + audio | Native stream accepted with video=true and advancing position; listener synchronization was not independently verified |
+| Natural completion | Four-second fixture advanced to the expected next recording once |
+| Explicit leave and rejoin | Account lease became available; repeated leave was safe; rejoin succeeded |
+| Real user interactions | Actual incoming Telegram callbacks and subsequent live playback were observed while the test build polled only the approved group/owner DM |
+| Do not disconnect while playing | Connected/playing state remained true beyond the cancelled original idle deadline |
+| Shutdown panel honesty | Follow-up code edits persistent panels to stopped; its rendered stopped panel was accepted by the real Telegram API |
 
-**Not live-verified:** existing-call audio/video delivery, listener synchronization/quality, native progress under Telegram transport, pause/resume/seek/volume, actual 600-second leave and cancellation, mobile visual appearance, pinning, channel permissions, two-account live concurrency, prolonged network recovery, 24–72 hour soak.
+Initial transport checks used quiet, generated, rights-cleared local media through the real queue/bridge/Telegram stack. They did not prove arbitrary third-party catalog availability. Later interactive playback produced canonical cached media and a live FFmpeg decoder; no raw query/callback bodies or account credentials were logged. The public Audius API also returned HTTP 200 with the adapter's actual User-Agent; a default urllib request returned 403, illustrating why API outcomes and request contracts must be checked rather than assumed.
 
-**Not implemented:** durable automatic playback resumption after restart, crossfade/beatmatching/DJ mixing, unrestricted commercial-catalog availability, automatic recreation of externally deleted player dashboards. The operations guide states these limits; no nonstop-for-days guarantee is made.
+## Idle test: exact honest result
 
-A channel test needs a separately approved active channel stream. Live concurrency needs another independently authorized playback account/destination. Neither should be inferred from a single-group test or offline mocks.
+The configured idle duration was **600 seconds**. The diagnostic started an empty connected idle period, then deliberately added playback to cancel that deadline, then began a second idle period 23 seconds later.
 
-## Continuation checklist
+During observation, actual interactive playback was started. This correctly invalidated the empty-idle assumption. Structured samples remained `connected: true, status: playing` through 679 seconds of the test, including after the original cancelled 600-second deadline.
 
-1. Recheck the test group for an actual existing call before pausing the original service again; discover current PIDs rather than reusing old ones.
-2. Preserve the isolated data boundary and restoration guard. Never launch competing pollers/native players for the same token/session.
-3. Test the actual existing-call identity before and after Lancy leaves; leave only the playback account, not the group/channel or the other participants' call.
-4. Complete the real idle window, observe state/resource cleanup, and restore the original service for this test-only authorization. Prior in-memory queues may not resume.
-5. Record exact live evidence and limitations, final regression result, feature commit/branch and verified push status. No deployment without its separate authorization.
-6. Remove the specifically enrolled temporary SSH key from `authorized_keys` and delete its local private key when remote work is finished.
+The fixed idle-only harness asserted that the session must still be `idle`; because it was legitimately **playing**, the harness stopped with `CANCELLED_DEADLINE_LEFT_EARLY` and child exit 1. That label is misleading in this situation: the recorded connection had **not** left early. The raw failure is preserved, not relabelled as a passing idle-leave test. The operator wrapper then restored production and verified the call/group were preserved.
+
+Therefore:
+- Actual new-work cancellation and not leaving while playback continues are supported by live evidence.
+- An **uninterrupted real 600-second empty-idle departure remains unverified**. Offline timer/race tests pass; they are not a substitute for that clean live window.
+- User-interactive exercise and a fixed no-interference idle assertion should be separate phases in the next diagnostic, rather than forcing a playing queue to stop just to manufacture a passing timer result.
+
+The main owner was sent a clarification. Test-only panels were closed/marked finished so they would not falsely show ongoing test playback after restoration.
+
+## Corrections driven by verification
+
+1. Real installed-library decoding caught a bass-filter placement bug missed by mocks. PyTgCalls 3.0.0 needs `--audio ---mid` for audio-only post-input filters. Corrected commands actually decoded generated audio/video and seek-offset fixtures.
+2. A definitive native `NotInCallError` now clears stale call metadata after idempotent departure confirmation and releases its lease. An ended call is not advertised as active merely because cached metadata remains. Generic uncertain failures still retain leases conservatively.
+3. A failed initial volume confirmation no longer silently skips an otherwise started track; volume is shown unconfirmed and later reconciled.
+4. Shutdown renders a stopped player rather than abandoning a fake playing card. Old mutation callbacks are rejected when a restarted session has no current panel; navigation can open the current player safely.
+
+## Implemented scope
+
+Canonical provider/recording identity; exact-source resolution; stream/download rights separation; `/play` download versus `/addq` audio queue and `/vplay` real requested video; multi-page selection and callback deduplication; destination-local queues/locks; exclusive account leases; stable-ID queue editing, repeat/history/skip/seek/volume; bounded cache/files/timeouts and shutdown; owner-private encrypted account pool with allowlists and real health checks; secure terminal onboarding; strict lyrics matching and rights-conscious display; serialized private AI/history and group AI isolation; persistent compact views, permission/rate checks and restrained controls.
+
+Group general AI is off. Only plain play requests replying to this bot go directly into canonical download selection. Old chat OTP/password collection is retired in this branch. The current production service does not receive those source/security changes until a separate rollout is authorized.
+
+## Remaining limitations and release gate
+
+Not certified: uninterrupted 600-second idle leave, active channel-stream permissions/transport, two-account two-destination live concurrency, prolonged network recovery, 24–72 hour soak, mobile visual inspection, listener bass quality and audio/video synchronization. Single-account group checks and offline fakes do not establish these results.
+
+Not implemented: durable automatic playback resumption after process restart; crossfade/beatmatching/DJ mixing; guaranteed unrestricted commercial-catalog downloads; automatic recreation of externally deleted dashboards. Old inactive records may expire; operational limits are documented in `MUSIC_OPERATIONS.md`.
+
+No fixed 320 kbps call bitrate or improved source fidelity is promised. Audio is prepared as 48 kHz stereo with neutral default; gentle bass is an opt-in next-track filter with headroom/limiter.
+
+A rollout must preserve the 22 tracked dirty production changes and 5 untracked entries, not replace production with clean upstream. Use consistent SQLite/key backups, a reviewed engineering-only overlay/merge, the actual supervisor and smoke tests. Only the approved test destination may be allowlisted automatically as part of approved setup; other destinations need owner approval. Production deployment requires separate authorization.

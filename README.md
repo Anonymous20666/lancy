@@ -174,5 +174,7 @@ setup; bot tokens alone cannot operate this bridge.
 
 Start with [the operations guide](docs/MUSIC_OPERATIONS.md) and
 [the audit/requirements/architecture](docs/MUSIC_ENGINEERING.md). The engine is
-implemented and offline-tested; read the verification report before rollout.
-Real Telegram transport and multi-day uptime must not be inferred from mocks.
+implemented, offline-tested and checked in a limited real group-call window;
+read [the verification report](docs/MUSIC_VERIFICATION.md) before rollout.
+Channel/concurrent-destination transport, uninterrupted real idle leave and multi-day
+uptime must not be inferred from the group checks or mocks.

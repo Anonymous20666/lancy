@@ -154,6 +154,11 @@ export class QueueManager extends EventEmitter {
   }
   async shutdown() {
     this.closed = true; clearInterval(this.poller);
-    await Promise.allSettled([...this.sessions.values()].map(s => this.locks.run(s.chatId, async () => { this.#cancelIdle(s); try { if (s.connected) this.#assert(await this.voice.stop(s.chatId)); } finally { this.#release(s); s.connected = false; s.currentTrack = null; s.upcoming = []; s.status = 'idle'; } })));
+    await Promise.allSettled([...this.sessions.values()].map(s => this.locks.run(s.chatId, async () => {
+      this.#cancelIdle(s);let confirmed=!s.connected;
+      try{if(s.connected)this.#assert(await this.voice.stop(s.chatId));confirmed=true;}
+      catch{s.lastError='The service is stopping, but call departure has not been confirmed.';}
+      finally{this.#release(s);s.connected=!confirmed;s.currentTrack=null;s.upcoming=[];s.playbackId=null;s.positionSeconds=null;s.status='stopped';s.view='player';if(confirmed){s.accountAlias=null;s.lastError=null;}await this.updatePlayerCard(s.chatId);}
+    })));
   }
 }

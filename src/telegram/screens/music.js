@@ -21,6 +21,7 @@ export function createMusicScreen({ app }) {
   }
   function renderPlayer(s){
     const b=card(s.isChannel?'CHANNEL LIVE BROADCAST':'Lancy · now playing',`${s.isChannel?'Channel':'Group'} ${s.chatId} · ${s.status}`);
+    if(s.status==='stopped'){b.quote(rt.text('Playback service stopped. Open the current player after restart.'));if(s.lastError)b.paragraph(rt.text(s.lastError));b.buttons([button('Open current player','openplayer')]);return finish(b);}
     const t=s.currentTrack;
     if(!t){ b.quote(rt.text(s.connected?'Queue complete. Holding the call for ten minutes.':'No active playback. Search with /addq.')); }
     else {

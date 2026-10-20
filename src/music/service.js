@@ -50,7 +50,8 @@ export class MusicService {
   async player(ctx,id=this.destination(ctx)) { return this.panelLock.run(id,()=>this._player(ctx,id)); }
   async _player(ctx,id) {
     await this.authorize(ctx,false,id);
-    const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.bass=this.app.db.getSetting(`music.bass.${id}`,false);
+    const qm=this.app.musicQueueManager,s=qm.getSession(id);
+    if(ctx.query&&!s.screenMessageId)throw new MusicError('STALE_PLAYER','That player belongs to an earlier session. Open /player.'); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.bass=this.app.db.getSetting(`music.bass.${id}`,false);
     if(s.screenMessageId && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view='player';
     if(!s.screenMessageId){ const sent=await ctx.api.sendRichMessage(ctx.chatId,this.app.screens.get('music').renderPlayer(s)); qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api); }
@@ -66,6 +67,7 @@ export class MusicService {
     if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','selectaccount','pin'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const id=await this.authorize(ctx,!['player','queue','qpage','lyrics','lypage','accounts','refresh_status'].includes(action));
     const qm=this.app.musicQueueManager,s=qm.getSession(id);
+    if(ctx.query&&!s.screenMessageId)throw new MusicError('STALE_PLAYER','That player belongs to an earlier session. Open /player.');
     if(ctx.query && args.pop() !== String(s.controlRevision || 0))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
     if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');
     if(['pause','resume','skip','previous'].includes(action))await qm[action](id);
