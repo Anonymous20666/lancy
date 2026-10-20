@@ -41,6 +41,9 @@ async def main():
                     for command in [stream.microphone.path] + ([stream.camera.path] if video else []):
                         subprocess.run(shlex.split(command), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=20)
             bridge = MODULE.Bridge(temp)
+            # This decoder-only probe must not authenticate or perform publisher RPCs.
+            async def no_network_publisher(*_): pass
+            bridge.ensure_publisher = no_network_publisher
             await bridge.stream({'engine': CaptureEngine()}, -1, {'offset': offset, 'bass': bass, 'video': video, 'path': str(path)})
             results.append({'video': video, 'bass': bass, 'offset': offset, 'decoders_exit_zero': True})
         empty = StreamParams.get_stream_params(Stream())

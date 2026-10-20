@@ -84,12 +84,12 @@ An existing `TELEGRAM_STRING_SESSION` is migrated once as alias `legacy` with **
 
 ## Permissions and destinations
 
-- The bot must be able to receive commands, send/edit its own messages and send audio files. Pinning requires the bot's pin permission and the caller to be an authorized administrator/owner.
+- The bot must be able to receive commands, send/edit its own messages and send audio files. Group pinning requires the bot’s pin permission and a verified administrator. Private channel dashboards use real private-chat pinning, not a fabricated private administrator lookup.
 - The playback user account must already belong to the destination and be permitted to speak/stream. The bridge never joins a Telegram group or promotes an account automatically.
 - Start the group call/channel live stream first. `auto_start=False` is deliberate. A broadcast channel may require administrator/speaker rights. Merely giving the **bot** administrator rights is insufficient for the **user account**.
 - Fresh string sessions lack peer/access-hash caches. On a cache miss, the bridge searches at most 500 existing account dialogs within a bounded timeout; it does not autojoin a destination. A dedicated account with too many dialogs may need operator attention.
-- Members may select/add tracks; destructive controls (pause/resume/skip/previous/seek/volume/stop/leave/remove/clear/shuffle/repeat/bass/account selection) require verified group administrator or main-owner authority. Permission lookup failure denies the operation.
-- Channel control is main-owner-private: `/destination <negative-channel-id>`, then `/addq`, `/vplay`, `/player`. The binding is scoped to owner and bot. Its account still needs the destination allowlist and channel rights. Another bot/chat cannot take over an existing destination's dashboard.
+- Group dashboard use, queue additions and playback/queue/settings mutations require verified group administrator rights, including for a global bot owner. Public listen/download is separate. Permission lookup failure denies the operation.
+- Channel control belongs in the initiating verified channel administrator’s bot DM: `/channel @name` or `/destination <negative-channel-id>`. The account still needs owner approval for that destination and channel speaking rights. Private views are administrator/bot/message scoped; an older view or search retains its original destination.
 
 ## User workflows
 
@@ -101,7 +101,7 @@ An existing `TELEGRAM_STRING_SESSION` is migrated once as alias `legacy` with **
 - `/player`: one destination dashboard. Player, queue, lyrics, volume and accounts replace its content rather than generating a new status message for every poll. Deleted/uneditable dashboard recovery is not automatically proven; see limitations.
 - `/pause`, `/resume`, `/skip` (`/next`), `/previous`, `/queue` (`/q`), `/shuffle`, `/loop` (`/repeat`), `/seek <absolute-seconds>`, `/volume <0–150>`, `/stop`, `/leave`. `/volume` without a value opens presets. Queue entries have stable IDs; removal targets an entry rather than a shifting row index.
 - `/stop` clears playback and stays connected idle; ten minutes later it leaves the **call**, never the group. `/leave` exits immediately. Paused playback is not idle. New queue work invalidates an old idle timer under the destination lock.
-- `/playlist list`, `/playlist save <name>`, `/playlist load <name>`, `/playlist remove <name>` use the existing database. Names exclude reserved prototype properties. Restart does not resume live playback automatically.
+- `/playlist list`, `/playlist save <name>`, `/playlist load <name>`, `/playlist delete <name>` use the existing database. Names exclude reserved prototype properties. Restart does not resume live playback automatically.
 - Group general AI is off: names, tags and casual replies do not invoke the LLM. Plain `play <query>` replying to **this bot's** message goes directly to canonical download search, before stale interaction states. Replies to another bot/person do not trigger it. DM AI remains available, serialized per user, with actual history and honest tool errors.
 
 ## Source quality, matching and rights
@@ -123,7 +123,7 @@ Lyrics require normalized exact title/artist agreement, compatible duration when
 
 ## Full-song listening and quiet UI
 
-`/play` never auto-joins a VC. Its selected recording is delivered through the same rich full-audio component as the existing downloader, replacing the search card in place. Tap the native Telegram audio to listen, or use its audio menu to save the MP3. “Search for VC” is a separate action requiring a group or an owner-bound destination; it does not guess a group from private chat.
+`/play` never auto-joins a VC. Its selected recording is delivered through the same rich full-audio component as the existing downloader, replacing the search card in place. Tap the native Telegram audio to listen, or use its audio menu to save the MP3. “Search for VC” is a separate action requiring a group or a verified administrator-bound channel destination; it does not guess a group from private chat.
 
 The live `/player` dashboard also exposes full downloadable audio where the canonical source permits it. Its native audio widget is **not synchronized to the voice call**: the VC progress bar/volume/transport controls operate the shared call, while Telegram's player operates the listener's local playback. Unsupported or creator-restricted full-file preview is labelled honestly; the authorized VC stream continues. More → Retry full preview is available after temporary preparation failures.
 
