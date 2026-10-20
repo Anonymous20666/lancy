@@ -29,6 +29,13 @@ export class SettingsManager extends EventEmitter {
         this.values[category] = mergeSettings(DEFAULT_SETTINGS[category], stored);
       }
     }
+    // Music transport settings use the existing configuration mechanism.
+    if (process.env.MUSIC_IDLE_SECONDS) {
+      const seconds = Number(process.env.MUSIC_IDLE_SECONDS);
+      if (!Number.isFinite(seconds) || seconds < 1 || seconds > 86400) throw new Error('MUSIC_IDLE_SECONDS must be between 1 and 86400');
+      this.values.music.idleLeaveSeconds = seconds;
+    }
+    if (process.env.MUSIC_YTDLP_ENABLED) this.values.music.allowYtDlp = process.env.MUSIC_YTDLP_ENABLED === 'true';
     // Env wins for secrets / identity.
     if (this.env.BOT_TOKEN) this.values.telegram.botToken = this.env.BOT_TOKEN;
     if (this.env.OWNER_IDS) {

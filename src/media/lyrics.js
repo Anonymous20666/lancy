@@ -395,7 +395,9 @@ export async function getLyrics(rawTitle, rawArtist = '') {
       if (sRes.ok) {
         const results = await sRes.json();
         if (Array.isArray(results) && results.length > 0) {
-          const match = results.find((r) => r.plainLyrics || r.syncedLyrics);
+          const normalize = s => String(s || '').normalize('NFKD').replace(/\p{M}/gu, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+          const candidates = results.filter(r => (r.plainLyrics || r.syncedLyrics) && normalize(r.trackName) === normalize(title) && artist && normalize(r.artistName) === normalize(artist));
+          const match = candidates.length === 1 ? candidates[0] : null;
           if (match) {
             const plain = (match.plainLyrics || '').trim();
             const synced = stripLrcTimestamps(match.syncedLyrics || '').trim();

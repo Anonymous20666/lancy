@@ -30,7 +30,7 @@ export class OpenAICompatibleProvider {
   }
 
   async generate({ task = 'chat', style = 'girly', text = '', context = {}, maxTokens = 400 }) {
-    const system = BUILTIN_SYSTEM_PROMPTS[task] ?? BUILTIN_SYSTEM_PROMPTS.chat;
+    const system = context.system || BUILTIN_SYSTEM_PROMPTS[task] || BUILTIN_SYSTEM_PROMPTS.chat;
     const response = await fetch(`${this.endpoint}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -41,6 +41,7 @@ export class OpenAICompatibleProvider {
         model: this.model,
         messages: [
           { role: 'system', content: `${system}\nStyle: ${style}. Personality: Lancy.` },
+          ...(Array.isArray(context.history) ? context.history.slice(-10).map(h => ({ role: h.role === 'assistant' ? 'assistant' : 'user', content: String(h.content) })) : []),
           { role: 'user', content: text }
         ],
         max_tokens: maxTokens,

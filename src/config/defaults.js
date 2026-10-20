@@ -115,6 +115,14 @@ export const DEFAULT_SETTINGS = {
     chatMode: true
   },
 
+  music: {
+    idleLeaveSeconds: 600,
+    allowYtDlp: false,
+    maxCacheMiB: 512,
+    maxFileMiB: 48,
+    cacheTtlMinutes: 1440
+  },
+
   media: {
     ffmpegPath: '',              // empty = auto-detect (ffmpeg-static, vendor, PATH)
     maxDownloadBytes: 60 * 1024 * 1024,
@@ -189,7 +197,12 @@ export const RESTART_REQUIRED_PATHS = new Set([
   'general.ownerIds',
   'media.ffmpegPath',
   'ai.provider',
-  'ai.endpoint'
+  'ai.endpoint',
+  'music.idleLeaveSeconds',
+  'music.allowYtDlp',
+  'music.maxCacheMiB',
+  'music.maxFileMiB',
+  'music.cacheTtlMinutes'
 ]);
 
 /** Deep-merge user settings over defaults. */

@@ -41,7 +41,7 @@ function makeMockApp(db) {
   };
 }
 
-test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, and quotes', async () => {
+test('Group routing: names, tags and non-music replies do not invoke AI', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
   settings.values.general.ownerIds = [1001];
@@ -84,7 +84,7 @@ test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, 
   });
   assert.equal(assistantCalled, false, 'Untagged message between members must NOT trigger AI');
 
-  // 2. Calling "lancy play starboy" in Group Chat triggers AI
+  // 2. Unquoted calling "lancy play starboy" in GC does NOT trigger AI (GC general AI triggers removed)
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 2,
@@ -95,10 +95,9 @@ test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, 
       text: 'lancy play starboy'
     }
   });
-  assert.equal(assistantCalled, true, 'Calling "lancy play starboy" in GC must trigger AI');
-  assert.equal(receivedText, 'lancy play starboy');
+  assert.equal(assistantCalled, false, 'Unquoted message in GC must NOT trigger AI');
 
-  // 3. Calling "lancy search nsfw" in Group Chat triggers AI
+  // 3. Calling "lancy search nsfw" in Group Chat does NOT trigger AI
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 3,
@@ -109,9 +108,9 @@ test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, 
       text: 'lancy search nsfw'
     }
   });
-  assert.equal(assistantCalled, true, 'Calling "lancy search nsfw" in GC must trigger AI');
+  assert.equal(assistantCalled, false, 'Non-music search in GC must NOT trigger AI');
 
-  // 4. Calling "lancy nsfw video random" in Group Chat triggers AI
+  // 4. Tagging the bot in Group Chat with non-play does NOT trigger AI
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 4,
@@ -119,12 +118,12 @@ test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, 
       message_id: 204,
       from: { id: 1001, first_name: 'Alex' },
       chat: { id: -100555, type: 'supergroup' },
-      text: 'lancy nsfw video random'
+      text: '@Lancy_easy_bot find me naruto wallpapers'
     }
   });
-  assert.equal(assistantCalled, true, 'Calling "lancy nsfw video random" in GC must trigger AI');
+  assert.equal(assistantCalled, false, 'Tagging in GC for non-play must NOT trigger AI');
 
-  // 5. Quoting the bot in Group Chat triggers AI
+  // 5. Quoting the bot in Group Chat with general chat does NOT trigger AI
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 5,
@@ -136,9 +135,9 @@ test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, 
       text: 'can you give me another one?'
     }
   });
-  assert.equal(assistantCalled, true, 'Quoting the bot in GC must trigger AI');
+  assert.equal(assistantCalled, false, 'Quoting the bot in GC with non-play text must NOT trigger AI');
 
-  // 6. Tagging @Lancy_easy_bot in Group Chat triggers AI
+  // 6. Quoting the bot in Group Chat with "play starboy" DOES trigger AI to play music!
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 6,
@@ -146,10 +145,12 @@ test('Conversational AI: Group Chat invocation via bot name ("lancy ..."), tag, 
       message_id: 206,
       from: { id: 1001, first_name: 'Alex' },
       chat: { id: -100555, type: 'supergroup' },
-      text: '@Lancy_easy_bot find me naruto wallpapers'
+      reply_to_message: { from: { id: 100, is_bot: true, username: 'Lancy_easy_bot' } },
+      text: 'play starboy'
     }
   });
-  assert.equal(assistantCalled, true, 'Tagging the bot in GC must trigger AI');
+  assert.equal(assistantCalled, true, 'Quoting the bot in GC with "play ..." MUST trigger AI');
+  assert.equal(receivedText, 'play starboy');
 
   db.close();
 });
@@ -186,6 +187,7 @@ test('Conversational AI: Cloned Bot triggers with its custom bot name (e.g. "Rin
   cloneController.botUsername = 'RinaBot';
 
   // 1. Untagged conversation does not trigger
+  // 1. Untagged conversation does not trigger
   assistantCalled = false;
   await cloneController.handleUpdate({
     update_id: 1,
@@ -198,66 +200,66 @@ test('Conversational AI: Cloned Bot triggers with its custom bot name (e.g. "Rin
   });
   assert.equal(assistantCalled, false);
 
-  // 2. Calling "rina play starboy" triggers Rina's AI
+  // 2. Calling "rina play starboy" in private DM triggers Rina's AI
   assistantCalled = false;
   await cloneController.handleUpdate({
     update_id: 2,
     message: {
       message_id: 302,
       from: { id: 1001, first_name: 'Alex' },
-      chat: { id: -100999, type: 'supergroup' },
+      chat: { id: 1001, type: 'private' },
       text: 'rina play starboy'
     }
   });
-  assert.equal(assistantCalled, true, 'Calling "rina play starboy" must trigger cloned bot');
+  assert.equal(assistantCalled, true, 'Calling "rina play starboy" in DM must trigger cloned bot');
 
-  // 3. Calling "rina search nsfw" triggers Rina's AI
+  // 3. Calling "rina search nsfw" in private DM triggers Rina's AI
   assistantCalled = false;
   await cloneController.handleUpdate({
     update_id: 3,
     message: {
       message_id: 303,
       from: { id: 1001, first_name: 'Alex' },
-      chat: { id: -100999, type: 'supergroup' },
+      chat: { id: 1001, type: 'private' },
       text: 'rina search nsfw'
     }
   });
-  assert.equal(assistantCalled, true, 'Calling "rina search nsfw" must trigger cloned bot');
+  assert.equal(assistantCalled, true, 'Calling "rina search nsfw" in DM must trigger cloned bot');
 
-  // 4. Calling "rina nsfw video random" triggers Rina's AI
+  // 4. Calling "rina nsfw video random" in private DM triggers Rina's AI
   assistantCalled = false;
   await cloneController.handleUpdate({
     update_id: 4,
     message: {
       message_id: 304,
       from: { id: 1001, first_name: 'Alex' },
-      chat: { id: -100999, type: 'supergroup' },
+      chat: { id: 1001, type: 'private' },
       text: 'rina nsfw video random'
     }
   });
-  assert.equal(assistantCalled, true, 'Calling "rina nsfw video random" must trigger cloned bot');
+  assert.equal(assistantCalled, true, 'Calling "rina nsfw video random" in DM must trigger cloned bot');
 
-  // 5. Universal "lancy" name trigger also triggers clone as fallback
+  // 5. Universal "lancy" name trigger also triggers clone as fallback in private DM
   assistantCalled = false;
   await cloneController.handleUpdate({
     update_id: 5,
     message: {
       message_id: 305,
       from: { id: 1001, first_name: 'Alex' },
-      chat: { id: -100999, type: 'supergroup' },
+      chat: { id: 1001, type: 'private' },
       text: 'lancy play starboy'
     }
   });
   assert.equal(assistantCalled, true, 'Universal "lancy" call must also trigger cloned bot');
 
-  // 6. Tagging @RinaBot triggers clone
+  // 6. Tagging @RinaBot in private DM triggers clone
   assistantCalled = false;
   await cloneController.handleUpdate({
     update_id: 6,
     message: {
       message_id: 306,
       from: { id: 1001, first_name: 'Alex' },
-      chat: { id: -100999, type: 'supergroup' },
+      chat: { id: 1001, type: 'private' },
       text: '@RinaBot how are you'
     }
   });

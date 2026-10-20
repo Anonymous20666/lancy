@@ -337,7 +337,10 @@ export class TelegramController extends EventEmitter {
       { command: 'connect4', description: '🔴🟡 1v1 Connect Four Board Game' },
       { command: 'rps', description: '🪨📄✂️ 1v1 Rock Paper Scissors Duel' },
       { command: 'topleaderboard', description: '🏆 Group trivia & game hall of fame' },
-      { command: 'play', description: '🎵 Search, stream & download music / MP3' },
+      { command: 'play', description: 'Download a selected music track' },
+      { command: 'addq', description: 'Search and queue music in a live call' },
+      { command: 'vplay', description: 'Queue video + audio in a live call' },
+      { command: 'player', description: 'Open the destination music dashboard' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
       { command: 'search', description: '🔍 Search Pinterest (HD photos & aesthetic art)' },
@@ -367,7 +370,10 @@ export class TelegramController extends EventEmitter {
       { command: 'logos', description: '🏢 Guess the Brand Logo (Fashion & Tech)' },
       { command: 'icons', description: '📱 Guess the App & Gaming Icon' },
       { command: 'topleaderboard', description: '🏆 Trivia & game hall of fame' },
-      { command: 'play', description: '🎵 Search, stream & download music / MP3' },
+      { command: 'play', description: 'Download a selected music track' },
+      { command: 'addq', description: 'Search and queue music in a live call' },
+      { command: 'vplay', description: 'Queue video + audio in a live call' },
+      { command: 'player', description: 'Open the destination music dashboard' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
       { command: 'search', description: '🔍 Search Pinterest (HD photos & videos)' },
@@ -441,8 +447,8 @@ export class TelegramController extends EventEmitter {
     this.log.info({
       updateId: update.update_id,
       from: update.message?.from?.id ?? update.callback_query?.from?.id,
-      text: update.message?.text,
-      data: update.callback_query?.data
+      hasText: Boolean(update.message?.text),
+      hasCallback: Boolean(update.callback_query?.data)
     }, 'received update');
     if (update.inline_query) return this.#handleInlineQuery(update.inline_query);
     if (update.chosen_inline_result) {
@@ -1880,6 +1886,13 @@ export class TelegramController extends EventEmitter {
   }
 
   async #fetchInlineMusicSearch(queryTopic, offset = 0) {
+    if (this.app?.music) {
+      try {
+        const page = await this.app.musicProviders.search(queryTopic, { offset: Math.max(0, Number(offset) || 0), limit: 5 });
+        return { results: page.items.map(t => ({ type: 'article', id: t.id, title: t.title, description: `${t.artist || 'Artist not supplied'} · ${t.provider} · select to open download search`, input_message_content: { message_text: `/play ${t.sourceRef && t.provider === 'youtube' ? t.sourceRef : `audius: ${t.title} ${t.artist || ''}`}` } })), nextOffset: page.nextOffset == null ? '' : String(page.nextOffset) };
+      } catch { return { results: [], nextOffset: '' }; }
+    }
+
     if (!queryTopic) return { results: [], nextOffset: '' };
     try {
       const botUser = this.botUsername || 'Lancy_easy_bot';
@@ -3485,7 +3498,7 @@ export class TelegramController extends EventEmitter {
         action.includes('page')
       );
 
-      const isFromMedia = !isPagination && Boolean(
+      const isFromMedia = screen !== 'music' && !isPagination && Boolean(
         args?.includes('from_media') ||
         (query.message && this.isMediaDeliveryMessage(query.message)) ||
         (query.message?.message_id && this.isMediaDeliveryMessageId(query.message.message_id))
@@ -3637,6 +3650,19 @@ export class TelegramController extends EventEmitter {
       const targetBot = parts[1]?.toLowerCase();
       if (targetBot && this.botUsername && targetBot !== this.botUsername.toLowerCase()) {
         return;
+      }
+
+      // One integrated music workflow; legacy branches remain only for injected controllers
+      // without the composition-root music service (backward-compatible test/extensions).
+      if (this.app?.music) {
+        const musicScreen = this.screens.get('music');
+        if (await musicScreen?.handleCommand?.(this.#ctx(tgId, { message }, { forceNew: true }), command, rest)) return;
+        if (command === '/lyrics' && rest.length === 0) {
+          const musicCtx = this.#ctx(tgId, { message });
+          try { await this.app.music.player(musicCtx); await this.app.music.control({ ...musicCtx, messageId: null, query: null }, 'lyrics'); }
+          catch (e) { await this.api.sendMessage(chatId, e.code ? e.message : 'Lyrics are currently unavailable.'); }
+          return;
+        }
       }
 
       if (command === '/forcejoin' || command === '/fsub' || command === '/forcesub') {
@@ -4327,6 +4353,11 @@ export class TelegramController extends EventEmitter {
         )
       );
       const isReplyToBot = isReplyToThisBot;
+      if (this.app?.music && isGroup && isReplyToThisBot && /^play(?:\s|$)/i.test(text)) {
+        const musicCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate: false, isReplyToBot: true });
+        await this.screens.get('music')?.search(musicCtx, text.replace(/^play\s*/i, ''), 'download');
+        return;
+      }
 
       const nameRegex = new RegExp(`\\b(?:${[...nameTriggers].map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')})\\b`, 'i');
       const isNameTriggered = Boolean(text && nameRegex.test(text));
@@ -4353,7 +4384,8 @@ export class TelegramController extends EventEmitter {
       // In DM (private chat): state inputs work directly without needing to quote or tag!
       // In Group Chat: interactive prompt input requires replying to the bot or tagging @bot
       // to avoid chat conflicts when group members talk with each other.
-      const shouldHandleState = isPrivate || isReplyToBot || isTag;
+      const stateChat = this.sm.get?.(tgId)?.chatId;
+      const shouldHandleState = (stateChat == null || Number(stateChat) === Number(chatId)) && (isPrivate || isReplyToBot || isTag);
       const ctx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
       const handled = shouldHandleState ? await this.sm.handleMessage(tgId, { ...message, chatId }, ctx) : false;
       if (!handled) {
@@ -4405,7 +4437,8 @@ export class TelegramController extends EventEmitter {
           // AI assistant: responds in private DM and in group chat when tagged, quoted, or called by name
           const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
           if (enabled && this.app?.assistant) {
-            const shouldReply = isPrivate || isReplyToThisBot || isTag || isNameTriggered;
+            const isGcPlayMusic = isGroup && isReplyToThisBot && /^\s*play\b/i.test(text);
+            const shouldReply = isGroup ? isGcPlayMusic : (isPrivate || isReplyToThisBot || isTag || isNameTriggered);
             if (shouldReply) {
               const aiCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot: isReplyToThisBot, isTag, forceNew: true });
               await this.app.assistant.handleMessage({ ctx: aiCtx, message, text });
@@ -4418,6 +4451,8 @@ export class TelegramController extends EventEmitter {
       await this.api.sendMessage(chatId, friendly(error)).catch(() => {});
     }
   }
+
+  async executeMusicVoicePlay(ctx, query) { return this.screens.get('music')?.search(ctx, query, 'queue'); }
 
   async handleAudioRecognition(ctx, mediaObj, message, mediaInfo = null) {
     const chatId = ctx.chatId || message?.chat?.id;

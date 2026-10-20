@@ -1,0 +1,15 @@
+# Existing credentials, already managed by Lancy: BOT_TOKEN, OWNER_IDS, DATA_DIR,
+# TELEGRAM_API_ID, TELEGRAM_API_HASH, FFMPEG_PATH. Never put real credentials here.
+# An existing TELEGRAM_STRING_SESSION is migrated to alias legacy with no allowed chats.
+MUSIC_IDLE_SECONDS=600
+# Optional existing yt-dlp tool, only for content you have permission to use.
+MUSIC_YTDLP_ENABLED=false
+# Full lyrics display only with appropriate display rights; excerpts otherwise.
+MUSIC_LYRICS_FULL_TEXT=false
+# Optional bridge reattachment token (32+ random characters); keep secret.
+# VOICE_BRIDGE_TOKEN=
+VOICE_BRIDGE_HOST=127.0.0.1
+VOICE_BRIDGE_PORT=3056
+# Optional 32-byte AES encryption key as 64 hex characters; otherwise a mode-600
+# key is created at DATA_DIR/secrets/music-session.key (back up separately from DB).
+# MUSIC_SESSION_KEY=

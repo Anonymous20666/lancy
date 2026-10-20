@@ -19,11 +19,13 @@ export function createHelpScreen({ app }) {
     const guideText =
 `✨ Welcome to your ultimate aesthetic all-in-one companion! Tap to uncover all superpowers:
 
-🎵 HIGH-SPEED MUSIC & MP3 STREAMING
-• Type /play <song> or /music <song> to stream & download high-speed 320k MP3s with official cover art!
-• Need the file in your music player? Tap "🎵 Send Audio File" to save the raw audio directly into Telegram.
-• Tap "📜 Lyrics" to sing along with synchronized, expandable lyrics cards!
-• Heard a fire song in a video or voice note? Just reply or forward it to the bot — our Shazam recognizer identifies it instantly!
+🎵 MUSIC · DOWNLOADS & LIVE CALLS
+• /play <title artist> searches for a permitted downloadable recording. It does not join a voice chat.
+• /addq <title artist> opens multi-select audio queue search; /vplay queues genuine video with audio.
+• /player is the destination dashboard: queue, pause, resume, skip, previous, volume, repeat, seek and lyrics.
+• /stop clears playback and holds the call idle for ten minutes; /leave exits the call immediately, not the group.
+• A dedicated owner-approved user account and an active call are required. Source permissions and metadata determine availability.
+• Lyrics are shown only for a reliable match. Audio quality depends on the source and Telegram; no fixed output bitrate is promised.
 
 📥 UNIVERSAL HD MEDIA DOWNLOADER & TIKTOK SEARCH (/grab, /download)
 • Paste ANY link or type /grab <link> from TikTok (no watermark!), Instagram Reels, YouTube Shorts, Twitter/X, Pinterest, or Facebook.
@@ -51,7 +53,7 @@ export function createHelpScreen({ app }) {
   - Auto pack splitting: Packs with >60 stickers are split into Part 1, Part 2 automatically.
 
 📱 LIVE INLINE SEARCH EVERYWHERE
-• Type ${botTag} <song name> in ANY chat to stream full songs live!
+• Type ${botTag} <song name> in ANY chat to discover tracks and open their download search.
 • Type ${botTag} pint <topic> in ANY chat to share HD aesthetic photos!
 • Type ${botTag} tt <topic> in ANY chat to find trending TikTok clips!
 • (Tip: Cloned bots must have /setinline enabled in @BotFather to activate live search in chats)
@@ -61,7 +63,7 @@ export function createHelpScreen({ app }) {
 
 👥 GROUP CHATS & MULTITASKING
 • Add the bot to your group chats for shared music drops, media downloads, and Pinterest searches.
-• Zero spam: tag ${botTag} or use /play to search, keeping your chats clean and conflict-free!`;
+• Groups have no AI conversation. Use commands, or reply to this bot with plain "play <title artist>" for download search.`;
 
     b.expandableBlockquote(guideText);
     b.divider();
@@ -69,10 +71,13 @@ export function createHelpScreen({ app }) {
     b.heading('⛧ essential commands', 3);
     b.table([
       [{ text: rt.bold('/start'), align: 'left', valign: 'middle' }, { text: 'Open the aesthetic dashboard', align: 'left', valign: 'middle' }],
-      [{ text: rt.bold('/play'), align: 'left', valign: 'middle' }, { text: 'Play & download music/MP3', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/play'), align: 'left', valign: 'middle' }, { text: 'Find and download a permitted recording', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/addq'), align: 'left', valign: 'middle' }, { text: 'Search and queue live-call audio', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/vplay'), align: 'left', valign: 'middle' }, { text: 'Queue live-call video + audio', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/player'), align: 'left', valign: 'middle' }, { text: 'Open the persistent player', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/grab'), align: 'left', valign: 'middle' }, { text: 'Universal media downloader', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/search'), align: 'left', valign: 'middle' }, { text: 'Pinterest HD aesthetic search', align: 'left', valign: 'middle' }],
-      [{ text: rt.bold('/lyrics'), align: 'left', valign: 'middle' }, { text: 'Get synchronized lyrics', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/lyrics'), align: 'left', valign: 'middle' }, { text: 'Matched lyrics for the current track', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/clone'), align: 'left', valign: 'middle' }, { text: 'Bring your own bot (60s)', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/setprefix'), align: 'left', valign: 'middle' }, { text: 'Change prefix trigger (/ to !)', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/postchannel'), align: 'left', valign: 'middle' }, { text: 'Post sticker pack to TG channel', align: 'left', valign: 'middle' }],

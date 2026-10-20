@@ -163,3 +163,16 @@ src/
 *made with love ♡*
 
 </div>
+
+## Music and voice-call engine (feature branch)
+
+`/play` searches/selects a permitted audio **download**; `/addq` queues audio;
+`/vplay` requests actual video+audio in an existing group call/channel stream.
+`/player` is the destination-specific control panel. `/lyrics` uses the selected
+recording's canonical metadata. User-account playback requires owner-private
+setup; bot tokens alone cannot operate this bridge.
+
+Start with [the operations guide](docs/MUSIC_OPERATIONS.md) and
+[the audit/requirements/architecture](docs/MUSIC_ENGINEERING.md). The engine is
+implemented and offline-tested; read the verification report before rollout.
+Real Telegram transport and multi-day uptime must not be inferred from mocks.

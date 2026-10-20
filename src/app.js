@@ -40,7 +40,16 @@ import { createCloneScreen } from './telegram/screens/clone.js';
 import { createChannelPostScreen } from './telegram/screens/channelPost.js';
 import { createAutoPostScreen } from './telegram/screens/autoPost.js';
 import { createNsfwScreen } from './telegram/screens/nsfw.js';
+import { createMusicScreen } from './telegram/screens/music.js';
 import { MultiBotManager } from './telegram/multiBotManager.js';
+import { VoiceClient } from './music/voiceClient.js';
+import { QueueManager as MusicQueueManager } from './music/queueManager.js';
+import { ProviderRegistry as MusicProviders } from './music/providers.js';
+import { MediaLibrary } from './music/library.js';
+import { SearchSessions } from './music/search.js';
+import { MatchedLyrics } from './music/lyrics.js';
+import { AccountStore } from './music/accounts.js';
+import { MusicService } from './music/service.js';
 
 /**
  * LancyApp — the composition root. Every service is constructed here and
@@ -145,6 +154,17 @@ export class LancyApp {
     this.mediaDownloader = new MediaDownloader({ log: this.log });
     this.videoServer = new VideoStreamingServer({ app: this, port: 3055, log: this.log });
 
+    // ── Voice Chat & Music Streaming ──
+    this.voiceClient = new VoiceClient({ app: this, log: this.log });
+    this.musicQueueManager = new MusicQueueManager({ app: this, voiceClient: this.voiceClient, db: this.db, log: this.log });
+
+    this.musicProviders = new MusicProviders();
+    this.musicProviders.get('youtube').enabled = this.settings.get('music.allowYtDlp');
+    this.musicQueueManager.idleTimeoutMs = this.settings.get('music.idleLeaveSeconds') * 1000;
+    this.musicLibrary = new MediaLibrary({ root: join(this.root, 'cache', 'music'), providers: this.musicProviders, maxBytes: this.settings.get('music.maxFileMiB') * 1024 * 1024, quotaBytes: this.settings.get('music.maxCacheMiB') * 1024 * 1024, ttlMs: this.settings.get('music.cacheTtlMinutes') * 60000 });
+    this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient });
+    this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
+
     // ── Screens ──
     this.screens = new Map();
   }
@@ -192,7 +212,7 @@ export class LancyApp {
       createDashboardScreen, createPinterestScreen, createStickersScreen,
       createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
       createDownloaderScreen, createCloneScreen, createChannelPostScreen,
-      createAutoPostScreen, createNsfwScreen
+      createAutoPostScreen, createNsfwScreen, createMusicScreen
     ];
     for (const factory of factories) {
       const screen = factory({ app: this });
@@ -335,6 +355,9 @@ export class LancyApp {
     clearInterval(this.cleanupTimer);
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
+    await this.musicQueueManager?.shutdown();
+    await this.musicLibrary?.shutdown();
+    await this.voiceClient?.stopDaemon();
     await this.videoServer?.stop().catch(() => {});
     await this.multiBotManager?.stopAll();
     await this.telegram.controller?.stop();

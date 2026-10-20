@@ -10,7 +10,7 @@ import { createPinterestScreen } from '../src/telegram/screens/pinterest.js';
 import { createStickersScreen } from '../src/telegram/screens/stickers.js';
 import { richTextToString } from '../src/telegram/rich.js';
 
-test('AI Assistant: responds in Group Chat when tagged, quoted, or called by name, and ignores untagged group chatter', async () => {
+test('Group routing: ignores mentions and general chatter; only literal play replies trigger music', async () => {
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
   settings.values.general.ownerIds = [1001];
@@ -53,7 +53,7 @@ test('AI Assistant: responds in Group Chat when tagged, quoted, or called by nam
   });
   assert.equal(assistantCalled, false, 'AI assistant must NOT respond to random untagged group chatter');
 
-  // 2. Group Chat tagged with @botUsername: AI responds!
+  // 2. Group Chat untagged/unquoted messages do NOT trigger AI
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 2,
@@ -64,22 +64,9 @@ test('AI Assistant: responds in Group Chat when tagged, quoted, or called by nam
       text: '@Lancy_easy_bot write me a poem'
     }
   });
-  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when tagged');
+  assert.equal(assistantCalled, false, 'AI assistant must NOT respond to general chatter in GC');
 
-  // 3. Group Chat called by name ("lancy ..."): AI responds!
-  assistantCalled = false;
-  await controller.handleUpdate({
-    update_id: 3,
-    message: {
-      message_id: 203,
-      from: { id: 1001, first_name: 'Alex' },
-      chat: { id: -100555, type: 'supergroup' },
-      text: 'lancy play starboy'
-    }
-  });
-  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when called by name');
-
-  // 4. Group Chat quoting / replying to the bot: AI responds!
+  // 3. Group Chat quoting / replying to bot with 'play' triggers AI music:
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 4,
@@ -88,12 +75,12 @@ test('AI Assistant: responds in Group Chat when tagged, quoted, or called by nam
       from: { id: 1001, first_name: 'Alex' },
       chat: { id: -100555, type: 'supergroup' },
       reply_to_message: { from: { id: 100, is_bot: true, username: 'Lancy_easy_bot' } },
-      text: 'give me another one'
+      text: 'play starboy'
     }
   });
-  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when quoted');
+  assert.equal(assistantCalled, true, 'AI assistant must respond in GC when quoting her message with play');
 
-  // 5. DM (private chat): AI responds in DM directly!
+  // 4. DM (private chat): AI responds in DM directly!
   assistantCalled = false;
   await controller.handleUpdate({
     update_id: 5,
@@ -326,7 +313,7 @@ test('Dashboard and Help: include heads-up banner and expandable superpowers gui
   const dashExpandable = dashRich.blocks.find((b) => b.type === 'expandable_blockquote');
   assert.ok(dashExpandable, 'Dashboard must contain expandable blockquote');
   const dashStr = richTextToString(dashExpandable.text);
-  assert.match(dashStr, /HIGH-SPEED MUSIC & MP3 STREAMING/);
+  assert.match(dashStr, /MUSIC · DOWNLOADS & LIVE CALLS/);
   assert.match(dashStr, /UNIVERSAL HD MEDIA DOWNLOADER/);
   assert.match(dashStr, /PINTEREST HD AESTHETIC STUDIO/);
   assert.match(dashStr, /BRING YOUR OWN BOT/);
@@ -346,7 +333,7 @@ test('Dashboard and Help: include heads-up banner and expandable superpowers gui
   const helpExpandable = sentHelp.blocks.find((b) => b.type === 'expandable_blockquote');
   assert.ok(helpExpandable, 'Help screen must contain expandable blockquote');
   const helpStr = richTextToString(helpExpandable.text);
-  assert.match(helpStr, /HIGH-SPEED MUSIC & MP3 STREAMING/);
+  assert.match(helpStr, /MUSIC · DOWNLOADS & LIVE CALLS/);
 
   db.close();
 });

@@ -12,3 +12,16 @@ logs/
 sessions/
 .DS_Store
 *cookies.txt
+
+service/voice/.venv/
+__pycache__/
+*.pyc
+*.session
+*.session-*
+secrets/
+music-inbox/
+*.key
+
+# Also ignore dependency symlinks used by isolated verification worktrees.
+node_modules
+service/voice/.venv

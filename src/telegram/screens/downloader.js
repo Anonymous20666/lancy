@@ -955,6 +955,7 @@ export function createDownloaderScreen({ app }) {
   }
 
   async function executeDownload(ctx, url) {
+    if (app.music && !/^https?:\/\//i.test(String(url))) return app.screens.get('music')?.search(ctx, String(url), 'download');
     const isGroup = Boolean(ctx.isGroup);
     const forceNew = Boolean(ctx.forceNew);
     const api = ctx.api || app.telegram?.api;
@@ -1794,6 +1795,7 @@ export function createDownloaderScreen({ app }) {
   }
 
   async function executeLyricsSearch(ctx, query) {
+    if(app.music)return app.screens.get('music')?.search(ctx,String(query||''),'lyrics');
     const cleanQuery = String(query || '').trim();
     if (!cleanQuery) return;
 
@@ -1916,6 +1918,8 @@ export function createDownloaderScreen({ app }) {
       return ctx.editScreen(renderMainMenu(ctx));
     },
     async handle(ctx, action, args) {
+      if(app.music&&['lyrics','searchLyrics'].includes(action))return app.screens.get('music')?.search(ctx,'','lyrics');
+      if (app.music && action === 'play') return app.screens.get('music')?.search(ctx, '', 'download');
       const fromMedia = Boolean(args?.includes('from_media') || ctx.fromMedia || ctx.forceNew);
       switch (action) {
         case 'open':
