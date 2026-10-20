@@ -18,6 +18,7 @@ MESSAGES = {
     'ACCOUNT_UNAVAILABLE': 'The selected account is disabled, unauthorized, or not approved for this destination.',
     'NO_ACTIVE_CALL': 'Start a voice chat or channel live stream first. Lancy will not create one automatically.',
     'PERMISSION_DENIED': 'The playback account must be a member and allowed to speak in this call. Channel streams may require channel administrator/speaker rights.',
+    'PUBLISHER_UNVERIFIED': 'Telegram publisher verification failed. The queue is retained. Check speaking permission and retry playback.',
     'MEDIA_INVALID': 'The media is outside the managed cache or lacks required streams.',
     'CALL_FAILED': 'Telegram could not complete the call operation. Check account health, membership and call permissions.',
     'INVALID_REQUEST': 'Invalid voice-engine request.',
@@ -25,7 +26,7 @@ MESSAGES = {
 }
 
 class VoiceFailure(Exception):
-    def __init__(self, code): self.code = code
+    def __init__(self, code, publisher_state=None): self.code = code; self.publisher_state = publisher_state
 
 def classify(error):
     if isinstance(error, VoiceFailure): return error.code
@@ -144,12 +145,67 @@ class Bridge:
             return str(path)
         except (ValueError, TypeError, OSError): raise VoiceFailure('MEDIA_INVALID') from None
 
+    async def publisher_step(self, operation, stage, timeout=8):
+        try: return await asyncio.wait_for(operation, timeout)
+        except VoiceFailure: raise
+        except Exception as error:
+            detail={'stage':stage,'kind':type(error).__name__}
+            if type(error).__name__=='FloodWait': detail['retry_after']=int(getattr(error,'value',0))
+            raise VoiceFailure('PUBLISHER_UNVERIFIED',detail) from None
+
+    async def native_publisher(self, a, chat, input_call=None):
+        """Fresh, self-only Telegram publisher state; never enumerate listener identities."""
+        from pyrogram import raw
+        client = a['client']
+        if input_call is None:
+            peer = await self.publisher_step(client.resolve_peer(chat), 'resolve_peer')
+            if isinstance(peer, raw.types.InputPeerChannel):
+                request = raw.functions.channels.GetFullChannel(channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash))
+            elif isinstance(peer, raw.types.InputPeerChat):
+                request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
+            else:
+                raise VoiceFailure('PERMISSION_DENIED')
+            full = await self.publisher_step(client.invoke(request, sleep_threshold=0), 'call_state')
+            input_call = getattr(full.full_chat, 'call', None)
+            if input_call is None: raise VoiceFailure('NO_ACTIVE_CALL')
+        result = await self.publisher_step(client.invoke(raw.functions.phone.GetGroupParticipants(call=input_call, ids=[raw.types.InputPeerSelf()], sources=[], offset='', limit=1), sleep_threshold=0), 'self_participant')
+        participant = next((p for p in result.participants if getattr(p, 'is_self', False) or getattr(p.peer, 'user_id', None) == a['uid']), None)
+        return input_call, participant
+
+    async def ensure_publisher(self, a, chat, call):
+        # Join/play acceptance alone can leave NTgCalls' microphone muted. Only
+        # explicitly requested start/resume/seek/recovery may self-unmute. Never
+        # promote an account or override a moderator's cannot-self-unmute state.
+        from pyrogram import raw
+        input_call, participant = await self.native_publisher(a, chat, call.get('native_call'))
+        if participant is None or getattr(participant, 'left', False): raise VoiceFailure('PERMISSION_DENIED', {'stage':'self_missing'})
+        if getattr(participant, 'muted', False) and not getattr(participant, 'can_self_unmute', False): raise VoiceFailure('PERMISSION_DENIED', {'stage':'self_locked','muted':True,'can_self_unmute':False,'min':bool(getattr(participant,'min',False))})
+        # NTgCalls 3.0 exposes the actual capture mute bit through get_state.
+        # Avoid repeating a no-op native transition on every source replacement.
+        binding=getattr(a['engine'],'_binding',None)
+        state=await self.publisher_step(binding.get_state(chat),'local_state',3) if binding else None
+        if state is None or getattr(state,'muted',True):
+            await self.publisher_step(a['engine'].unmute(chat),'local_unmute')
+        if getattr(participant, 'muted', False):
+            await self.publisher_step(a['client'].invoke(raw.functions.phone.EditGroupCallParticipant(call=input_call, participant=raw.types.InputPeerSelf(), muted=False), sleep_threshold=0),'self_unmute')
+        for attempt in range(3):
+            input_call, participant = await self.native_publisher(a, chat, input_call)
+            if participant is not None and not getattr(participant, 'left', False) and not getattr(participant, 'muted', False) and getattr(participant, 'source', 0):
+                call.update(native_call=input_call, publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic()+5)
+                return
+            if attempt < 2: await asyncio.sleep(0.2)
+        raise VoiceFailure('PERMISSION_DENIED', {'stage':'verification_failed','present':participant is not None,'muted':bool(getattr(participant,'muted',True)),'can_self_unmute':bool(getattr(participant,'can_self_unmute',False)),'source_present':bool(getattr(participant,'source',0))})
+
     async def stream(self, a, chat, call):
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, GroupCallConfig
         ff = f'-ss {call["offset"]:.3f}' if call['offset'] else ''
         if call['bass']: ff += ' --audio ---mid -af volume=0.75,bass=g=3:f=100:w=0.5,alimiter=limit=0.95'
         stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=MediaStream.Flags.REQUIRED if call['video'] else MediaStream.Flags.IGNORE, ffmpeg_parameters=ff or None)
         await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 40)
+        if call.get('status') != 'paused':
+            try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
+            except VoiceFailure: raise
+            except Exception as error: raise VoiceFailure('PUBLISHER_UNVERIFIED', {'stage':'publisher_check','kind':type(error).__name__}) from None
 
     async def resolve_destination(self, client, chat):
         # String sessions do not contain a peer/access-hash cache. Resolve only
@@ -177,6 +233,7 @@ class Bridge:
             previous = self.calls.get(chat)
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
             call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
+            if previous and previous.get('native_call') is not None: call['native_call']=previous['native_call']
             try:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
                 me = await asyncio.wait_for(a['client'].get_me(), 10)
@@ -217,6 +274,12 @@ class Bridge:
                 call['status'] = 'idle'; call['playback_id'] = None; call['position_seconds'] = None
             elif op in {'pause', 'resume'}:
                 await asyncio.wait_for(getattr(engine, op)(chat), 10)
+                if op == 'resume':
+                    try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
+                    except Exception:
+                        try: await asyncio.wait_for(engine.pause(chat), 8)
+                        except Exception: pass
+                        raise
                 call['status'] = 'paused' if op == 'pause' else 'playing'; call['last_progress'] = time.monotonic()
             elif op == 'volume':
                 volume = int(data['volume'])
@@ -259,9 +322,15 @@ class Bridge:
                         return {'ok': True, 'active': False}
                     call['clock_errors'] += 1; call['position_seconds'] = None
                     if call['clock_errors'] >= 3: call['status'] = 'error'
+            if call['status'] == 'playing' and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
+                call['publisher_check_after'] = time.monotonic()+5
+                _, participant = await self.native_publisher(a, chat, call['native_call'])
+                if participant is None or getattr(participant, 'left', False) or getattr(participant, 'muted', False):
+                    # Do not fight subsequent moderator mute actions or discard songs.
+                    call.update(status='error', publisher_muted=True, publisher_verified=False, position_seconds=None)
             if call['status'] == 'recovering' and time.monotonic() >= call['retry_after']: call['status'] = 'error'
-            if call['status'] == 'error' and call['retries'] < 2 and time.monotonic() < call['retry_after']: call['status'] = 'recovering'
-            if call['status'] == 'error' and call['retries'] < 2 and time.monotonic() >= call['retry_after']:
+            if call['status'] == 'error' and not call.get('publisher_muted') and call['retries'] < 2 and time.monotonic() < call['retry_after']: call['status'] = 'recovering'
+            if call['status'] == 'error' and not call.get('publisher_muted') and call['retries'] < 2 and time.monotonic() >= call['retry_after']:
                 call['retries'] += 1
                 call['offset'] = min(call.get('last_known_position', 0.0), max(0, call['duration'] - 1))
                 call['retry_after'] = time.monotonic() + 5 * (2 ** call['retries'])
@@ -273,7 +342,7 @@ class Bridge:
                     # Retain the lease while retrying; never hand an uncertain native call
                     # to another destination. Node sees buffering, not a false success.
                     if call['retries'] < 2: call['status'] = 'recovering'
-            return {'ok': True, 'active': True, 'info': {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume']}}
+            return {'ok': True, 'active': True, 'info': {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted']}}
 
     async def shutdown(self):
         self.closing = True
@@ -293,11 +362,11 @@ def make_app(bridge, token):
         if not hmac.compare_digest(request.headers.get('Authorization', ''), f'Bearer {token}'):
             return web.json_response({'ok': False, 'error': 'UNAUTHORIZED'}, status=401)
         try: return await handler(request)
-        except VoiceFailure as e: return web.json_response({'ok': False, 'error': e.code, 'message': MESSAGES.get(e.code, MESSAGES['CALL_FAILED'])}, status=409)
+        except VoiceFailure as e: return web.json_response({'ok': False, 'error': e.code, 'message': MESSAGES.get(e.code, MESSAGES['CALL_FAILED']), 'publisher_state':e.publisher_state}, status=409)
         except (ValueError, KeyError, TypeError): return web.json_response({'ok': False, 'error': 'INVALID_REQUEST', 'message': MESSAGES['INVALID_REQUEST']}, status=400)
         except Exception as e:
             code = classify(e); log.warning('Voice operation failed kind=%s', type(e).__name__)
-            return web.json_response({'ok': False, 'error': code, 'message': MESSAGES.get(code, MESSAGES['CALL_FAILED'])}, status=503)
+            return web.json_response({'ok': False, 'error': code, 'message': MESSAGES.get(code, MESSAGES['CALL_FAILED']), 'error_kind':type(e).__name__}, status=503)
     app = web.Application(middlewares=[authenticate], client_max_size=32768)
     async def health(request): return web.json_response({'ok': True, 'protocol': 2, 'ready': any(a['status'] == 'available' and a['enabled'] for a in bridge.accounts.values()), 'active_calls_count': len(bridge.calls), 'session_configured': bool(bridge.accounts), 'mode': 'account_pool'})
     async def accounts(request):

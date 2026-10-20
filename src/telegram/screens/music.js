@@ -1,6 +1,7 @@
+import { PANEL_ACTIONS } from '../../music/channelPanels.js';
 import { TemporaryBotMessages } from '../../music/messages.js';
 import { audioInput } from '../../music/preview.js';
-import { RichMessageBuilder, rt, richButton, encodeCallback, NOOP_CALLBACK } from '../rich.js';
+import { RichMessageBuilder, rt, richButton, encodeCallback, decodeCallback, NOOP_CALLBACK } from '../rich.js';
 import { States } from '../../core/stateMachine.js';
 import { durationText, MusicError } from '../../music/model.js';
 const cut = (s,n=65) => [...String(s || '')].slice(0,n).join('');
@@ -12,7 +13,10 @@ const finish = b => { b.validate(); return b.toJSON(); };
 export function createMusicScreen({ app }) {
   const id='music';
   const temporary = new TemporaryBotMessages();
-  function controls(s,label,action,...args){return button(label,action,...args,s.controlRevision||0);}
+  function controls(s,label,action,...args){
+    if(s.panelToken){if(action==='remove')args[0]=String(args[0]).replaceAll('-','').slice(0,12);return button(label,'pc',s.panelToken,PANEL_ACTIONS.indexOf(action).toString(36),...args,Number(s.controlRevision||0).toString(36));}
+    return button(label,action,...args,s.controlRevision||0);
+  }
   function renderHome(){
     const b=card('Lancy · music','Find your track. Set the mood.');
     b.quote(rt.text('/play — listen here or download\n/addq — search and queue audio\n/vplay — queue genuine video + audio\n/player — your live dashboard'));
@@ -36,7 +40,7 @@ export function createMusicScreen({ app }) {
   }
   function renderPlayer(s){
     const b=card(s.isChannel?'Lancy · CHANNEL LIVE BROADCAST':'Lancy · music',`${s.isChannel?'Channel broadcast':'Voice chat'} · ${s.destinationTitle || (s.isChannel?'Channel':'Group')} · ${s.status}`);
-    if(s.status==='stopped'){b.quote(rt.text('Playback service stopped. Open the current player after restart.'));if(s.lastError)b.paragraph(rt.text(s.lastError));b.buttons([button('Open current player','openplayer')]);return finish(b);}
+    if(s.status==='stopped'){b.quote(rt.text('Playback service stopped. Open the current player after restart.'));if(s.lastError)b.paragraph(rt.text(s.lastError));b.buttons([s.panelToken?controls(s,'Open current player','player'):button('Open current player','openplayer')]);return finish(b);}
     const t=s.currentTrack;
     if(!t){ b.quote(rt.text(s.connected?'Queue complete. Holding the call for ten minutes.':'No active playback. Use Add tracks for VC, or Listen / download without joining a call.')); }
     else {
@@ -51,10 +55,12 @@ export function createMusicScreen({ app }) {
       if(['playing','paused'].includes(s.status))b.buttons([controls(s,'Previous','previous'),controls(s,s.status==='paused'?'Resume VC':'Pause VC',s.status==='paused'?'resume':'pause'),controls(s,'Skip','skip')]);
       if(t.capabilities?.seek&&Number.isFinite(s.positionSeconds))b.buttons([controls(s,'−10 sec','seekby',-10),controls(s,'+10 sec','seekby',10)]);
     }
+    if(s.panelNotice)b.paragraph(rt.text(cut(s.panelNotice,240)));
     if(s.lastNotice)b.paragraph(rt.text(cut(s.lastNotice,350)));
     if(s.lastError)b.paragraph(rt.text(cut(s.lastError,350)));
     b.buttons([controls(s,`Queue · ${s.upcoming?.length||0}`,'queue'),controls(s,'Lyrics','lyrics'),controls(s,'VC volume','volume')]);
-    b.buttons([button('Add tracks','prompt','queue'),button('Listen / download','prompt','download'),controls(s,'More','options')]);
+    b.buttons([s.panelToken?controls(s,'Add tracks','prompt','queue'):button('Add tracks','prompt','queue'),s.panelToken?controls(s,'Listen / download','prompt','download'):button('Listen / download','prompt','download'),controls(s,'More','options')]);
+    if(s.panelToken)b.paragraph(rt.italic('Reply here with a song title + artist, then Select → Add selected for this channel. /play stays listen/download only.'));
     return finish(b);
   }
   function renderOptions(s){
@@ -80,7 +86,7 @@ export function createMusicScreen({ app }) {
   }
   function renderVolumePicker(s){const b=card('Lancy · volume',`${s.volume}% · unity gain is 100%; boosting can clip`);b.buttons([50,75,100].map(v=>controls(s,`${v}%`,'setvol',v)));b.buttons([controls(s,'Back to player','player')]);return finish(b);}
   function renderSearch(s){
-    const p=s.pages[s.index],b=card(s.mode==='lyrics'?'Lancy · lyrics':s.mode==='download'?'Lancy · download':'Lancy · select your tracks',`${cut(s.query,90)} · ${p.provider} · page ${s.index+1}${['download','lyrics'].includes(s.mode)?'':` · destination ${s.destination}`}`);
+    const p=s.pages[s.index],b=card(s.mode==='lyrics'?'Lancy · lyrics':s.mode==='download'?'Lancy · download':'Lancy · select your tracks',`${cut(s.query,90)} · ${p.provider} · page ${s.index+1}${['download','lyrics'].includes(s.mode)?'':` · ${cut(s.destinationTitle||s.destination,55)}`}`);
     if(!p.items.length)b.paragraph(rt.text('No new results. Go back or search a different title and artist.'));
     p.items.forEach((t,i)=>{const selected=s.selected.has(t.id);b.paragraph(rt.text(`${i+1}. ${cut(t.title,100)}\n${cut(t.artist||'Artist not supplied',65)} · ${durationText(t.durationSeconds)} · ${t.provider}`));b.buttons([button(selected?'✓ Selected':'Select','pick',s.id,s.revision,i)]);});
     const row=[];if(s.index>0)row.push(button('Previous','spage',s.id,s.revision,s.index-1));if(p.nextOffset!=null)row.push(button('Next','spage',s.id,s.revision,s.index+1));if(row.length)b.buttons(row);
@@ -123,7 +129,7 @@ export function createMusicScreen({ app }) {
     catch(e){await ctx.api.editMessageText(ctx.chatId,pending.message_id,e instanceof MusicError?e.message:'Search failed. Try a different title and artist.');temporary.keep(temporaryToken);temporary.remember(ctx,pending,{ttlMs:60000});}
   }
   async function prompt(ctx,mode){
-    if(['queue','video'].includes(mode))app.music.destination?.(ctx);
+    if(['queue','video'].includes(mode)){app.music.destination?.(ctx);await app.music.authorize?.(ctx,true);}
     if(app.sm.state(ctx.tgId)===States.MUSIC_QUEUE_INPUT)await app.sm.reset(ctx.tgId);
     const group=Number(ctx.chatId)<0, name=cut(ctx.user?.first_name||'Music request',40);
     const text=`${group?`${name}, `:''}send a track title and artist${group?' as a reply to this message':''}. /cancel closes this search.`;
@@ -131,7 +137,7 @@ export function createMusicScreen({ app }) {
       ...(group?{entities:[{type:'text_mention',offset:0,length:name.length,user:{id:Number(ctx.tgId),is_bot:false,first_name:name}}]}:{}),
       ...(ctx.message?.from?.id===Number(ctx.tgId)?{reply_to_message_id:ctx.message.message_id}:{})});
     const temporaryToken=temporary.remember(ctx,sent,{ttlMs:120000});
-    try{await app.sm.transition(ctx.tgId,States.MUSIC_QUEUE_INPUT,{chatId:ctx.chatId,timeoutMs:120000,context:{mode,botKey:app.music.botKey(ctx),promptMessageId:sent.message_id,temporaryToken}});}catch(e){await temporary.remove(temporaryToken);throw e;}
+    try{await app.sm.transition(ctx.tgId,States.MUSIC_QUEUE_INPUT,{chatId:ctx.chatId,timeoutMs:120000,context:{mode,botKey:app.music.botKey(ctx),promptMessageId:sent.message_id,temporaryToken,panelToken:ctx.musicPanel?.panelToken||null}});}catch(e){await temporary.remove(temporaryToken);throw e;}
     return sent;
   }
   async function showAccounts(ctx){
@@ -143,6 +149,7 @@ export function createMusicScreen({ app }) {
   }
   async function handle(ctx,action,args=[]){
     try{
+      if(action==='pc'){const [token,wire,...controlArgs]=args;const command=PANEL_ACTIONS[parseInt(wire,36)];if(!command)throw new MusicError('STALE_PLAYER','Open your current channel dashboard.');const panel=await app.music.channelPanels.resolve(ctx,token);if(command==='prompt')return await prompt({...ctx,musicPanel:panel},controlArgs[0]||'queue');return await app.music.control({...ctx,musicPanel:panel},command,controlArgs);}
       if(action==='prompt')return await prompt(ctx,args[0]||'queue');
       if(action==='openplayer')return await app.music.player(ctx);
       if(['pick','spage','sclear','submit'].includes(action)){
@@ -174,7 +181,7 @@ export function createMusicScreen({ app }) {
     }catch(e){await error(ctx,e);}
   }
   async function handleCommand(ctx,command,args=[]){
-    const commands=['/play','/song','/music','/addq','/vplay','/stream','/vc','/vcplay','/player','/pause','/resume','/skip','/next','/previous','/stop','/end','/leave','/queue','/q','/volume','/vol','/loop','/repeat','/shuffle','/seek','/accounts','/destination','/session','/gensession','/authassistant','/linkassistant','/playlist','/lyrics'];
+    const commands=['/play','/song','/music','/addq','/vplay','/stream','/vc','/vcplay','/player','/pause','/resume','/skip','/next','/previous','/stop','/end','/leave','/queue','/q','/volume','/vol','/loop','/repeat','/shuffle','/seek','/accounts','/destination','/channel','/session','/gensession','/authassistant','/linkassistant','/playlist','/lyrics'];
     if(!commands.includes(command))return false;
     try{
       if(['/play','/song'].includes(command)&&!args.length&&ctx.controller?.handleAudioRecognition&&[ctx.replyTo?.audio,ctx.replyTo?.voice,ctx.replyTo?.video,ctx.replyTo?.video_note].some(Boolean)){await ctx.controller.handleAudioRecognition(ctx,ctx.replyTo);return true;}
@@ -186,7 +193,7 @@ export function createMusicScreen({ app }) {
       else if(command==='/music'){if(args.length)await search(ctx,args.join(' '),'download');else await ctx.api.sendRichMessage(ctx.chatId,renderHome());}
       else if(command==='/accounts'){const accounts=await app.music.accountCommand(ctx,args);await ctx.api.sendMessage(ctx.chatId,accounts.map(a=>`${a.alias} · ${a.status}${a.destination?` · ${a.destination}`:''}\nApproved: ${a.allowed.join(', ')||'none'}`).join('\n\n')||'No registered accounts. Generate one locally, then /accounts register <alias>.');}
       else if(['/session','/gensession','/authassistant','/linkassistant'].includes(command)){if(!app.music.owner(ctx)||Number(ctx.chatId)<0)throw new MusicError('OWNER_ONLY','Use /accounts in the main owner private chat.');await ctx.api.sendRichMessage(ctx.chatId,renderSessionSetupNotice());}
-      else if(command==='/destination'){app.music.bind(ctx,args[0]);await ctx.api.sendMessage(ctx.chatId,`Control destination set to ${Number(args[0])}. Use /player.`);}
+      else if(command==='/destination'||command==='/channel'){if(args[0]==='close'){const id=app.music.destination(ctx);await app.music.channelPanels.close(ctx,id);}else{const id=await app.music.bind(ctx,args[0]);await app.music.player(ctx,id);}}
       else if(command==='/playlist')await playlist(ctx,args);
       else{
         const s=await app.music.player(ctx);ctx={...ctx,messageId:null,query:null};
@@ -201,17 +208,80 @@ export function createMusicScreen({ app }) {
     if(!/^[\p{L}\p{N} _-]{1,40}$/u.test(name)||['__proto__','constructor','prototype'].includes(name))throw new MusicError('PLAYLIST_NAME','Use a playlist name of 1–40 letters, numbers, spaces, underscores or hyphens.');
     if(action==='save'){const id=await app.music.authorize(ctx);const s=app.musicQueueManager.getSession(id);if(Object.keys(lists).length>=20&&!lists[name])throw new MusicError('PLAYLIST_LIMIT','Keep up to 20 playlists.');lists[name]=[s.currentTrack,...s.upcoming].filter(t=>t&&['youtube','audius'].includes(t.provider)).slice(0,50).map(({id,provider,providerId,title,artist,album,durationSeconds,artwork,sourceRef,mediaType,capabilities})=>({id,provider,providerId,title,artist,album,durationSeconds,artwork,sourceRef,mediaType,capabilities}));app.db.setSetting(key,lists);}
     else if(action==='delete'){delete lists[name];app.db.setSetting(key,lists);}
-    else if(action==='load'){const id=await app.music.authorize(ctx);if(!lists[name]?.length)throw new MusicError('PLAYLIST_MISSING','That playlist is missing or empty.');await app.music.accounts.sync();await app.musicQueueManager.addMany(id,lists[name]);await app.music.player(ctx,id);}
+    else if(action==='load'){const id=await app.music.authorize(ctx,true);if(!lists[name]?.length)throw new MusicError('PLAYLIST_MISSING','That playlist is missing or empty.');await app.music.accounts.sync();await app.musicQueueManager.addMany(id,lists[name]);await app.music.player(ctx,id);}
     else throw new MusicError('PLAYLIST_ACTION','Use /playlist list, save, load or delete.');
     return ctx.api.sendMessage(ctx.chatId,`Playlist ${action} completed · ${name}`);
+  }
+  function musicText(ctx,value){
+    const text=String(value||'').trim(),chatPrefix=app.db?.getChatPrefix?.(ctx.chatId)||'/',userPrefix=app.db?.getUserPrefix?.(ctx.tgId)||'/';
+    const prefix=Number(ctx.chatId)<0?chatPrefix:userPrefix!=='/'?userPrefix:chatPrefix;
+    if(prefix!=='/'&&text.startsWith(prefix))return '/'+text.slice(prefix.length).trim();
+    if(prefix==='/'&&/^[!.]/.test(text))return '/'+text.slice(1).trim();
+    return text;
+  }
+  async function handlePlayerReply(ctx,message){
+    if(!message.text||message.reply_to_message?.from?.id!==ctx.api?.me?.id)return false;
+    let source=ctx;
+    if(Number(ctx.chatId)>0){
+      const record=app.music.channelPanels.replyPanel(ctx,message);if(!record)return false;
+      try{const panel=await app.music.channelPanels.resolve({...ctx,messageId:record.screenMessageId},record.panelToken);source={...ctx,musicPanel:panel};}catch(e){await error(ctx,e);return true;}
+    }else{
+      const session=app.musicQueueManager?.sessions?.get(Number(ctx.chatId));
+      if(!session||session.isChannel||session.screenMessageId!==message.reply_to_message.message_id)return false;
+    }
+    const text=musicText(ctx,message.text),[head,...rest]=text.split(/\s+/),command=head.split('@')[0].toLowerCase();
+    if(head.startsWith('/')&&head.includes('@')&&head.split('@')[1].toLowerCase()!==ctx.api.me.username?.toLowerCase())return false;
+    let mode='queue',query=text;
+    if(['/play','/song'].includes(command)||/^play\s+/i.test(text)){mode='download';query=command.startsWith('/')?rest.join(' '):text.replace(/^play\s+/i,'');}
+    else if(['/addq','/vplay','/vcplay','/stream','/vc'].includes(command)){mode=command==='/vplay'?'video':'queue';query=rest.join(' ');}
+    else if(/^(?:add(?:\s+(?:track|song))?|queue)\s+/i.test(text))query=text.replace(/^(?:add(?:\s+(?:track|song))?|queue)\s+/i,'');
+    else if(command.startsWith('/')){if(!channelCommands.has(command))return false;try{await app.music.authorize(source,true);return await handleCommand(source,command,rest);}catch(e){await error(ctx,e);return true;}}
+    try{if(mode!=='download')await app.music.authorize(source,true);const pending=app.sm?.get(ctx.tgId);if(pending?.state===States.MUSIC_QUEUE_INPUT&&pending.context.botKey===app.music.botKey(ctx)&&Number(pending.chatId)===Number(ctx.chatId))await app.sm.reset(ctx.tgId);await search(source,query,mode);}
+    catch(e){await error(ctx,e);}return true;
+  }
+  const channelCommands=new Set(['/channel','/destination','/player','/addq','/vplay','/vcplay','/vc','/stream','/pause','/resume','/skip','/next','/previous','/stop','/end','/leave','/queue','/q','/volume','/vol','/seek','/repeat','/loop','/shuffle','/playlist','/lyrics','/play','/song','/music','/cancel']);
+  function privateChannelRequest(ctx,source){
+    if(Number(ctx.chatId)<=0||Number(ctx.chatId)!==Number(ctx.tgId))return false;
+    if(!source.data&&app.music.channelPanels?.replyPanel(ctx,source))return true;
+    if(source.data){const d=decodeCallback(source.data);return d?.screen==='music'&&(d.action==='pc'||app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`));}
+    const command=musicText(ctx,source.text).split(/\s+/)[0]?.split('@')[0]?.toLowerCase();
+    return command==='/channel'||command==='/destination'||(app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`)&&(channelCommands.has(command)||app.sm?.state(ctx.tgId)===States.MUSIC_QUEUE_INPUT));
+  }
+  async function handlePrivateChannel(ctx,source){
+    if(!privateChannelRequest(ctx,source))return false;
+    if(!source.data&&await handlePlayerReply(ctx,source))return true;
+    if(source.data){
+      const d=decodeCallback(source.data);
+      if(d.action!=='pc'){
+        try{
+          const session=['pick','spage','sclear','submit'].includes(d.action)?app.music.search.get(d.args[0],ctx):null;
+          await app.music.authorize(ctx,true,session&&['queue','video'].includes(session.mode)?session.destination:null);
+        }catch(e){await error(ctx,e);return true;}
+      }
+      await handle(ctx,d.action,d.args);return true;
+    }
+    const [head,...args]=musicText(ctx,source.text).split(/\s+/),[command,targetBot]=head.split('@');
+    if(targetBot&&targetBot.toLowerCase()!==ctx.api.me?.username?.toLowerCase())return false;
+    if(['/channel','/destination'].includes(command.toLowerCase()))return handleCommand(ctx,command.toLowerCase(),args);
+    const pending=app.sm?.get(ctx.tgId),scopedInput=pending?.state===States.MUSIC_QUEUE_INPUT&&pending.context.botKey===app.music.botKey(ctx)&&Number(pending.chatId)===Number(ctx.chatId);
+    if(scopedInput&&command.toLowerCase()==='/cancel'){await app.sm.cancel(ctx.tgId);return true;}
+    // A ForceReply retains its original panel, not the most recently bound DM channel.
+    if(scopedInput&&pending.context.panelToken&&!command.startsWith('/'))return app.sm.handleMessage(ctx.tgId,source,ctx);
+    try{await app.music.authorize(ctx,true);}catch{return false;}
+    if(channelCommands.has(command.toLowerCase()))return handleCommand(ctx,command.toLowerCase(),args);
+    if(!command.startsWith('/')&&app.sm?.state(ctx.tgId)===States.MUSIC_QUEUE_INPUT)return app.sm.handleMessage(ctx.tgId,source,ctx);
+    return false;
   }
   function registerStateHandlers(sm){
     sm.register(States.MUSIC_QUEUE_INPUT,{onCleanup:ctx=>temporary.remove(ctx.context?.temporaryToken),onMessage:async(ctx,message)=>{
       const record=sm.get(ctx.tgId);if(Number(record.chatId)!==Number(ctx.chatId)||record.context.botKey!==app.music.botKey(ctx))return false;
-      if(!message.text||(Number(ctx.chatId)<0&&message.reply_to_message?.message_id!==record.context.promptMessageId))return false;const mode=record.context.mode;await sm.reset(ctx.tgId);await search(ctx,message.text,mode);return true;
+      if(!message.text||(Number(ctx.chatId)<0&&message.reply_to_message?.message_id!==record.context.promptMessageId))return false;
+      const mode=record.context.mode,panelToken=record.context.panelToken;
+      try{const panel=panelToken?await app.music.channelPanels.resolve(ctx,panelToken,{requireMessage:false}):null;await sm.reset(ctx.tgId);await search(panel?{...ctx,musicPanel:panel}:ctx,message.text,mode);}
+      catch(e){await sm.reset(ctx.tgId);await error(ctx,e);}return true;
     }});
     // Recover persisted legacy login flows safely; never accept or forward their secrets.
     for(const state of [States.ASSISTANT_AUTH_PHONE,States.ASSISTANT_AUTH_CODE,States.ASSISTANT_AUTH_2FA])sm.register(state,{onMessage:async(ctx,message)=>{if(message.message_id)await ctx.api?.deleteMessage(ctx.chatId,message.message_id).catch(()=>{});await sm.reset(ctx.tgId);await ctx.api?.sendMessage(ctx.chatId,'Session setup now uses the protected local terminal. Never send login codes or passwords here.');return true;}});
   }
-  return{id,renderHome,renderListen,renderOptions,renderPlayer,renderQueue,renderVolumePicker,renderSearch,renderLyrics,renderAccounts,renderSessionSetupNotice,renderAssistantSessionStatus,registerStateHandlers,handle,handleCommand,search,cleanup:()=>temporary.shutdown(),async open(ctx){return ctx.api.sendRichMessage(ctx.chatId,renderHome());}};
+  return{id,renderHome,renderListen,renderOptions,renderPlayer,renderQueue,renderVolumePicker,renderSearch,renderLyrics,renderAccounts,renderSessionSetupNotice,renderAssistantSessionStatus,registerStateHandlers,handle,handleCommand,handlePlayerReply,privateChannelRequest,handlePrivateChannel,search,cleanup:()=>temporary.shutdown(),async open(ctx){return ctx.api.sendRichMessage(ctx.chatId,renderHome());}};
 }

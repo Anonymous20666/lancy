@@ -1,5 +1,19 @@
 # Lancy music v2 — setup, operations, and release gate
 
+## Channel administrators: private control and track replies
+
+See [channel verification and rollout boundary](MUSIC_CHANNEL_VERIFICATION.md). Source changes are not deployed automatically.
+
+1. Start the channel live stream yourself. Add both the bot and an approved playback account with the necessary administrator/speaking rights. Lancy will not create a call, join membership or promote an account automatically.
+2. The main owner approves a registered account for that exact destination using the existing private `/accounts` controls. Channel administrators cannot manage the encrypted pool.
+3. The channel administrator sends `/channel @channelname` in their own bot DM. The verified administrator's dashboard is pinned there; it is not posted to the channel.
+4. Reply to that dashboard with a title and artist (or tap **Add tracks** and answer its prompt). Select exact recordings, then **Add selected**. Old panels and searches retain their original channel even after a different DM binding is selected. Multiple verified admins share playback/queue but have separate private views.
+5. `/play` remains standalone listen/download; it does not silently add to VC. Actual stream and download permissions, provider enablement and cache/file limits remain enforced.
+6. If Telegram mutes the publisher, allow it to speak and stop/retry playback. Lancy does not override a locked moderator mute or discard the queue merely because publisher verification failed.
+7. `/channel close` closes only that administrator's view; it does not stop the shared queue. Use explicit Stop/Leave controls for shared playback.
+
+Group VC controls and queue changes require administrators. Public listen/download commands remain available under the existing access policy. Native command suggestions separate public and administrator scopes, with custom-prefix descriptions for scoped chats. Private channel music access does not open unrelated AI or owner account/session management, and retains the existing ForceJoin gate.
+
 See [MUSIC_ENGINEERING.md](MUSIC_ENGINEERING.md) for the audit, numbered requirements and architecture. This feature branch is staged separately from the running VPS checkout. It does **not** include the unrelated changes that were already uncommitted on that VPS. Do not replace the running checkout with this branch without reviewing those differences.
 
 ## Runtime and installation

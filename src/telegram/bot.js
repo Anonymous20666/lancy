@@ -1,3 +1,4 @@
+import { withMusicCommands } from '../music/commands.js';
 import { extname } from 'node:path';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
@@ -399,10 +400,10 @@ export class TelegramController extends EventEmitter {
     ];
 
     try {
-      await this.api.call('setMyCommands', { commands: privateCommands, scope: { type: 'default' } }).catch(() => {});
-      await this.api.call('setMyCommands', { commands: privateCommands, scope: { type: 'all_private_chats' } }).catch(() => {});
-      await this.api.call('setMyCommands', { commands: groupCommands, scope: { type: 'all_group_chats' } }).catch(() => {});
-      await this.api.call('setMyCommands', { commands: groupCommands, scope: { type: 'all_chat_administrators' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: withMusicCommands(privateCommands,{privateChat:true}), scope: { type: 'default' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: withMusicCommands(privateCommands,{privateChat:true}), scope: { type: 'all_private_chats' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: withMusicCommands(groupCommands), scope: { type: 'all_group_chats' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: withMusicCommands(groupCommands,{admin:true}), scope: { type: 'all_chat_administrators' } }).catch(() => {});
     } catch (err) {
       this.log.debug({ err: err?.message }, 'could not setMyCommands');
     }
@@ -3444,6 +3445,13 @@ export class TelegramController extends EventEmitter {
       this.db.recordGroupMember(query.message.chat.id, query.from);
     }
     const guard = this.isAllowed(query.from.id, { isGroup });
+    if (!guard.ok && !isGroup && this.app?.music) {
+      const screen=this.screens.get('music'),ctx=this.#ctx(String(query.from.id),query);
+      if(screen?.privateChannelRequest?.(ctx,query)){
+        if(!await this.#enforceForceJoin(query.from,query.message?.chat?.id,{query}))return;
+        if(await screen.handlePrivateChannel(ctx,query)){void this.api.answerCallbackQuery(query.id).catch(()=>{});return;}
+      }
+    }
     if (!guard.ok) {
       await this.api.answerCallbackQuery(query.id, { text: 'This Lancy belongs to someone else ♡', showAlert: true });
       return;
@@ -3576,7 +3584,14 @@ export class TelegramController extends EventEmitter {
     }
 
     const guard = this.isAllowed(message.from?.id, { isGroup });
-    if (!guard.ok) return; // silent for strangers in DMs
+    if (!guard.ok && !isGroup && this.app?.music) {
+      const screen=this.screens.get('music'),ctx=this.#ctx(tgId,{message});
+      if(screen?.privateChannelRequest?.(ctx,message)){
+        if(!await this.#enforceForceJoin(message.from,chatId,{message}))return;
+        if(await screen.handlePrivateChannel(ctx,message))return;
+      }
+    }
+    if (!guard.ok) return; // silent for unrelated private features/strangers
 
     // In active game sessions, test incoming group messages for correct trivia answers!
     if (chatId && this.gameEngine?.hasActiveGame(chatId) && (message.text || message.caption)) {
@@ -3642,6 +3657,9 @@ export class TelegramController extends EventEmitter {
       const allowedByFj = await this.#enforceForceJoin(message.from, chatId, { message });
       if (!allowedByFj) return;
     }
+
+    // Preserve ForceJoin and prefix normalization before scoped music reply routing.
+    if(this.app?.music&&await this.screens.get('music')?.handlePlayerReply?.(this.#ctx(tgId,{message}),{...message,text}))return;
 
     if (text.startsWith('/')) {
       const [cmd, ...rest] = text.split(/\s+/);
@@ -5688,6 +5706,8 @@ export class TelegramController extends EventEmitter {
     const chatId = message.chat?.id;
     if (!chatId) return;
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+    const membership=isGroup?await this.api.getChatMember?.(chatId,message.from?.id).catch(()=>null):null;
+    const musicAdmin=!isGroup||['creator','administrator'].includes(membership?.status);
     const scopeLabel = isGroup ? 'Group' : 'Personal';
 
     const b = new RichMessageBuilder();
@@ -5701,7 +5721,11 @@ export class TelegramController extends EventEmitter {
       [`⚡ ${prefix}pokemon`, 'Catch Wild & Shiny Pokémon in Chat'],
       [`🔥 ${prefix}afro`, 'Guess the Naija / Afrobeats Hit Song'],
       [`🥷 ${prefix}anime`, 'Guess the Popular Anime Character'],
-      [`🎵 ${prefix}play <song>`, 'Stream 320k high-speed MP3 audio'],
+      [`🎵 ${prefix}play <song>`, 'Listen/download a full recording; no VC'],
+      [`🎧 ${prefix}music`, 'Listen/download and music options'],
+      [`📝 ${prefix}lyrics <song>`, 'Reliably matched recording lyrics'],
+      ...(musicAdmin?[[`${prefix}addq <song>`, 'Admin: select and queue VC audio'],[`${prefix}vplay <song>`, 'Admin: queue genuine video + audio'],[`${prefix}player`, 'Admin: persistent playback controls'],[`${prefix}volume / ${prefix}queue`, 'Admin: volume and queue editing']]:[]),
+      ...(!isGroup?[[`${prefix}channel @name`, 'Channel admin: pinned private control panel']]:[]),
       [`📥 ${prefix}grab <link>`, 'Download HD videos/music (TT/IG/YT/X)'],
       [`👥 ${prefix}pfp <theme>`, 'Matching PFP albums (duo/couple)'],
       [`🔍 ${prefix}pint <search>`, 'Aesthetic Pinterest HD gallery'],
@@ -5761,6 +5785,7 @@ export class TelegramController extends EventEmitter {
         await this.api.call('deleteMyCommands', {
           scope: { type: 'chat', chat_id: Number(chatId) }
         }).catch(() => {});
+        if(Number(chatId)<0)await this.api.call('deleteMyCommands',{scope:{type:'chat_administrators',chat_id:Number(chatId)}}).catch(()=>{});
         return;
       }
 
@@ -5783,7 +5808,7 @@ export class TelegramController extends EventEmitter {
         { command: 'ttt', description: `[${prefix}ttt] 1v1 Tic-Tac-Toe Board` },
         { command: 'connect4', description: `[${prefix}connect4] 1v1 Connect Four Board` },
         { command: 'topleaderboard', description: `[${prefix}topleaderboard] Game Hall of Fame` },
-        { command: 'play', description: `[${prefix}play] Stream high-speed 320k MP3` },
+        { command: 'play', description: 'Listen to/download a selected full recording' },
         { command: 'grab', description: `[${prefix}grab] Download HD video/music` },
         { command: 'pfp', description: `[${prefix}pfp] Matching PFP albums` },
         { command: 'pint', description: `[${prefix}pint] Search aesthetic Pinterest` },
@@ -5794,9 +5819,10 @@ export class TelegramController extends EventEmitter {
         { command: 'cancel', description: `[${prefix}cancel] Cancel current active operation` }
       ];
       await this.api.call('setMyCommands', {
-        commands,
+        commands: withMusicCommands(commands,{privateChat:Number(chatId)>0,prefix}),
         scope: { type: 'chat', chat_id: Number(chatId) }
       }).catch(() => {});
+      if(Number(chatId)<0)await this.api.call('setMyCommands',{commands:withMusicCommands(commands,{admin:true,prefix}),scope:{type:'chat_administrators',chat_id:Number(chatId)}}).catch(()=>{});
     } catch {}
   }
 

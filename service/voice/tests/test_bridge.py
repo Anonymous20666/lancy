@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 from aiohttp.test_utils import TestClient, TestServer
 SPEC = importlib.util.spec_from_file_location('lancy_voice', Path(__file__).resolve().parents[1] / 'main.py')
 MODULE = importlib.util.module_from_spec(SPEC); SPEC.loader.exec_module(MODULE)
@@ -131,7 +131,7 @@ class MediaContract(unittest.IsolatedAsyncioTestCase):
         class Config:
             def __init__(self, **kw): self.kw=kw
         fake_types = types.ModuleType('pytgcalls.types'); fake_types.MediaStream=Stream; fake_types.AudioQuality=types.SimpleNamespace(HIGH='48k-stereo'); fake_types.VideoQuality=types.SimpleNamespace(SD_360p='360p'); fake_types.GroupCallConfig=Config
-        bridge=Bridge('/tmp'); engine=FakeEngine()
+        bridge=Bridge('/tmp'); engine=FakeEngine(); bridge.ensure_publisher=AsyncMock()
         base={'path':'fixture.mp4','offset':10.0,'bass':True,'video':True}
         with patch.dict(sys.modules, {'pytgcalls':types.ModuleType('pytgcalls'),'pytgcalls.types':fake_types}):
             await bridge.stream({'engine':engine}, -1, base)
@@ -141,6 +141,9 @@ class MediaContract(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(engine.streams[-1][2]['config'].kw['auto_start'])
             await bridge.stream({'engine':engine}, -1, {**base, 'video':False})
             self.assertEqual(engine.streams[-1][1].kw['video_flags'], 'ignore')
+            self.assertEqual(bridge.ensure_publisher.await_count, 2)
+            await bridge.stream({'engine':engine}, -1, {**base, 'status':'paused'})
+            self.assertEqual(bridge.ensure_publisher.await_count, 2, 'Seeking a paused source must not force an unmute')
 
 if __name__ == '__main__': unittest.main()
 
@@ -181,3 +184,60 @@ class NativeCallAbsenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(status['active'])
         self.assertNotIn(-1,self.bridge.calls)
         self.assertIsNone(self.bridge.accounts['one']['lease'])
+
+
+class PublisherVerificationTests(unittest.IsolatedAsyncioTestCase):
+    def participant(self, muted=False, allowed=True):
+        return types.SimpleNamespace(peer=types.SimpleNamespace(user_id=7), muted=muted, can_self_unmute=allowed, source=123, left=False)
+    async def test_local_unmute_and_fresh_server_verification_are_required(self):
+        bridge=Bridge('/tmp'); call={}; client=types.SimpleNamespace(invoke=AsyncMock()); engine=types.SimpleNamespace(unmute=AsyncMock())
+        bridge.native_publisher=AsyncMock(side_effect=[('existing-call',self.participant(True)),('existing-call',self.participant())])
+        await bridge.ensure_publisher({'client':client,'engine':engine,'uid':7},-100,call)
+        engine.unmute.assert_awaited_once_with(-100);self.assertTrue(call['publisher_verified']);self.assertFalse(call['publisher_muted'])
+        request=client.invoke.await_args.args[0];self.assertFalse(request.muted);self.assertEqual(type(request.participant).__name__,'InputPeerSelf')
+    async def test_moderator_locked_mute_is_not_overridden(self):
+        bridge=Bridge('/tmp');client=types.SimpleNamespace(invoke=AsyncMock());engine=types.SimpleNamespace(unmute=AsyncMock())
+        bridge.native_publisher=AsyncMock(return_value=('existing-call',self.participant(True,False)))
+        with self.assertRaises(VoiceFailure) as caught:await bridge.ensure_publisher({'client':client,'engine':engine,'uid':7},-100,{})
+        self.assertEqual(caught.exception.code,'PERMISSION_DENIED');engine.unmute.assert_not_awaited();client.invoke.assert_not_awaited()
+    async def test_remaining_muted_cannot_be_reported_as_playing(self):
+        bridge=Bridge('/tmp');client=types.SimpleNamespace(invoke=AsyncMock());engine=types.SimpleNamespace(unmute=AsyncMock());call={}
+        bridge.native_publisher=AsyncMock(return_value=('existing-call',self.participant(True)))
+        with self.assertRaises(VoiceFailure):await bridge.ensure_publisher({'client':client,'engine':engine,'uid':7},-100,call)
+        self.assertNotIn('publisher_verified',call)
+    async def test_later_server_mute_is_reported_without_auto_unmute_or_recovery(self):
+        bridge=Bridge('/tmp');engine=types.SimpleNamespace(unmute=AsyncMock(),time=AsyncMock(return_value=5));bridge.accounts['one']={'engine':engine}
+        bridge.native_publisher=AsyncMock(return_value=('existing-call',self.participant(True)))
+        bridge.calls[-100]={'alias':'one','status':'playing','native_call':'existing-call','publisher_check_after':0,'publisher_verified':True,'retries':0,'playback_id':'recording','position_seconds':5,'duration':120,'offset':0,'last_progress':MODULE.time.monotonic(),'clock_errors':0}
+        result=await bridge.status(-100);self.assertEqual(result['info']['status'],'error');self.assertTrue(result['info']['publisher_muted']);self.assertFalse(result['info']['publisher_verified']);engine.unmute.assert_not_awaited()
+    async def test_native_self_lookup_uses_minimal_self_only_rpc(self):
+        from pyrogram import raw
+        bridge=Bridge('/tmp');own=self.participant();client=types.SimpleNamespace(invoke=AsyncMock(return_value=types.SimpleNamespace(participants=[own])))
+        existing=raw.types.InputGroupCall(id=1,access_hash=2);_,participant=await bridge.native_publisher({'client':client,'uid':7},-100,existing)
+        self.assertIs(participant,own);request=client.invoke.await_args.args[0];self.assertEqual(request.limit,1);self.assertEqual(type(request.ids[0]).__name__,'InputPeerSelf')
+
+    async def test_completed_recording_is_not_misclassified_as_moderator_mute(self):
+        bridge=Bridge('/tmp');engine=types.SimpleNamespace(time=AsyncMock(return_value=120));bridge.accounts['one']={'engine':engine}
+        bridge.native_publisher=AsyncMock(return_value=('existing-call',self.participant(True)))
+        bridge.calls[-100]={'alias':'one','status':'playing','native_call':'existing-call','publisher_check_after':0,'publisher_verified':True,'retries':0,'playback_id':'recording','position_seconds':5,'duration':120,'offset':0,'last_progress':MODULE.time.monotonic(),'clock_errors':0}
+        result=await bridge.status(-100);self.assertEqual(result['info']['status'],'ended');bridge.native_publisher.assert_not_awaited()
+    async def test_already_unmuted_capture_does_not_repeat_native_transition(self):
+        bridge=Bridge('/tmp');call={};client=types.SimpleNamespace(invoke=AsyncMock());binding=types.SimpleNamespace(get_state=AsyncMock(return_value=types.SimpleNamespace(muted=False)));engine=types.SimpleNamespace(unmute=AsyncMock(),_binding=binding)
+        bridge.native_publisher=AsyncMock(return_value=('existing-call',self.participant()))
+        await bridge.ensure_publisher({'client':client,'engine':engine,'uid':7},-100,call)
+        binding.get_state.assert_awaited_once_with(-100);engine.unmute.assert_not_awaited();client.invoke.assert_not_awaited();self.assertTrue(call['publisher_verified'])
+    async def test_publisher_api_failure_is_actionable_without_raw_exception_contents(self):
+        bridge=Bridge('/tmp')
+        async def failed():raise TimeoutError('sensitive-runtime-details')
+        with self.assertRaises(VoiceFailure) as caught:await bridge.publisher_step(failed(),'self_participant')
+        self.assertEqual(caught.exception.code,'PUBLISHER_UNVERIFIED');self.assertEqual(caught.exception.publisher_state,{'stage':'self_participant','kind':'TimeoutError'});self.assertNotIn('sensitive',str(caught.exception.publisher_state))
+
+class ResumePublisherFailureTests(unittest.IsolatedAsyncioTestCase):
+    body=TestBridge.body
+    asyncSetUp=TestBridge.asyncSetUp
+    asyncTearDown=TestBridge.asyncTearDown
+    async def test_failed_resume_verification_repauses_without_false_playing_status(self):
+        await self.bridge.play(self.body());await self.bridge.control('pause',{'chat_id':-1});self.engine.pause=AsyncMock()
+        self.bridge.ensure_publisher=AsyncMock(side_effect=VoiceFailure('PERMISSION_DENIED'))
+        with self.assertRaises(VoiceFailure):await self.bridge.control('resume',{'chat_id':-1})
+        self.engine.pause.assert_awaited_once_with(-1);self.assertEqual(self.bridge.calls[-1]['status'],'paused')

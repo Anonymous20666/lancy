@@ -40,12 +40,12 @@ export class VoiceClient {
     try {
       const r = await fetch(`${this.baseUrl}${endpoint}`, { method, headers: { 'Content-Type':'application/json', Authorization: `Bearer ${this.token}` }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
       if (r.status === 401) throw new MusicError('BRIDGE_INCOMPATIBLE', 'The existing voice bridge is not authorized for this process. Do not start a competing player; arrange a controlled restart.');
-      const data = await r.json(); if (!r.ok || !data.ok) throw new MusicError(data.error || 'BRIDGE_FAILURE', data.message || 'The playback engine rejected this operation.'); return data;
+      const data = await r.json(); if (!r.ok || !data.ok) { const error=new MusicError(data.error || 'BRIDGE_FAILURE', data.message || 'The playback engine rejected this operation.');if(data.publisher_state)error.publisherState=data.publisher_state;if(data.error_kind)error.backendKind=data.error_kind;throw error; } return data;
     } catch (error) { if (error instanceof MusicError) throw error; throw new MusicError('BRIDGE_UNAVAILABLE', 'The voice engine is unreachable or timed out. Check its status before retrying.'); }
   }
   checkHealth() { return this.request('/health', { timeoutMs: 1500 }); }
-  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, bass:Boolean(opts.bass) }, timeoutMs:95000 }); }
-  control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 50000 : 20000 }); }
+  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, bass:Boolean(opts.bass) }, timeoutMs:110000 }); }
+  control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 65000 : op === 'resume' ? 35000 : 20000 }); }
   pause(id) { return this.control('pause', id); }
   resume(id) { return this.control('resume', id); }
   stop(id) { return this.control('stop', id); }

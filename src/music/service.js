@@ -1,16 +1,18 @@
+import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { isMusicOwner } from './accounts.js';
 import { KeyedLock, MusicError } from './model.js';
 import { checkChatMediaPermissions } from '../telegram/permissions.js';
 export class MusicService {
-  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; }
+  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.channelPanels=new ChannelPanels({service:this}); }
   owner(ctx) { return isMusicOwner(this.app,ctx.tgId); }
   botKey(ctx) { return String(ctx.api?.me?.id || ctx.botUsername || ''); }
   destination(ctx) {
+    if(ctx.musicPanel)return ctx.musicPanel.chatId;
     if (Number(ctx.chatId)<0) return Number(ctx.chatId);
     const binding=this.destinations.get(`${this.botKey(ctx)}:${ctx.tgId}`);
-    if (!binding) throw new MusicError('DESTINATION_REQUIRED','Use this command in a group. The owner can bind a channel from private chat with /destination <negative numeric ID>.');
-    if (!this.owner(ctx)) throw new MusicError('OWNER_ONLY','Channel control is owner-only.'); return binding;
+    if (!binding) throw new MusicError('DESTINATION_REQUIRED','Use this command in a group, or select your channel in private chat with /channel @channelname.');
+    return binding;
   }
   rate(ctx) {
     const now=Date.now(); for (const [key,t] of this.rates) if(now-t>60000)this.rates.delete(key);
@@ -18,16 +20,27 @@ export class MusicService {
   }
   async authorize(ctx, destructive=false, destination=null) {
     const id=destination ?? this.destination(ctx);
-    if (this.owner(ctx)) return id;
-    if (Number(ctx.chatId)!==id) throw new MusicError('PERMISSION_DENIED','Operate this player from its own group.');
-    const member=await ctx.api.getChatMember(id,Number(ctx.tgId)).catch(()=>null);
-    if (!member || !['creator','administrator','member','restricted'].includes(member.status) || (member.status==='restricted' && !member.is_member)) throw new MusicError('PERMISSION_DENIED','Membership could not be verified.');
-    if (destructive && !['creator','administrator'].includes(member.status)) throw new MusicError('ADMIN_ONLY','Only group administrators can change playback or remove queued tracks.'); return id;
+    const remote=Number(ctx.chatId)!==id;
+    if(remote){
+      if(Number(ctx.chatId)<=0 || Number(ctx.chatId)!==Number(ctx.tgId))throw new MusicError('PERMISSION_DENIED','Use your own private chat to control a channel.');
+      const chat=await ctx.api?.getChat(id).catch(()=>null);
+      if(!chat || (chat.type!=='channel'&&!this.owner(ctx)))throw new MusicError('PERMISSION_DENIED','Only verified channel administrators can use this private controller.');
+      if(chat.type==='channel'){
+        const botId=ctx.api?.me?.id;
+        const bot=botId?await ctx.api.getChatMember(id,botId).catch(()=>null):null;
+        if(!bot||!['creator','administrator'].includes(bot.status))throw new MusicError('BOT_ADMIN_REQUIRED','Make this bot a channel administrator before opening its private dashboard.');
+      }
+    }else if(!destructive&&this.owner(ctx))return id;
+    const member=await ctx.api?.getChatMember?.(id,Number(ctx.tgId)).catch(()=>null);
+    if(!member || !['creator','administrator','member','restricted'].includes(member.status) || (member.status==='restricted'&&!member.is_member))throw new MusicError('PERMISSION_DENIED','Membership could not be verified.');
+    if((destructive||remote)&&!['creator','administrator'].includes(member.status))throw new MusicError('ADMIN_ONLY','Only verified chat administrators can operate the player or change playback, queue and settings.');
+    return id;
   }
   async startSearch(ctx,query,mode='queue') {
-    this.rate(ctx); const destination=['download','lyrics'].includes(mode) ? Number(ctx.chatId) : await this.authorize(ctx);
-    if (!['download','lyrics'].includes(mode)) { const chat=await ctx.api.getChat(destination); const state=this.app.musicQueueManager.getSession(destination);state.isChannel=chat.type==='channel';state.bass=this.app.db.getSetting(`music.bass.${destination}`,false); await this.accounts.sync(); const available=await this.app.voiceClient.accounts(destination); if(!available.accounts.some(a=>a.enabled && ['available','busy'].includes(a.status))) throw new MusicError('ACCOUNT_UNAVAILABLE','No authorized player account is approved for this destination. Ask the owner to use /accounts allow <alias> <chat-id>.'); }
+    this.rate(ctx); const destination=['download','lyrics'].includes(mode) ? Number(ctx.chatId) : await this.authorize(ctx,true);
+    if (!['download','lyrics'].includes(mode)) { const chat=await ctx.api.getChat(destination); const state=this.app.musicQueueManager.getSession(destination);state.isChannel=chat.type==='channel';state.destinationTitle=chat.title||String(destination);state.bass=this.app.db.getSetting(`music.bass.${destination}`,false); await this.accounts.sync(); const available=await this.app.voiceClient.accounts(destination); if(!available.accounts.some(a=>a.enabled && ['available','busy'].includes(a.status))) throw new MusicError('ACCOUNT_UNAVAILABLE','No authorized player account is approved for this destination. Ask the owner to use /accounts allow <alias> <chat-id>.'); }
     const s=this.search.create({ userId:ctx.tgId,chatId:ctx.chatId,botId:this.botKey(ctx),destination,query,mode });
+    if(!['download','lyrics'].includes(mode))s.destinationTitle=this.app.musicQueueManager.getSession(destination).destinationTitle;
     await this.search.page(s,0); return s;
   }
   async submit(ctx,s) {
@@ -55,14 +68,15 @@ export class MusicService {
       }finally{this.downloads--;}
       return;
     }
-    await this.authorize(ctx,false,s.destination); const tracks=[...s.selected.values()].map(t=>({...t,mediaType:s.mode==='video'?'video':'audio',requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
+    await this.authorize(ctx,true,s.destination); const tracks=[...s.selected.values()].map(t=>({...t,mediaType:s.mode==='video'?'video':'audio',requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
     await this.app.musicQueueManager.addMany(s.destination,tracks); s.consumed=true;
     await this.player(ctx,s.destination);
   }
   async player(ctx,id=this.destination(ctx)) { return this.panelLock.run(id,()=>this._player(ctx,id)); }
   async _player(ctx,id) {
-    await this.authorize(ctx,false,id);
+    await this.authorize(ctx,true,id);
     const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.destinationTitle=chat.title || (s.isChannel?'Channel':'Group'); s.bass=this.app.db.getSetting(`music.bass.${id}`,false);
+    if(s.isChannel)return this.channelPanels.open(ctx,s);
     if(s.screenMessageId && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view='player';
     const created=!s.screenMessageId;
@@ -79,10 +93,13 @@ export class MusicService {
   }
   async _control(ctx,action,args=[]) {
     if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','selectaccount','pin','options','preview'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
-    const id=await this.authorize(ctx,!['player','queue','qpage','lyrics','lypage','accounts','refresh_status','options','preview'].includes(action));
-    const qm=this.app.musicQueueManager,s=qm.getSession(id);
+    const id=await this.authorize(ctx,true);
+    const qm=this.app.musicQueueManager;
+    const panel=ctx.musicPanel || (qm.getSession(id).isChannel ? this.channelPanels.find(ctx,id) : null);
+    const s=panel?.state ? this.channelPanels.state(panel) : panel || qm.getSession(id);
+    if(s.isChannel&&!s.panelToken)throw new MusicError('CHANNEL_DM_REQUIRED','Open /channel @channelname in your private chat first.');
     if(ctx.query&&!s.screenMessageId)throw new MusicError('STALE_PLAYER','That player belongs to an earlier session. Open /player.');
-    if(ctx.query && args.pop() !== String(s.controlRevision || 0))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
+    if(ctx.query && args.pop() !== (s.panelToken?Number(s.controlRevision||0).toString(36):String(s.controlRevision||0)))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
     if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');
     if(['pause','resume','skip','previous'].includes(action))await qm[action](id);
     else if(action==='stop'||action==='leave')await qm.stop(id,{leave:action==='leave'});
@@ -92,7 +109,7 @@ export class MusicService {
     else if(action==='shuffle')qm.shuffle(id);
     else if(action==='loop')qm.toggleLoopMode(id);
     else if(action==='clear')qm.clearQueue(id);
-    else if(action==='remove')qm.removeTrack(id,args[0]);
+    else if(action==='remove'){let entry=args[0];if(s.panelToken){const matches=s.upcoming.filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entry);if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued recording is no longer available.');entry=matches[0].entryId;}qm.removeTrack(id,entry);}
     else if(action==='options'){s.view='options';}
     else if(action==='preview'){if(this.previews.pending.has(id))throw new MusicError('PREVIEW_BUSY','The full preview is already being prepared.');s.fullPreview=null;s.view='player';}
     else if(action==='volume'){s.view='volume';}
@@ -106,6 +123,7 @@ export class MusicService {
       const pool=await this.app.voiceClient.accounts(id);const account=pool.accounts.find(a=>a.alias===args[0]&&a.status==='available'&&a.enabled);
       if(!account)throw new MusicError('ACCOUNT_UNAVAILABLE','That approved account is no longer available.');s.preferredAccount=account.alias;
     }
+    else if(action==='pin'&&s.panelToken)await this.channelPanels.pin(s.panelToken,{force:true});
     else if(action==='pin'){
       const me=ctx.api.me?.id;if(!me)throw new MusicError('PERMISSION_DENIED','Bot identity unavailable.');
       const member=await ctx.api.getChatMember(ctx.chatId,me);
@@ -123,5 +141,17 @@ export class MusicService {
     await this.accounts.sync(); const live=await this.app.voiceClient.accounts(null,action==='health');
     const records=this.accounts.records(); return records.map(a=>{const runtime=live.accounts.find(x=>x.alias===a.alias);return{alias:a.alias,allowed:a.allowed,status:!a.enabled?'disabled':runtime?.status||'authentication_required',destination:runtime?.destination};});
   }
-  bind(ctx,id){if(!this.owner(ctx)||Number(ctx.chatId)<0||!Number.isSafeInteger(Number(id))||Number(id)>=0)throw new MusicError('OWNER_ONLY','The main owner can bind a numeric channel/group ID in private chat.');this.destinations.set(`${this.botKey(ctx)}:${ctx.tgId}`,Number(id));}
+  async bind(ctx,value){
+    if(Number(ctx.chatId)<=0||Number(ctx.chatId)!==Number(ctx.tgId))throw new MusicError('CHANNEL_DM_REQUIRED','Use /channel @channelname in your private chat.');
+    this.rate(ctx);
+    let target=String(value||'').trim();
+    const link=target.match(/^https:\/\/t\.me\/([A-Za-z][\w]{3,31})\/?$/i);if(link)target=`@${link[1]}`;
+    if(!/^@[A-Za-z][\w]{3,31}$/.test(target)&&!/^-[1-9]\d{3,15}$/.test(target))throw new MusicError('INVALID_DESTINATION','Use /channel @channelname, its t.me link, or a negative numeric channel ID.');
+    const chat=await ctx.api.getChat(target);
+    if(!Number.isSafeInteger(chat.id)||chat.id>=0||(!this.owner(ctx)&&chat.type!=='channel'))throw new MusicError('INVALID_DESTINATION','Choose a channel you administer.');
+    await this.authorize(ctx,true,chat.id);
+    this.destinations.set(`${this.botKey(ctx)}:${ctx.tgId}`,chat.id);
+    const session=this.app.musicQueueManager.getSession(chat.id);session.isChannel=chat.type==='channel';session.destinationTitle=chat.title||'Channel';
+    return chat.id;
+  }
 }

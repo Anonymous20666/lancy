@@ -56,7 +56,7 @@ export class FullTrackPreviews {
     return value && Date.now() < value.expires ? value.fileId : null;
   }
   current(s, request) {
-    return !this.closed && !this.app.musicQueueManager?.closed && s.fullPreview?.request === request &&
+    return !this.closed && !this.app.musicQueueManager?.closed && (!s.panelToken || s.panelActive) && s.fullPreview?.request === request &&
       s.fullPreview.trackId === s.currentTrack?.id && s.fullPreview.playbackId === s.playbackId && ['playing', 'paused'].includes(s.status);
   }
   schedule(s) {
@@ -95,7 +95,7 @@ export class FullTrackPreviews {
         const fileId = this.cached(s.api, track);
         if (fileId) s.fullPreview = { ...s.fullPreview, status: 'ready', fileId, track: media.track };
         else {
-          const published = await this.app.musicQueueManager.updatePlayerCard(s.chatId, { preview: { request, media } });
+          const published = await this.app.musicQueueManager.updatePlayerCard(s.chatId, { preview: { request, media }, panelToken: s.panelToken || null });
           if (!published && this.current(s, request)) {
             if (s.view !== 'player') s.fullPreview = null;
             else s.fullPreview = { ...s.fullPreview, status: 'unavailable', reason: 'Full preview is temporarily unavailable. Retry from More; VC playback is unaffected.' };

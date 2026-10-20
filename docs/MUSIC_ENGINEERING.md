@@ -1,5 +1,11 @@
 # Lancy music engineering record
 
+## Channel/admin and publisher follow-up
+
+The later implementation adds `src/music/channelPanels.js` for per-bot/per-admin private views of one canonical destination session and `src/music/commands.js` for public/admin/private Telegram command scopes. Reply routing and ForceReply context preserve the original destination; scoped callbacks validate administrator, bot, DM, message and revision. Channel panels never publish the control card to the channel. A narrow music-only private route supports verified channel administrators while preserving unrelated private access and ForceJoin policy.
+
+The pinned PyTgCalls/NTgCalls runtime is checked against fresh self-only Telegram publisher state. Native capture mute is read before an unmute transition, permitted self-unmute is confirmed, later mute does not trigger destructive auto-advance, and publisher verification failures retain queued recordings. Existing-call references and bounded operation deadlines avoid treating decoder acceptance as an audible-publisher guarantee. See [the detailed verification record](MUSIC_CHANNEL_VERIFICATION.md) for failed diagnostics, corrections, final human acceptance and unverified limits. Production remains a separate rollout decision.
+
 ## Scope and audit baseline — 2026-10-20
 
 Repository: existing `lancy`, branch `main`, HEAD `85ceca7`. Production host `pappy-titan`. The working tree already had 22 modified tracked files and unfinished untracked `src/music`, music screen, Python bridge, and tests. Preserve all baseline modifications; do not stage them wholesale. A source-only snapshot was taken, excluding credentials, databases, cookies, user data and sessions. No production restart is authorized by this record.

@@ -16,7 +16,7 @@ export class QueueManager extends EventEmitter {
   getSession(chatId) {
     const id = Number(chatId);
     if (!Number.isSafeInteger(id) || !id) throw new MusicError('INVALID_DESTINATION', 'Invalid playback destination.');
-    if(!this.sessions.has(id)&&this.sessions.size>=1000){const old=[...this.sessions].find(([,s])=>!s.connected&&!s.currentTrack&&!s.upcoming.length&&!s.idleTimeout);if(old)this.sessions.delete(old[0]);else throw new MusicError('SESSION_LIMIT','The music destination limit has been reached.');}
+    if(!this.sessions.has(id)&&this.sessions.size>=1000){const old=[...this.sessions].find(([,s])=>!s.connected&&!s.currentTrack&&!s.upcoming.length&&!s.idleTimeout&&!this.app?.music?.channelPanels?.hasDestination(s.chatId));if(old)this.sessions.delete(old[0]);else throw new MusicError('SESSION_LIMIT','The music destination limit has been reached.');}
     if (!this.sessions.has(id)) this.sessions.set(id, { chatId: id, status: 'idle', currentTrack: null, upcoming: [], history: [], loopMode: 'off', volume: 100, isChannel: false, screenMessageId: null, playerChatId: id, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null, connected: false, accountAlias: null, preferredAccount: null, lastError: null, view: 'player', page: 0, bass: false });
     return this.sessions.get(id);
   }
@@ -79,7 +79,7 @@ export class QueueManager extends EventEmitter {
         this.log.warn({ chatId: s.chatId, code: error.code || 'PLAY_FAILED' }, 'Music track could not start');
         this.emit('track_error', { chatId: s.chatId, track: entry, code: error.code || 'PLAY_FAILED' });
         s.lastNotice=`Could not play ${entry.title}. ${s.lastError}`;
-        if (['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE'].includes(error.code)) { s.upcoming.unshift(entry); s.currentTrack = null; s.status = 'error'; await this.updatePlayerCard(s.chatId); return null; }
+        if (['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED'].includes(error.code)) { s.upcoming.unshift(entry); s.currentTrack = null; s.status = 'error'; await this.updatePlayerCard(s.chatId); return null; }
         s.currentTrack = null;
       }
     }
@@ -137,6 +137,7 @@ export class QueueManager extends EventEmitter {
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}
           if(r.info.status === 'recovering'){s.lastError='Reconnecting this stream; other destinations are unaffected.';s.positionSeconds=null;}
           if (r.info.status === 'ended' && s.status === 'playing') await this.#next(s);
+          else if (r.info.status === 'error' && r.info.publisher_muted) { s.status='error';s.positionSeconds=null;s.lastError='Telegram muted the playback account. Allow it to speak, then stop and retry playback. Your current recording and queue are retained.'; }
           else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
         }
         s.failures = 0;
@@ -145,9 +146,14 @@ export class QueueManager extends EventEmitter {
     })));
   }
   setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; }
-  async updatePlayerCard(id, { preview = null } = {}) {
-    return this.cardLocks.run(Number(id), async () => {
-      const s = this.getSession(id), api = s.api || this.app?.telegram?.api;
+  async updatePlayerCard(id, options = {}) {
+    const s=this.getSession(id);
+    if(s.isChannel&&this.app?.music?.channelPanels)return this.app.music.channelPanels.update(id,options);
+    return this.updatePlayerView(s,options);
+  }
+  async updatePlayerView(s, { preview = null } = {}) {
+    return this.cardLocks.run(s.panelToken || s.chatId, async () => {
+      const api = s.api || this.app?.telegram?.api;
       if (!s.screenMessageId || !api || Date.now() < (s.editAfter || 0)) return false;
       const screen = this.app?.screens?.get('music'); if (!screen) return false;
       const previews = this.app?.music?.previews;
@@ -177,7 +183,7 @@ export class QueueManager extends EventEmitter {
       } catch (e) {
         if (preview) throw e;
         s.editAfter = Date.now() + Math.max(3, Number(e.retry_after || e.parameters?.retry_after || 5)) * 1000;
-        this.log.debug({ chatId: id }, 'Player edit deferred'); return false;
+        this.log.debug({ chatId: s.chatId }, 'Player edit deferred'); return false;
       }
     });
   }

@@ -1,5 +1,9 @@
 # Lancy music v2 — implementation and verification
 
+## Latest channel follow-up — 20 October 2026
+
+See [MUSIC_CHANNEL_VERIFICATION.md](MUSIC_CHANNEL_VERIFICATION.md) for the later channel/admin implementation, initial failed listener findings, native publisher correction and successful human acceptance. Final follow-up results: **193/193 focused Node tests; 27/27 Python tests; full Node 520 total / 517 passed / one known failure / two timeouts**. The user confirmed audible channel playback and working reply/select/add. The original service was restored; no permanent deployment was performed. The full-song figures below are the earlier checkpoint, not the latest channel-suite totals.
+
 ## Release boundary
 
 Feature branch: `engineering/lancy-music-v2-20261020`, based on upstream `85ceca7`. The first implementation commit, `2972805dec90f43236be92a4731bc309f0daf649`, was pushed and its remote reference independently matched. Follow-up lifecycle/UI hardening and this evidence report are on the same scoped branch. The final delivery status records its latest exact commit.
