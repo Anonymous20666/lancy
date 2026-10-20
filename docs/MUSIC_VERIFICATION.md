@@ -6,20 +6,38 @@ Feature branch: `engineering/lancy-music-v2-20261020`, based on upstream `85ceca
 
 The production checkout contains unrelated preexisting changes. They were **not** committed into the feature branch, reset, checked out over, or replaced. During the explicitly approved test window, only the identified Lancy service/bridge was paused; the original service was restored afterwards. A feature push is not a production deployment.
 
+## Full-song UI follow-up — 20 October 2026
+
+Implemented on the same feature branch, **not deployed to production**:
+
+- Reuses the existing `/play` `RichMessageBuilder.audio` full-recording widget: real title, performer, measured duration and MP3 attachment, not a 30-second sample.
+- `/play` selection becomes a listen/download card **in the original search message**. Listening and saving from Telegram's audio menu do not join or control VC. No redundant “Audio delivered” message is left behind.
+- The VC dashboard embeds the same full-audio widget when the selected source permits downloadable files. Telegram listening is explicitly independent of the authoritative **VC** clock and VC transport/volume controls.
+- Main controls are compact; repeat, shuffle, bass, account selection, pin, stop, leave and preview retry live under **More**, editing the same dashboard. Real destination titles replace raw group IDs in the player heading; channel broadcast identity stays explicit.
+- Full Telegram audio files are not exposed for streaming-only recordings. Audius creator download consent is rechecked before cached audio/file IDs can be reused; YouTube remains owner opt-in. Unknown source duration is not advertised as a verified full recording. Preview failure does not stop the VC.
+- Complete cached VC audio can be reused after download authorization; video is never labelled as an MP3. Cached Telegram audio references are isolated per bot and recording, bounded to 100 entries/six hours. Automatic preparation is single-flight per destination, capped at two jobs; concurrent destinations deduplicate uploads for the same bot/recording. Explicit full-song deliveries have two fail-fast slots. Existing file/cache limits still apply.
+- Bot ForceReply prompts are removed after accepted input, cancellation or timeout. Completed queue-selection cards are removed; full-song audio cards and matched-lyrics results are retained. Routine music errors expire. Active submissions hold cleanup expiry so a completed audio card cannot accidentally be deleted mid-delivery. Deletion is best effort, with up to three bounded attempts and flood-wait handling; it never targets ordinary user messages or sweeps old production history.
+
+**Real Telegram API verification:** in the main owner's private chat, a complete, rights-cleared generated 90-second recording was uploaded in the new rich card, its actual returned audio `file_id` was reused in the VC-layout preview, and volume/settings/queue/lyrics/player edits all retained the same message ID. All eight transport/cleanup assertions passed, including deletion of the temporary bot panel. This was an API/layout test, not a new call, account login, polling process, music-provider availability test, listener playback assessment or mobile visual certification. Production remained online throughout; no restart or source rollout was performed.
+
+The UI follow-up adds **27 focused regression tests**, covering canonical identity, streaming/download permission separation, source duration, full-card delivery, stale-song and navigation races, cache/bot isolation, upload deduplication, concurrent work limits, shutdown, temporary-message provenance, expiry and preserving delivered audio. The expanded targeted selection (including the earlier feature/AI suites) passes 150/150.
+
 ## Automated evidence
 
 | Check | Latest result |
 |---|---|
-| Targeted Node feature/routing/lifecycle suite on VPS | **92 passed, 0 failed** |
+| Targeted Node feature/routing/lifecycle suite on VPS | **150 passed, 0 failed** |
 | Python bridge suite on VPS | **18 passed, 0 failed** |
-| Full VPS regression | **464 total: 461 passed, 1 failed, 2 cancelled**, 45562 ms |
+| Full VPS regression | **491 total: 488 passed, 1 failed, 2 cancelled**, 45560 ms |
 | Installed-library / real FFmpeg probe | Neutral audio, bass audio, video+audio+bass, video seek offset and empty idle-stream conversion passed |
 | Installed Python versions | py-tgcalls 3.0.0; ntgcalls 3.0.4; pyrogrammod 2.4.1; aiohttp 3.14.5; python-dotenv 1.2.4; TgCrypto 1.2.5 |
 | Original preserved dirty-source baseline | 413 total: 401 passed, 9 failed, 3 cancelled |
 
 **The full suite is not completely green.** Its remaining assertion is the preexisting `/setprefix` group-suggestions expectation in `channelPostAndPrefix.test.js`. Two preexisting files hit the 45-second file bound: `inlineSearchAndHotReload.test.js` and `liveSearchAndNoDuplicates.test.js`. All three identities also failed/timed out in the preserved baseline. Other legacy external-search/download assertions varied by environment and passed on the VPS; different-tree/environment totals are not a same-tree performance comparison.
 
-Saved evidence: `targeted.log`, `python.log`, `full-regression.log`, `live-events.ndjson`, `live-results.json`, `operator-events.ndjson`, `live-node.log`, and `native-contract-probe.log`. The source archive is produced with `git archive`, excluding credentials, runtime data, dependencies and operator scripts.
+UI follow-up evidence: `ui-targeted.log`, `ui-full-regression.log`, `ui-python.log`, `ui-native-contract.log`, and `full-audio-ui-probe.json`. Earlier controlled-call evidence is preserved separately.
+
+Saved earlier evidence: `targeted.log`, `python.log`, `full-regression.log`, `live-events.ndjson`, `live-results.json`, `operator-events.ndjson`, `live-node.log`, and `native-contract-probe.log`. The source archive is produced with `git archive`, excluding credentials, runtime data, dependencies and operator scripts.
 
 ## Genuine Telegram / native transport results
 
@@ -81,7 +99,7 @@ The main owner was sent a clarification. Test-only panels were closed/marked fin
 
 ## Implemented scope
 
-Canonical provider/recording identity; exact-source resolution; stream/download rights separation; `/play` download versus `/addq` audio queue and `/vplay` real requested video; multi-page selection and callback deduplication; destination-local queues/locks; exclusive account leases; stable-ID queue editing, repeat/history/skip/seek/volume; bounded cache/files/timeouts and shutdown; owner-private encrypted account pool with allowlists and real health checks; secure terminal onboarding; strict lyrics matching and rights-conscious display; serialized private AI/history and group AI isolation; persistent compact views, permission/rate checks and restrained controls.
+Canonical provider/recording identity; exact-source resolution; stream/download rights separation; `/play` full-song listening/download versus `/addq` audio queue and `/vplay` real requested video; multi-page selection and callback deduplication; destination-local queues/locks; exclusive account leases; stable-ID queue editing, repeat/history/skip/seek/volume; bounded cache/files/timeouts and shutdown; owner-private encrypted account pool with allowlists and real health checks; secure terminal onboarding; strict lyrics matching and rights-conscious display; serialized private AI/history and group AI isolation; persistent compact views, permission/rate checks and restrained controls.
 
 Group general AI is off. Only plain play requests replying to this bot go directly into canonical download selection. Old chat OTP/password collection is retired in this branch. The current production service does not receive those source/security changes until a separate rollout is authorized.
 

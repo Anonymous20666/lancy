@@ -56,6 +56,7 @@ export class AudiusProvider {
   async media(track, { download = false } = {}) {
     if (!/^[a-zA-Z0-9]+$/.test(track.providerId)) throw new MusicError('INVALID_TRACK', 'Invalid track identifier.');
     const meta = this.normalize(await this.request(`/tracks/${track.providerId}`));
+    if (meta.providerId !== track.providerId) throw new MusicError('TRACK_MISMATCH', 'The provider returned a different recording.');
     if (meta.availability === 'unavailable' || !(download ? meta.downloadable : meta.streamable)) throw new MusicError('RESTRICTED', download ? 'This artist has not enabled an ungated download for this recording.' : 'This recording is not available for ungated streaming.');
     return { track: meta, url: `${this.base}/tracks/${track.providerId}/${download ? 'download' : 'stream'}?app_name=Lancy` };
   }

@@ -1,8 +1,9 @@
+import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { isMusicOwner } from './accounts.js';
 import { KeyedLock, MusicError } from './model.js';
 import { checkChatMediaPermissions } from '../telegram/permissions.js';
 export class MusicService {
-  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); }
+  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; }
   owner(ctx) { return isMusicOwner(this.app,ctx.tgId); }
   botKey(ctx) { return String(ctx.api?.me?.id || ctx.botUsername || ''); }
   destination(ctx) {
@@ -34,13 +35,24 @@ export class MusicService {
     if(s.mode==='lyrics'){if(s.selected.size!==1)throw new MusicError('ONE_SELECTION','Select one recording for lyrics.');s.lyricsTrack=[...s.selected.values()][0];s.lyricsResult=await this.lyrics.get(s.lyricsTrack);s.consumed=true;return;}
     if (s.mode==='download') {
       if (s.selected.size!==1) throw new MusicError('ONE_DOWNLOAD','Choose one track to download.');
+      if(this.downloads>=2)throw new MusicError('DOWNLOAD_BUSY','Two full-song deliveries are already being prepared. Please try again shortly.');
+      this.downloads++;
+      try{
       const permission=await checkChatMediaPermissions(ctx.api,ctx.chatId,Number(ctx.tgId)).catch(()=>null);
       if(permission?.canSendAudios===false)throw new MusicError('MEDIA_RESTRICTED','Audio uploads are restricted in this chat.');
       const track=[...s.selected.values()][0]; const media=await this.app.musicLibrary.acquire(track,{download:true});
       try {
-        await ctx.api.sendAudio(ctx.chatId,await import('node:fs/promises').then(fs=>fs.readFile(media.filePath)),{title:media.track.title,performer:media.track.artist || undefined,duration:Math.floor(media.track.durationSeconds),caption:`${media.track.title}\nSource: ${media.track.provider}`,reply_to_message_id:ctx.messageId,filename:`${media.track.title.replace(/[^\p{L}\p{N}\s._-]/gu,'').slice(0,80)||'track'}.mp3`});
-        s.consumed=true;
+        if(media.track.id!==track.id)throw new MusicError('TRACK_MISMATCH','The provider returned a different recording.');
+        const screen=this.app.screens.get('music');
+        const rich=screen.renderListen(media.track,'attach://music_full_audio');
+        const files=await audioUpload(media);
+        const sent=s.messageId && s.messageId===ctx.messageId
+          ? await ctx.api.editMessageRich(ctx.chatId,s.messageId,rich,{},files)
+          : await ctx.api.sendRichMessage(ctx.chatId,rich,{},files);
+        this.previews.remember(ctx.api,media.track,audioFileId(sent));
+        s.consumed=true; s.deliveryMessageId=sent?.message_id || s.messageId;
       } finally { media.release(); }
+      }finally{this.downloads--;}
       return;
     }
     await this.authorize(ctx,false,s.destination); const tracks=[...s.selected.values()].map(t=>({...t,mediaType:s.mode==='video'?'video':'audio',requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
@@ -50,21 +62,24 @@ export class MusicService {
   async player(ctx,id=this.destination(ctx)) { return this.panelLock.run(id,()=>this._player(ctx,id)); }
   async _player(ctx,id) {
     await this.authorize(ctx,false,id);
-    const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.bass=this.app.db.getSetting(`music.bass.${id}`,false);
+    const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.destinationTitle=chat.title || (s.isChannel?'Channel':'Group'); s.bass=this.app.db.getSetting(`music.bass.${id}`,false);
     if(s.screenMessageId && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view='player';
-    if(!s.screenMessageId){ const sent=await ctx.api.sendRichMessage(ctx.chatId,this.app.screens.get('music').renderPlayer(s)); qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api); }
+    const created=!s.screenMessageId;
+    if(created){const rich=this.app.screens.get('music').renderPlayer(s);const sent=await ctx.api.sendRichMessage(ctx.chatId,rich);qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);s.lastRender=JSON.stringify(rich);}
     else await qm.updatePlayerCard(id);
+    this.previews.schedule(s);
+    if(created&&s.fullPreview)await qm.updatePlayerCard(id);
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','lyrics','lypage','accounts','volume'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','lyrics','lypage','accounts','volume','options'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     return this.controlLock.run(destination,()=>this._control(ctx,action,[...args]));
   }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','selectaccount','pin'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
-    const id=await this.authorize(ctx,!['player','queue','qpage','lyrics','lypage','accounts','refresh_status'].includes(action));
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','selectaccount','pin','options','preview'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    const id=await this.authorize(ctx,!['player','queue','qpage','lyrics','lypage','accounts','refresh_status','options','preview'].includes(action));
     const qm=this.app.musicQueueManager,s=qm.getSession(id);
     if(ctx.query&&!s.screenMessageId)throw new MusicError('STALE_PLAYER','That player belongs to an earlier session. Open /player.');
     if(ctx.query && args.pop() !== String(s.controlRevision || 0))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
@@ -78,6 +93,8 @@ export class MusicService {
     else if(action==='loop')qm.toggleLoopMode(id);
     else if(action==='clear')qm.clearQueue(id);
     else if(action==='remove')qm.removeTrack(id,args[0]);
+    else if(action==='options'){s.view='options';}
+    else if(action==='preview'){if(this.previews.pending.has(id))throw new MusicError('PREVIEW_BUSY','The full preview is already being prepared.');s.fullPreview=null;s.view='player';}
     else if(action==='volume'){s.view='volume';}
     else if(action==='accounts'){await this.accounts.sync();s.availableAccounts=(await this.app.voiceClient.accounts(id)).accounts;s.view='accounts';}
     else if(action==='queue'||action==='qpage'){s.view='queue';s.page=Math.max(0,Number(args[0])||0);}

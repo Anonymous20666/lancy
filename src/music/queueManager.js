@@ -1,3 +1,4 @@
+import { audioUpload, audioFileId } from './preview.js';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import { logger } from '../core/logger.js';
@@ -7,7 +8,7 @@ import { KeyedLock, MusicError, queueEntry } from './model.js';
 export class QueueManager extends EventEmitter {
   constructor({ app, voiceClient, db, log, idleTimeoutMs = Number(process.env.MUSIC_IDLE_SECONDS || 600) * 1000, pollMs = 10000 } = {}) {
     super(); this.app = app; this.voice = voiceClient; this.db = db;
-    this.log = log || logger().child({ module: 'music-queue' }); this.sessions = new Map(); this.locks = new KeyedLock(); this.closed = false;
+    this.log = log || logger().child({ module: 'music-queue' }); this.sessions = new Map(); this.locks = new KeyedLock(); this.cardLocks = new KeyedLock(); this.closed = false;
     if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) throw new MusicError('INVALID_CONFIGURATION', 'Music idle timeout must be a positive duration.');
     this.idleTimeoutMs = idleTimeoutMs;
     if (pollMs > 0) { this.poller = setInterval(() => this.reconcile().catch(() => this.log.warn('Music reconciliation failed')), pollMs); this.poller.unref?.(); }
@@ -144,13 +145,41 @@ export class QueueManager extends EventEmitter {
     })));
   }
   setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; }
-  async updatePlayerCard(id) {
-    const s = this.getSession(id); const api = s.api || this.app?.telegram?.api; if (!s.screenMessageId || !api || Date.now() < (s.editAfter || 0)) return;
-    const screen = this.app?.screens?.get('music'); if (!screen) return;
-    const rich = s.view === 'queue' ? screen.renderQueue(s, s.page) : s.view === 'lyrics' ? screen.renderLyrics?.(s) : s.view === 'volume' ? screen.renderVolumePicker(s) : s.view === 'accounts' ? screen.renderAccounts(s) : screen.renderPlayer(s);
-    if (!rich) return; const content = JSON.stringify(rich); if (content === s.lastRender) return;
-    try { await api.editMessageRich(s.playerChatId, s.screenMessageId, rich); s.lastRender = content; }
-    catch (e) { s.editAfter = Date.now() + Math.max(3, Number(e.retry_after || e.parameters?.retry_after || 5)) * 1000; this.log.debug({ chatId: id }, 'Player edit deferred'); }
+  async updatePlayerCard(id, { preview = null } = {}) {
+    return this.cardLocks.run(Number(id), async () => {
+      const s = this.getSession(id), api = s.api || this.app?.telegram?.api;
+      if (!s.screenMessageId || !api || Date.now() < (s.editAfter || 0)) return false;
+      const screen = this.app?.screens?.get('music'); if (!screen) return false;
+      const previews = this.app?.music?.previews;
+      if (!preview) previews?.schedule(s);
+      if (preview && (!previews?.current(s, preview.request) || s.view !== 'player')) return false;
+      const display = preview ? { ...s, fullPreview: { ...s.fullPreview, status: 'ready', fileId: 'attach://music_full_audio', track: preview.media.track } } : s;
+      const rich = display.view === 'queue' ? screen.renderQueue(display, display.page) : display.view === 'lyrics' ? screen.renderLyrics?.(display) : display.view === 'volume' ? screen.renderVolumePicker(display) : display.view === 'accounts' ? screen.renderAccounts(display) : display.view === 'options' ? screen.renderOptions(display) : screen.renderPlayer(display);
+      if (!rich) return false;
+      const content = JSON.stringify(rich); if (!preview && content === s.lastRender) return true;
+      try {
+        const files = preview ? await audioUpload(preview.media) : null;
+        // A track/control can change while reading the file. Never upload stale audio.
+        if (preview && (!previews.current(s, preview.request) || s.view !== 'player')) return false;
+        const sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, rich, { dropOnFloodWait: true }, files);
+        s.lastRender = content;
+        if (preview) {
+          const fileId = audioFileId(sent);
+          if (!fileId) throw new MusicError('PREVIEW_REFERENCE_UNAVAILABLE', 'Telegram did not return a reusable audio reference. Full preview is unavailable; VC playback is unaffected.');
+          previews.remember(api, preview.media.track, fileId);
+          if (previews.current(s, preview.request)) {
+            s.fullPreview = { ...s.fullPreview, status: 'ready', fileId, track: preview.media.track };
+            // Subsequent progress/control edits reuse file_id, never upload again.
+            s.lastRender = JSON.stringify(screen.renderPlayer({ ...display, fullPreview: s.fullPreview }));
+          }
+        }
+        return true;
+      } catch (e) {
+        if (preview) throw e;
+        s.editAfter = Date.now() + Math.max(3, Number(e.retry_after || e.parameters?.retry_after || 5)) * 1000;
+        this.log.debug({ chatId: id }, 'Player edit deferred'); return false;
+      }
+    });
   }
   async shutdown() {
     this.closed = true; clearInterval(this.poller);

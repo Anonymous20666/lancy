@@ -107,10 +107,20 @@ Lyrics require normalized exact title/artist agreement, compatible duration when
 - The bridge watches parent death and attempts cleanup. Graceful shutdown cancels timers, closes queues, leaves calls and stops user clients. Stop/start is **not** seamless nonstop playback: queues and active positions are ephemeral, no durable playback checkpoint is implemented.
 - A process manager and monitoring are still required. Multi-day reliability, automatic supervisor restart behavior, provider long-run failure rates and real listener quality are **not certified** by these offline tests.
 
+## Full-song listening and quiet UI
+
+`/play` never auto-joins a VC. Its selected recording is delivered through the same rich full-audio component as the existing downloader, replacing the search card in place. Tap the native Telegram audio to listen, or use its audio menu to save the MP3. “Search for VC” is a separate action requiring a group or an owner-bound destination; it does not guess a group from private chat.
+
+The live `/player` dashboard also exposes full downloadable audio where the canonical source permits it. Its native audio widget is **not synchronized to the voice call**: the VC progress bar/volume/transport controls operate the shared call, while Telegram's player operates the listener's local playback. Unsupported or creator-restricted full-file preview is labelled honestly; the authorized VC stream continues. More → Retry full preview is available after temporary preparation failures.
+
+Routine views and settings edit the current dashboard. Bot input prompts are scoped to the requester (including group selective ForceReply mentions), expire after two minutes, and are cleaned on completion/cancel. Unsubmitted search cards expire after ten minutes; completed VC selection cards are deleted. `/play` audio cards and matched-lyrics results remain as useful deliverables. Transient error notices expire after one minute. Cleanup retains active submissions until their result is known, deletes only API-recorded bot message IDs, retries transient deletion failures at most twice, and respects flood waits. Deletion cannot be guaranteed when Telegram/network permissions prevent it; no user-message deletion or retroactive production-history sweep is performed by this routine cleanup.
+
+Full-preview jobs are capped at two globally, single-flight per destination; explicit full-song deliveries have two concurrent fail-fast slots. Telegram file-ID cache: at most 100 bot/recording entries, six-hour TTL. Audio uploads for the same bot and recording are serialized/deduplicated. Audius download permission is checked even for cached media; complete audio-only VC files can then be reused without downloading/transcoding again. A video asset is never sent with a false MP3 label. Retain conservative file/cache limits (48 MiB/512 MiB defaults); native uploads and multipart buffers consume memory in addition to the disk cache.
+
 ## Verification commands
 
 ```sh
-node --test --test-timeout=20000 tests/musicEngineering.test.js tests/voiceChatAndMusicSystem.test.js tests/assistantSessionAuth.test.js tests/aiAssistantAndScheduler.test.js tests/aiAndSpotifyEnrichment.test.js tests/groupAndDmInteraction.test.js tests/conversationalAiAndClonedTriggers.test.js
+node --test --test-timeout=20000 tests/musicEngineering.test.js tests/voiceChatAndMusicSystem.test.js tests/assistantSessionAuth.test.js tests/aiAssistantAndScheduler.test.js tests/aiAndSpotifyEnrichment.test.js tests/groupAndDmInteraction.test.js tests/conversationalAiAndClonedTriggers.test.js tests/musicPreviewUi.test.js tests/musicIntentAndLinkPreview.test.js tests/musicPlayLyricsAndRecognition.test.js
 python3 -m unittest discover -s service/voice/tests -v
 service/voice/.venv/bin/python3 service/voice/tests/native_contract_probe.py
 node --test --test-timeout=45000 tests/*.test.js

@@ -39,25 +39,42 @@ export class MediaLibrary {
   }
   async acquire(track, { video = false, download = false } = {}) {
     if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
-    const key = createHash('sha256').update(`${track.id}:${video}:${download}`).digest('hex');
+    const adapter = this.providers.get(track.provider);
+    if (track.provider === 'youtube') adapter.assertEnabled?.();
+    // Permission checks run before the decoder lock; a slow preview API cannot
+    // hold up the next VC track. Revalidate even for a cached downloadable file.
+    const permitted = download && track.provider === 'audius' ? await adapter.media(track, { download: true }) : null;
+    let key = createHash('sha256').update(`${track.id}:${video}:${download}`).digest('hex');
     return this.locks.run('downloads', async () => {
       if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
       await mkdir(this.root, { recursive: true, mode: 0o700 });
       const filePath = join(this.root, `${key}.${video ? 'mp4' : 'mp3'}`);
       let result = this.active.get(key);
+      if (!result && download && !video) {
+        const streamKey = createHash('sha256').update(`${track.id}:false:false`).digest('hex');
+        const cached = this.active.get(streamKey);
+        // Reuse a complete, probed audio recording only AFTER download consent.
+        // Video is never passed off as an MP3; its audio is resolved separately.
+        const knownDuration = cached && (Object.hasOwn(cached.track, 'sourceDurationSeconds') ? cached.track.sourceDurationSeconds : cached.track.durationSeconds);
+        const complete = cached && (!permitted?.track.durationSeconds || Math.abs(permitted.track.durationSeconds - cached.track.durationSeconds) <= 4);
+        if (complete && (track.provider === 'youtube' || permitted) && (permitted?.track.durationSeconds || knownDuration)) {
+          result = cached; key = streamKey;
+        }
+      }
       if (!result) {
         const prefix = join(this.root, `.partial-${randomUUID()}`); const source = `${prefix}.source`; const output = `${prefix}.${video ? 'mp4' : 'mp3'}`;
         try {
           await this.cleanup();
           const files = await readdir(this.root); let used = 0; for (const f of files) used += (await stat(join(this.root, f))).size;
           if (used + this.maxBytes * 3 > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
-          const adapter = this.providers.get(track.provider); let meta;
+          let meta;
           if (track.provider === 'youtube') meta = await adapter.download(track, source, { video, maxBytes: this.maxBytes });
           else {
             if (video) throw new MusicError('VIDEO_UNSUPPORTED', 'This source offers audio, not video.');
-            const media = await adapter.media(track, { download }); meta = media.track;
+            const media = permitted || await adapter.media(track, { download }); meta = media.track;
             await boundedFetchFile(media.url, source, this.maxBytes);
           }
+          if (download && !meta.durationSeconds) throw new MusicError('DURATION_UNVERIFIED', 'The provider did not supply a reliable full duration. Choose another recording for full-song listening/download.');
           const candidates = (await readdir(this.root)).filter(f => f.startsWith(prefix.split('/').at(-1)) && f.includes('.source'));
           if (candidates.length !== 1) throw new MusicError('SOURCE_MISSING', 'The selected source did not produce one usable media file.');
           const input = join(this.root, candidates[0]);
@@ -71,7 +88,7 @@ export class MediaLibrary {
           const info = JSON.parse(probe.stdout); const duration = Number(info.format?.duration); const size = (await stat(output)).size;
           if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (video && !info.streams.some(s => s.codec_type === 'video')) || size >= this.maxBytes || (meta.durationSeconds && duration < meta.durationSeconds - 4)) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
           await rename(output, filePath);
-          result = { key, filePath, track: { ...meta, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || track.provider === 'youtube', seek: true, video } } }; this.active.set(key, result);
+          result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || track.provider === 'youtube', seek: true, video } } }; this.active.set(key, result);
         } catch (error) {
           if (error instanceof MusicError) throw error;
           throw new MusicError('RESOLUTION_FAILED', 'The selected recording could not be downloaded or decoded. Try another permitted result.');

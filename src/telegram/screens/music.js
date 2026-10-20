@@ -1,3 +1,5 @@
+import { TemporaryBotMessages } from '../../music/messages.js';
+import { audioInput } from '../../music/preview.js';
 import { RichMessageBuilder, rt, richButton, encodeCallback, NOOP_CALLBACK } from '../rich.js';
 import { States } from '../../core/stateMachine.js';
 import { durationText, MusicError } from '../../music/model.js';
@@ -9,36 +11,61 @@ const finish = b => { b.validate(); return b.toJSON(); };
 
 export function createMusicScreen({ app }) {
   const id='music';
+  const temporary = new TemporaryBotMessages();
   function controls(s,label,action,...args){return button(label,action,...args,s.controlRevision||0);}
   function renderHome(){
     const b=card('Lancy · music','Find your track. Set the mood.');
-    b.quote(rt.text('/play — download a track\n/addq — search and queue audio\n/vplay — queue genuine video + audio\n/player — your live dashboard'));
-    b.buttons([button('Queue audio','prompt','queue'),button('Download','prompt','download')]);
+    b.quote(rt.text('/play — listen here or download\n/addq — search and queue audio\n/vplay — queue genuine video + audio\n/player — your live dashboard'));
+    b.buttons([button('Voice chat','prompt','queue'),button('Listen / download','prompt','download')]);
     b.buttons([button('Video','prompt','video'),button('Open player','openplayer')]);
     b.paragraph(rt.text('Search “title artist”, or prefix audius: / youtube:. Availability depends on source permissions.'));
     b.paragraph(rt.text('/playlist list · /playlist save <name> · /playlist load <name>'));
     return finish(b);
   }
+  function trackAudio(b, track, media, vc = false) {
+    b.audio(audioInput(track, media), vc ? 'Full track · listen here, independently of the voice chat' : 'Full track · listen in Telegram or save from the audio menu');
+  }
+  function renderListen(track, media) {
+    const b=card('Lancy · listen & download','Your full recording. No voice chat needed.');
+    trackAudio(b,track,media);
+    b.quote(rt.concat(rt.bold(cut(track.title,160)),rt.text(`\n${cut(track.artist||'Artist not supplied',100)}${track.album?` · ${cut(track.album,60)}`:''}`)));
+    b.paragraph(rt.text(`${durationText(track.durationSeconds)} · ${track.provider} · MP3`));
+    b.buttons([button('Find another song','prompt','download'),button('Search for VC','prompt','queue')]);
+    b.paragraph(rt.italic('Tap the audio to listen; use its menu to save the file. VC search is separate and requires a group or an owner-bound destination.'));
+    return finish(b);
+  }
   function renderPlayer(s){
-    const b=card(s.isChannel?'CHANNEL LIVE BROADCAST':'Lancy · now playing',`${s.isChannel?'Channel':'Group'} ${s.chatId} · ${s.status}`);
+    const b=card(s.isChannel?'Lancy · CHANNEL LIVE BROADCAST':'Lancy · music',`${s.isChannel?'Channel broadcast':'Voice chat'} · ${s.destinationTitle || (s.isChannel?'Channel':'Group')} · ${s.status}`);
     if(s.status==='stopped'){b.quote(rt.text('Playback service stopped. Open the current player after restart.'));if(s.lastError)b.paragraph(rt.text(s.lastError));b.buttons([button('Open current player','openplayer')]);return finish(b);}
     const t=s.currentTrack;
-    if(!t){ b.quote(rt.text(s.connected?'Queue complete. Holding the call for ten minutes.':'No active playback. Search with /addq.')); }
+    if(!t){ b.quote(rt.text(s.connected?'Queue complete. Holding the call for ten minutes.':'No active playback. Use Add tracks for VC, or Listen / download without joining a call.')); }
     else {
-      b.quote(rt.concat(rt.bold(cut(t.title,160)),rt.text(`\n${cut(t.artist||'Artist not supplied',100)}${t.album?` · ${cut(t.album,60)}`:''}\n${durationText(s.positionSeconds)} / ${durationText(t.durationSeconds)} · ${t.mediaType==='video'?'Video + audio':'Audio'}`)));
+      const preview=s.fullPreview?.trackId===t.id?s.fullPreview:null;
+      if(preview?.status==='ready'&&preview.fileId)trackAudio(b,preview.track||t,preview.fileId,true);
+      else if(preview?.status==='pending')b.paragraph(rt.italic('Preparing the full-song audio player… VC playback continues independently.'));
+      else if(preview?.status==='unavailable')b.paragraph(rt.italic(cut(preview.reason,240)));
+      b.quote(rt.concat(rt.bold(cut(t.title,160)),rt.text(`\n${cut(t.artist||'Artist not supplied',100)}${t.album?` · ${cut(t.album,60)}`:''}\nVC · ${durationText(s.positionSeconds)} / ${durationText(t.durationSeconds)} · ${t.mediaType==='video'?'Video + audio':'Audio'} · ${t.provider}`)));
       if(Number.isFinite(s.positionSeconds)&&t.durationSeconds){const n=Math.max(0,Math.min(10,Math.floor(s.positionSeconds/t.durationSeconds*10)));b.paragraph(rt.text('━'.repeat(n)+'─'.repeat(10-n)));}
-      b.paragraph(rt.text(`Volume ${s.volumeConfirmed===false?'unconfirmed':`${s.volume}%`} · Repeat ${s.loopMode}\n${s.upcoming?.length||0} queued · ${s.accountAlias||'Account connecting'}${s.bass?' · Gentle bass':''}`));
+      b.paragraph(rt.text(`VC volume ${s.volumeConfirmed===false?'unconfirmed':`${s.volume}%`} · Repeat ${s.loopMode} · ${s.upcoming?.length||0} queued`));
       if(s.upcoming?.[0])b.paragraph(rt.text(`Up next · ${cut(s.upcoming[0].title)}`));
-      if(['playing','paused'].includes(s.status))b.buttons([controls(s,'Previous','previous'),controls(s,s.status==='paused'?'Resume':'Pause',s.status==='paused'?'resume':'pause'),controls(s,'Skip','skip')]);
+      if(['playing','paused'].includes(s.status))b.buttons([controls(s,'Previous','previous'),controls(s,s.status==='paused'?'Resume VC':'Pause VC',s.status==='paused'?'resume':'pause'),controls(s,'Skip','skip')]);
       if(t.capabilities?.seek&&Number.isFinite(s.positionSeconds))b.buttons([controls(s,'−10 sec','seekby',-10),controls(s,'+10 sec','seekby',10)]);
     }
     if(s.lastNotice)b.paragraph(rt.text(cut(s.lastNotice,350)));
     if(s.lastError)b.paragraph(rt.text(cut(s.lastError,350)));
-    b.buttons([controls(s,`Queue · ${s.upcoming?.length||0}`,'queue'),controls(s,'Lyrics','lyrics'),controls(s,'Stop','stop')]);
-    b.buttons([controls(s,`Repeat · ${s.loopMode}`,'loop'),controls(s,'Shuffle','shuffle'),controls(s,'Volume','volume')]);
-    b.buttons([controls(s,'Accounts','accounts'),controls(s,'Pin player','pin'),controls(s,'Leave call','leave')]);
-    b.buttons([controls(s,s.bass?'Bass · on':'Bass · off','bass'),button('Add tracks','prompt','queue')]);
-    b.paragraph(rt.italic('Bass changes apply to the next track. /seek <seconds> · /volume <0–150>'));
+    b.buttons([controls(s,`Queue · ${s.upcoming?.length||0}`,'queue'),controls(s,'Lyrics','lyrics'),controls(s,'VC volume','volume')]);
+    b.buttons([button('Add tracks','prompt','queue'),button('Listen / download','prompt','download'),controls(s,'More','options')]);
+    return finish(b);
+  }
+  function renderOptions(s){
+    const b=card('Lancy · voice-chat settings','Changes stay in this dashboard');
+    b.paragraph(rt.text(`Account · ${s.accountAlias||s.preferredAccount||'Not connected'}\nRepeat · ${s.loopMode}\nGentle bass · ${s.bass?'on':'off'}`));
+    b.buttons([controls(s,`Repeat · ${s.loopMode}`,'loop'),controls(s,'Shuffle','shuffle')]);
+    b.buttons([controls(s,s.bass?'Bass · on':'Bass · off','bass'),controls(s,'Accounts','accounts')]);
+    b.buttons([controls(s,'Pin player','pin'),controls(s,'Retry full preview','preview')]);
+    b.buttons([controls(s,'Stop playback','stop'),controls(s,'Leave call','leave')]);
+    b.buttons([controls(s,'Back to player','player')]);
+    b.paragraph(rt.italic('VC settings do not control the audio player above. Bass changes apply to the next track. /seek <seconds> · /volume <0–150>'));
     return finish(b);
   }
   function renderQueue(s,page=0){
@@ -87,16 +114,24 @@ export function createMusicScreen({ app }) {
   }
   function renderSessionSetupNotice(){const b=card('ASSISTANT ACCOUNT SETUP REQUIRED','Owner-managed user sessions');b.paragraph(rt.text('A bot token alone is not a playback account. The main owner should run the local terminal session generator, register its alias with /accounts, and approve this destination. Never send login codes or session strings to the bot.'));b.buttons([button('Account status','refresh_status')]);return finish(b);}
   function renderAssistantSessionStatus(health){const b=card('STREAMING ENGINE STATUS',health?.ready?'Account pool ready':'Voice engine not ready');b.paragraph(rt.text(`Mode · ${health?.mode==='bot_token'?'Bot Direct (unsupported for playback)':health?.mode==='assistant_user'?'Assistant Userbot (legacy)':health?.mode||'offline'}\nActive calls · ${health?.active_calls_count||0}`));b.paragraph(rt.text('Owner setup: /accounts list. Registration is local-terminal only.'));return finish(b);}
-  async function error(ctx,e){return ctx.api.sendMessage(ctx.chatId,e instanceof MusicError?e.message:'The music operation could not finish. Check account health or try again later.');}
+  async function error(ctx,e){const sent=await ctx.api.sendMessage(ctx.chatId,e instanceof MusicError?e.message:'The music operation could not finish. Check account health or try again later.');temporary.remember(ctx,sent,{ttlMs:60000});return sent;}
   async function search(ctx,query,mode='queue'){
     if(!query)return prompt(ctx,mode);
     const pending=await ctx.api.sendMessage(ctx.chatId,'Finding your tracks…');
-    try{const s=await app.music.startSearch(ctx,query,mode);s.messageId=pending.message_id;await ctx.api.editMessageRich(ctx.chatId,s.messageId,renderSearch(s));return s;}
-    catch(e){await ctx.api.editMessageText(ctx.chatId,pending.message_id,e instanceof MusicError?e.message:'Search failed. Try a different title and artist.');}
+    const temporaryToken=temporary.remember(ctx,pending);
+    try{const s=await app.music.startSearch(ctx,query,mode);s.messageId=pending.message_id;s.temporaryToken=temporaryToken;await ctx.api.editMessageRich(ctx.chatId,s.messageId,renderSearch(s));return s;}
+    catch(e){await ctx.api.editMessageText(ctx.chatId,pending.message_id,e instanceof MusicError?e.message:'Search failed. Try a different title and artist.');temporary.keep(temporaryToken);temporary.remember(ctx,pending,{ttlMs:60000});}
   }
   async function prompt(ctx,mode){
-    const sent=await ctx.api.sendMessage(ctx.chatId,`Send a track title and artist${Number(ctx.chatId)<0?' as a reply to this message':''}. /cancel closes this search.`,{reply_markup:{force_reply:true,selective:true},reply_to_message_id:ctx.message?.message_id});
-    await app.sm.transition(ctx.tgId,States.MUSIC_QUEUE_INPUT,{chatId:ctx.chatId,context:{mode,botKey:app.music.botKey(ctx),promptMessageId:sent.message_id}});
+    if(['queue','video'].includes(mode))app.music.destination?.(ctx);
+    if(app.sm.state(ctx.tgId)===States.MUSIC_QUEUE_INPUT)await app.sm.reset(ctx.tgId);
+    const group=Number(ctx.chatId)<0, name=cut(ctx.user?.first_name||'Music request',40);
+    const text=`${group?`${name}, `:''}send a track title and artist${group?' as a reply to this message':''}. /cancel closes this search.`;
+    const sent=await ctx.api.sendMessage(ctx.chatId,text,{reply_markup:{force_reply:true,selective:true},
+      ...(group?{entities:[{type:'text_mention',offset:0,length:name.length,user:{id:Number(ctx.tgId),is_bot:false,first_name:name}}]}:{}),
+      ...(ctx.message?.from?.id===Number(ctx.tgId)?{reply_to_message_id:ctx.message.message_id}:{})});
+    const temporaryToken=temporary.remember(ctx,sent,{ttlMs:120000});
+    try{await app.sm.transition(ctx.tgId,States.MUSIC_QUEUE_INPUT,{chatId:ctx.chatId,timeoutMs:120000,context:{mode,botKey:app.music.botKey(ctx),promptMessageId:sent.message_id,temporaryToken}});}catch(e){await temporary.remove(temporaryToken);throw e;}
     return sent;
   }
   async function showAccounts(ctx){
@@ -108,23 +143,33 @@ export function createMusicScreen({ app }) {
   }
   async function handle(ctx,action,args=[]){
     try{
-      if(action==='prompt')return prompt(ctx,args[0]||'queue');
-      if(action==='openplayer')return app.music.player(ctx);
+      if(action==='prompt')return await prompt(ctx,args[0]||'queue');
+      if(action==='openplayer')return await app.music.player(ctx);
       if(['pick','spage','sclear','submit'].includes(action)){
         const [token,revision,index]=args;
         let state;
         await app.music.search.action(token,revision,ctx,async s=>{state=s;if(action==='spage')await app.music.search.page(s,Number(index));
           if(action==='pick'){const t=s.pages[s.index].items[Number(index)];if(!t)throw new MusicError('INVALID_SELECTION','That track is unavailable.');if(s.selected.has(t.id))s.selected.delete(t.id);else{if(['download','lyrics'].includes(s.mode))s.selected.clear();if(s.selected.size>=20)throw new MusicError('SELECTION_LIMIT','Select up to 20 tracks per batch.');s.selected.set(t.id,t);}}
-          if(action==='sclear')s.selected.clear();if(action==='submit')await app.music.submit(ctx,s);
+          if(action==='sclear')s.selected.clear();
+          if(action==='submit'){
+            temporary.hold(s.temporaryToken);
+            try{await app.music.submit(ctx,s);}
+            finally{
+              if(s.consumed&&s.mode==='download')temporary.keep(s.temporaryToken);
+              else if(s.consumed&&s.mode!=='lyrics')await temporary.remove(s.temporaryToken);
+              else temporary.expire(s.temporaryToken,Math.max(1000,(s.expires||Date.now()+60000)-Date.now()));
+            }
+          }
         });
-        if(state.consumed&&state.mode==='lyrics')await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,renderStandaloneLyrics(state.lyricsTrack,state.lyricsResult));
-        else if(state.consumed)await ctx.api.editMessageText(ctx.chatId,ctx.messageId,state.mode==='download'?'Audio delivered.':'Selection added. Open /player for playback status.');
+        if(state.consumed&&state.mode==='lyrics'){await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,renderStandaloneLyrics(state.lyricsTrack,state.lyricsResult));temporary.keep(state.temporaryToken);}
+        else if(state.consumed&&state.mode==='download')temporary.keep(state.temporaryToken);
+        else if(state.consumed)await temporary.remove(state.temporaryToken);
         else await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,renderSearch(state));return;
       }
       if(action==='refresh_status'){if(!app.music.owner(ctx)||Number(ctx.chatId)<0)throw new MusicError('OWNER_ONLY','Account health is available to the main owner in private chat.');const health=await app.voiceClient.checkHealth();return ctx.api.editMessageRich(ctx.chatId,ctx.messageId,renderAssistantSessionStatus(health));}
       if(action==='link_assistant')throw new MusicError('TERMINAL_SETUP','Telegram login-code collection has been retired. Use the protected local terminal generator.');
-      if(action==='accounts')return app.music.control(ctx,'accounts',args);
-      if(action==='volume')return app.music.control(ctx,'volume',args);
+      if(action==='accounts')return await app.music.control(ctx,'accounts',args);
+      if(action==='volume')return await app.music.control(ctx,'volume',args);
       await app.music.control(ctx,action,args);
     }catch(e){await error(ctx,e);}
   }
@@ -161,12 +206,12 @@ export function createMusicScreen({ app }) {
     return ctx.api.sendMessage(ctx.chatId,`Playlist ${action} completed · ${name}`);
   }
   function registerStateHandlers(sm){
-    sm.register(States.MUSIC_QUEUE_INPUT,{onMessage:async(ctx,message)=>{
+    sm.register(States.MUSIC_QUEUE_INPUT,{onCleanup:ctx=>temporary.remove(ctx.context?.temporaryToken),onMessage:async(ctx,message)=>{
       const record=sm.get(ctx.tgId);if(Number(record.chatId)!==Number(ctx.chatId)||record.context.botKey!==app.music.botKey(ctx))return false;
       if(!message.text||(Number(ctx.chatId)<0&&message.reply_to_message?.message_id!==record.context.promptMessageId))return false;const mode=record.context.mode;await sm.reset(ctx.tgId);await search(ctx,message.text,mode);return true;
     }});
     // Recover persisted legacy login flows safely; never accept or forward their secrets.
     for(const state of [States.ASSISTANT_AUTH_PHONE,States.ASSISTANT_AUTH_CODE,States.ASSISTANT_AUTH_2FA])sm.register(state,{onMessage:async(ctx,message)=>{if(message.message_id)await ctx.api?.deleteMessage(ctx.chatId,message.message_id).catch(()=>{});await sm.reset(ctx.tgId);await ctx.api?.sendMessage(ctx.chatId,'Session setup now uses the protected local terminal. Never send login codes or passwords here.');return true;}});
   }
-  return{id,renderHome,renderPlayer,renderQueue,renderVolumePicker,renderSearch,renderLyrics,renderAccounts,renderSessionSetupNotice,renderAssistantSessionStatus,registerStateHandlers,handle,handleCommand,search,async open(ctx){return ctx.api.sendRichMessage(ctx.chatId,renderHome());}};
+  return{id,renderHome,renderListen,renderOptions,renderPlayer,renderQueue,renderVolumePicker,renderSearch,renderLyrics,renderAccounts,renderSessionSetupNotice,renderAssistantSessionStatus,registerStateHandlers,handle,handleCommand,search,cleanup:()=>temporary.shutdown(),async open(ctx){return ctx.api.sendRichMessage(ctx.chatId,renderHome());}};
 }

@@ -356,6 +356,8 @@ export class LancyApp {
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
     await this.musicQueueManager?.shutdown();
+    await this.music?.previews?.shutdown();
+    await this.screens.get('music')?.cleanup?.();
     await this.musicLibrary?.shutdown();
     await this.voiceClient?.stopDaemon();
     await this.videoServer?.stop().catch(() => {});
