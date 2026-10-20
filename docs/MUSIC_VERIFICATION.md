@@ -10,9 +10,9 @@ The production checkout contains unrelated preexisting changes. They were **not*
 
 | Check | Latest result |
 |---|---|
-| Targeted Node feature/routing/lifecycle suite on VPS | **91 passed, 0 failed** |
+| Targeted Node feature/routing/lifecycle suite on VPS | **92 passed, 0 failed** |
 | Python bridge suite on VPS | **18 passed, 0 failed** |
-| Full VPS regression | **463 total: 460 passed, 1 failed, 2 cancelled**, 45479 ms |
+| Full VPS regression | **464 total: 461 passed, 1 failed, 2 cancelled**, 45562 ms |
 | Installed-library / real FFmpeg probe | Neutral audio, bass audio, video+audio+bass, video seek offset and empty idle-stream conversion passed |
 | Installed Python versions | py-tgcalls 3.0.0; ntgcalls 3.0.4; pyrogrammod 2.4.1; aiohttp 3.14.5; python-dotenv 1.2.4; TgCrypto 1.2.5 |
 | Original preserved dirty-source baseline | 413 total: 401 passed, 9 failed, 3 cancelled |
