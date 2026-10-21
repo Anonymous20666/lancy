@@ -15,22 +15,24 @@ export function publicIPv4(ip) {
   return p.length === 4 && p.every(n => Number.isInteger(n) && n >= 0 && n <= 255) && ![0,10,127].includes(p[0]) && !(p[0] === 169 && p[1] === 254) && !(p[0] === 172 && p[1] >= 16 && p[1] <= 31) && !(p[0] === 192 && p[1] === 168) && !(p[0] === 100 && p[1] >= 64 && p[1] <= 127) && p[0] < 224 && !(p[0] === 198 && [18,19].includes(p[1]));
 }
 /** Pin DNS results into the TLS connection. Redirects are revalidated; no private networking. */
-export async function boundedFetchFile(url, path, maxBytes, redirects = 0) {
+export async function boundedFetchFile(url, path, maxBytes, redirects = 0, { signal } = {}) {
+  signal?.throwIfAborted();
   if (redirects > 4) throw new MusicError('REDIRECT_LIMIT', 'Media redirected too many times.');
   const u = new URL(url);
   if (u.protocol !== 'https:' || u.username || u.password || (u.port && u.port !== '443')) throw new MusicError('UNSAFE_SOURCE', 'Unsafe media source.');
   const addresses = await lookup(u.hostname, { all: true, family: 4 });
+  signal?.throwIfAborted();
   if (!addresses.length || addresses.some(a => !publicIPv4(a.address))) throw new MusicError('UNSAFE_SOURCE', 'Private media sources are not accepted.');
   const response = await new Promise((ok, reject) => {
-    const req = https.get(u, { lookup: (_host, options, cb) => cb(null, ...(options?.all ? [[addresses[0]]] : [addresses[0].address, 4])), headers: { 'User-Agent': 'Lancy/1.0' } }, ok);
+    const req = https.get(u, { signal, lookup: (_host, options, cb) => cb(null, ...(options?.all ? [[addresses[0]]] : [addresses[0].address, 4])), headers: { 'User-Agent': 'Lancy/1.0' } }, ok);
     req.setTimeout(30000, () => req.destroy(new Error('Media request timeout'))); req.on('error', reject);
   });
-  if ([301,302,303,307,308].includes(response.statusCode)) { response.resume(); return boundedFetchFile(new URL(response.headers.location, u).href, path, maxBytes, redirects + 1); }
+  if ([301,302,303,307,308].includes(response.statusCode)) { response.resume(); return boundedFetchFile(new URL(response.headers.location, u).href, path, maxBytes, redirects + 1, { signal }); }
   if (response.statusCode !== 200 || Number(response.headers['content-length']) > maxBytes) { response.destroy(); throw new MusicError('DOWNLOAD_FAILED', 'The provider could not deliver a file within the size limit.'); }
   let bytes = 0;
   const bound = new Transform({ transform(chunk, _, cb) { bytes += chunk.length; cb(bytes > maxBytes ? new MusicError('FILE_TOO_LARGE', 'The media file exceeds the size limit.') : null, chunk); } });
   const deadline = setTimeout(() => response.destroy(new Error('Download deadline exceeded')), 120000);
-  try { await pipeline(response, bound, createWriteStream(path, { mode: 0o600, flags: 'wx' })); } finally { clearTimeout(deadline); }
+  try { await pipeline(response, bound, createWriteStream(path, { mode: 0o600, flags: 'wx' }), { signal }); } finally { clearTimeout(deadline); }
 }
 export class MediaLibrary {
   constructor({ root, providers, ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', runner = exec, maxBytes = 48 * 1024 * 1024, quotaBytes = 512 * 1024 * 1024, ttlMs = 86400000 } = {}) {

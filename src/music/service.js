@@ -1,5 +1,6 @@
 import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
+import { originalPlayDelivery } from './originalPlayCard.js';
 import { isMusicOwner } from './accounts.js';
 import { KeyedLock, MusicError } from './model.js';
 import { checkChatMediaPermissions } from '../telegram/permissions.js';
@@ -56,9 +57,9 @@ export class MusicService {
       const track=[...s.selected.values()][0]; const media=await this.app.musicLibrary.acquire(track,{download:true});
       try {
         if(media.track.id!==track.id)throw new MusicError('TRACK_MISMATCH','The provider returned a different recording.');
-        const screen=this.app.screens.get('music');
-        const rich=screen.renderListen(media.track,'attach://music_full_audio');
-        const files=await audioUpload(media);
+        const lyrics=await Promise.resolve(this.lyrics?.get?.(media.track)).catch(()=>null);
+        const uploaded=await audioUpload(media);
+        const {rich,files}=await originalPlayDelivery({app:this.app,ctx,track:media.track,audio:uploaded.music_full_audio,lyrics,allowArtwork:permission?.canSendPhotos!==false});
         const sent=s.messageId && s.messageId===ctx.messageId
           ? await ctx.api.editMessageRich(ctx.chatId,s.messageId,rich,{},files)
           : await ctx.api.sendRichMessage(ctx.chatId,rich,{},files);

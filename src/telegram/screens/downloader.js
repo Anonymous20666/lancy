@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import sharp from 'sharp';
@@ -596,15 +597,16 @@ export function createDownloaderScreen({ app }) {
     pfpCurrentIndex = 0,
     pfpTotalCount = 0,
     targetGoal = null,
-    extraCount = 0
+    extraCount = 0,
+    canonicalMusic = null
   }) {
     const files = {};
     const b = new RichMessageBuilder();
 
-    const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result?.artist);
+    const isMusic = Boolean(canonicalMusic) || platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result?.artist);
     const videoCount = mediaItems.filter((m) => m.type === 'video').length;
     const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
-    const isMatchingPfp = Boolean(
+    const isMatchingPfp = !canonicalMusic && Boolean(
       result?.isMatchingPfp ||
       /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(title || '') ||
       /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(result?.sourceUrl || '') ||
@@ -759,14 +761,14 @@ export function createDownloaderScreen({ app }) {
       b.table(kvTable(pfpRows), { compact: true });
     } else if (isMusic) {
       const musicRows = [
-        ['📱 Platform', 'SPOTIFY / MUSIC ♡'],
+        ['📱 Platform', canonicalMusic?.platform || 'SPOTIFY / MUSIC ♡'],
         ['🎵 Title', truncate(result?.title || title, 40)],
         ['🎧 Artist', truncate(result?.artist || result?.author || 'Spotify', 36)]
       ];
       if (result?.album) musicRows.push(['💿 Album', truncate(result.album, 36)]);
       if (result?.year) musicRows.push(['📅 Release', String(result.year)]);
       if (result?.duration) musicRows.push(['⏱ Duration', String(result.duration)]);
-      musicRows.push(['📦 Audio Quality', 'High-Speed MP3 (192k) + Artwork ♡']);
+      musicRows.push(['📦 Audio Quality', canonicalMusic?.quality || 'High-Speed MP3 (192k) + Artwork ♡']);
       if (ctx?.isGroup) {
         musicRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
       }
@@ -894,6 +896,9 @@ export function createDownloaderScreen({ app }) {
         ]);
       }
     }
+
+    // Optional VC action is additive: never replace the original non-VC controls.
+    if (canonicalMusic?.queueButton) b.buttons([canonicalMusic.queueButton]);
 
     // 7. General Action Buttons
     const mediaRow = [
@@ -1914,6 +1919,35 @@ export function createDownloaderScreen({ app }) {
     executeLyricsSearch,
     saveAlbum,
     getAlbum,
+    // Presentation adapter only. Resolution/download rights and exact recording identity
+    // remain enforced by MusicService/MediaLibrary, not the legacy search pipeline.
+    async renderRecordingCard({ctx, track, audio, artwork = null, lyrics = null, queueButton = null}) {
+      if (!Buffer.isBuffer(audio?.buffer)) throw new TypeError('A complete audio attachment is required.');
+      const audioKey = randomBytes(12).toString('hex');
+      const imageKey = artwork ? randomBytes(12).toString('hex') : null;
+      const meta = {
+        title: track.title, performer: track.artist || 'Artist not supplied',
+        duration: Math.floor(track.durationSeconds || 0) || undefined,
+        filename: audio.filename, album: track.album || null, year: track.year || null,
+        platform: String(track.provider || 'Music').toUpperCase(),
+        quality: `Full-song MP3${artwork ? ' + Artwork ♡' : ''}`,
+        requestedBy: ctx.isGroup ? ctx.user?.first_name || 'Member' : null
+      };
+      saveTrackAudio(audioKey, audio.buffer, meta, artwork?.buffer);
+      const mediaItems = artwork ? [{type:'photo', ...artwork}] : [];
+      if (imageKey) saveMediaImages(imageKey, mediaItems);
+      const lyricText = lyrics?.found
+        ? lyrics.instrumental ? 'Instrumental recording.' : [...String(lyrics.text || '')].slice(0, process.env.MUSIC_LYRICS_FULL_TEXT === 'true' ? 1800 : 200).join('')
+        : lyrics?.reason || 'No reliable matched lyrics available.';
+      return buildDeliveryRichMessage({
+        ctx, platform: track.provider || 'Music', title: track.title,
+        result: {title:track.title, artist:track.artist || 'Artist not supplied', album:track.album, year:track.year,
+          duration:track.durationSeconds ? `${Math.floor(track.durationSeconds / 60)}:${String(Math.floor(track.durationSeconds % 60)).padStart(2,'0')}` : null},
+        audioTrack: {...audio, title:meta.title, performer:meta.performer, duration:meta.duration},
+        mediaItems, imageKey, audioKey, lyrics:lyricText,
+        canonicalMusic: {platform:meta.platform, quality:`Full-song MP3${artwork ? ' + Artwork ♡' : ''}`, queueButton}
+      });
+    },
     async open(ctx) {
       return ctx.editScreen(renderMainMenu(ctx));
     },
@@ -2446,7 +2480,7 @@ export function createDownloaderScreen({ app }) {
             (meta.album ? `💿 <b>Album:</b> ${escapeHtml(meta.album)}\n` : '') +
             (meta.year ? `📅 <b>Release:</b> ${escapeHtml(String(meta.year))}\n` : '') +
             (meta.duration ? `⏱ <b>Duration:</b> ${Math.floor(meta.duration / 60)}:${String(meta.duration % 60).padStart(2, '0')}\n` : '') +
-            `📦 <b>Audio Quality:</b> High-Speed MP3 (192k) + Artwork ♡` +
+            `📦 <b>Audio Quality:</b> ${escapeHtml(meta.quality || 'High-Speed MP3 (192k) + Artwork ♡')}` +
             (meta.requestedBy ? `\n👤 <b>Requested By:</b> ${escapeHtml(meta.requestedBy)}` : '') +
             `</blockquote>`;
 
