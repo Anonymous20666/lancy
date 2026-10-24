@@ -1333,6 +1333,8 @@ export class MediaDownloader {
       const queryTerms = clean.toLowerCase().split(/\s+/).filter(Boolean);
       const wantsLongMix = /\b(mix|compilation|full\s*album|album|1\s*hour|2\s*hour|3\s*hour|10\s*hour|1hr|2hr|3hr|10hr|hours|extended|continuous|medley|playlist|podcast|lofi|lo-fi)\b/i.test(clean);
 
+      onProgress?.(`Searching source & metadata for "${clean}"… ♡`);
+
       // Fast concurrent search via InnerTube (NG + US wide) + Deezer + iTunes
       const [fastItemsResult, deezerResult, itunesResult] = await Promise.allSettled([
         searchYouTubeFast(clean, 'NG', { wide: true }),
@@ -1406,6 +1408,7 @@ export class MediaDownloader {
         if (initialClean.artist) trackAuthor = initialClean.artist;
       }
 
+      onProgress?.(`Resolving media match: "${trackTitle}" — ${trackAuthor}… ♡`);
       onProgress?.(`Downloading full audio track for "${trackTitle}"… ♡`);
 
       // Pre-fetch thumbnail in background while audio downloads
@@ -1512,26 +1515,29 @@ export class MediaDownloader {
         }
       }
 
-      // Layer 3: YouTube via SOCKS5 proxy fallback
+      // Layer 3: YouTube via SOCKS5 proxy fallback (only when local proxy port is reachable)
       if (!downloaded) {
         try {
-          await execFileAsync('yt-dlp', [
-            '--no-warnings',
-            '--no-playlist',
-            '--proxy', 'socks5h://127.0.0.1:9000',
-            ...cookieArgs,
-            '-N', '8',
-            '--max-filesize', '48M',
-            '--js-runtimes', 'node:/usr/bin/node',
-            '-f', 'ba/b',
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '2',
-            '-P', tempDir,
-            '-o', '%(title).60s.%(ext)s',
-            `ytsearch1:${clean}`
-          ], { timeout: 40000 });
-          if (await getValidAudioFile()) downloaded = true;
+          const { isProxyReachable } = await import('./musicResolver.js');
+          if (await isProxyReachable('socks5h://127.0.0.1:9000')) {
+            await execFileAsync('yt-dlp', [
+              '--no-warnings',
+              '--no-playlist',
+              '--proxy', 'socks5h://127.0.0.1:9000',
+              ...cookieArgs,
+              '-N', '8',
+              '--max-filesize', '48M',
+              '--js-runtimes', 'node:/usr/bin/node',
+              '-f', 'ba/b',
+              '-x',
+              '--audio-format', 'mp3',
+              '--audio-quality', '2',
+              '-P', tempDir,
+              '-o', '%(title).60s.%(ext)s',
+              `ytsearch1:${clean}`
+            ], { timeout: 40000 });
+            if (await getValidAudioFile()) downloaded = true;
+          }
         } catch (proxyErr) {
           this.log.warn({ err: proxyErr.message }, 'YouTube proxy download failed, trying SoundCloud fallback');
         }
@@ -1559,13 +1565,22 @@ export class MediaDownloader {
         }
       }
 
-      // Layer 5: multi-source resolver — YouTube via residential proxy,
+      // Layer 5: multi-source resolver — YouTube via residential proxy (if reachable),
       // JioSaavn (320k), Audius. Duration-validated, previews can't pass.
       if (!downloaded) {
         try {
           const { resolveAndDownloadAudio } = await import('./musicResolver.js');
           const resolvedPath = join(tempDir, 'resolved.mp3');
-          const resolved = await resolveAndDownloadAudio({ query: clean, trackId: videoId || null, tempPath: resolvedPath, minSeconds: 45 });
+          const preMeta = bestSp ? { title: trackTitle, artist: trackAuthor } : null;
+          const resolved = await resolveAndDownloadAudio({
+            query: clean,
+            trackId: videoId || null,
+            tempPath: resolvedPath,
+            minSeconds: 45,
+            meta: preMeta,
+            skipYouTube: true,
+            onProgress
+          });
           if (resolved.ok) {
             onProgress?.(`Got full track via ${resolved.source} ♡`);
             this.log?.info?.({ query: clean, source: resolved.source }, 'multi-source resolver delivered full track');
@@ -1589,6 +1604,8 @@ export class MediaDownloader {
       const finalClean = cleanSongMetadata(trackTitle, trackAuthor);
       if (finalClean.title) trackTitle = finalClean.title;
       if (finalClean.artist) trackAuthor = finalClean.artist;
+
+      onProgress?.(`Processing audio & tagging "${trackTitle}"… ♡`);
 
       const [coverBuf, audioBuf] = await Promise.all([
         coverPromise.then(async (buf) => {

@@ -767,6 +767,7 @@ export class GameEngine extends EventEmitter {
         this.sessions.delete(session.chatId);
       }
     }, ms);
+    session.timerHandle?.unref?.();
   }
 
   /**
@@ -2030,6 +2031,8 @@ export class GameEngine extends EventEmitter {
       question.revealedTiles = [4, Math.floor(Math.random() * 4) * 2];
     }
 
+    if (session.isStopped || this.sessions.get(session.chatId) !== session) return;
+
     session.currentQuestion = question;
     session.roundStartTime = Date.now();
 
@@ -2037,6 +2040,8 @@ export class GameEngine extends EventEmitter {
       stage: 0,
       bannerStatus: '⏱️ 30s Smart Timer • Type your answer in chat or use the buttons below! ♡'
     });
+
+    if (session.isStopped || this.sessions.get(session.chatId) !== session) return;
 
     let sent = null;
     if (typeof this.api.sendRichMessage === 'function') {
@@ -2051,6 +2056,12 @@ export class GameEngine extends EventEmitter {
     } else if (typeof this.api.sendMessage === 'function') {
       sent = await this.api.sendMessage(session.chatId, payload?.text || 'Round Start').catch(() => null);
     }
+    if (session.isStopped || this.sessions.get(session.chatId) !== session) {
+      if (sent?.message_id) {
+        this.api.deleteMessage?.(session.chatId, sent.message_id)?.catch?.(() => {});
+      }
+      return;
+    }
     session.cardMessageId = sent?.message_id || null;
 
     // Smart Hint 1 at 10s elapsed (20s remaining)
@@ -2064,6 +2075,7 @@ export class GameEngine extends EventEmitter {
         bannerStatus: '⏱️ 20s remaining • 💡 Hint 1 Unlocked!'
       });
     }, 10_000);
+    session.hint1Timeout?.unref?.();
 
     // Smart Hint 2 at 20s elapsed (10s remaining)
     session.hint2Timeout = setTimeout(async () => {
@@ -2076,6 +2088,7 @@ export class GameEngine extends EventEmitter {
         bannerStatus: '⏱️ 10s remaining! • 🔥 Final Hint Unlocked!'
       });
     }, 20_000);
+    session.hint2Timeout?.unref?.();
 
     // Round Timeout at 30s
     session.timerHandle = setTimeout(async () => {
@@ -2112,6 +2125,7 @@ export class GameEngine extends EventEmitter {
 
       void this.#runNextRound(session);
     }, 30_000);
+    session.timerHandle?.unref?.();
   }
 
   #ensureQuestionOptions(q, roundMode) {

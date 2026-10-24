@@ -559,22 +559,40 @@ export function createDownloaderScreen({ app }) {
   }
 
   function renderDownloadProgress({ stage, platform, url, elapsedMs = 0, current = 0, total = 0, requester = null }) {
+    const isUrl = /^https?:\/\//i.test(String(url || ''));
     const b = new RichMessageBuilder();
-    b.header('𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪', 1);
-    b.paragraph(rt.italic('₊˚⊹♡  processing your media  ˙ᵕ˙'));
+    b.header(isUrl ? '𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪' : '𓆩♡𓆪 MUSIC DOWNLOADER 𓆩♡𓆪', 1);
+    b.paragraph(rt.italic(isUrl ? '₊˚⊹♡  processing your media  ˙ᵕ˙' : '₊˚⊹♡  searching & preparing your track  ˙ᵕ˙'));
     b.divider();
+
+    const s = String(stage || '');
+    let stageTrail = 'Searching source → Resolving media → Downloading → Processing audio → Delivering file';
+    if (/deliver|upload|send/i.test(s)) {
+      stageTrail = 'Searching source → Resolving media → Downloading → Processing audio → [Delivering file]';
+    } else if (/process|convert|transcod|tagging|tag\b/i.test(s)) {
+      stageTrail = 'Searching source → Resolving media → Downloading → [Processing audio] → Delivering file';
+    } else if (/download|fetch|grab/i.test(s)) {
+      stageTrail = 'Searching source → Resolving media → [Downloading] → Processing audio → Delivering file';
+    } else if (/^searching|analyz|look/i.test(s)) {
+      stageTrail = '[Searching source] → Resolving media → Downloading → Processing audio → Delivering file';
+    } else if (/resolv|match|extract|stream/i.test(s)) {
+      stageTrail = 'Searching source → [Resolving media] → Downloading → Processing audio → Delivering file';
+    } else {
+      stageTrail = '[Searching source] → Resolving media → Downloading → Processing audio → Delivering file';
+    }
 
     const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
     b.quote(rt.text(
       `⏳ Stage: ${stage}\n` +
-      `🔗 Link: ${truncate(url, 40)}\n` +
+      `🔄 Flow: ${stageTrail}\n` +
+      `${isUrl ? '🔗 Link' : '🎵 Track'}: ${truncate(url, 48)}\n` +
       (platform ? `📱 Platform: ${platform.toUpperCase()}\n` : '') +
       (total > 0 ? `📦 Items: ${current}/${total}\n` : '') +
       (requester ? `👤 Requested by: ${requester}\n` : '') +
       `⏱ Elapsed: ${elapsedSec}s ♡`
     ));
     b.divider();
-    b.paragraph(rt.italic('Fetching full quality files & extracting audio track… ♡'));
+    b.paragraph(rt.italic(isUrl ? 'Fetching full quality files & extracting audio track… ♡' : 'Resolving best legitimate match & preparing full audio track… ♡'));
     b.validate();
     return b.toJSON();
   }
@@ -814,6 +832,11 @@ export function createDownloaderScreen({ app }) {
           JSON.stringify(songMeta)
         );
       } catch {}
+      if (!canonicalMusic) {
+        audioActionRow.push(
+          richButton.callback('📜 Full Lyrics', encodeCallback(id, 'lyrics', lyricKey), { style: 'primary' })
+        );
+      }
     } else if (audioKey) {
       audioActionRow.push(
         richButton.callback('🎙️ Recognize Music / Identify Song', encodeCallback(id, 'identify', audioKey), { style: 'primary' })
@@ -960,10 +983,10 @@ export function createDownloaderScreen({ app }) {
   }
 
   async function executeDownload(ctx, url) {
-    if (app.music && !/^https?:\/\//i.test(String(url))) return app.screens.get('music')?.search(ctx, String(url), 'download');
     const isGroup = Boolean(ctx.isGroup);
     const forceNew = Boolean(ctx.forceNew);
     const api = ctx.api || app.telegram?.api;
+    const isMusicQuery = !/^https?:\/\//i.test(String(url || ''));
 
     // Pre-flight permission check for group chats to prevent entering download/retry loops
     // when admin permissions restrict non-admin bots from sending media.
@@ -1018,8 +1041,8 @@ export function createDownloaderScreen({ app }) {
     });
 
     await tracker.live((state, { elapsedMs }) => renderDownloadProgress({ ...state, elapsedMs, url, requester: requesterName }), {
-      stage: ctx.initialStage || 'Analyzing link & detecting platform…',
-      platform: '',
+      stage: ctx.initialStage || (isMusicQuery ? 'Searching source & resolving media…' : 'Analyzing link & detecting platform…'),
+      platform: isMusicQuery ? 'MUSIC' : '',
       url
     });
 
@@ -1031,7 +1054,7 @@ export function createDownloaderScreen({ app }) {
       });
 
       const { mediaItems = [], audioTrack = null, platform = 'Media', title = 'Downloaded Media' } = result;
-      tracker.set({ stage: 'Delivering media to chat…', platform, total: mediaItems.length, current: mediaItems.length });
+      tracker.set({ stage: 'Delivering file to chat…', platform, total: mediaItems.length, current: mediaItems.length });
 
       const hasVideo = mediaItems.some((m) => m.type === 'video');
       tracker.setAction(hasVideo ? 'upload_video' : 'upload_photo');
@@ -1800,7 +1823,6 @@ export function createDownloaderScreen({ app }) {
   }
 
   async function executeLyricsSearch(ctx, query) {
-    if(app.music)return app.screens.get('music')?.search(ctx,String(query||''),'lyrics');
     const cleanQuery = String(query || '').trim();
     if (!cleanQuery) return;
 
@@ -1952,8 +1974,6 @@ export function createDownloaderScreen({ app }) {
       return ctx.editScreen(renderMainMenu(ctx));
     },
     async handle(ctx, action, args) {
-      if(app.music&&['lyrics','searchLyrics'].includes(action))return app.screens.get('music')?.search(ctx,'','lyrics');
-      if (app.music && action === 'play') return app.screens.get('music')?.search(ctx, '', 'download');
       const fromMedia = Boolean(args?.includes('from_media') || ctx.fromMedia || ctx.forceNew);
       switch (action) {
         case 'open':

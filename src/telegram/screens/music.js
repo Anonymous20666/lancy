@@ -186,11 +186,11 @@ export function createMusicScreen({ app }) {
     try{
       if(['/play','/song'].includes(command)&&!args.length&&ctx.controller?.handleAudioRecognition&&[ctx.replyTo?.audio,ctx.replyTo?.voice,ctx.replyTo?.video,ctx.replyTo?.video_note].some(Boolean)){await ctx.controller.handleAudioRecognition(ctx,ctx.replyTo);return true;}
       if(command==='/lyrics'){
-        if(args.length)await search(ctx,args.join(' '),'lyrics');
+        if(args.length){if(app.screens?.get('downloader')?.executeLyricsSearch){await app.screens.get('downloader').executeLyricsSearch(ctx,args.join(' '),{forceNew:true});return true;}await search(ctx,args.join(' '),'lyrics');}
         else {let current=null;try{current=app.musicQueueManager.getSession(app.music.destination(ctx)).currentTrack;}catch{}if(current)await app.music.control(ctx,'lyrics',[]);else await search(ctx,'','lyrics');}
       }
-      else if(['/play','/song','/addq','/vplay','/stream','/vcplay','/vc'].includes(command)){await app.sm?.reset(ctx.tgId);await search(ctx,args.join(' '),['/play','/song'].includes(command)?'download':command==='/vplay'?'video':'queue');}
-      else if(command==='/music'){if(args.length)await search(ctx,args.join(' '),'download');else await ctx.api.sendRichMessage(ctx.chatId,renderHome());}
+      else if(['/play','/song','/addq','/vplay','/stream','/vcplay','/vc'].includes(command)){await app.sm?.reset(ctx.tgId);if(['/play','/song'].includes(command)&&args.length&&app.screens?.get('downloader')?.executeDownload){await app.screens.get('downloader').executeDownload(ctx,args.join(' '),{forceMusicSearch:true,forceNew:true});return true;}await search(ctx,args.join(' '),['/play','/song'].includes(command)?'download':command==='/vplay'?'video':'queue');}
+      else if(command==='/music'){if(args.length){if(app.screens?.get('downloader')?.executeDownload){await app.screens.get('downloader').executeDownload(ctx,args.join(' '),{forceMusicSearch:true,forceNew:true});return true;}await search(ctx,args.join(' '),'download');}else await ctx.api.sendRichMessage(ctx.chatId,renderHome());}
       else if(command==='/accounts'){const accounts=await app.music.accountCommand(ctx,args);await ctx.api.sendMessage(ctx.chatId,accounts.map(a=>`${a.alias} · ${a.status}${a.destination?` · ${a.destination}`:''}\nApproved: ${a.allowed.join(', ')||'none'}`).join('\n\n')||'No registered accounts. Generate one locally, then /accounts register <alias>.');}
       else if(['/session','/gensession','/authassistant','/linkassistant'].includes(command)){if(!app.music.owner(ctx)||Number(ctx.chatId)<0)throw new MusicError('OWNER_ONLY','Use /accounts in the main owner private chat.');await ctx.api.sendRichMessage(ctx.chatId,renderSessionSetupNotice());}
       else if(command==='/destination'||command==='/channel'){if(args[0]==='close'){const id=app.music.destination(ctx);await app.music.channelPanels.close(ctx,id);}else{const id=await app.music.bind(ctx,args[0]);await app.music.player(ctx,id);}}
@@ -232,7 +232,7 @@ export function createMusicScreen({ app }) {
     const text=musicText(ctx,message.text),[head,...rest]=text.split(/\s+/),command=head.split('@')[0].toLowerCase();
     if(head.startsWith('/')&&head.includes('@')&&head.split('@')[1].toLowerCase()!==ctx.api.me.username?.toLowerCase())return false;
     let mode='queue',query=text;
-    if(['/play','/song'].includes(command)||/^play\s+/i.test(text)){mode='download';query=command.startsWith('/')?rest.join(' '):text.replace(/^play\s+/i,'');}
+    if(['/play','/song'].includes(command)||/^play\s+/i.test(text)){mode='download';query=command.startsWith('/')?rest.join(' '):text.replace(/^play\s+/i,'');if(app.screens?.has('downloader')&&query.trim()){await app.screens.get('downloader').executeDownload(ctx,query.trim(),{forceMusicSearch:true,forceNew:true});return true;}}
     else if(['/addq','/vplay','/vcplay','/stream','/vc'].includes(command)){mode=command==='/vplay'?'video':'queue';query=rest.join(' ');}
     else if(/^(?:add(?:\s+(?:track|song))?|queue)\s+/i.test(text))query=text.replace(/^(?:add(?:\s+(?:track|song))?|queue)\s+/i,'');
     else if(command.startsWith('/')){if(!channelCommands.has(command))return false;try{await app.music.authorize(source,true);return await handleCommand(source,command,rest);}catch(e){await error(ctx,e);return true;}}

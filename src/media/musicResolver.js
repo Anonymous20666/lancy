@@ -12,6 +12,7 @@ import { createWriteStream, existsSync, statSync, unlinkSync, renameSync } from 
 import { createDecipheriv } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
+import { createConnection } from 'node:net';
 
 const execFileAsync = promisify(execFile);
 
@@ -26,6 +27,45 @@ const JIO_KEY = Buffer.from('38346591', 'utf8');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const wantsExplicit = (q) => /\b(explicit|18\+|uncensored|dirty|nsfw|x[- ]?rated)\b/i.test(String(q || ''));
+
+const metadataCache = new Map();
+const METADATA_TTL_MS = 10 * 60 * 1000;
+const proxyStatusCache = new Map();
+const PROXY_STATUS_TTL_MS = 60 * 1000;
+
+export async function isProxyReachable(proxyUrl, timeoutMs = 150) {
+    if (!proxyUrl) return false;
+    const now = Date.now();
+    const cached = proxyStatusCache.get(proxyUrl);
+    if (cached && now - cached.at < PROXY_STATUS_TTL_MS) {
+        return cached.ok;
+    }
+    let host = '127.0.0.1';
+    let port = 8888;
+    try {
+        const parsed = new URL(proxyUrl.replace(/^socks5h?:\/\//i, 'http://'));
+        host = parsed.hostname || '127.0.0.1';
+        port = Number(parsed.port) || 8888;
+    } catch {
+        return false;
+    }
+    const ok = await new Promise((resolve) => {
+        const socket = createConnection({ host, port });
+        let settled = false;
+        const finish = (val) => {
+            if (settled) return;
+            settled = true;
+            try { socket.destroy(); } catch {}
+            resolve(val);
+        };
+        socket.setTimeout(timeoutMs);
+        socket.once('connect', () => finish(true));
+        socket.once('timeout', () => finish(false));
+        socket.once('error', () => finish(false));
+    });
+    proxyStatusCache.set(proxyUrl, { ok, at: now });
+    return ok;
+}
 
 /** ── metadata (title/artist/explicit/duration) ─────────────────────── */
 async function deezerMatch(query) {
@@ -53,8 +93,23 @@ async function itunesMatch(query) {
 }
 
 export async function resolveMetadata(query) {
+    const cacheKey = String(query || '').trim().toLowerCase();
+    if (!cacheKey) return null;
+    const now = Date.now();
+    const cached = metadataCache.get(cacheKey);
+    if (cached && now - cached.at < METADATA_TTL_MS) {
+        return cached.value;
+    }
     const [dz, it] = await Promise.all([deezerMatch(query), itunesMatch(query)]);
-    return ((dz?.duration ?? 0) >= 45 ? dz : (it ?? dz)) ?? null;
+    const value = ((dz?.duration ?? 0) >= 45 ? dz : (it ?? dz)) ?? null;
+    if (value) {
+        metadataCache.set(cacheKey, { value, at: now });
+        if (metadataCache.size > 300) {
+            const firstKey = metadataCache.keys().next().value;
+            metadataCache.delete(firstKey);
+        }
+    }
+    return value;
 }
 
 /** ── source 1: YouTube via residential proxy ───────────────────────── */
@@ -68,7 +123,16 @@ async function ytDlpMp3(url, tempPath, { minSeconds = 45, timeoutMs = 90000 } = 
         '-f', 'ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '2',
         '-o', tempPath, url,
     ], { timeout: timeoutMs });
-    try { await run(RESIDENTIAL_PROXY); } catch { await sleep(800); await run(null); }
+    if (await isProxyReachable(RESIDENTIAL_PROXY)) {
+        try {
+            await run(RESIDENTIAL_PROXY);
+        } catch {
+            await sleep(400);
+            await run(null);
+        }
+    } else {
+        await run(null);
+    }
     return existsSync(tempPath) && statSync(tempPath).size > 20000;
 }
 
@@ -191,37 +255,51 @@ async function durationOf(file, ffmpeg = 'ffmpeg') {
  * Resolve + download a FULL track as MP3.
  * Returns { ok, source, meta }.
  */
-export async function resolveAndDownloadAudio({ query, trackId, tempPath, ffmpegPath = 'ffmpeg', minSeconds = 45 }) {
-    const meta = await resolveMetadata(query);
+export async function resolveAndDownloadAudio({
+    query,
+    trackId,
+    tempPath,
+    ffmpegPath = 'ffmpeg',
+    minSeconds = 45,
+    meta: preResolvedMeta = undefined,
+    skipYouTube = false,
+    onProgress = null
+}) {
+    onProgress?.('Searching source & resolving metadata… ♡');
+    const meta = preResolvedMeta !== undefined ? preResolvedMeta : await resolveMetadata(query);
     const rawQuery = String(query ?? '').replace(/\.mp3$/i, '').replace(/_/g, ' ').trim();
     const searchQuery = meta ? `${meta.artist} ${meta.title}`.trim() : rawQuery;
     const attempts = [];
 
-    if (trackId && /^[a-zA-Z0-9_-]{11}$/.test(trackId)) {
-        attempts.push({ name: 'youtube-id', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${trackId}`, tempPath, { minSeconds }) });
-    } else {
-        // exact metadata title+artist first (best for long-tail/meme tracks)
-        if (meta) {
-            const ytIdMeta = await ytSearchId(searchQuery, minSeconds);
-            if (ytIdMeta) attempts.push({ name: 'youtube-search', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdMeta}`, tempPath, { minSeconds }) });
+    const proxyUp = await isProxyReachable(RESIDENTIAL_PROXY);
+    if (!skipYouTube || proxyUp) {
+        if (trackId && /^[a-zA-Z0-9_-]{11}$/.test(trackId)) {
+            attempts.push({ name: 'youtube-id', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${trackId}`, tempPath, { minSeconds }) });
+        } else {
+            if (meta) {
+                const ytIdMeta = await ytSearchId(searchQuery, minSeconds);
+                if (ytIdMeta) attempts.push({ name: 'youtube-search', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdMeta}`, tempPath, { minSeconds }) });
+            }
+            const ytIdRaw = await ytSearchId(rawQuery, minSeconds);
+            if (ytIdRaw) attempts.push({ name: 'youtube-search-raw', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdRaw}`, tempPath, { minSeconds }) });
         }
-        const ytIdRaw = await ytSearchId(rawQuery, minSeconds);
-        if (ytIdRaw) attempts.push({ name: 'youtube-search-raw', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdRaw}`, tempPath, { minSeconds }) });
-    }
 
-    attempts.push({
-        name: 'youtube-direct',
-        run: async () => {
-            if (meta && (await ytDlpMp3(`ytsearch3:${searchQuery}`, tempPath, { minSeconds }))) return true;
-            return ytDlpMp3(`ytsearch3:${rawQuery || searchQuery}`, tempPath, { minSeconds });
-        },
-    });
+        attempts.push({
+            name: 'youtube-direct',
+            run: async () => {
+                if (meta && (await ytDlpMp3(`ytsearch3:${searchQuery}`, tempPath, { minSeconds }))) return true;
+                return ytDlpMp3(`ytsearch3:${rawQuery || searchQuery}`, tempPath, { minSeconds });
+            },
+        });
+    }
 
     attempts.push({
         name: 'jiosaavn',
         run: async () => {
-            const t = await jiosaavnPick(rawQuery);
+            onProgress?.(`Resolving media on JioSaavn for "${searchQuery || rawQuery}"… ♡`);
+            const t = await jiosaavnPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await jiosaavnPick(rawQuery) : null);
             if (!t) return false;
+            onProgress?.(`Downloading full track "${t.title}"… ♡`);
             const ok = await jiosaavnDownload(t, tempPath);
             if (ok) {
                 try {
@@ -234,16 +312,20 @@ export async function resolveAndDownloadAudio({ query, trackId, tempPath, ffmpeg
         },
     });
 
-    attempts.push({
-        name: 'soundcloud',
-        run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 75000 }),
-    });
+    if (!skipYouTube) {
+        attempts.push({
+            name: 'soundcloud',
+            run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 75000 }),
+        });
+    }
 
     attempts.push({
         name: 'audius',
         run: async () => {
-            const t = await audiusPick(searchQuery || rawQuery);
+            onProgress?.(`Resolving media on Audius for "${searchQuery || rawQuery}"… ♡`);
+            const t = await audiusPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await audiusPick(rawQuery) : null);
             if (!t) return false;
+            onProgress?.(`Downloading full track "${t.title}"… ♡`);
             const ok = await audiusDownload(t, tempPath);
             if (ok) {
                 try {
@@ -259,6 +341,7 @@ export async function resolveAndDownloadAudio({ query, trackId, tempPath, ffmpeg
     for (const attempt of attempts) {
         try {
             if (!(await attempt.run())) continue;
+            onProgress?.('Processing audio & verifying track duration… ♡');
             const dur = await durationOf(tempPath, ffmpegPath);
             if (dur !== null && dur < minSeconds) {
                 try { unlinkSync(tempPath); } catch {}

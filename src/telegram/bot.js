@@ -1486,7 +1486,9 @@ export class TelegramController extends EventEmitter {
       }
 
       // Ensure we have enough items in the pool for the requested offset + PAGE_SIZE
-      while (cached.items.length < (numOffset + PAGE_SIZE) && cached.combosTried < combos.length) {
+      let safetyLoops = 0;
+      while (cached.items.length < (numOffset + PAGE_SIZE) && cached.combosTried < combos.length && safetyLoops < 12) {
+        safetyLoops++;
         let res = null;
         if (cached.bookmark) {
           const bm = cached.bookmark;
@@ -1503,6 +1505,7 @@ export class TelegramController extends EventEmitter {
         }
         if (res?.items?.length) {
           const seen = new Set(cached.items.map((i) => i.mediaUrl || i.pinId));
+          let addedInPass = 0;
           for (const item of res.items) {
             const key = item.mediaUrl || item.pinId;
             if (item.pinId && seenPins.has(item.pinId)) continue;
@@ -1510,7 +1513,12 @@ export class TelegramController extends EventEmitter {
             if (key && !seen.has(key)) {
               seen.add(key);
               cached.items.push(item);
+              addedInPass++;
             }
+          }
+          if (addedInPass === 0) {
+            cached.bookmark = null;
+            cached.combosTried++;
           }
         } else {
           cached.combosTried++;
@@ -3674,12 +3682,21 @@ export class TelegramController extends EventEmitter {
       // without the composition-root music service (backward-compatible test/extensions).
       if (this.app?.music) {
         const musicScreen = this.screens.get('music');
-        if (await musicScreen?.handleCommand?.(this.#ctx(tgId, { message }, { forceNew: true }), command, rest)) return;
+        const hasDownloader = this.screens.has('downloader');
+        const isOneStepDownloadOrLyricsCmd =
+          hasDownloader &&
+          (command === '/play' || command === '/song' || command === '/music' || (command === '/lyrics' && rest.length > 0));
+        if (!isOneStepDownloadOrLyricsCmd) {
+          if (await musicScreen?.handleCommand?.(this.#ctx(tgId, { message }, { forceNew: true }), command, rest)) return;
+        }
         if (command === '/lyrics' && rest.length === 0) {
-          const musicCtx = this.#ctx(tgId, { message });
-          try { await this.app.music.player(musicCtx); await this.app.music.control({ ...musicCtx, messageId: null, query: null }, 'lyrics'); }
-          catch (e) { await this.api.sendMessage(chatId, e.code ? e.message : 'Lyrics are currently unavailable.'); }
-          return;
+          const activeVcSession = this.app.musicQueueManager?.sessions?.get(Number(chatId));
+          if (!hasDownloader || activeVcSession?.currentTrack) {
+            const musicCtx = this.#ctx(tgId, { message });
+            try { await this.app.music.player(musicCtx); await this.app.music.control({ ...musicCtx, messageId: null, query: null }, 'lyrics'); }
+            catch (e) { await this.api.sendMessage(chatId, e.code ? e.message : 'Lyrics are currently unavailable.'); }
+            return;
+          }
         }
       }
 
@@ -4373,7 +4390,13 @@ export class TelegramController extends EventEmitter {
       const isReplyToBot = isReplyToThisBot;
       if (this.app?.music && isGroup && isReplyToThisBot && /^play(?:\s|$)/i.test(text)) {
         const musicCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate: false, isReplyToBot: true });
-        await this.screens.get('music')?.search(musicCtx, text.replace(/^play\s*/i, ''), 'download');
+        const query = text.replace(/^play\s*/i, '').trim();
+        const downloaderScreen = this.screens.get('downloader');
+        if (downloaderScreen?.executeDownload && query) {
+          await downloaderScreen.executeDownload(musicCtx, query);
+        } else {
+          await this.screens.get('music')?.search(musicCtx, query, 'download');
+        }
         return;
       }
 
@@ -5776,7 +5799,38 @@ export class TelegramController extends EventEmitter {
     if (typeof this.api.sendRichMessage === 'function') {
       return await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
     }
-    return await this.api.sendMessage(chatId, 'Command Suggestions').catch(() => {});
+    const richJson = b.toJSON();
+    const inlineKeyboard = (richJson.blocks || [])
+      .filter((blk) => blk.type === 'buttons' && Array.isArray(blk.buttons))
+      .map((blk) =>
+        blk.buttons.map((btn) => {
+          const item = { text: typeof btn.text === 'string' ? btn.text : String(btn.text || '') };
+          if (btn.callback_data) item.callback_data = btn.callback_data;
+          if (btn.url) item.url = btn.url;
+          if (btn.switch_inline_query !== undefined) item.switch_inline_query = btn.switch_inline_query;
+          if (btn.switch_inline_query_current_chat !== undefined) item.switch_inline_query_current_chat = btn.switch_inline_query_current_chat;
+          if (btn.style) item.style = btn.style;
+          return item;
+        })
+      );
+    const fallbackHtml =
+      `𓆩♡𓆪 <b>COMMAND SUGGESTIONS (${escapeHtml(prefix)})</b> 𓆩♡𓆪\n` +
+      `<i>₊˚⊹♡ available studio, group &amp; live game commands ˙ᵕ˙</i>\n\n` +
+      `<blockquote>` +
+      `• <code>${escapeHtml(prefix)}game</code> — 16+ Live Games Hub\n` +
+      `• <code>${escapeHtml(prefix)}grid</code> — 8×8 Word Grid\n` +
+      `• <code>${escapeHtml(prefix)}pokemon</code> — Catch Wild &amp; Shiny Pokémon\n` +
+      `• <code>${escapeHtml(prefix)}play &lt;song&gt;</code> — Instant music search &amp; download\n` +
+      `• <code>${escapeHtml(prefix)}lyrics &lt;song&gt;</code> — Song lyrics lookup\n` +
+      `• <code>${escapeHtml(prefix)}grab &lt;link&gt;</code> — Download HD videos/music\n` +
+      `• <code>${escapeHtml(prefix)}pfp &lt;theme&gt;</code> — Matching PFP albums\n` +
+      `• <code>${escapeHtml(prefix)}pint &lt;search&gt;</code> — Aesthetic Pinterest gallery\n` +
+      `• <code>${escapeHtml(prefix)}menu</code> — Studio dashboard &amp; settings` +
+      `</blockquote>`;
+    return await this.api.sendMessage(chatId, fallbackHtml, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: inlineKeyboard }
+    }).catch(() => {});
   }
 
   async updateCommandsForChat(chatId, prefix = '/') {
