@@ -36,8 +36,8 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
   result=await self.bridge.setup({'chat_id':-1,'stage':'start','create':True});self.assertTrue(result['created']);self.assertEqual(self.client.invoke.await_count,1)
   request=self.client.invoke.await_args.args[0];self.assertEqual(type(request).__name__,'CreateGroupCall')
  async def test_join_when_already_participant_succeeds_and_resolves_destination(self):
-  err = Exception(); err.__class__.__name__ = 'UserAlreadyParticipant'
-  self.client.join_chat.side_effect = err
+  UserAlreadyParticipant = type('UserAlreadyParticipant', (Exception,), {})
+  self.client.join_chat.side_effect = UserAlreadyParticipant()
   result = await self.bridge.setup({'chat_id': -1, 'stage': 'join', 'invite_link': 'https://t.me/+fixture_invite'})
   self.assertTrue(result['ok'])
   self.assertIn(-1, self.bridge.accounts['one']['managed'])
@@ -53,8 +53,8 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
   req = self.client.invoke.await_args.args[0]
   self.assertEqual(type(req).__name__, 'CreateGroupCall')
  def test_classify_handles_floodwait_and_rpc_groupcall_errors(self):
-  fw = Exception(); fw.__class__.__name__ = 'FloodWait'; fw.value = 3
-  self.assertEqual(MODULE.classify(fw), 'RATE_LIMITED')
+  FloodWait = type('FloodWait', (Exception,), {'value': 3})
+  self.assertEqual(MODULE.classify(FloodWait()), 'RATE_LIMITED')
   rpc = Exception('GROUPCALL_ALREADY_DISCARDED')
   self.assertEqual(MODULE.classify(rpc), 'NO_ACTIVE_CALL')
   rpc_admin = Exception('CHAT_ADMIN_REQUIRED')
