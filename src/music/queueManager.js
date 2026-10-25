@@ -89,7 +89,24 @@ export class QueueManager extends EventEmitter {
         else if(warm){media=warm.media||await this.#awaitMedia(s,()=>warm.promise);if(s.prefetched===warm)s.prefetched=null;warm.media=null;}
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
         const wantsVideo=entry.mediaType==='video'||Boolean(s.isChannel);
-        if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram'].includes(entry.provider))media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
+        if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram'].includes(entry.provider)){
+          try {
+            media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
+          } catch(acquireErr) {
+            if(this.app?.musicProviders&&entry.provider!=='telegram'){
+              const altProvider=entry.provider==='youtube'?'audius':(this.app.musicProviders.get('youtube')?.enabled?'youtube':null);
+              if(altProvider&&(!wantsVideo||altProvider==='youtube')){
+                const query=`${entry.title} ${entry.artist||''}`.trim();
+                const altRes=await this.app.musicProviders.get(altProvider).search(query,{limit:1}).catch(()=>null);
+                if(altRes?.items?.[0]){
+                  const altTrack={...altRes.items[0],entryId:entry.entryId,requester:entry.requester};
+                  media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(altTrack,{video:wantsVideo})).catch(()=>null);
+                }
+              }
+            }
+            if(!media)throw acquireErr;
+          }
+        }
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
         const track=media?{...media.track,entryId:entry.entryId,requester:entry.requester}:entry;
         if(wantsVideo&&track.capabilities)track.capabilities={...track.capabilities,video:true};

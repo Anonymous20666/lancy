@@ -66,9 +66,34 @@ export class ProviderRegistry {
   get(id) { const p = this.adapters.get(id); if (!p) throw new MusicError('UNSUPPORTED_PROVIDER', 'Unsupported music provider.'); return p; }
   async search(query, options) {
     const m = String(query).match(/^(youtube|yt|audius):\s*(.+)$/i);
-    const provider = m ? (m[1].toLowerCase() === 'yt' ? 'youtube' : m[1].toLowerCase()) : (options?.video||youtubeId(query)) ? 'youtube' : this.get('youtube').enabled ? 'youtube' : 'audius';
+    const explicit = Boolean(m);
+    const provider = explicit ? (m[1].toLowerCase() === 'yt' ? 'youtube' : m[1].toLowerCase()) : (options?.video||youtubeId(query)) ? 'youtube' : this.get('youtube').enabled ? 'youtube' : 'audius';
     if(options?.video&&provider!=='youtube')throw new MusicError('VIDEO_UNSUPPORTED','Choose a permitted YouTube video, or reply /vidc to a video file. Audius is audio-only.');
     if(options?.video&&!this.get('youtube').enabled)throw new MusicError('PROVIDER_DISABLED','Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
-    return { ...(await this.get(provider).search(m ? m[2] : query, options)), provider };
+    const q = m ? m[2] : query;
+    try {
+      const res = await this.get(provider).search(q, options);
+      if ((res.items && res.items.length > 0) || explicit || options?.video || youtubeId(query)) {
+        return { ...res, provider };
+      }
+    } catch (err) {
+      if (explicit || options?.video || youtubeId(query)) throw err;
+      const fallback = provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null);
+      if (fallback) {
+        try {
+          const fallbackRes = await this.get(fallback).search(q, options);
+          if (fallbackRes.items && fallbackRes.items.length > 0) return { ...fallbackRes, provider: fallback };
+        } catch {}
+      }
+      throw err;
+    }
+    const fallback = provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null);
+    if (fallback) {
+      try {
+        const fallbackRes = await this.get(fallback).search(q, options);
+        if (fallbackRes.items && fallbackRes.items.length > 0) return { ...fallbackRes, provider: fallback };
+      } catch {}
+    }
+    return { ...(await this.get(provider).search(q, options)), provider };
   }
 }

@@ -68,10 +68,18 @@ export function createMusicScreen({ app }) {
       if(Number.isFinite(s.positionSeconds)&&t.durationSeconds){const n=Math.max(0,Math.min(10,Math.floor(s.positionSeconds/t.durationSeconds*10)));b.paragraph(rt.text('━'.repeat(n)+'─'.repeat(10-n)));}
       b.paragraph(rt.text(`VC volume ${s.volumeConfirmed===false?'unconfirmed':`${s.volume}%`} · Repeat ${s.loopMode} · ${s.upcoming?.length||0} queued`));
       if(s.upcoming?.[0])b.paragraph(rt.text(`Up next · ${cut(s.upcoming[0].title)}`));
-      if(['playing','paused'].includes(s.status))b.buttons([controls(s,'Previous','previous'),controls(s,s.status==='paused'?'Resume VC':'Pause VC',s.status==='paused'?'resume':'pause'),controls(s,'Skip','skip'),controls(s,s.skipVotes?.length?`Vote skip (${s.skipVotes.length})`:'Vote skip','voteskip')]);
-      if(t.capabilities?.seek&&Number.isFinite(s.positionSeconds))b.buttons([controls(s,'−10 sec','seekby',-10),controls(s,'+10 sec','seekby',10)]);
+      if(['playing','paused'].includes(s.status))b.buttons([controls(s,'Previous','previous'),controls(s,s.status==='paused'?'Resume VC':'Pause VC',s.status==='paused'?'resume':'pause'),controls(s,'Skip','skip'),controls(s,'Stop','stop')]);
+      const extraRow=[];
+      if(t.capabilities?.seek&&Number.isFinite(s.positionSeconds))extraRow.push(controls(s,'−10 sec','seekby',-10),controls(s,'+10 sec','seekby',10));
+      if(['playing','paused'].includes(s.status)&&!s.isChannel)extraRow.push(controls(s,s.skipVotes?.length?`Vote skip (${s.skipVotes.length})`:'Vote skip','voteskip'));
+      if(extraRow.length)b.buttons(extraRow);
     }
-    if(!t&&s.upcoming?.length&&s.status==='error')b.buttons([controls(s,'Retry queued track','retry')]);
+    if(!t&&s.upcoming?.length){
+      if(s.status==='error')b.buttons([controls(s,'Retry queued track','retry'),controls(s,'Stop & clear','stop')]);
+      else b.buttons([controls(s,'Resume playback','resume'),controls(s,'Stop & clear','stop')]);
+    } else if(!t&&!s.upcoming?.length&&(s.connected||s.prepared)){
+      b.buttons([controls(s,s.isChannel?'Stop & leave call':'Stop & leave group','stop')]);
+    }
     if(s.radio?.enabled)b.paragraph(rt.text(`Infinite radio · ${s.radio.queries.join(' + ')}`));
     if(s.radio?.notice)b.paragraph(rt.text(cut(s.radio.notice,220)));
     if(s.panelNotice)b.paragraph(rt.text(cut(s.panelNotice,240)));
