@@ -12,22 +12,28 @@ export class InfiniteRadio {
    for(let attempt=0;attempt<Math.min(3,r.queries.length);attempt++){
     if(this.app.musicQueueManager.closed||!r.enabled||s.radio!==r)return;
     const query=r.queries[r.cursor++%r.queries.length],offset=r.offsets[query]||0;
-    const page=await this.app.musicProviders.search(query,{offset,limit:5});
+    const isVideo=Boolean(r.video||s.isChannel||s.radioVideo);
+    const page=await this.app.musicProviders.search(query,{offset,limit:5,video:isVideo});
     if(!r.enabled||s.radio!==r||this.app.musicQueueManager.closed)return;
     r.offsets[query]=page.nextOffset??0;
-    const tracks=page.items.filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable');
+    const tracks=page.items.filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false);
     for(let i=tracks.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[tracks[i],tracks[j]]=[tracks[j],tracks[i]];}
-    const isVideo=Boolean(r.video||s.isChannel||s.radioVideo);
     for(const t of tracks.slice(0,Math.min(3,100-s.upcoming.length))){this.app.musicQueueManager.enqueue(s.chatId,{...t,mediaType:isVideo?'video':'audio',requester:'Infinite radio'});r.seen.push(t.id);excluded.add(t.id);}
     r.seen=r.seen.slice(-300);
     if(tracks.length){r.misses=0;r.notice=null;return;}
    }
-   r.offsets={};
-   r.seen=[];
-   r.misses=0;
-   r.notice=null;
+    if(r.seen.length && r.misses === 0){
+      r.offsets={};
+      r.seen=[];
+      r.misses++;
+    } else {
+      r.misses++;
+      r.notice='No new permitted tracks found. Try another category or custom search.';
+      if(r.misses>=2) r.enabled=false;
+    }
   }catch(error){
-   r.notice=error instanceof MusicError?error.message:'Refilling infinite radio stream…';
+    r.enabled=false;
+    r.notice=error instanceof MusicError?error.message:'Autoplay paused because the catalog is unavailable. Your existing queue is retained.';
   }
  }
 }

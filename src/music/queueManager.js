@@ -57,13 +57,13 @@ export class QueueManager extends EventEmitter {
     const next=s.upcoming[0];
     if(!next||!['youtube','audius','telegram'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
     if(s.prefetched?.entryId===next.entryId)return;
-    this.dropPrefetch(s);if(this.prefetchJobs>=2)return;
+    this.dropPrefetch(s);if(this.prefetchJobs>=5)return;
     const p={entryId:next.entryId,media:null,claimed:false};s.prefetched=p;this.prefetchJobs++;
     const wantsVideo=next.mediaType==='video'||Boolean(s.isChannel);
     p.promise=this.app.musicLibrary.acquire(next,{video:wantsVideo}).then(media=>{
       if(this.closed||s.prefetched!==p||(!p.claimed&&s.upcoming[0]?.entryId!==p.entryId)){media.release();return null;}
       p.media=media;return media;
-    }).catch(()=>null).finally(()=>{this.prefetchJobs--;this.prefetchWork.delete(p.promise);});this.prefetchWork.add(p.promise);
+    }).catch(()=>null).finally(()=>{this.prefetchJobs=Math.max(0,this.prefetchJobs-1);this.prefetchWork.delete(p.promise);});this.prefetchWork.add(p.promise);
   }
   async #next(s, { manual = false } = {}) {
     if(this.closed)return null;
@@ -194,13 +194,10 @@ export class QueueManager extends EventEmitter {
     this.#cancelIdle(s); const generation = s.generation,armedAt=Date.now(),armedMonotonic=performance.now();s.idleDeadline=armedAt+this.idleTimeoutMs;
     const leave = () => this.locks.run(s.chatId, async () => {
       if (this.closed || s.generation !== generation || s.currentTrack || s.upcoming.length || s.status !== 'idle') return;
-      if (s.isChannel) return; // In channel broadcasts, assistant stays in call until explicitly stopped by admin
       try { const groupLeft=Boolean(s.prepared&&!s.isChannel);this.#assert(await this.voice.stop(s.chatId,{leaveMembership:groupLeft})); s.connected = false;s.prepared=false;this.app?.music?.setup?.forget(s.chatId);this.db?.setSetting?.(`music.idleReceipt.${s.chatId}`,{armedAt,departedAt:Date.now(),elapsedMs:Math.round(performance.now()-armedMonotonic),groupLeft});s.lastNotice=groupLeft?'Ten idle minutes completed; the assistant left the call and group.':'Ten idle minutes completed; the assistant left the call.'; s.accountAlias = null; s.idleTimeout = null; await this.updatePlayerCard(s.chatId); }
       catch { s.lastError = 'Idle departure failed; retrying shortly.'; s.idleTimeout = setTimeout(() => void leave(), 30000); s.idleTimeout.unref?.(); }
     });
-    if (!s.isChannel) {
-      s.idleTimeout = setTimeout(() => void leave(), this.idleTimeoutMs); s.idleTimeout.unref?.();
-    }
+    s.idleTimeout = setTimeout(() => void leave(), this.idleTimeoutMs); s.idleTimeout.unref?.();
   }
   async reconcile() {
     if(this.reconciling)return this.reconciling;

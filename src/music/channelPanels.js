@@ -38,6 +38,7 @@ export class ChannelPanels {
   }
   key(ctx, destination) { return `${this.service.botKey(ctx)}:${ctx.tgId}:${destination}`; }
   find(ctx, destination) { return [...this.panels.values()].find(p => p.key === this.key(ctx, destination)); }
+  api(p) { return p?.api || this.service?.app?.telegram?.api; }
   state(p) {
     if (!p.state) {
       const session = this.app.musicQueueManager.getSession(p.destination);
@@ -52,6 +53,10 @@ export class ChannelPanels {
   }
   async open(ctx, session, { forceNew = false } = {}) {
     if (Number(ctx.chatId) <= 0 || Number(ctx.chatId) !== Number(ctx.tgId)) throw new MusicError('CHANNEL_DM_REQUIRED','Channel dashboards belong in the initiating administrator’s private chat. Use /channel @channelname in DM.');
+    if (session.status === 'stopped') {
+      session.status = 'idle';
+      session.lastError = null;
+    }
     await this.service.authorize(ctx, true, session.chatId);
     const botKey = this.service.botKey(ctx);
     if (session.controlBotKey && session.controlBotKey !== botKey) throw new MusicError('PLAYER_ELSEWHERE','This channel is controlled through a different bot. Use that bot’s private dashboard.');
@@ -68,12 +73,17 @@ export class ChannelPanels {
       }
       p.panelActive = true; p.checkedAt = Date.now(); p.view = 'player'; p.api = ctx.api; p.panelNotice = null;
       const state = this.state(p);
+      if (state.status === 'stopped') {
+        state.status = 'idle';
+        state.lastError = null;
+      }
+      const api = this.api(p);
       const shouldSendNew = Boolean(!p.screenMessageId || forceNew || ctx.forceNew || (ctx.message && !ctx.query));
       if (shouldSendNew) {
         const oldMsgId = p.screenMessageId;
         const rich = this.app.screens.get('music').renderPlayer(state);
         try {
-          const sent = await p.api.sendRichMessage(p.playerChatId, rich);
+          const sent = await api.sendRichMessage(p.playerChatId, rich);
           p.screenMessageId = sent.message_id;
           p.lastRender = JSON.stringify(rich);
           p.pinned = false;
@@ -82,7 +92,7 @@ export class ChannelPanels {
           throw error;
         }
         if (oldMsgId && oldMsgId !== p.screenMessageId) {
-          await p.api.call('unpinChatMessage', { chat_id: p.playerChatId, message_id: oldMsgId }).catch(() => {});
+          await api.call('unpinChatMessage', { chat_id: p.playerChatId, message_id: oldMsgId }).catch(() => {});
         }
       }
       try { await this.pin(p.panelToken, { force: shouldSendNew }); }
@@ -121,8 +131,9 @@ export class ChannelPanels {
   async pin(token, { force = false } = {}) {
     const p = this.panels.get(token);
     if (!p?.panelActive || !p.screenMessageId) throw new MusicError('STALE_PLAYER','Open /channel again in private chat.');
+    const api = this.api(p);
     if (!p.pinned || force) {
-      const ok = await p.api.call('pinChatMessage', { chat_id: p.playerChatId, message_id: p.screenMessageId, disable_notification: true });
+      const ok = await api.call('pinChatMessage', { chat_id: p.playerChatId, message_id: p.screenMessageId, disable_notification: true });
       if (ok !== true) throw new MusicError('PIN_FAILED','Telegram did not confirm pinning your private dashboard.');
       p.pinned = true; p.panelNotice = null;
     }
@@ -132,11 +143,12 @@ export class ChannelPanels {
     for (const p of this.panels.values()) {
       if (p.destination !== Number(destination) || (panelToken && p.panelToken !== panelToken) || !p.screenMessageId) continue;
       if (!p.panelActive) continue;
+      const api = this.api(p);
       if (Date.now() - p.checkedAt >= this.membershipTtlMs) {
-        try { await this.service.authorize({ api: p.api, tgId: p.userId, chatId: p.playerChatId }, true, p.destination); p.checkedAt = Date.now(); }
+        try { await this.service.authorize({ api, tgId: p.userId, chatId: p.playerChatId }, true, p.destination); p.checkedAt = Date.now(); }
         catch {
           p.panelActive = false; p.lastRender = null; p.fullPreview = null;
-          await p.api.editMessageText(p.playerChatId, p.screenMessageId, 'Channel dashboard locked: administrator access could not be verified. Use /channel @channelname in private chat after access is restored.').catch(() => {});
+          await api.editMessageText(p.playerChatId, p.screenMessageId, 'Channel dashboard locked: administrator access could not be verified. Use /channel @channelname in private chat after access is restored.').catch(() => {});
           continue;
         }
       }

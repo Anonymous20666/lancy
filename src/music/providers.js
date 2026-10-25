@@ -50,7 +50,7 @@ export class AudiusProvider {
   async search(query, { offset = 0, limit = 5 } = {}) {
     if (/^https?:/i.test(query)) throw new MusicError('UNSUPPORTED_URL', 'For Audius, search by title and artist.');
     const data = await this.request(`/tracks/search?query=${encodeURIComponent(query)}&offset=${offset}&limit=${limit + 1}`);
-    const items = (data || []).map(x => this.normalize(x));
+    const items = (data || []).map(x => this.normalize(x)).filter(x => x.availability !== 'unavailable' && x.streamable !== false);
     return { items: items.slice(0, limit), nextOffset: items.length > limit && offset + limit < 100 ? offset + limit : null };
   }
   async media(track, { download = false } = {}) {

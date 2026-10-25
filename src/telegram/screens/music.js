@@ -413,10 +413,25 @@ export function createMusicScreen({ app }) {
         if(command==='infinact'){
           return await handleInfiniteAction({...ctx,musicPanel:panel},controlArgs,token);
         }
+        if(command==='player'){
+          const dest=panel?.destination||app.music.destination(ctx);
+          if(dest){
+            const s=app.musicQueueManager.getSession(dest);
+            if(s.status==='stopped'){s.status='idle';s.lastError=null;}
+          }
+        }
         return await app.music.control({...ctx,musicPanel:panel},command,controlArgs);
       }
       if(action==='prompt')return await prompt(ctx,args[0]||'queue');
-      if(action==='openplayer'){if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'Opening player…'}).catch(()=>{});return await app.music.player({...ctx,forceNew:true});}
+      if(action==='openplayer'){
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'Opening player…'}).catch(()=>{});
+        const dest=app.music.destination(ctx);
+        if(dest){
+          const s=app.musicQueueManager.getSession(dest);
+          if(s.status==='stopped'){s.status='idle';s.lastError=null;}
+        }
+        return await app.music.player({...ctx,forceNew:true});
+      }
       if(['pick','spage','sclear','submit'].includes(action)){
         const [token,revision,index]=args;
         let state;
@@ -500,6 +515,8 @@ export function createMusicScreen({ app }) {
           await channels(ctx);
         else{
           const id=await app.music.bind(ctx,args[0]);
+          const session=app.musicQueueManager.getSession(id);
+          if(session.status==='stopped'){session.status='idle';session.lastError=null;}
           await app.music.player({...ctx,forceNew:true},id);
         }
         return true;

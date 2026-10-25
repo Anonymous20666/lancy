@@ -38,13 +38,22 @@ def classify(error):
     name = type(error).__name__
     msg = str(getattr(error, 'MESSAGE', '') or getattr(error, 'message', '') or error).upper()
     if name == 'FloodWait': return 'RATE_LIMITED'
-    if name in {'ConnectionNotFound', 'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected', 'GroupCallDiscarded', 'CallDiscarded', 'NoActiveCall'} or any(x in msg for x in {'GROUPCALL_ALREADY_DISCARDED', 'GROUPCALL_INVALID', 'GROUPCALL_NOT_FOUND', 'NO_ACTIVE_GROUP_CALL', 'NO ACTIVE CALL', 'CONNECTION NOT FOUND', 'CONNECTIONNOTFOUND'}):
+    if name in {'TimeoutError', 'TimedOutAnswer', 'ConnectionNotFound', 'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected', 'GroupCallDiscarded', 'CallDiscarded', 'NoActiveCall'} or any(x in msg for x in {'GROUPCALL_ALREADY_DISCARDED', 'GROUPCALL_INVALID', 'GROUPCALL_NOT_FOUND', 'NO_ACTIVE_GROUP_CALL', 'NO ACTIVE CALL', 'CONNECTION NOT FOUND', 'CONNECTIONNOTFOUND', 'TIMED OUT', 'TIMEOUT'}):
         return 'NO_ACTIVE_CALL'
     if name in {'ChatAdminRequired', 'UserNotParticipant', 'ChannelPrivate', 'PeerIdInvalid', 'Forbidden', 'ChatWriteForbidden', 'ChatAdminInviteRequired'} or any(x in msg for x in {'CHAT_ADMIN_REQUIRED', 'USER_NOT_PARTICIPANT', 'FORBIDDEN', 'CHANNEL_PRIVATE', 'PEER_ID_INVALID'}):
         return 'PERMISSION_DENIED'
     if name in {'AuthKeyUnregistered', 'SessionRevoked', 'UserDeactivated', 'Unauthorized', 'BotMethodInvalid'} or any(x in msg for x in {'AUTH_KEY_UNREGISTERED', 'SESSION_REVOKED', 'USER_DEACTIVATED'}):
         return 'SESSION_NOT_READY'
     return 'CALL_FAILED'
+
+def clear_engine_cache(engine, chat):
+    try:
+        if hasattr(engine, '_clear_cache'): engine._clear_cache(chat)
+    except Exception: pass
+    try:
+        bind = getattr(getattr(engine, '_app', None), '_bind_client', None)
+        if bind and hasattr(bind, '_cache'): bind._cache.drop_cache(chat)
+    except Exception: pass
 
 class Bridge:
     def __init__(self, root, factory=None):
@@ -389,7 +398,7 @@ class Bridge:
         has_video = bool(call.get('video') or (is_channel and str(call.get('path', '')).endswith('.mp4')))
         video_flags = MediaStream.Flags.REQUIRED if has_video else MediaStream.Flags.IGNORE
         stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
-        await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 40)
+        await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 15)
         if call.get('status') != 'paused':
             try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
             except VoiceFailure: raise
@@ -432,6 +441,7 @@ class Bridge:
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
             call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
             if previous:
+                clear_engine_cache(a['engine'], chat)
                 try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                 except Exception: pass
             try:
@@ -458,12 +468,19 @@ class Bridge:
                                 _, native = await self.native_call(a['client'], chat)
                     if native is not None:
                         call['native_call'] = native
+                        bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
+                        if bind and hasattr(bind, '_cache'):
+                            try:
+                                bind._cache.drop_cache(chat)
+                                bind._cache.set_cache(chat, native)
+                            except Exception: pass
                     elif not call.get('native_call'):
                         raise VoiceFailure('NO_ACTIVE_CALL')
                 try:
                     await self.stream(a, chat, call)
                 except Exception as stream_err:
                     if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) == 'NO_ACTIVE_CALL':
+                        clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                         except Exception: pass
                         peer, native = await self.native_call(a['client'], chat)
@@ -477,6 +494,12 @@ class Bridge:
                                     if native is not None: break
                             except Exception: pass
                         if native is not None:
+                            bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
+                            if bind and hasattr(bind, '_cache'):
+                                try:
+                                    bind._cache.drop_cache(chat)
+                                    bind._cache.set_cache(chat, native)
+                                except Exception: pass
                             call['native_call'] = native
                             await self.stream(a, chat, call)
                         else:
@@ -514,11 +537,12 @@ class Bridge:
                 raise VoiceFailure('NO_ACTIVE_CALL')
             a = self.accounts[call['alias']]; engine = a['engine']
             if op == 'stop':
+                clear_engine_cache(engine, chat)
                 try: await asyncio.wait_for(engine.leave_call(chat), 15)
                 except Exception as e:
-                    if type(e).__name__ not in {'NotInCallError', 'NoActiveGroupCall'}: raise
+                    if classify(e) != 'NO_ACTIVE_CALL': raise
                 if data.get('leave_membership'): await self.leave_membership(a, chat)
-                self.calls.pop(chat); self.prepared.pop(chat, None); self.release_destination(a, chat); a.get('group_grants', set()).discard(chat)
+                self.calls.pop(chat, None); self.prepared.pop(chat, None); self.release_destination(a, chat); a.get('group_grants', set()).discard(chat)
                 return {'ok': True, 'status': 'stopped'}
             if op == 'idle':
                 # Empty raw stream replaces FFmpeg sources without leaving the call.
@@ -569,13 +593,14 @@ class Bridge:
                     if classify(error) == 'NO_ACTIVE_CALL':
                         # Definitive native absence is not a live call merely because
                         # its metadata remains cached. Confirm idempotent departure.
+                        clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 10)
                         except Exception as leave_error:
                             if classify(leave_error) != 'NO_ACTIVE_CALL': raise
                         self.calls.pop(chat, None); self.release_destination(a, chat)
                         return {'ok': True, 'active': False}
                     call['clock_errors'] += 1; call['position_seconds'] = None
-                    if call['clock_errors'] >= 3: call['status'] = 'error'
+                    if call['clock_errors'] >= 10: call['status'] = 'error'
             if call['status'] == 'playing' and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
                 call['publisher_check_after'] = time.monotonic() + 5
                 try:
@@ -592,15 +617,27 @@ class Bridge:
                 call['offset'] = min(call.get('last_known_position', 0.0), max(0, call['duration'] - 1))
                 call['retry_after'] = time.monotonic() + 5 * (2 ** call['retries'])
                 try:
+                    clear_engine_cache(a['engine'], chat)
+                    peer, native = await self.native_call(a['client'], chat)
+                    if native is not None:
+                        bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
+                        if bind and hasattr(bind, '_cache'):
+                            try:
+                                bind._cache.drop_cache(chat)
+                                bind._cache.set_cache(chat, native)
+                            except Exception: pass
+                        call['native_call'] = native
                     await self.stream(a, chat, call)
                     call['status'] = 'playing'; call['clock_errors'] = 0
                     call['last_progress'] = time.monotonic()
+                    self.last_failures.pop(chat, None)
                 except Exception as error:
                     self.remember_failure(chat, error)
                     # Retain this destination's lease while retrying. Never mutate another
                     # chat's source or state. Node sees buffering, not a false success.
                     if call['retries'] < 2: call['status'] = 'recovering'
-            if call.get('status') == 'error' and classify(self.last_failures.get(chat, {}).get('code')) == 'NO_ACTIVE_CALL':
+            if call.get('status') == 'error' and call.get('retries', 0) >= 2 and time.monotonic() >= call.get('retry_after', 0) and classify(self.last_failures.get(chat, {}).get('code')) == 'NO_ACTIVE_CALL':
+                clear_engine_cache(a['engine'], chat)
                 try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                 except Exception: pass
                 self.calls.pop(chat, None); self.release_destination(a, chat)
