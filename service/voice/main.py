@@ -600,7 +600,7 @@ class Bridge:
                     # Retain this destination's lease while retrying. Never mutate another
                     # chat's source or state. Node sees buffering, not a false success.
                     if call['retries'] < 2: call['status'] = 'recovering'
-            if call.get('status') == 'error' and (classify(self.last_failures.get(chat, {}).get('code')) == 'NO_ACTIVE_CALL' or (call.get('retries', 0) >= 2 and time.monotonic() >= call.get('retry_after', 0))):
+            if call.get('status') == 'error' and classify(self.last_failures.get(chat, {}).get('code')) == 'NO_ACTIVE_CALL':
                 try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                 except Exception: pass
                 self.calls.pop(chat, None); self.release_destination(a, chat)
