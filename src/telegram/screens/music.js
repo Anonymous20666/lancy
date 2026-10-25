@@ -307,6 +307,7 @@ export function createMusicScreen({ app }) {
       await app.musicQueueManager.ensurePlaying(destination);
       s.view='player';
       if(panelToken)await app.music.channelPanels.update(destination,{panelToken});
+      else if(!s.screenMessageId&&Number(ctx.chatId)<0)await app.music.player(targetCtx,destination);
       else await app.musicQueueManager.updatePlayerCard(destination);
     }else if(op==='queue'){
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`➕ Queued ${cut(genre,25)} tracks!`}).catch(()=>{});
@@ -328,6 +329,7 @@ export function createMusicScreen({ app }) {
       }
       s.view='player';
       if(panelToken)await app.music.channelPanels.update(destination,{panelToken});
+      else if(!s.screenMessageId&&Number(ctx.chatId)<0)await app.music.player(targetCtx,destination);
       else await app.musicQueueManager.updatePlayerCard(destination);
     }
   }
@@ -447,7 +449,7 @@ export function createMusicScreen({ app }) {
       else if(command==='/music'){if(args.length){if(app.screens?.get('downloader')?.executeDownload){await app.screens.get('downloader').executeDownload(ctx,args.join(' '),{forceMusicSearch:true,forceNew:true});return true;}await search(ctx,args.join(' '),'download');}else await ctx.api.sendRichMessage(ctx.chatId,renderHome());}
       else if(command==='/accounts'){const accounts=await app.music.accountCommand(ctx,args);await ctx.api.sendMessage(ctx.chatId,accounts.map(a=>`${a.alias} · ${a.status} · ${a.activeCalls||0} active calls\nApproved: ${a.allowed.join(', ')||'none'}`).join('\n\n')||'No registered accounts. Generate one locally, then /accounts register <alias>.');}
       else if(['/session','/gensession','/authassistant','/linkassistant'].includes(command)){if(!app.music.owner(ctx)||Number(ctx.chatId)<0)throw new MusicError('OWNER_ONLY','Use /accounts in the main owner private chat.');await ctx.api.sendRichMessage(ctx.chatId,renderSessionSetupNotice());}
-      else if(command==='/destination'||command==='/channel'){if(args[0]==='close'){const id=app.music.destination(ctx);await app.music.channelPanels.close(ctx,id);}else if(!args.length&&!ctx.message?.forward_origin&&!ctx.message?.forward_from_chat)await channels(ctx);else{const id=await app.music.bind(ctx,args[0]);await app.music.player(ctx,id);}}
+      else if(command==='/destination'||command==='/channel'){if(Number(ctx.chatId)<0){await app.music.player(ctx,Number(ctx.chatId));return;}if(args[0]==='close'){const id=app.music.destination(ctx);await app.music.channelPanels.close(ctx,id);}else if(!args.length&&!ctx.message?.forward_origin&&!ctx.message?.forward_from_chat)await channels(ctx);else{const id=await app.music.bind(ctx,args[0]);await app.music.player(ctx,id);}}
       else if(command==='/playlist')await playlist(ctx,args);
       else{
         if(command==='/voteskip'){await app.music.control({...ctx,messageId:null,query:null},'voteskip',args);return true;}
@@ -482,7 +484,7 @@ export function createMusicScreen({ app }) {
       try{const panel=await app.music.channelPanels.resolve({...ctx,messageId:record.screenMessageId},record.panelToken);source={...ctx,musicPanel:panel};}catch(e){await error(ctx,e);return true;}
     }else{
       const session=app.musicQueueManager?.sessions?.get(Number(ctx.chatId));
-      if(!session||session.isChannel||session.screenMessageId!==message.reply_to_message.message_id)return false;
+      if(!session||session.screenMessageId!==message.reply_to_message.message_id)return false;
     }
     const text=musicText(ctx,message.text),[head,...rest]=text.split(/\s+/),command=head.split('@')[0].toLowerCase();
     if(head.startsWith('/')&&head.includes('@')&&head.split('@')[1].toLowerCase()!==ctx.api.me.username?.toLowerCase())return false;

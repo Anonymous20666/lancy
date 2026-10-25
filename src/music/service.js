@@ -92,6 +92,7 @@ export class MusicService {
         if(!bot||!['creator','administrator'].includes(bot.status))throw new MusicError('BOT_ADMIN_REQUIRED','Make this bot a channel administrator before opening its private dashboard.');
       }
     }else if(!destructive&&this.owner(ctx))return id;
+    if(!remote&&Number(ctx.chatId)<0&&(Number(ctx.tgId)===id||ctx.message?.sender_chat?.id===id))return id;
     const member=await ctx.api?.getChatMember?.(id,Number(ctx.tgId)).catch(()=>null);
     if(!member || !['creator','administrator','member','restricted'].includes(member.status) || (member.status==='restricted'&&!member.is_member))throw new MusicError('PERMISSION_DENIED','Membership could not be verified.');
     if((destructive||remote)&&!['creator','administrator'].includes(member.status)&&!(allowDj&&!remote&&this.isDj(ctx,id)))throw new MusicError('ADMIN_ONLY','Only verified chat administrators can operate the player or change playback, queue and settings.');
@@ -140,7 +141,7 @@ export class MusicService {
     await this.authorize(ctx,true,id,{allowDj:true});
     const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.destinationTitle=chat.title || (s.isChannel?'Channel':'Group'); s.bass=this.app.db?.getSetting?.(`music.bass.${id}`,false)||false; s.eqPreset=this.app.db?.getSetting?.(`music.eq.${id}`,s.bass?'bass':'off')||'off';
     if(s.currentTrack)this.requestCardLyrics(s);
-    if(s.isChannel)return this.channelPanels.open(ctx,s);
+    if(s.isChannel && Number(ctx.chatId) > 0)return this.channelPanels.open(ctx,s);
     if(s.screenMessageId && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view='player';
     const created=!s.screenMessageId;
@@ -160,14 +161,14 @@ export class MusicService {
     return this.controlLock.run(destination,()=>this._control(ctx,action,[...args]));
   }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','eq','voteskip','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','eq','voteskip','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isVoteSkip=action==='voteskip';
     const allowDj=!['stop','leave','accounts','selectaccount','pin'].includes(action);
     const id=await this.authorize(ctx,!isVoteSkip,null,{allowDj});
     const qm=this.app.musicQueueManager;
-    const panel=ctx.musicPanel || (qm.getSession(id).isChannel ? this.channelPanels.find(ctx,id) : null);
+    const panel=ctx.musicPanel || ((qm.getSession(id).isChannel && Number(ctx.chatId) > 0) ? this.channelPanels.find(ctx,id) : null);
     const s=panel?.state ? this.channelPanels.state(panel) : panel || qm.getSession(id);
-    if(s.isChannel&&!s.panelToken)throw new MusicError('CHANNEL_DM_REQUIRED','Open /channel @channelname in your private chat first.');
+    if(s.isChannel&&!s.panelToken&&Number(ctx.chatId)>0)throw new MusicError('CHANNEL_DM_REQUIRED','Open /channel @channelname in your private chat first.');
     if(ctx.query&&!s.screenMessageId)throw new MusicError('STALE_PLAYER','That player belongs to an earlier session. Open /player.');
     if(ctx.query && args.pop() !== (s.panelToken?Number(s.controlRevision||0).toString(36):String(s.controlRevision||0)))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
     if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');

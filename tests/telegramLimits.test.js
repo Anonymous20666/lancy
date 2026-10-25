@@ -347,4 +347,102 @@ test('Advanced VC: Infinite Play submenu, category queueing, channel panel routi
   }
 });
 
+test('Direct Channel Music: in-channel commands, player rendering, controls and persistence', async t => {
+  const { QueueManager } = await import('../src/music/queueManager.js');
+  const { ChannelPanels } = await import('../src/music/channelPanels.js');
+  const { createMusicScreen } = await import('../src/telegram/screens/music.js');
+
+  const sent = [];
+  const api = {
+    me: { id: 99, username: 'Lancy_easy_bot' },
+    call: async () => true,
+    async getChat(id) { return { id, type: 'channel', title: 'Test Broadcast Channel' }; },
+    async getChatMember(chatId, userId) { return { status: 'administrator', user: { id: userId } }; },
+    async sendMessage(chatId, text) { sent.push({ chatId, text }); return { message_id: sent.length + 100 }; },
+    async sendRichMessage(chatId, rich) { sent.push({ chatId, rich }); return { message_id: sent.length + 100 }; },
+    async editMessageRich(chatId, messageId, rich) { sent.push({ chatId, messageId, rich }); return true; },
+    async answerCallbackQuery() { return true; }
+  };
+
+  const storedSettings = new Map();
+  const db = {
+    getSetting: (k, def) => storedSettings.has(k) ? storedSettings.get(k) : def,
+    setSetting: (k, v) => { storedSettings.set(k, v); },
+    getChatPrefix: () => '/',
+    getUserPrefix: () => '/'
+  };
+
+  const fakeVoice = {
+    getStatus: async () => ({ active: true, info: { status: 'playing', playback_id: 'p1', volume: 100 } }),
+    play: async () => ({ account_alias: 'acc1' }),
+    setVolume: async () => ({ ok: true }),
+    stop: async () => ({ ok: true })
+  };
+
+  const qm = new QueueManager({ voiceClient: fakeVoice, db });
+  const service = {
+    app: { musicQueueManager: qm, db },
+    botKey: () => '99',
+    destination: (ctx) => Number(ctx.chatId),
+    rate: () => {},
+    owner: () => false,
+    isDj: () => false,
+    async authorize(ctx) { return Number(ctx.chatId); },
+    async prepare() { return {}; },
+    queueGeneration: () => 0,
+    assertQueueGeneration: () => {}
+  };
+
+  const musicScreenMock = { renderPlayer: () => ({ blocks: [{ type: 'paragraph', text: 'Channel Broadcast' }] }) };
+  const appMock = {
+    musicQueueManager: qm,
+    db,
+    telegram: { api },
+    screens: new Map([['music', musicScreenMock]])
+  };
+  service.app = appMock;
+  qm.app = appMock;
+  const panels = new ChannelPanels({ service });
+  service.channelPanels = panels;
+
+  try {
+    // 1. Direct in-channel player rendering (chatId < 0)
+    const session = qm.getSession(-100888);
+    session.isChannel = true;
+    session.destinationTitle = 'Test Broadcast Channel';
+
+    // Simulated service._player logic for in-channel:
+    session.view = 'player';
+    qm.setPlayerMessage(-100888, 555, -100888, api);
+    await qm.updatePlayerCard(-100888);
+    assert.equal(session.screenMessageId, 555);
+    assert.equal(session.playerChatId, -100888);
+
+    // 2. Channel panels persistence across reloads
+    const dmCtx = { tgId: '10', chatId: 10, api };
+    const dmState = await panels.open(dmCtx, session);
+    assert.ok(dmState.panelToken);
+    assert.ok(storedSettings.has('music.activePanels'));
+
+    // Reconstruct fresh ChannelPanels simulating restart
+    const freshPanels = new ChannelPanels({ service });
+    assert.ok(freshPanels.panels.has(dmState.panelToken));
+
+    // Resolve should succeed from persisted storage without throwing STALE_PLAYER
+    const resolved = await freshPanels.resolve(dmCtx, dmState.panelToken, { requireMessage: false });
+    assert.equal(resolved.destination, -100888);
+
+    // 3. Stale callback in channel gives in-channel guidance, not "Use in original private chat"
+    try {
+      await freshPanels.resolve({ tgId: '999', chatId: -100888, api }, 'bad_token');
+      assert.fail('should reject');
+    } catch (e) {
+      assert.equal(e.code, 'STALE_PLAYER');
+      assert.match(e.message, /Use the live controls in this channel/);
+    }
+  } finally {
+    await qm.shutdown();
+  }
+});
+
 

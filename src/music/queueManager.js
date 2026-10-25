@@ -197,8 +197,15 @@ export class QueueManager extends EventEmitter {
   setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; }
   async updatePlayerCard(id, options = {}) {
     const s=this.getSession(id);
-    if(s.isChannel&&this.app?.music?.channelPanels)return this.app.music.channelPanels.update(id,options);
-    return this.updatePlayerView(s,options);
+    let updated = false;
+    if(s.screenMessageId) {
+      updated = (await this.updatePlayerView(s, options)) || updated;
+    }
+    if(s.isChannel&&this.app?.music?.channelPanels){
+      const panelUpdated = await this.app.music.channelPanels.update(id, options);
+      updated = panelUpdated || updated;
+    }
+    return updated;
   }
   async updatePlayerView(s, { preview = null } = {}) {
     return this.cardLocks.run(s.panelToken || s.chatId, async () => {

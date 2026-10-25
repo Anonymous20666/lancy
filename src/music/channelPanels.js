@@ -3,7 +3,7 @@ import { KeyedLock, MusicError } from './model.js';
 
 // Compact wire actions keep scoped callbacks below Telegram's 64-byte bound.
 export const PANEL_ACTIONS = ['player','previous','pause','resume','skip','seekby','queue','lyrics','volume','options','loop','shuffle','bass','accounts','pin','preview','stop','leave','qpage','lypage','clear','remove','setvol','selectaccount','seek','prompt','playnow','radio','rpage','rpick','rstart','roff','channels','retry','eq','voteskip','catmenu','catpick','genresub','infinact'];
-const LOCAL = new Set(['screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom']);
+const LOCAL = new Set(['destination','userId','botKey','screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom']);
 
 /** Many verified administrators' private views; one authoritative destination queue.
  * No channel messages are sent, and a callback never relies on the latest DM binding. */
@@ -11,6 +11,30 @@ export class ChannelPanels {
   constructor({ service, maxPanels = 100, maxPerChannel = 8, membershipTtlMs = 30000 }) {
     this.service = service; this.app = service.app; this.maxPanels = maxPanels; this.maxPerChannel = maxPerChannel;
     this.membershipTtlMs = membershipTtlMs; this.panels = new Map(); this.locks = new KeyedLock();
+    this.loadPersistedPanels();
+  }
+  loadPersistedPanels() {
+    try {
+      const records = this.app?.db?.getSetting?.('music.activePanels', []) || [];
+      for (const r of records) {
+        if (!r.panelToken || this.panels.has(r.panelToken)) continue;
+        const p = {
+          ...r, api: this.app?.telegram?.api || null, page: 0, lyricsPage: 0,
+          panelActive: true, checkedAt: Date.now(), fullPreview: null
+        };
+        this.panels.set(r.panelToken, p);
+      }
+    } catch {}
+  }
+  savePersistedPanels() {
+    try {
+      const records = [...this.panels.values()].filter(p => p.panelActive).map(p => ({
+        key: p.key, destination: p.destination, userId: p.userId, botKey: p.botKey,
+        panelToken: p.panelToken, playerChatId: p.playerChatId, screenMessageId: p.screenMessageId,
+        pinned: p.pinned, view: p.view
+      }));
+      this.app?.db?.setSetting?.('music.activePanels', records);
+    } catch {}
   }
   key(ctx, destination) { return `${this.service.botKey(ctx)}:${ctx.tgId}:${destination}`; }
   find(ctx, destination) { return [...this.panels.values()].find(p => p.key === this.key(ctx, destination)); }
@@ -51,6 +75,7 @@ export class ChannelPanels {
       }
       try { await this.pin(p.panelToken); }
       catch { p.panelNotice = 'This private dashboard could not be pinned. Use More → Pin player to retry; channel playback is unaffected.'; }
+      this.savePersistedPanels();
       await this.app.musicQueueManager.updatePlayerView(state);
       return state;
     });
@@ -61,8 +86,21 @@ export class ChannelPanels {
     return [...this.panels.values()].find(p=>p.userId===String(ctx.tgId)&&p.botKey===this.service.botKey(ctx)&&p.playerChatId===Number(ctx.chatId)&&p.screenMessageId===message.reply_to_message.message_id)||null;
   }
   async resolve(ctx, token, { requireMessage = true } = {}) {
-    const p = this.panels.get(token);
-    if (!p || p.userId !== String(ctx.tgId) || p.botKey !== this.service.botKey(ctx) || p.playerChatId !== Number(ctx.chatId) || (requireMessage && p.screenMessageId !== ctx.messageId)) throw new MusicError('STALE_PLAYER','Use your own channel dashboard in its original private chat.');
+    let p = this.panels.get(token);
+    if (!p) {
+      this.loadPersistedPanels();
+      p = this.panels.get(token);
+    }
+    const isDirectChannel = Boolean(p && Number(ctx.chatId) === Number(p.destination));
+    const validCaller = Boolean(p && (isDirectChannel || (p.userId === String(ctx.tgId) && p.playerChatId === Number(ctx.chatId))));
+    const validMessage = Boolean(!requireMessage || isDirectChannel || (p && p.screenMessageId === ctx.messageId));
+    const validBot = Boolean(p && p.botKey === this.service.botKey(ctx));
+    if (!p || !validCaller || !validBot || !validMessage) {
+      const msg = Number(ctx.chatId) < 0
+        ? 'Use the live controls in this channel, or /vplay.'
+        : 'Open your current channel dashboard with /channel.';
+      throw new MusicError('STALE_PLAYER', msg);
+    }
     await this.service.authorize(ctx, true, p.destination);
     p.panelActive = true; p.checkedAt = Date.now(); return this.state(p);
   }
@@ -97,6 +135,8 @@ export class ChannelPanels {
     p.panelActive = false;
     await p.api.editMessageText(p.playerChatId, p.screenMessageId, 'Channel control dashboard closed. The shared channel playback was not stopped.').catch(() => {});
     if (p.pinned) await p.api.call('unpinChatMessage', { chat_id: p.playerChatId, message_id: p.screenMessageId }).catch(() => {});
-    this.panels.delete(p.panelToken); return true;
+    this.panels.delete(p.panelToken);
+    this.savePersistedPanels();
+    return true;
   }
 }

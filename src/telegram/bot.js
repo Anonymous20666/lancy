@@ -243,7 +243,7 @@ export class TelegramController extends EventEmitter {
     return this;
   }
 
-  isAllowed(tgId, { isGroup = false } = {}) {
+  isAllowed(tgId, { isGroup = false, isChannel = false } = {}) {
     const id = Number(tgId);
     if (this.isOwner(id)) return { ok: true, role: 'owner' };
     const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
@@ -252,8 +252,8 @@ export class TelegramController extends EventEmitter {
     // Cloned bots are public for their audience:
     if (this.botContext?.isClone) return { ok: true, role: 'allowed' };
 
-    // In group chats, any member can use public commands & buttons:
-    if (isGroup) return { ok: true, role: 'member' };
+    // In group chats and channels, any member or channel administrator can use public commands & buttons:
+    if (isGroup || isChannel) return { ok: true, role: 'member' };
 
     // Public platform access if enabled:
     if (this.settings.get('security.publicAccess') === true) {
@@ -462,6 +462,8 @@ export class TelegramController extends EventEmitter {
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
+    if (update.channel_post) return this.#handleMessage(update.channel_post);
+    if (update.edited_channel_post) return this.#handleMessage(update.edited_channel_post, { edited: true });
   }
 
   #handleChatMemberUpdated(chatMember) {
@@ -3449,10 +3451,11 @@ export class TelegramController extends EventEmitter {
     const user = this.#upsertUser(query.from);
     const chatType = query.message?.chat?.type;
     const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
+    const isChannel = Boolean(chatType === 'channel');
     if (isGroup && query.message?.chat?.id && query.from && !query.from.is_bot) {
       this.db.recordGroupMember(query.message.chat.id, query.from);
     }
-    const guard = this.isAllowed(query.from.id, { isGroup });
+    const guard = this.isAllowed(query.from.id, { isGroup, isChannel });
     if (!guard.ok && !isGroup && this.app?.music) {
       const screen=this.screens.get('music'),ctx=this.#ctx(String(query.from.id),query);
       if(screen?.privateChannelRequest?.(ctx,query)){
@@ -3543,9 +3546,12 @@ export class TelegramController extends EventEmitter {
   }
 
   async #handleMessage(message, { edited = false } = {}) {
-    const user = this.#upsertUser(message.from);
-    const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
-    const tgId = String(message.from?.id);
+    if (!message) return;
+    const user = message.from ? this.#upsertUser(message.from) : null;
+    const chatType = message.chat?.type;
+    const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
+    const isChannel = Boolean(chatType === 'channel');
+    const tgId = String(message.from?.id ?? message.sender_chat?.id ?? message.chat?.id);
     const chatId = message.chat.id;
 
     // In group chats, passively keep group roster up-to-date for /hidetag
@@ -3591,7 +3597,7 @@ export class TelegramController extends EventEmitter {
       }
     }
 
-    const guard = this.isAllowed(message.from?.id, { isGroup });
+    const guard = this.isAllowed(message.from?.id ?? message.sender_chat?.id ?? message.chat?.id, { isGroup, isChannel });
     if (!guard.ok && !isGroup && this.app?.music) {
       const screen=this.screens.get('music'),ctx=this.#ctx(tgId,{message});
       if(screen?.privateChannelRequest?.(ctx,message)){
@@ -3617,9 +3623,9 @@ export class TelegramController extends EventEmitter {
     const chatPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
     const userPrefix = this.db?.getUserPrefix ? this.db.getUserPrefix(tgId) : '/';
 
-    // Group chats: the chat's prefix set by admin is the single universal prefix for all group members!
+    // Group chats & channels: the chat's prefix set by admin is the single universal prefix for all group members!
     // Private chats (DM): the user's personal prefix or chat prefix applies.
-    const activePrefix = isGroup ? (chatPrefix || '/') : (userPrefix && userPrefix !== '/' ? userPrefix : (chatPrefix || '/'));
+    const activePrefix = (isGroup || isChannel) ? (chatPrefix || '/') : (userPrefix && userPrefix !== '/' ? userPrefix : (chatPrefix || '/'));
 
     // Check if message is prefix alone (e.g. "🎀") or custom prefix help trigger (e.g. "🎀help", "🎀commands")
     const isPrefixOnly = text === activePrefix || (activePrefix !== '/' && text.startsWith(activePrefix) && text.slice(activePrefix.length).trim() === '');
