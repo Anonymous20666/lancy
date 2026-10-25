@@ -38,7 +38,7 @@ def classify(error):
     name = type(error).__name__
     msg = str(getattr(error, 'MESSAGE', '') or getattr(error, 'message', '') or error).upper()
     if name == 'FloodWait': return 'RATE_LIMITED'
-    if name in {'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected'} or any(x in msg for x in {'GROUPCALL_ALREADY_DISCARDED', 'GROUPCALL_INVALID', 'GROUPCALL_NOT_FOUND', 'NO_ACTIVE_GROUP_CALL', 'NO ACTIVE CALL'}):
+    if name in {'ConnectionNotFound', 'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected', 'GroupCallDiscarded', 'CallDiscarded', 'NoActiveCall'} or any(x in msg for x in {'GROUPCALL_ALREADY_DISCARDED', 'GROUPCALL_INVALID', 'GROUPCALL_NOT_FOUND', 'NO_ACTIVE_GROUP_CALL', 'NO ACTIVE CALL', 'CONNECTION NOT FOUND', 'CONNECTIONNOTFOUND'}):
         return 'NO_ACTIVE_CALL'
     if name in {'ChatAdminRequired', 'UserNotParticipant', 'ChannelPrivate', 'PeerIdInvalid', 'Forbidden', 'ChatWriteForbidden', 'ChatAdminInviteRequired'} or any(x in msg for x in {'CHAT_ADMIN_REQUIRED', 'USER_NOT_PARTICIPANT', 'FORBIDDEN', 'CHANNEL_PRIVATE', 'PEER_ID_INVALID'}):
         return 'PERMISSION_DENIED'
@@ -141,7 +141,7 @@ class Bridge:
         async with self.lock:
             a = self.accounts.get(alias)
             if not a: raise VoiceFailure('ACCOUNT_UNAVAILABLE')
-            if a['leases'] or any(p['alias'] == alias for p in self.prepared.values()):
+            if (data.get('remove') or data.get('enabled') is False) and (a['leases'] or any(p['alias'] == alias for p in self.prepared.values())):
                 raise VoiceFailure('ACCOUNT_IN_USE')
             if 'allowed' in data: a['allowed'] = list(data['allowed'])
             if 'denied' in data: a['denied'] = list(data['denied'])
@@ -431,7 +431,9 @@ class Bridge:
             previous = self.calls.get(chat)
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
             call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
-            if previous and previous.get('native_call') is not None: call['native_call']=previous['native_call']
+            if previous:
+                try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                except Exception: pass
             try:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
                 me = await asyncio.wait_for(a['client'].get_me(), 10)
@@ -454,19 +456,26 @@ class Bridge:
                             if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 5:
                                 await asyncio.sleep(getattr(create_err, 'value', 1))
                                 _, native = await self.native_call(a['client'], chat)
-                    if native is not None: call['native_call'] = native
+                    if native is not None:
+                        call['native_call'] = native
+                    elif not call.get('native_call'):
+                        raise VoiceFailure('NO_ACTIVE_CALL')
                 try:
                     await self.stream(a, chat, call)
                 except Exception as stream_err:
-                    if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and type(stream_err).__name__ in {'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected'}:
+                    if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) == 'NO_ACTIVE_CALL':
+                        try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                        except Exception: pass
                         peer, native = await self.native_call(a['client'], chat)
                         if native is None:
                             from pyrogram import raw
-                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
-                            for _ in range(4):
-                                await asyncio.sleep(0.3)
-                                _, native = await self.native_call(a['client'], chat)
-                                if native is not None: break
+                            try:
+                                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
+                                for _ in range(4):
+                                    await asyncio.sleep(0.3)
+                                    _, native = await self.native_call(a['client'], chat)
+                                    if native is not None: break
+                            except Exception: pass
                         if native is not None:
                             call['native_call'] = native
                             await self.stream(a, chat, call)
@@ -566,7 +575,7 @@ class Bridge:
                         self.calls.pop(chat, None); self.release_destination(a, chat)
                         return {'ok': True, 'active': False}
                     call['clock_errors'] += 1; call['position_seconds'] = None
-                    if call['clock_errors'] >= 10: call['status'] = 'error'
+                    if call['clock_errors'] >= 3: call['status'] = 'error'
             if call['status'] == 'playing' and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
                 call['publisher_check_after'] = time.monotonic() + 5
                 try:
@@ -591,6 +600,11 @@ class Bridge:
                     # Retain this destination's lease while retrying. Never mutate another
                     # chat's source or state. Node sees buffering, not a false success.
                     if call['retries'] < 2: call['status'] = 'recovering'
+            if call.get('status') == 'error' and (classify(self.last_failures.get(chat, {}).get('code')) == 'NO_ACTIVE_CALL' or (call.get('retries', 0) >= 2 and time.monotonic() >= call.get('retry_after', 0))):
+                try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                except Exception: pass
+                self.calls.pop(chat, None); self.release_destination(a, chat)
+                return {'ok': True, 'active': False, 'last_failure': self.last_failures.get(chat)}
             return {'ok': True, 'active': True, 'last_failure': self.last_failures.get(chat), 'info': {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted']}}
 
     async def shutdown(self):
