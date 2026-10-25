@@ -373,7 +373,7 @@ export function createMusicScreen({ app }) {
         if(operation==='select'){
           if(!selected)throw new MusicError('CHANNEL_MENU_EXPIRED','That channel is unavailable.');
           if(state.queueCardToken){const token=state.queueCardToken;await app.music.queueListen(ctx,token,{destination:selected.id,fromCatalog:true});state.queueCardToken=null;}
-          else{await app.music.bind(ctx,String(selected.id));await app.music.player(ctx,selected.id);}
+          else{await app.music.bind(ctx,String(selected.id));await app.music.player({...ctx,forceNew:true},selected.id);}
         }
       });
       if(action==='listenq'){const c=app.music.listenCard(ctx,args[0]);if(!c.destination)return channels(ctx,c.token);return await app.music.queueListen(ctx,c.token);}
@@ -416,7 +416,7 @@ export function createMusicScreen({ app }) {
         return await app.music.control({...ctx,musicPanel:panel},command,controlArgs);
       }
       if(action==='prompt')return await prompt(ctx,args[0]||'queue');
-      if(action==='openplayer')return await app.music.player(ctx);
+      if(action==='openplayer'){if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'Opening player…'}).catch(()=>{});return await app.music.player({...ctx,forceNew:true});}
       if(['pick','spage','sclear','submit'].includes(action)){
         const [token,revision,index]=args;
         let state;
@@ -500,7 +500,7 @@ export function createMusicScreen({ app }) {
           await channels(ctx);
         else{
           const id=await app.music.bind(ctx,args[0]);
-          await app.music.player(ctx,id);
+          await app.music.player({...ctx,forceNew:true},id);
         }
         return true;
       }

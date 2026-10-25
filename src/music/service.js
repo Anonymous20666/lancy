@@ -142,7 +142,7 @@ export class MusicService {
     await this.authorize(ctx,true,id,{allowDj:true});
     const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.destinationTitle=chat.title || (s.isChannel?'Channel':'Group'); s.bass=this.app.db?.getSetting?.(`music.bass.${id}`,false)||false; s.eqPreset=this.app.db?.getSetting?.(`music.eq.${id}`,s.bass?'bass':'off')||'off';
     if(s.currentTrack)this.requestCardLyrics(s);
-    if(s.isChannel && Number(ctx.chatId) > 0)return this.channelPanels.open(ctx,s);
+    if(s.isChannel && Number(ctx.chatId) > 0)return this.channelPanels.open(ctx,s,{forceNew:Boolean(ctx.forceNew)});
     if(s.screenMessageId && !s.isChannel && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view='player';
     const created=!s.screenMessageId || (s.isChannel && s.playerChatId !== Number(ctx.chatId));

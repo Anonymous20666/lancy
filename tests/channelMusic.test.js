@@ -98,7 +98,7 @@ test('group queue additions, dashboard access and playlist loads require admin r
  h.app.music.search={create:()=>({}),page:async()=>{}};h.app.music.rates.clear();await h.app.music.startSearch(member,'song','download');
 });
 test('channel Add tracks prompt preserves its original destination after the private DM binding changes',async t=>{
- const h=setup(t),p=await h.open(),rich=h.screen.renderPlayer(p),button=rich.blocks.flatMap(b=>b.buttons||[]).find(b=>b.text==='Add tracks'),d=decodeCallback(button.callback_data);
+ const h=setup(t),p=await h.open(),rich=h.screen.renderPlayer(p),button=rich.blocks.flatMap(b=>b.buttons||[]).find(b=>b.text==='Add tracks'||b.text==='Add music / video'),d=decodeCallback(button.callback_data);
  await h.open(10,-10022);await h.screen.handle({...h.ctx(),messageId:p.screenMessageId,query:{}},d.action,d.args);
  assert.equal(h.app.sm.context('10').panelToken,p.panelToken);
  let target;h.app.music.startSearch=async(ctx)=>{target=h.app.music.destination(ctx);return{id:'s',pages:[{items:[],provider:'fixture'}],index:0,query:'song',selected:new Map(),mode:'queue',revision:0};};
@@ -145,7 +145,7 @@ test('replying with a title or add-track intent to a private channel dashboard o
  const h=setup(t),a=await h.open(10,-10011);await h.open(10,-10022);const requests=[];
  h.app.music.startSearch=async(ctx,query,mode)=>{requests.push({destination:h.app.music.destination(ctx),query,mode});return{id:'search',query,mode,pages:[{items:[],provider:'fixture'}],index:0,revision:0,selected:new Map()};};
  for(const text of ['Artist and recording','add track Artist and recording','queue Artist and recording','/addq Artist and recording'])assert.equal(await h.screen.handlePlayerReply(h.ctx(),{text,reply_to_message:{message_id:a.screenMessageId,from:{id:99}}}),true);
- assert.ok(requests.every(x=>x.destination===-10011&&x.mode==='queue'));assert.equal(requests[1].query,'Artist and recording');assert.equal(h.calls.length,0);
+ assert.ok(requests.every(x=>x.destination===-10011&&['queue','video'].includes(x.mode)));assert.equal(requests[1].query,'Artist and recording');assert.equal(h.calls.length,0);
 });
 test('play replies retain standalone-download semantics rather than accidentally queueing to the channel',async t=>{
  const h=setup(t),p=await h.open();let mode;
@@ -176,7 +176,7 @@ test('real reply → search → pick → submit remains canonical when another D
 });
 test('closed-private ForceReply targets its original permitted channel even when a later DM binding is revoked',async t=>{
  const h=setup(t),db=new Database(':memory:');t.after(()=>db.close());const settings=new SettingsManager(db,{env:{OWNER_IDS:'1000'}});h.app.settings=settings;h.app.db=db;
- const p=await h.open(),prompt=h.screen.renderPlayer(p).blocks.flatMap(b=>b.buttons||[]).find(b=>b.text==='Add tracks'),d=decodeCallback(prompt.callback_data);await h.screen.handle({...h.ctx(),messageId:p.screenMessageId},d.action,d.args);
+ const p=await h.open(),prompt=h.screen.renderPlayer(p).blocks.flatMap(b=>b.buttons||[]).find(b=>b.text==='Add tracks'||b.text==='Add music / video'),d=decodeCallback(prompt.callback_data);await h.screen.handle({...h.ctx(),messageId:p.screenMessageId},d.action,d.args);
  await h.open(10,-10022);h.members.set('-10022:10','member');let target;
  h.app.music.startSearch=async(ctx,query,mode)=>{target=h.app.music.destination(ctx);return{id:'s',query,mode,pages:[{items:[],provider:'fixture'}],index:0,revision:0,selected:new Map()};};
  const c=new TelegramController({api:h.api,db,settings,sm:h.app.sm,screens:h.app.screens,app:h.app});await c.handleUpdate({message:{message_id:44,from:{id:10,is_bot:false,first_name:'Admin'},chat:{id:10,type:'private'},text:'Artist recording'}});assert.equal(target,-10011);assert.equal(h.app.sm.context(10).panelToken,undefined);
@@ -198,3 +198,22 @@ test('closed-private channel music honors existing personal custom command prefi
  const h=setup(t);h.app.db.getUserPrefix=()=>'!';const ctx=h.ctx(),source={text:'!channel @onechannel'};
  assert.equal(h.screen.privateChannelRequest(ctx,source),true);assert.equal(await h.screen.handlePrivateChannel(ctx,source),true);assert.ok(h.app.music.channelPanels.find(ctx,-10011));
 });
+
+test('repeated /channel command always posts a fresh dashboard at the bottom of the chat and unpins old',async t=>{
+ const h=setup(t),db=new Database(':memory:');t.after(()=>db.close());
+ const settings=new SettingsManager(db,{env:{OWNER_IDS:'1000'}});h.app.settings=settings;h.app.db=db;
+ const p1=await h.open(10,-10011);
+ assert.ok(p1.screenMessageId);
+ const firstId=p1.screenMessageId;
+ assert.equal(h.sent.length,1);
+ h.app.music.rates.clear();
+ // Simulate user sending /channel @onechannel again later in DM
+ const c=new TelegramController({api:h.api,db,settings,sm:h.app.sm,screens:h.app.screens,app:h.app});
+ const from={id:10,is_bot:false,first_name:'Admin'},chat={id:10,type:'private'};
+ await c.handleUpdate({message:{message_id:888,from,chat,text:'/channel @onechannel'}});
+ assert.equal(h.sent.length,2);
+ const p2=h.app.music.channelPanels.find(h.ctx(10),-10011);
+ assert.notEqual(p2.screenMessageId,firstId);
+ assert.ok(h.pins.some(p=>p.method==='unpinChatMessage'&&p.message_id===firstId));
+});
+

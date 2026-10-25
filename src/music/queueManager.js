@@ -273,6 +273,10 @@ export class QueueManager extends EventEmitter {
         return true;
       } catch (e) {
         if (preview) throw e;
+        const desc = String(e?.description || e?.message || '');
+        if (/message to edit not found|message_id_invalid|chat not found/i.test(desc)) {
+          s.screenMessageId = null;
+        }
         s.editAfter = Date.now() + Math.max(3, Number(e.retry_after || e.parameters?.retry_after || 5)) * 1000;
         this.log.debug({ chatId: s.chatId }, 'Player edit deferred'); return false;
       }

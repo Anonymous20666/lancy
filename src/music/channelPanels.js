@@ -50,7 +50,7 @@ export class ChannelPanels {
     }
     return p.state;
   }
-  async open(ctx, session) {
+  async open(ctx, session, { forceNew = false } = {}) {
     if (Number(ctx.chatId) <= 0 || Number(ctx.chatId) !== Number(ctx.tgId)) throw new MusicError('CHANNEL_DM_REQUIRED','Channel dashboards belong in the initiating administrator’s private chat. Use /channel @channelname in DM.');
     await this.service.authorize(ctx, true, session.chatId);
     const botKey = this.service.botKey(ctx);
@@ -68,15 +68,29 @@ export class ChannelPanels {
       }
       p.panelActive = true; p.checkedAt = Date.now(); p.view = 'player'; p.api = ctx.api; p.panelNotice = null;
       const state = this.state(p);
-      if (!p.screenMessageId) {
+      const shouldSendNew = Boolean(!p.screenMessageId || forceNew || ctx.forceNew || (ctx.message && !ctx.query));
+      if (shouldSendNew) {
+        const oldMsgId = p.screenMessageId;
         const rich = this.app.screens.get('music').renderPlayer(state);
-        try { const sent = await p.api.sendRichMessage(p.playerChatId, rich); p.screenMessageId = sent.message_id; p.lastRender = JSON.stringify(rich); }
-        catch (error) { this.panels.delete(p.panelToken); throw error; }
+        try {
+          const sent = await p.api.sendRichMessage(p.playerChatId, rich);
+          p.screenMessageId = sent.message_id;
+          p.lastRender = JSON.stringify(rich);
+          p.pinned = false;
+        } catch (error) {
+          if (!oldMsgId) this.panels.delete(p.panelToken);
+          throw error;
+        }
+        if (oldMsgId && oldMsgId !== p.screenMessageId) {
+          await p.api.call('unpinChatMessage', { chat_id: p.playerChatId, message_id: oldMsgId }).catch(() => {});
+        }
       }
-      try { await this.pin(p.panelToken); }
+      try { await this.pin(p.panelToken, { force: shouldSendNew }); }
       catch { p.panelNotice = 'This private dashboard could not be pinned. Use More → Pin player to retry; channel playback is unaffected.'; }
       this.savePersistedPanels();
-      await this.app.musicQueueManager.updatePlayerView(state);
+      if (!shouldSendNew) {
+        await this.app.musicQueueManager.updatePlayerView(state);
+      }
       return state;
     });
   }
