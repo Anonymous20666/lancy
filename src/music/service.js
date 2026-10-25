@@ -143,9 +143,9 @@ export class MusicService {
     const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.destinationTitle=chat.title || (s.isChannel?'Channel':'Group'); s.bass=this.app.db?.getSetting?.(`music.bass.${id}`,false)||false; s.eqPreset=this.app.db?.getSetting?.(`music.eq.${id}`,s.bass?'bass':'off')||'off';
     if(s.currentTrack)this.requestCardLyrics(s);
     if(s.isChannel && Number(ctx.chatId) > 0)return this.channelPanels.open(ctx,s);
-    if(s.screenMessageId && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
+    if(s.screenMessageId && !s.isChannel && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view='player';
-    const created=!s.screenMessageId;
+    const created=!s.screenMessageId || (s.isChannel && s.playerChatId !== Number(ctx.chatId));
     if(created){const rich=this.app.screens.get('music').renderPlayer(s);const sent=await ctx.api.sendRichMessage(ctx.chatId,rich);qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);s.lastRender=JSON.stringify(rich);}
     else await qm.updatePlayerCard(id);
     this.previews.schedule(s);
@@ -246,7 +246,18 @@ export class MusicService {
       s.view='radio';if(action==='rpage')s.radioPage=Math.max(0,Math.min(7,Number(args[0])||0));
       if(action==='rpick'){const index=Number(args[0]);if(!RADIO_CATEGORIES[index])throw new MusicError('RADIO_SELECTION','Choose a category from this menu.');const selected=[...(s.radioSelected||[])];const at=selected.indexOf(index);if(at>=0)selected.splice(at,1);else{if(selected.length+(s.radioCustom?1:0)>=5)throw new MusicError('RADIO_SELECTION','Choose up to five categories/custom searches.');selected.push(index);}s.radioSelected=selected;}
       if(action==='roff')this.radio.stop(qm.getSession(id));
-      if(action==='rstart'){const generation=qm.getSession(id).stopGeneration||0;await this.prepare(ctx,id);if((qm.getSession(id).stopGeneration||0)!==generation)throw new MusicError('ACTION_CANCELLED','Radio start was cancelled by Stop.');this.radio.configure(qm.getSession(id),[...(s.radioSelected||[]).map(i=>RADIO_CATEGORIES[i]),...(s.radioCustom?[s.radioCustom]:[])]);await this.radio.refill(qm.getSession(id));await qm.ensurePlaying(id);s.view='player';}
+      if(action==='rstart'){
+        s.lastNotice='⏳ Starting infinite radio… Connecting assistant & tracks…';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏳ Starting infinite radio…'}).catch(()=>{});
+        if(s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
+        const generation=qm.getSession(id).stopGeneration||0;
+        await this.prepare(ctx,id);
+        if((qm.getSession(id).stopGeneration||0)!==generation)throw new MusicError('ACTION_CANCELLED','Radio start was cancelled by Stop.');
+        this.radio.configure(qm.getSession(id),[...(s.radioSelected||[]).map(i=>RADIO_CATEGORIES[i]),...(s.radioCustom?[s.radioCustom]:[])]);
+        await this.radio.refill(qm.getSession(id));
+        await qm.ensurePlaying(id);
+        s.view='player';
+      }
     }
     else if(action==='remove'){let entry=args[0];if(s.panelToken){const matches=s.upcoming.filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entry);if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued recording is no longer available.');entry=matches[0].entryId;}qm.removeTrack(id,entry);}
     else if(action==='options'){s.view='options';}

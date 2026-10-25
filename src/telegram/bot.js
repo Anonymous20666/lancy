@@ -3476,8 +3476,8 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      // Smart Dual-Tier Force-Join Gate on callbacks in private DM only (never in group chats, owners bypass)
-      const isGroupCallback = (query.message?.chat?.type === 'group' || query.message?.chat?.type === 'supergroup') || Number(query.message?.chat?.id) < 0;
+      // Smart Dual-Tier Force-Join Gate on callbacks in private DM only (never in group chats or channels, owners bypass)
+      const isGroupCallback = (query.message?.chat?.type === 'group' || query.message?.chat?.type === 'supergroup' || query.message?.chat?.type === 'channel') || Number(query.message?.chat?.id) < 0;
       if (!isGroupCallback && !this.isOwner(query.from.id) && !this.isMainOwner(query.from.id)) {
         const allowedByFj = await this.#enforceForceJoin(query.from, query.message?.chat?.id, { query });
         if (!allowedByFj) return;
@@ -3666,8 +3666,8 @@ export class TelegramController extends EventEmitter {
       }
     }
 
-    // Smart Dual-Tier Force-Join Gate for private DM actions only (never for group chats, owners bypass)
-    if (!isGroup && !this.isOwner(tgId) && !this.isMainOwner(tgId)) {
+    // Smart Dual-Tier Force-Join Gate for private DM actions only (never for group chats or channels, owners bypass)
+    if (!isGroup && !isChannel && !this.isOwner(tgId) && !this.isMainOwner(tgId)) {
       const allowedByFj = await this.#enforceForceJoin(message.from, chatId, { message });
       if (!allowedByFj) return;
     }

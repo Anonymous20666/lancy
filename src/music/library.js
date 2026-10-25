@@ -85,9 +85,9 @@ export class MediaLibrary {
       if (!result) {
         const limit = video ? this.videoMaxBytes : this.maxBytes; const prefix = join(this.root, `.partial-${randomUUID()}`); const source = `${prefix}.source`; const output = `${prefix}.${video ? 'mp4' : 'mp3'}`;
         try {
-          await this.cleanup();
-          const files = await readdir(this.root); let used = 0; for (const f of files) used += (await stat(join(this.root, f))).size;
-          if (used + Math.max(limit, this.maxBytes * 3) > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
+          const required = Math.max(limit, this.maxBytes * 3);
+          const used = await this.cleanup(required);
+          if (used + required > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
           let meta;
           let artworkFile = null;
           if (track.provider === 'youtube') meta = await adapter.download(track, source, { video, maxBytes: limit });
@@ -132,7 +132,7 @@ export class MediaLibrary {
           await this.runner(this.ffmpeg, args, { timeout: 180000 + Math.min(7200, Number(meta.durationSeconds) || 0) * (video ? 1500 : 200), maxBuffer: 1024 * 1024 });
           const probe = await this.runner('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', output], { timeout: 15000 });
           const info = JSON.parse(probe.stdout); const duration = Number(info.format?.duration); const size = (await stat(output)).size;
-          if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (video && !info.streams.some(s => s.codec_type === 'video')) || size >= limit || (meta.durationSeconds && duration < meta.durationSeconds - 4)) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
+          if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (video && !info.streams.some(s => s.codec_type === 'video')) || size >= limit || (meta.durationSeconds && duration < Math.min(meta.durationSeconds - 20, meta.durationSeconds * 0.7))) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
           await rename(output, filePath);
           result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || track.provider === 'youtube', seek: true, video } } }; this.active.set(key, result);
         } catch (error) {
@@ -147,16 +147,28 @@ export class MediaLibrary {
       return { ...result, release: () => { if (!released) { released = true; this.refs.set(key, Math.max(0, (this.refs.get(key) || 1) - 1)); } } };
     });
   }
-  async cleanup() {
+  async cleanup(requiredBytes = 0) {
     await mkdir(this.root, { recursive: true, mode: 0o700 });
     const files = await Promise.all((await readdir(this.root)).map(async name => ({ name, ...(await stat(join(this.root, name))) })));
     let bytes = files.reduce((s, f) => s + f.size, 0);
+    const targetBytes = Math.max(0, this.quotaBytes - requiredBytes);
     for (const f of files.sort((a,b) => a.mtimeMs - b.mtimeMs)) {
+      if (f.name.startsWith('.partial-')) {
+        if (Date.now() - f.mtimeMs > 1800000) {
+          await unlink(join(this.root, f.name)).catch(() => {});
+          bytes -= f.size;
+        }
+        continue;
+      }
       const key = f.name.split('.')[0];
-      if (!this.refs.get(key) && (Date.now() - f.mtimeMs > this.ttlMs || bytes > this.quotaBytes - this.maxBytes * 3)) {
-        await unlink(join(this.root, f.name)); bytes -= f.size; this.active.delete(key); this.refs.delete(key);
+      if (!this.refs.get(key) && (Date.now() - f.mtimeMs > this.ttlMs || bytes > targetBytes)) {
+        await unlink(join(this.root, f.name)).catch(() => {});
+        bytes -= f.size;
+        this.active.delete(key);
+        this.refs.delete(key);
       }
     }
+    return bytes;
   }
   async shutdown() { this.closed = true; await this.locks.run('downloads', () => this.cleanup()); }
 }

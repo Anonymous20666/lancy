@@ -297,6 +297,15 @@ export function createMusicScreen({ app }) {
     const s=panel||app.musicQueueManager.getSession(destination);
     const genre=resolveGenre(genreRef,s);
     const isVideo=mode==='video'||Boolean(s.isChannel);
+    const procMsg=card(`Lancy · ${cut(genre,40)}`,op==='start'?'Starting non-stop playback…':'Adding to queue…');
+    procMsg.quote(rt.text(op==='start'
+      ?`⏳ Starting non-stop ${genre} streaming…\nConnecting assistant to voice chat and resolving tracks…`
+      :`⏳ Adding ${genre} tracks to upcoming queue…\nResolving media sources…`));
+    procMsg.buttons([button('⏳ Processing…','noop')]);
+    if(ctx.messageId&&ctx.query)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,finish(procMsg)).catch(()=>{});
+    else if(ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,finish(procMsg)).catch(()=>{});
+    s.lastNotice=op==='start'?`⏳ Starting non-stop ${genre} streaming…`:`⏳ Adding ${genre} to queue…`;
+    if(s.screenMessageId&&!panelToken)void app.musicQueueManager.updatePlayerCard(destination).catch(()=>{});
     if(op==='start'){
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`♾️ Streaming non-stop ${cut(genre,25)}…`}).catch(()=>{});
       const generation=app.music.queueGeneration(destination);
@@ -310,7 +319,13 @@ export function createMusicScreen({ app }) {
       s.view='player';
       if(panelToken)await app.music.channelPanels.update(destination,{panelToken});
       else if(!s.screenMessageId&&Number(ctx.chatId)<0)await app.music.player(targetCtx,destination);
-      else await app.musicQueueManager.updatePlayerCard(destination);
+      else {
+        await app.musicQueueManager.updatePlayerCard(destination);
+        if(ctx.messageId&&ctx.messageId!==s.screenMessageId){
+          const doneCard=renderPlayer(s);
+          await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,doneCard).catch(()=>{});
+        }
+      }
     }else if(op==='queue'){
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`➕ Queued ${cut(genre,25)} tracks!`}).catch(()=>{});
       const generation=app.music.queueGeneration(destination);
@@ -333,7 +348,15 @@ export function createMusicScreen({ app }) {
       s.view='player';
       if(panelToken)await app.music.channelPanels.update(destination,{panelToken});
       else if(!s.screenMessageId&&Number(ctx.chatId)<0)await app.music.player(targetCtx,destination);
-      else await app.musicQueueManager.updatePlayerCard(destination);
+      else {
+        await app.musicQueueManager.updatePlayerCard(destination);
+        if(ctx.messageId&&ctx.messageId!==s.screenMessageId){
+          const doneMsg=card(`Lancy · ${cut(genre,40)}`,'Added to upcoming queue');
+          doneMsg.quote(rt.text(`✅ Added ${tracks.length||'new'} ${genre} tracks to the queue!\nUse /q or /player to view upcoming songs.`));
+          doneMsg.buttons([button('Open player','openplayer'),button('« All Genres','catmenu',mode)]);
+          await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,finish(doneMsg)).catch(()=>{});
+        }
+      }
     }
   }
   async function handle(ctx,action,args=[]){
@@ -454,7 +477,33 @@ export function createMusicScreen({ app }) {
       else if(command==='/music'){if(args.length){if(app.screens?.get('downloader')?.executeDownload){await app.screens.get('downloader').executeDownload(ctx,args.join(' '),{forceMusicSearch:true,forceNew:true});return true;}await search(ctx,args.join(' '),'download');}else await ctx.api.sendRichMessage(ctx.chatId,renderHome());}
       else if(command==='/accounts'){const accounts=await app.music.accountCommand(ctx,args);await ctx.api.sendMessage(ctx.chatId,accounts.map(a=>`${a.alias} · ${a.status} · ${a.activeCalls||0} active calls\nApproved: ${a.allowed.join(', ')||'none'}`).join('\n\n')||'No registered accounts. Generate one locally, then /accounts register <alias>.');}
       else if(['/session','/gensession','/authassistant','/linkassistant'].includes(command)){if(!app.music.owner(ctx)||Number(ctx.chatId)<0)throw new MusicError('OWNER_ONLY','Use /accounts in the main owner private chat.');await ctx.api.sendRichMessage(ctx.chatId,renderSessionSetupNotice());}
-      else if(command==='/destination'||command==='/channel'){if(Number(ctx.chatId)<0){await app.music.player(ctx,Number(ctx.chatId));return;}if(args[0]==='close'){const id=app.music.destination(ctx);await app.music.channelPanels.close(ctx,id);}else if(!args.length&&!ctx.message?.forward_origin&&!ctx.message?.forward_from_chat)await channels(ctx);else{const id=await app.music.bind(ctx,args[0]);await app.music.player(ctx,id);}}
+      else if(command==='/destination'||command==='/channel'){
+        const isChan=ctx.message?.chat?.type==='channel';
+        if(isChan){
+          await app.music.player(ctx,Number(ctx.chatId));
+          return true;
+        }
+        if(Number(ctx.chatId)<0){
+          if(args.length){
+            const id=await app.music.bind(ctx,args[0]);
+            await app.music.player(ctx,id);
+          }else{
+            await ctx.api.sendMessage(ctx.chatId,`<blockquote>🌸 To manage channels, open a private chat with @${ctx.api?.me?.username || 'the bot'} and send <code>/channel</code> ♡\nTo bind a channel here, use <code>/channel @channelname</code>.</blockquote>`,{parse_mode:'HTML'}).catch(()=>{});
+          }
+          return true;
+        }
+        if(args[0]==='close'){
+          const id=app.music.destination(ctx);
+          await app.music.channelPanels.close(ctx,id);
+        }
+        else if(!args.length&&!ctx.message?.forward_origin&&!ctx.message?.forward_from_chat)
+          await channels(ctx);
+        else{
+          const id=await app.music.bind(ctx,args[0]);
+          await app.music.player(ctx,id);
+        }
+        return true;
+      }
       else if(command==='/playlist')await playlist(ctx,args);
       else{
         if(command==='/voteskip'){await app.music.control({...ctx,messageId:null,query:null},'voteskip',args);return true;}
@@ -528,14 +577,14 @@ export function createMusicScreen({ app }) {
     }
     const [head,...args]=musicText(ctx,source.text).split(/\s+/),[command,targetBot]=head.split('@');
     if(targetBot&&targetBot.toLowerCase()!==ctx.api.me?.username?.toLowerCase())return false;
-    if(['/channel','/destination'].includes(command.toLowerCase()))return handleCommand(ctx,command.toLowerCase(),args);
+    if(['/channel','/destination'].includes(command.toLowerCase()))return await handleCommand(ctx,command.toLowerCase(),args);
     const pending=app.sm?.get(ctx.tgId),scopedInput=pending?.state===States.MUSIC_QUEUE_INPUT&&pending.context.botKey===app.music.botKey(ctx)&&Number(pending.chatId)===Number(ctx.chatId);
     if(scopedInput&&command.toLowerCase()==='/cancel'){await app.sm.cancel(ctx.tgId);return true;}
     if(scopedInput&&pending.context.mode==='channel'&&!command.startsWith('/'))return app.sm.handleMessage(ctx.tgId,source,ctx);
     // A ForceReply retains its original panel, not the most recently bound DM channel.
     if(scopedInput&&pending.context.panelToken&&!command.startsWith('/'))return app.sm.handleMessage(ctx.tgId,source,ctx);
     try{await app.music.authorize(ctx,true);}catch{return false;}
-    if(channelCommands.has(command.toLowerCase()))return handleCommand(ctx,command.toLowerCase(),args);
+    if(channelCommands.has(command.toLowerCase()))return await handleCommand(ctx,command.toLowerCase(),args);
     if(!command.startsWith('/')&&app.sm?.state(ctx.tgId)===States.MUSIC_QUEUE_INPUT)return app.sm.handleMessage(ctx.tgId,source,ctx);
     return false;
   }

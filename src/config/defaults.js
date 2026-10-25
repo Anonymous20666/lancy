@@ -119,7 +119,7 @@ export const DEFAULT_SETTINGS = {
     idleLeaveSeconds: 600,
     allowYtDlp: true,
     allowExistingGroupMembers: true,
-    maxCacheMiB: 1536,
+    maxCacheMiB: 4096,
     maxFileMiB: 48,
     maxVideoMiB: 700,            // VC movie night: one video stream (≈2 h at 360p)
     cacheTtlMinutes: 1440

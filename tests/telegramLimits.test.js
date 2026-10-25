@@ -606,5 +606,125 @@ test('Channel live video and artwork picture transmission: auto-enables video fo
   }
 });
 
+test('Instant processing indicator on Infinite Play, /channel routing in GC/channel, and LRU cache eviction', async (t) => {
+  const { QueueManager } = await import('../src/music/queueManager.js');
+  const { MusicService } = await import('../src/music/service.js');
+  const { createMusicScreen } = await import('../src/telegram/screens/music.js');
+  const { MediaLibrary } = await import('../src/music/library.js');
+
+  const editedMessages = [];
+  const fakeApi = {
+    call: async () => ({ ok: true, result: { message_id: 888 } }),
+    getChat: async (id) => ({ id, type: id === -100999 ? 'channel' : 'supergroup', title: 'Test Chat' }),
+    getChatMember: async () => ({ status: 'administrator', can_manage_video_chats: true }),
+    sendRichMessage: async () => ({ message_id: 777 }),
+    editMessageRich: async (chatId, msgId, rich) => {
+      editedMessages.push({ chatId, msgId, rich });
+      return { message_id: msgId };
+    },
+    sendMessage: async (chatId, text) => ({ message_id: 666, text }),
+    me: { id: 99, username: 'Lancy_bot' }
+  };
+
+  const storedSettings = new Map();
+  const db = {
+    getSetting: (k, def) => storedSettings.has(k) ? storedSettings.get(k) : def,
+    setSetting: (k, v) => storedSettings.set(k, v),
+    run: () => {},
+    getChatPrefix: () => '/'
+  };
+
+  const fakeVoice = {
+    play: async () => ({ ok: true, account_alias: 'legacy' }),
+    setVolume: async () => ({ ok: true }),
+    idle: async () => ({ ok: true }),
+    accounts: async () => ({ accounts: [{ alias: 'legacy', enabled: true, status: 'available' }] })
+  };
+
+  const qm = new QueueManager({ voiceClient: fakeVoice, db });
+  const app = {
+    musicQueueManager: qm,
+    db,
+    telegram: { api: fakeApi },
+    musicProviders: {
+      search: async () => ({ items: [{ id: 'yt:inf1', title: 'Inf Song', durationSeconds: 200, provider: 'youtube' }] })
+    }
+  };
+  const service = new MusicService({ app, search: {}, lyrics: {}, accounts: { sync: async () => [] } });
+  app.music = service;
+  qm.app = app;
+
+  const musicScreen = createMusicScreen({ app });
+  app.screens = new Map([['music', musicScreen]]);
+
+  try {
+    // 1. Instant processing indicator on handleInfiniteAction (infinact)
+    const ctx = {
+      tgId: '10',
+      chatId: -100123,
+      messageId: 501,
+      query: { id: 'cb1' },
+      api: fakeApi,
+      user: { id: 10, first_name: 'Pappy' }
+    };
+    qm.getSession(-100123);
+    await musicScreen.handle(ctx, 'infinact', ['queue', 'start', 'Afrobeats']);
+    assert.ok(editedMessages.length >= 1);
+    const firstEdit = editedMessages[0];
+    assert.equal(firstEdit.msgId, 501);
+    assert.match(JSON.stringify(firstEdit.rich), /Starting non-stop|Processing/);
+
+    // 2. /channel in channel returns true and opens player without error
+    const chanCtx = {
+      tgId: '10',
+      chatId: -100999,
+      api: fakeApi,
+      user: { id: 10, first_name: 'Pappy' },
+      message: { chat: { id: -100999, type: 'channel' }, text: '/channel' }
+    };
+    const chanRes = await musicScreen.handleCommand(chanCtx, '/channel', []);
+    assert.equal(chanRes, true);
+
+    // 3. /channel in group chat returns true and sends guidance
+    const gcCtx = {
+      tgId: '10',
+      chatId: -100123,
+      api: fakeApi,
+      user: { id: 10, first_name: 'Pappy' },
+      message: { chat: { id: -100123, type: 'supergroup' }, text: '/channel' }
+    };
+    const gcRes = await musicScreen.handleCommand(gcCtx, '/channel', []);
+    assert.equal(gcRes, true);
+
+    // 4. MediaLibrary proactive cache cleanup
+    const testDir = '/tmp/test-cache-lru-' + Date.now();
+    const fs = await import('node:fs/promises');
+    await fs.mkdir(testDir, { recursive: true });
+    t.after(() => fs.rm(testDir, { recursive: true, force: true }).catch(() => {}));
+
+    const lib = new MediaLibrary({
+      root: testDir,
+      providers: new Map(),
+      maxBytes: 10 * 1024 * 1024,
+      quotaBytes: 30 * 1024 * 1024
+    });
+
+    // Write three 8 MB dummy files
+    await fs.writeFile(`${testDir}/file1.mp3`, Buffer.alloc(8 * 1024 * 1024));
+    await fs.writeFile(`${testDir}/file2.mp3`, Buffer.alloc(8 * 1024 * 1024));
+    await fs.writeFile(`${testDir}/file3.mp3`, Buffer.alloc(8 * 1024 * 1024));
+
+    // Requesting 15 MB requires cleaning down so 24 + 15 <= 30 (i.e. bytes <= 15 MB)
+    const usedAfter = await lib.cleanup(15 * 1024 * 1024);
+    assert.ok(usedAfter <= 15 * 1024 * 1024);
+    const remainingFiles = await fs.readdir(testDir);
+    assert.ok(remainingFiles.length < 3, 'Oldest unreferenced files were pruned');
+
+  } finally {
+    await qm.shutdown();
+  }
+});
+
+
 
 
