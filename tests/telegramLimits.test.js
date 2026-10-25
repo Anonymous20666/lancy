@@ -256,4 +256,95 @@ test('Advanced VC: category picker, volume up to 200% and instant nexting indica
   }
 });
 
+test('Advanced VC: Infinite Play submenu, category queueing, channel panel routing and custom artist', async () => {
+  const { createMusicScreen } = await import('../src/telegram/screens/music.js');
+  const { QueueManager } = await import('../src/music/queueManager.js');
+  const { MusicService } = await import('../src/music/service.js');
+  const { normalizeTrack } = await import('../src/music/model.js');
+
+  const sent = [], toasts = [];
+  const api = {
+    me: { id: 99 },
+    sendRichMessage: async (_chatId, rich) => { sent.push(rich); return { message_id: 101 }; },
+    editMessageRich: async (_chatId, _msgId, rich) => { sent.push(rich); return { message_id: 101 }; },
+    sendMessage: async (_chatId, text) => { sent.push({ text }); return { message_id: 102 }; },
+    answerCallbackQuery: async (_id, opts) => { toasts.push(opts?.text || ''); return true; },
+    getChat: async (id) => ({ id, type: id < 0 ? 'supergroup' : 'private', title: 'Group' }),
+    getChatMember: async () => ({ status: 'administrator', can_manage_video_chats: true })
+  };
+
+  const providers = {
+    search: async (query) => ({
+      items: [
+        normalizeTrack({ providerId: 'afro1', title: `${query} Hit 1`, artist: 'Star', durationSeconds: 180, streamUrl: 'https://example.org/a1.mp3' }, 'fixture'),
+        normalizeTrack({ providerId: 'afro2', title: `${query} Hit 2`, artist: 'Star', durationSeconds: 190, streamUrl: 'https://example.org/a2.mp3' }, 'fixture')
+      ],
+      nextOffset: null
+    })
+  };
+
+  const store = new Map();
+  const db = { getSetting: (k, d) => store.has(k) ? store.get(k) : d, setSetting: (k, v) => store.set(k, v) };
+  const voiceClient = {
+    play: async () => ({ ok: true, account_alias: 'legacy' }),
+    setVolume: async () => ({ ok: true }),
+    pause: async () => ({ ok: true }),
+    resume: async () => ({ ok: true }),
+    stop: async () => ({ ok: true }),
+    idle: async () => ({ ok: true }),
+    setup: async () => ({ ok: true, call_ready: true })
+  };
+  const app = { db, settings: { get: () => [] }, voiceClient, musicProviders: providers };
+  const qm = new QueueManager({ app, db, voiceClient, pollMs: 0 });
+  app.musicQueueManager = qm;
+  const service = new MusicService({ app, accounts: { sync: async () => {} } });
+  service.rate = () => {};
+  app.music = service;
+  const screen = createMusicScreen({ app });
+  app.screens = new Map([['music', screen]]);
+
+  try {
+    // 1. Tapping Afrobeats in category menu renders genre submenu with Start Non-stop & Queue
+    await screen.handle({ tgId: 10, chatId: -1003949983275, api, messageId: 101, query: { id: 'cb1' } }, 'genresub', ['queue', 'Afrobeats']);
+    const subCard = JSON.stringify(sent.at(-1));
+    assert.match(subCard, /Afrobeats/);
+    assert.match(subCard, /Start Non-stop/);
+    assert.match(subCard, /Queue/);
+    assert.match(subCard, /Browse Songs/);
+    assert.match(subCard, /Custom Artist/);
+
+    // 2. Queue Afrobeats via infinact
+    await screen.handle({ tgId: 10, chatId: -1003949983275, api, messageId: 101, query: { id: 'cb2' } }, 'infinact', ['queue', 'queue', 'Afrobeats']);
+    assert.ok(toasts.some(t => t.includes('Queued Afrobeats')));
+    const s = qm.getSession(-1003949983275);
+    assert.ok(s.radio?.enabled);
+    assert.deepEqual(s.radio.queries, ['Afrobeats']);
+    assert.ok(s.currentTrack || s.upcoming.length > 0);
+
+    // 3. Start Non-stop via infinact
+    await screen.handle({ tgId: 10, chatId: -1003949983275, api, messageId: 101, query: { id: 'cb3' } }, 'infinact', ['queue', 'start', 'Amapiano']);
+    assert.ok(toasts.some(t => t.includes('Streaming non-stop Amapiano')));
+    assert.deepEqual(s.radio.queries, ['Amapiano']);
+
+    // 4. Channel panel routing: category menu & submenu stay <= 64 bytes
+    const p = { panelToken: 'tok1234', destination: -1003949983275, userId: '10', botKey: '99', playerChatId: 10, screenMessageId: 101, view: 'player', page: 0 };
+    const playerRich = screen.renderPlayer(p);
+    assert.match(JSON.stringify(playerRich), /Infinite & Genres/);
+    for (const row of playerRich.blocks.filter(b => b.type === 'buttons')) {
+      for (const btn of row.buttons) {
+        assert.ok(Buffer.byteLength(btn.callback_data) <= 64, btn.callback_data);
+      }
+    }
+
+    const chanPicker = screen.renderCategoryPicker('queue', 'tok1234', 0);
+    for (const row of chanPicker.blocks.filter(b => b.type === 'buttons')) {
+      for (const btn of row.buttons) {
+        assert.ok(Buffer.byteLength(btn.callback_data) <= 64, btn.callback_data);
+      }
+    }
+  } finally {
+    await qm.shutdown();
+  }
+});
+
 
