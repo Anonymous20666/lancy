@@ -252,7 +252,7 @@ class Bridge:
                     raise
                 return {'ok': True, 'account_alias': a['alias'], 'user_id': me.id}
             if stage == 'manage':
-                if not self.factory:
+                if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
                     await self.resolve_destination(a['client'], chat)
                 a['managed'].add(chat)
                 return {'ok': True, 'account_alias': a['alias']}
@@ -268,7 +268,7 @@ class Bridge:
                     if not self.factory and type(error).__name__ in {'AttributeError', 'InviteHashExpired', 'InviteHashInvalid'}:
                         await self.resolve_destination(a['client'], chat)
                     elif type(error).__name__ != 'UserAlreadyParticipant': raise
-                if not self.factory:
+                if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
                     await self.resolve_destination(a['client'], chat)
                 a['managed'].add(chat)
                 return {'ok': True, 'account_alias': a['alias']}

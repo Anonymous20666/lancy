@@ -36,6 +36,7 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
   result=await self.bridge.setup({'chat_id':-1,'stage':'start','create':True});self.assertTrue(result['created']);self.assertEqual(self.client.invoke.await_count,1)
   request=self.client.invoke.await_args.args[0];self.assertEqual(type(request).__name__,'CreateGroupCall')
  async def test_join_when_already_participant_succeeds_and_resolves_destination(self):
+  self.bridge.auto_create_call_in_tests = True
   UserAlreadyParticipant = type('UserAlreadyParticipant', (Exception,), {})
   self.client.join_chat.side_effect = UserAlreadyParticipant()
   result = await self.bridge.setup({'chat_id': -1, 'stage': 'join', 'invite_link': 'https://t.me/+fixture_invite'})
