@@ -50,8 +50,12 @@ export class QueueManager extends EventEmitter {
   armPreparedIdle(id) { const s=this.getSession(id);if(!s.currentTrack&&!s.upcoming.length&&s.status==='idle')this.#idle(s); }
   dropPrefetch(s) { const p=s.prefetched;s.prefetched=null;p?.media?.release?.();if(p)p.media=null; }
   prefetch(s) {
+    if(this.closed||s.status!=='playing')return;
+    if(s.radio?.enabled&&s.upcoming.length<3){
+      void this.app?.music?.radio?.refill(s).catch(()=>{}).then(()=>this.prefetch(s));
+    }
     const next=s.upcoming[0];
-    if(this.closed||!next||!['youtube','audius','telegram'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
+    if(!next||!['youtube','audius','telegram'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
     if(s.prefetched?.entryId===next.entryId)return;
     this.dropPrefetch(s);if(this.prefetchJobs>=2)return;
     const p={entryId:next.entryId,media:null,claimed:false};s.prefetched=p;this.prefetchJobs++;
@@ -71,6 +75,7 @@ export class QueueManager extends EventEmitter {
       else if(s.loopMode==='queue'&&!s.upcoming.some(t=>t.entryId===previous.entryId))s.upcoming.push(previous);
     }
     if(s.radio?.enabled&&s.upcoming.length<3)await this.app?.music?.radio?.refill(s);
+    if(s.radio?.enabled&&!s.upcoming.length)await this.app?.music?.radio?.refill(s);
     if(this.closed||(s.stopGeneration||0)!==cancel)return null;
     const attempts=s.upcoming.length;
     for(let n=0;n<attempts;n++){
@@ -189,10 +194,13 @@ export class QueueManager extends EventEmitter {
     this.#cancelIdle(s); const generation = s.generation,armedAt=Date.now(),armedMonotonic=performance.now();s.idleDeadline=armedAt+this.idleTimeoutMs;
     const leave = () => this.locks.run(s.chatId, async () => {
       if (this.closed || s.generation !== generation || s.currentTrack || s.upcoming.length || s.status !== 'idle') return;
+      if (s.isChannel) return; // In channel broadcasts, assistant stays in call until explicitly stopped by admin
       try { const groupLeft=Boolean(s.prepared&&!s.isChannel);this.#assert(await this.voice.stop(s.chatId,{leaveMembership:groupLeft})); s.connected = false;s.prepared=false;this.app?.music?.setup?.forget(s.chatId);this.db?.setSetting?.(`music.idleReceipt.${s.chatId}`,{armedAt,departedAt:Date.now(),elapsedMs:Math.round(performance.now()-armedMonotonic),groupLeft});s.lastNotice=groupLeft?'Ten idle minutes completed; the assistant left the call and group.':'Ten idle minutes completed; the assistant left the call.'; s.accountAlias = null; s.idleTimeout = null; await this.updatePlayerCard(s.chatId); }
       catch { s.lastError = 'Idle departure failed; retrying shortly.'; s.idleTimeout = setTimeout(() => void leave(), 30000); s.idleTimeout.unref?.(); }
     });
-    s.idleTimeout = setTimeout(() => void leave(), this.idleTimeoutMs); s.idleTimeout.unref?.();
+    if (!s.isChannel) {
+      s.idleTimeout = setTimeout(() => void leave(), this.idleTimeoutMs); s.idleTimeout.unref?.();
+    }
   }
   async reconcile() {
     if(this.reconciling)return this.reconciling;
@@ -225,6 +233,7 @@ export class QueueManager extends EventEmitter {
           else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
         }
         s.failures = 0;
+        if(s.status==='playing'&&(!s.prefetched||(s.radio?.enabled&&s.upcoming.length<3))){this.prefetch(s);}
       } catch { s.failures = (s.failures || 0) + 1; s.positionSeconds = null; s.lastError = 'Playback status unavailable; reconnecting to the engine.'; }
       if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+5000;await this.updatePlayerCard(s.chatId);}
     })));

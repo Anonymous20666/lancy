@@ -22,8 +22,12 @@ export class InfiniteRadio {
     r.seen=r.seen.slice(-300);
     if(tracks.length){r.misses=0;r.notice=null;return;}
    }
-   r.misses++;r.notice='No new permitted tracks found. Try another category or custom search.';
-   if(r.misses>=2)r.enabled=false;
-  }catch(error){r.enabled=false;r.notice=error instanceof MusicError?error.message:'Autoplay paused because the catalog is unavailable. Your existing queue is retained.';}
+   r.offsets={};
+   r.seen=[];
+   r.misses=0;
+   r.notice=null;
+  }catch(error){
+   r.notice=error instanceof MusicError?error.message:'Refilling infinite radio stream…';
+  }
  }
 }

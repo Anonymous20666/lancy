@@ -15,7 +15,7 @@ export class CallSetup {
       const current=()=>{if((state.stopGeneration||0)!==generation)throw new MusicError('SETUP_CANCELLED','Assistant setup was cancelled by Stop.');};
       const checked=async operation=>{const result=await operation;current();return result;};
       try{await checked(this.service.authorize(ctx,true,id));}catch(error){if(error.code==='BOT_ADMIN_REQUIRED')throw new MusicError('BOT_SETUP_PERMISSIONS','Make Lancy a channel administrator with Invite users, Add new administrators and Manage video chats / live streams. Then retry setup.');throw error;}
-      const chat=await checked(ctx.api.getChat(id)),botId=ctx.api.me?.id;
+      const chat=await checked(ctx.api.getChat(id)),botId=ctx.api.me?.id || (await ctx.api.getMe?.().catch(()=>null))?.id;
       const bot=botId?await ctx.api.getChatMember(id,botId).catch(()=>null):null;
       const missing=[];
       if(!bot||!['administrator','creator'].includes(bot.status))missing.push('administrator');

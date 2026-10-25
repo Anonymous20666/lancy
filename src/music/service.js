@@ -88,7 +88,8 @@ export class MusicService {
       const chat=await ctx.api?.getChat(id).catch(()=>null);
       if(!chat || (chat.type!=='channel'&&!this.owner(ctx)))throw new MusicError('PERMISSION_DENIED','Only verified channel administrators can use this private controller.');
       if(chat.type==='channel'){
-        const botId=ctx.api?.me?.id;
+        const me=ctx.api?.me || (await ctx.api?.getMe?.().catch(()=>null));
+        const botId=me?.id;
         const bot=botId?await ctx.api.getChatMember(id,botId).catch(()=>null):null;
         if(!bot||!['creator','administrator'].includes(bot.status))throw new MusicError('BOT_ADMIN_REQUIRED','Make this bot a channel administrator before opening its private dashboard.');
       }
@@ -284,7 +285,7 @@ export class MusicService {
     }
     else if(action==='pin'&&s.panelToken)await this.channelPanels.pin(s.panelToken,{force:true});
     else if(action==='pin'){
-      const me=ctx.api.me?.id;if(!me)throw new MusicError('PERMISSION_DENIED','Bot identity unavailable.');
+      const me=ctx.api.me?.id || (await ctx.api.getMe?.().catch(()=>null))?.id;if(!me)throw new MusicError('PERMISSION_DENIED','Bot identity unavailable.');
       const member=await ctx.api.getChatMember(ctx.chatId,me);
       if(!['creator','administrator'].includes(member.status)||(member.status!=='creator'&&!member.can_pin_messages&&!(s.isChannel&&member.can_edit_messages)))throw new MusicError('PIN_PERMISSION','Grant only the pin permission if you want a pinned player. Playback does not require it.');
       if(!s.pinned){const result=await ctx.api.call('pinChatMessage',{chat_id:ctx.chatId,message_id:s.screenMessageId,disable_notification:true});if(!result)throw new MusicError('PIN_FAILED','Telegram did not confirm pinning.');s.pinned=true;}
@@ -304,7 +305,12 @@ export class MusicService {
     if(Number(ctx.chatId)<=0||Number(ctx.chatId)!==Number(ctx.tgId))throw new MusicError('CHANNEL_DM_REQUIRED','Use /channel @channelname in your private chat.');
     this.rate(ctx);
     const target=channelReference(value,ctx.message||{});
-    const chat=await ctx.api.getChat(target);
+    let chat;
+    try {
+      chat=await ctx.api.getChat(target);
+    } catch {
+      throw new MusicError('INVALID_DESTINATION','Could not access that channel. Make sure the channel username or link is correct and the bot has been added as an administrator to the channel.');
+    }
     if(!Number.isSafeInteger(chat.id)||chat.id>=0||(!this.owner(ctx)&&chat.type!=='channel'))throw new MusicError('INVALID_DESTINATION','Choose a channel you administer.');
     await this.authorize(ctx,true,chat.id);
     if(chat.type==='channel')await this.channels.save(ctx,chat.id);

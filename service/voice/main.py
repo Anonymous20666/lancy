@@ -341,6 +341,13 @@ class Bridge:
         # Join/play acceptance alone can leave NTgCalls' microphone muted. Only
         # explicitly requested start/resume/seek/recovery may self-unmute. Never
         # promote an account or override a moderator's cannot-self-unmute state.
+        if call.get('is_channel'):
+            binding = getattr(a['engine'], '_binding', None)
+            state = await self.publisher_step(binding.get_state(chat), 'local_state', 3) if binding else None
+            if state is None or getattr(state, 'muted', True):
+                await self.publisher_step(a['engine'].unmute(chat), 'local_unmute')
+            call.update(native_call=call.get('native_call'), publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic() + 3600)
+            return
         from pyrogram import raw
         input_call, participant = await self.native_publisher(a, chat, call.get('native_call'))
         if participant is None or getattr(participant, 'left', False): raise VoiceFailure('PERMISSION_DENIED', {'stage':'self_missing'})
@@ -559,11 +566,14 @@ class Bridge:
                         self.calls.pop(chat, None); self.release_destination(a, chat)
                         return {'ok': True, 'active': False}
                     call['clock_errors'] += 1; call['position_seconds'] = None
-                    if call['clock_errors'] >= 3: call['status'] = 'error'
-            if call['status'] == 'playing' and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
-                call['publisher_check_after'] = time.monotonic()+5
-                _, participant = await self.native_publisher(a, chat, call['native_call'])
-                if participant is None or getattr(participant, 'left', False) or getattr(participant, 'muted', False):
+                    if call['clock_errors'] >= 10: call['status'] = 'error'
+            if call['status'] == 'playing' and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
+                call['publisher_check_after'] = time.monotonic() + 5
+                try:
+                    _, participant = await self.native_publisher(a, chat, call['native_call'])
+                except Exception:
+                    participant = None
+                if participant is not None and (getattr(participant, 'left', False) or getattr(participant, 'muted', False)):
                     # Do not fight subsequent moderator mute actions or discard songs.
                     call.update(status='error', publisher_muted=True, publisher_verified=False, position_seconds=None)
             if call['status'] == 'recovering' and time.monotonic() >= call['retry_after']: call['status'] = 'error'
