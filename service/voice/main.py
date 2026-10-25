@@ -600,7 +600,7 @@ class Bridge:
                         self.calls.pop(chat, None); self.release_destination(a, chat)
                         return {'ok': True, 'active': False}
                     call['clock_errors'] += 1; call['position_seconds'] = None
-                    if call['clock_errors'] >= 10: call['status'] = 'error'
+                    if call['clock_errors'] >= 3: call['status'] = 'error'
             if call['status'] == 'playing' and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
                 call['publisher_check_after'] = time.monotonic() + 5
                 try:
