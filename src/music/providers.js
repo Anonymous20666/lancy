@@ -66,7 +66,9 @@ export class ProviderRegistry {
   get(id) { const p = this.adapters.get(id); if (!p) throw new MusicError('UNSUPPORTED_PROVIDER', 'Unsupported music provider.'); return p; }
   async search(query, options) {
     const m = String(query).match(/^(youtube|yt|audius):\s*(.+)$/i);
-    const provider = m ? (m[1].toLowerCase() === 'yt' ? 'youtube' : m[1].toLowerCase()) : youtubeId(query) ? 'youtube' : this.get('youtube').enabled ? 'youtube' : 'audius';
+    const provider = m ? (m[1].toLowerCase() === 'yt' ? 'youtube' : m[1].toLowerCase()) : (options?.video||youtubeId(query)) ? 'youtube' : this.get('youtube').enabled ? 'youtube' : 'audius';
+    if(options?.video&&provider!=='youtube')throw new MusicError('VIDEO_UNSUPPORTED','Choose a permitted YouTube video, or reply /vidc to a video file. Audius is audio-only.');
+    if(options?.video&&!this.get('youtube').enabled)throw new MusicError('PROVIDER_DISABLED','Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
     return { ...(await this.get(provider).search(m ? m[2] : query, options)), provider };
   }
 }

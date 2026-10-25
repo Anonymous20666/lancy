@@ -117,9 +117,11 @@ export const DEFAULT_SETTINGS = {
 
   music: {
     idleLeaveSeconds: 600,
-    allowYtDlp: false,
-    maxCacheMiB: 512,
+    allowYtDlp: true,
+    allowExistingGroupMembers: true,
+    maxCacheMiB: 1536,
     maxFileMiB: 48,
+    maxVideoMiB: 700,            // VC movie night: one video stream (≈2 h at 360p)
     cacheTtlMinutes: 1440
   },
 
@@ -200,8 +202,10 @@ export const RESTART_REQUIRED_PATHS = new Set([
   'ai.endpoint',
   'music.idleLeaveSeconds',
   'music.allowYtDlp',
+  'music.allowExistingGroupMembers',
   'music.maxCacheMiB',
   'music.maxFileMiB',
+  'music.maxVideoMiB',
   'music.cacheTtlMinutes'
 ]);
 

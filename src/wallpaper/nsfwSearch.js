@@ -35,6 +35,12 @@ export const CATEGORY_SUGGESTIONS = {
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+const BLOCKED_NSFW_PATTERN = /\b(loli|lolicon|shota|shotacon|underage|child|children|minor|minors|preteen|pedo|pedophile|cp|csam|toddler|infant|rape|noncon|forced_sex|bestiality|zoophilia)\b/i;
+
+export function isBlockedNsfwQuery(query = '') {
+  return BLOCKED_NSFW_PATTERN.test(String(query || ''));
+}
+
 function sanitizeBooruTag(q) {
   let s = String(q || '').toLowerCase().trim();
   s = s.replace(/\b(wallpaper|wallpapers|photo|photos|pic|pics|image|images|art|4k|hd|18\+|nsfw|hentai|uncensored|censored|ecchi|r18)\b/gi, '').trim();
@@ -597,6 +603,9 @@ async function fetchAnimatedHentai(query = '', page = 0, limit = 10, signal = nu
  */
 export async function searchNsfw({ query = '', category = 'all', page = 0, limit = 15, signal = null } = {}) {
   const cleanQuery = String(query || '').trim();
+  if (isBlockedNsfwQuery(cleanQuery)) {
+    return { results: [], category, total: 0, page, blocked: true };
+  }
   const cacheKey = `nsfw_${category}_${cleanQuery.toLowerCase()}_${page}_${limit}`;
 
   // Check memory cache

@@ -50,10 +50,16 @@ function sanitizeInlineResults(results) {
 }
 
 export class TelegramAPI {
-  constructor(token, { baseUrl = 'https://api.telegram.org', timeoutMs = 60000, log } = {}) {
+  /**
+   * baseUrl defaults to TELEGRAM_API_BASE_URL so a self-hosted Bot API server
+   * (telegram-bot-api --local, 2000 MB uploads) is used by the main bot and clones.
+   */
+  constructor(token, { baseUrl = process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org', timeoutMs = 60000, log } = {}) {
     if (!token) throw new Error('TelegramAPI: BOT_TOKEN is required');
     this.token = token;
-    this.baseUrl = `${baseUrl}/bot${token}`;
+    this.apiRoot = String(baseUrl).replace(/\/+$/, '');
+    this.isLocalServer = this.apiRoot !== 'https://api.telegram.org';
+    this.baseUrl = `${this.apiRoot}/bot${token}`;
     this.timeoutMs = timeoutMs;
     this.log = log ?? logger().child({ module: 'telegram-api' });
     this.me = null;
@@ -358,10 +364,24 @@ export class TelegramAPI {
     return this.call('getFile', { file_id: fileId });
   }
 
-  async downloadFile(filePath) {
-    const response = await fetch(`https://api.telegram.org/file/bot${this.token}/${filePath}`);
+  /** Resolve a getFile path: --local servers return an absolute path on disk. */
+  async readFileBytes(filePath, { maxBytes = Infinity, signal } = {}) {
+    if (this.isLocalServer && String(filePath).startsWith('/')) {
+      const { stat, readFile } = await import('node:fs/promises');
+      const root = process.env.TELEGRAM_LOCAL_FILES_ROOT || '/var/lib/telegram-bot-api';
+      const { resolve } = await import('node:path');
+      const full = resolve(filePath);
+      if (!full.startsWith(resolve(root) + '/')) throw new Error('Telegram local file is outside the configured Bot API data directory');
+      if ((await stat(full)).size > maxBytes) throw new Error('Telegram file exceeds the size limit');
+      return readFile(full);
+    }
+    const response = await fetch(`${this.apiRoot}/file/bot${this.token}/${filePath}`, { signal, redirect: 'error' });
     if (!response.ok) throw new Error(`Telegram file download failed: ${response.status}`);
     return Buffer.from(await response.arrayBuffer());
+  }
+
+  async downloadFile(filePath) {
+    return this.readFileBytes(filePath);
   }
 
   setMyCommands(commands, extra = {}) {

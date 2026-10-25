@@ -1764,10 +1764,14 @@ export class MediaDownloader {
 
     try {
       const cookieArgs = getCookieArgs();
+      const maxSourceMb = Math.max(60, Number(process.env.MEDIA_MAX_SOURCE_MB) || 1024);
       const args = [
         '--no-warnings',
         '--no-playlist',
         '--write-thumbnail',
+        '--max-filesize', `${maxSourceMb}M`,
+        // Prefer a rendition that already fits Telegram; fall back to the best one.
+        '-S', 'filesize~45M',
         '--js-runtimes', 'node:/usr/bin/node',
         '--ffmpeg-location', '/usr/bin/ffmpeg',
         '-P', tempDir,
@@ -1797,7 +1801,7 @@ export class MediaDownloader {
 
       const files = readdirSync(tempDir);
       if (files.length === 0) {
-        throw new Error('No media files could be downloaded from this link ♡');
+        throw new Error(`No media could be downloaded from this link. It may exceed the ${maxSourceMb} MB source limit or be unavailable ♡`);
       }
 
       const mediaItems = [];

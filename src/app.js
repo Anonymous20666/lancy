@@ -161,8 +161,8 @@ export class LancyApp {
     this.musicProviders = new MusicProviders();
     this.musicProviders.get('youtube').enabled = this.settings.get('music.allowYtDlp');
     this.musicQueueManager.idleTimeoutMs = this.settings.get('music.idleLeaveSeconds') * 1000;
-    this.musicLibrary = new MediaLibrary({ root: join(this.root, 'cache', 'music'), providers: this.musicProviders, maxBytes: this.settings.get('music.maxFileMiB') * 1024 * 1024, quotaBytes: this.settings.get('music.maxCacheMiB') * 1024 * 1024, ttlMs: this.settings.get('music.cacheTtlMinutes') * 60000 });
-    this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient });
+    this.musicLibrary = new MediaLibrary({ root: join(this.root, 'cache', 'music'), providers: this.musicProviders, maxBytes: this.settings.get('music.maxFileMiB') * 1024 * 1024, videoMaxBytes: (this.settings.get('music.maxVideoMiB') || this.settings.get('music.maxFileMiB')) * 1024 * 1024, quotaBytes: this.settings.get('music.maxCacheMiB') * 1024 * 1024, ttlMs: this.settings.get('music.cacheTtlMinutes') * 60000 });
+    this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
 
     // ── Screens ──
@@ -287,6 +287,8 @@ export class LancyApp {
     await this.multiBotManager.startAll();
     this.#setupTestTriggerWatcher();
     this.log.info('✦ Lancy Bot is ready ♡');
+    // Restore encrypted playback accounts/managed idle cleanup without blocking unrelated features.
+    void this.musicAccounts.sync().catch(() => this.log.warn('Playback account warmup unavailable; use /accounts health in the owner DM.'));
   }
 
   #setupTestTriggerWatcher() {

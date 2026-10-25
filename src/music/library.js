@@ -1,6 +1,7 @@
+import { TelegramMedia } from './telegramMedia.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, stat, unlink, rename } from 'node:fs/promises';
-import { createWriteStream } from 'node:fs';
+import { createWriteStream, existsSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -35,12 +36,14 @@ export async function boundedFetchFile(url, path, maxBytes, redirects = 0, { sig
   try { await pipeline(response, bound, createWriteStream(path, { mode: 0o600, flags: 'wx' }), { signal }); } finally { clearTimeout(deadline); }
 }
 export class MediaLibrary {
-  constructor({ root, providers, ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', runner = exec, maxBytes = 48 * 1024 * 1024, quotaBytes = 512 * 1024 * 1024, ttlMs = 86400000 } = {}) {
+  constructor({ root, providers, ffmpeg = process.env.FFMPEG_PATH || 'ffmpeg', runner = exec, maxBytes = 48 * 1024 * 1024, videoMaxBytes = maxBytes, quotaBytes = 512 * 1024 * 1024, ttlMs = 86400000 } = {}) {
     if (![maxBytes,quotaBytes,ttlMs].every(n=>Number.isFinite(n)&&n>0)||maxBytes>150*1024*1024||quotaBytes<maxBytes*3)throw new MusicError('INVALID_CONFIGURATION','Music storage limits must be positive, with space for at least three maximum-size files.');
-    this.root = resolve(root); this.providers = providers; this.ffmpeg = ffmpeg; this.runner = runner; this.maxBytes = maxBytes; this.quotaBytes = quotaBytes; this.ttlMs = ttlMs; this.locks = new KeyedLock(); this.active = new Map(); this.refs = new Map(); this.closed = false;
+    this.root = resolve(root); this.providers = providers; this.ffmpeg = ffmpeg; this.runner = runner; this.maxBytes = maxBytes; this.quotaBytes = quotaBytes; this.ttlMs = ttlMs; this.locks = new KeyedLock(); this.videoMaxBytes = Math.max(maxBytes, Math.min(Number(videoMaxBytes) || maxBytes, 2048 * 1024 * 1024, Math.floor(quotaBytes / 2))); this.active = new Map(); this.refs = new Map(); this.closed = false;this.telegram=new TelegramMedia(this);
   }
+  importTelegram(api,message,options={}) { return this.telegram.import(api,message,options); }
   async acquire(track, { video = false, download = false } = {}) {
     if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
+    if(track.provider==='telegram')return this.telegram.acquire(track,{video,download});
     const adapter = this.providers.get(track.provider);
     if (track.provider === 'youtube') adapter.assertEnabled?.();
     // Permission checks run before the decoder lock; a slow preview API cannot
@@ -52,6 +55,22 @@ export class MediaLibrary {
       await mkdir(this.root, { recursive: true, mode: 0o700 });
       const filePath = join(this.root, `${key}.${video ? 'mp4' : 'mp3'}`);
       let result = this.active.get(key);
+      if (!result && existsSync(filePath)) {
+        try {
+          const st = await stat(filePath);
+          if (st.size > 1024) {
+            const probe = await this.runner(this.ffmpeg.replace(/ffmpeg$/, 'ffprobe'), ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', filePath], { timeout: 10000 }).catch(() => null);
+            if (probe?.stdout) {
+              const info = JSON.parse(probe.stdout);
+              const duration = Number(info.format?.duration);
+              if (Number.isFinite(duration) && duration > 0 && info.streams?.some(s => s.codec_type === 'audio')) {
+                result = { key, filePath, track: { ...track, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || track.provider === 'youtube', seek: true, video } } };
+                this.active.set(key, result);
+              }
+            }
+          }
+        } catch {}
+      }
       if (!result && download && !video) {
         const streamKey = createHash('sha256').update(`${track.id}:false:false`).digest('hex');
         const cached = this.active.get(streamKey);
@@ -64,31 +83,31 @@ export class MediaLibrary {
         }
       }
       if (!result) {
-        const prefix = join(this.root, `.partial-${randomUUID()}`); const source = `${prefix}.source`; const output = `${prefix}.${video ? 'mp4' : 'mp3'}`;
+        const limit = video ? this.videoMaxBytes : this.maxBytes; const prefix = join(this.root, `.partial-${randomUUID()}`); const source = `${prefix}.source`; const output = `${prefix}.${video ? 'mp4' : 'mp3'}`;
         try {
           await this.cleanup();
           const files = await readdir(this.root); let used = 0; for (const f of files) used += (await stat(join(this.root, f))).size;
-          if (used + this.maxBytes * 3 > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
+          if (used + Math.max(limit, this.maxBytes * 3) > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
           let meta;
-          if (track.provider === 'youtube') meta = await adapter.download(track, source, { video, maxBytes: this.maxBytes });
+          if (track.provider === 'youtube') meta = await adapter.download(track, source, { video, maxBytes: limit });
           else {
             if (video) throw new MusicError('VIDEO_UNSUPPORTED', 'This source offers audio, not video.');
             const media = permitted || await adapter.media(track, { download }); meta = media.track;
-            await boundedFetchFile(media.url, source, this.maxBytes);
+            await boundedFetchFile(media.url, source, limit);
           }
           if (download && !meta.durationSeconds) throw new MusicError('DURATION_UNVERIFIED', 'The provider did not supply a reliable full duration. Choose another recording for full-song listening/download.');
           const candidates = (await readdir(this.root)).filter(f => f.startsWith(prefix.split('/').at(-1)) && f.includes('.source'));
           if (candidates.length !== 1) throw new MusicError('SOURCE_MISSING', 'The selected source did not produce one usable media file.');
           const input = join(this.root, candidates[0]);
-          if ((await stat(input)).size > this.maxBytes) throw new MusicError('FILE_TOO_LARGE', 'Media exceeds the file limit.');
+          if ((await stat(input)).size > limit) throw new MusicError('FILE_TOO_LARGE', 'Media exceeds the file limit.');
           const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', input, '-t', '7200'];
           if (video) args.push('-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=-2:360,fps=24', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
           else args.push('-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2');
-          args.push('-ar', '48000', '-ac', '2', '-metadata', `title=${meta.title}`, '-metadata', `artist=${meta.artist || ''}`, '-fs', String(this.maxBytes), output);
-          await this.runner(this.ffmpeg, args, { timeout: 180000, maxBuffer: 1024 * 1024 });
+          args.push('-ar', '48000', '-ac', '2', '-metadata', `title=${meta.title}`, '-metadata', `artist=${meta.artist || ''}`, '-fs', String(limit), output);
+          await this.runner(this.ffmpeg, args, { timeout: 180000 + Math.min(7200, Number(meta.durationSeconds) || 0) * (video ? 1500 : 200), maxBuffer: 1024 * 1024 });
           const probe = await this.runner('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', output], { timeout: 15000 });
           const info = JSON.parse(probe.stdout); const duration = Number(info.format?.duration); const size = (await stat(output)).size;
-          if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (video && !info.streams.some(s => s.codec_type === 'video')) || size >= this.maxBytes || (meta.durationSeconds && duration < meta.durationSeconds - 4)) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
+          if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (video && !info.streams.some(s => s.codec_type === 'video')) || size >= limit || (meta.durationSeconds && duration < meta.durationSeconds - 4)) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
           await rename(output, filePath);
           result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || track.provider === 'youtube', seek: true, video } } }; this.active.set(key, result);
         } catch (error) {

@@ -507,6 +507,8 @@ function blockTextLength(b) {
       return b.cells.flat().reduce((s, c) => s + (c.text ? richTextToString(c.text).length : 0), 0);
     case 'details':
       return richTextToString(b.summary).length + (b.blocks?.reduce((s, x) => s + blockTextLength(x), 0) ?? 0);
+    case 'list':
+      return b.items?.reduce((sum,item)=>sum+(item.blocks?.reduce((n,x)=>n+blockTextLength(x),0)??0),0)??0;
     case 'blockquote':
       return b.blocks?.reduce((s, x) => s + blockTextLength(x), 0) ?? 0;
     case 'expandable_blockquote':

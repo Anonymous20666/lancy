@@ -20,12 +20,21 @@ export function createHelpScreen({ app }) {
 `✨ Welcome to your ultimate aesthetic all-in-one companion! Tap to uncover all superpowers:
 
 🎵 MUSIC · DOWNLOADS & LIVE CALLS
-• /play <title artist> searches for a permitted downloadable recording. It does not join a voice chat.
-• /addq <title artist> opens multi-select audio queue search; /vplay queues genuine video with audio.
-• /player is the destination dashboard: queue, pause, resume, skip, previous, volume, repeat, seek and lyrics.
-• /stop clears playback and holds the call idle for ten minutes; /leave exits the call immediately, not the group.
-• A dedicated owner-approved user account and an active call are required. Source permissions and metadata determine availability.
-• Lyrics are shown only for a reliable match. Audio quality depends on the source and Telegram; no fixed output bitrate is promised.
+• /play <title artist> — finds the song and sends the full audio file with cover, details and lyrics. One step, no menu.
+• /lyrics <title artist> — matched lyrics only.
+• Reply /play to a voice note, audio or video to recognise the song.
+
+🎧 VOICE CHAT DJ (groups — admins control playback)
+• /vc — sets up the voice chat. The assistant joins, gets call rights and starts or reuses the call automatically when Lancy is an admin with Invite users, Add admins and Manage video chats.
+• /vc <title artist> or /addq — search and queue audio. /vidc or /vplay — queue real video with sound.
+• Reply /vc, /vidc or /stream to any song, voice note or video in the chat to play it live.
+• /random <mood> — infinite radio from a mood or genre (up to 5 mixed).
+• /player — one live dashboard: pause, skip, previous, seek ±10s, volume, repeat, shuffle, queue, lyrics. It updates in place instead of sending new messages.
+• /stop — clears the queue and the assistant leaves right away. After 10 idle minutes it leaves on its own.
+• Channels: /channel @name in DM gives you a private remote for a channel livestream.
+
+📏 LIMITS YOU SHOULD KNOW
+• Telegram only lets bots upload up to 50 MB. Bigger videos are compressed to fit when they'd still be watchable. If not, Lancy tells you why instead of failing silently.
 
 📥 UNIVERSAL HD MEDIA DOWNLOADER & TIKTOK SEARCH (/grab, /download)
 • Paste ANY link or type /grab <link> from TikTok (no watermark!), Instagram Reels, YouTube Shorts, Twitter/X, Pinterest, or Facebook.
@@ -71,7 +80,10 @@ export function createHelpScreen({ app }) {
     b.heading('⛧ essential commands', 3);
     b.table([
       [{ text: rt.bold('/start'), align: 'left', valign: 'middle' }, { text: 'Open the aesthetic dashboard', align: 'left', valign: 'middle' }],
-      [{ text: rt.bold('/play'), align: 'left', valign: 'middle' }, { text: 'Find and download a permitted recording', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/play'), align: 'left', valign: 'middle' }, { text: 'Download a full song in one step', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/vc'), align: 'left', valign: 'middle' }, { text: 'Voice chat: set up, play, or reply-to-stream', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/vidc'), align: 'left', valign: 'middle' }, { text: 'Voice chat with video', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/random'), align: 'left', valign: 'middle' }, { text: 'Infinite mood radio in voice chat', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/addq'), align: 'left', valign: 'middle' }, { text: 'Search and queue live-call audio', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/vplay'), align: 'left', valign: 'middle' }, { text: 'Queue live-call video + audio', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/player'), align: 'left', valign: 'middle' }, { text: 'Open the persistent player', align: 'left', valign: 'middle' }],

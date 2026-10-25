@@ -8,7 +8,7 @@ export function isMusicOwner(app, id) {
   return owners.includes(Number(id));
 }
 export class AccountStore {
-  constructor({ db, root, voice }) { this.db = db; this.root = root; this.voice = voice; this.lock = new KeyedLock(); this.initialized = false; }
+  constructor({ db, root, voice, allowExistingMemberGroups=false }) { this.allowExistingMemberGroups=Boolean(allowExistingMemberGroups);this.db = db; this.root = root; this.voice = voice; this.lock = new KeyedLock(); this.initialized = false; }
   key() {
     const dir = join(this.root, 'secrets'); mkdirSync(dir, { recursive:true, mode:0o700 });
     const path = join(dir,'music-session.key'); let key;
@@ -28,16 +28,28 @@ export class AccountStore {
     return this.lock.run('accounts', async () => {
       await this.voice.ensureDaemon();
       const records = this.records();
-      // Migrate, do not replace, the previously configured single assistant. Default deny
-      // destination access until the owner approves its chat IDs using /accounts allow.
+      // Migrate the configured assistant and approve it across all authorized chats ('*')
+      // unless explicitly denied by the owner via /accounts deny.
       if (!this.db.getSetting('music.legacyImported') && !records.length && process.env.TELEGRAM_STRING_SESSION) {
-        records.push({ alias:'legacy', enabled:true, allowed:[], encrypted:this.encrypt(process.env.TELEGRAM_STRING_SESSION) }); this.save(records); this.db.setSetting('music.legacyImported',true);
+        records.push({ alias:'legacy', enabled:true, allowed:['*'], encrypted:this.encrypt(process.env.TELEGRAM_STRING_SESSION) }); this.save(records); this.db.setSetting('music.legacyImported',true);
       }
+      let upgraded = false;
+      for (const record of records) {
+        if (record.enabled && Array.isArray(record.allowed) && !record.allowed.includes('*') && !(record.denied || []).includes('*')) {
+          record.allowed = ['*', ...record.allowed];
+          upgraded = true;
+        }
+      }
+      if (upgraded) this.save(records);
       const live = await this.voice.accounts(); const known = new Set(live.accounts.map(a => a.alias));
       const failures = [];
-      for (const record of records) if (record.enabled && !known.has(record.alias)) {
-        try { await this.voice.registerAccount({ ...record, encrypted:undefined, session:this.decrypt(record.encrypted) }); }
-        catch { failures.push(record.alias); }
+      for (const record of records) if (record.enabled) {
+        if (!known.has(record.alias)) {
+          try { const managed=this.db.getSetting('music.managedMemberships',{})||{};await this.voice.registerAccount({ ...record, encrypted:undefined, session:this.decrypt(record.encrypted), allow_existing_member_groups:this.allowExistingMemberGroups, managed_destinations:Object.entries(managed).filter(([,m])=>m.alias===record.alias).map(([id])=>Number(id)) }); }
+          catch { failures.push(record.alias); }
+        } else if (upgraded && typeof this.voice.configureAccount === 'function') {
+          await this.voice.configureAccount({ alias:record.alias, enabled:record.enabled, allowed:record.allowed, denied:record.denied || [] }).catch(() => {});
+        }
       }
       this.initialized = true; return failures;
     });
@@ -52,8 +64,8 @@ export class AccountStore {
       if (!/^[A-Za-z0-9_=-]{100,2048}$/.test(session)) throw new MusicError('INVALID_SESSION', 'The staged file does not contain a supported Pyrogram session.');
       const encrypted=this.encrypt(session);
       await this.voice.ensureDaemon();
-      await this.voice.registerAccount({ alias, enabled:true, allowed:[], session });
-      try{records.push({ alias, enabled:true, allowed:[], encrypted });this.save(records);}
+      await this.voice.registerAccount({ alias, enabled:true, allowed:['*'], session, allow_existing_member_groups:this.allowExistingMemberGroups });
+      try{records.push({ alias, enabled:true, allowed:['*'], encrypted });this.save(records);}
       catch(error){await this.voice.configureAccount({alias,remove:true}).catch(()=>{});throw new MusicError('STORAGE_FAILED','Account registration could not be persisted. The protected staging file was retained.');}
       unlinkSync(path);
     });
@@ -61,15 +73,15 @@ export class AccountStore {
   async configure(alias, action, destination) {
     return this.lock.run('accounts', async () => {
       const records = this.records(); const record = records.find(a => a.alias === alias); if (!record) throw new MusicError('UNKNOWN_ACCOUNT','Unknown player account alias.');
-      const next = { ...record, allowed:[...record.allowed] };
+      const next = { ...record, allowed:[...record.allowed], denied:[...(record.denied||[])] };
       if (action === 'enable' || action === 'disable') next.enabled = action === 'enable';
       else if (action === 'allow' || action === 'deny') {
-        if (!Number.isSafeInteger(Number(destination)) || Number(destination) >= 0) throw new MusicError('INVALID_DESTINATION','Use a negative numeric group or channel ID.');
-        next.allowed = next.allowed.filter(x => x !== String(destination)); if (action === 'allow') next.allowed.push(String(destination));
+        if (destination !== '*' && (!Number.isSafeInteger(Number(destination)) || Number(destination) >= 0)) throw new MusicError('INVALID_DESTINATION','Use a negative numeric group or channel ID.');
+        next.allowed = next.allowed.filter(x => x !== String(destination));next.denied=next.denied.filter(x=>x!==String(destination)); if (action === 'allow') next.allowed.push(String(destination));else next.denied.push(String(destination));
       } else if (action !== 'remove') throw new MusicError('INVALID_ACTION','Use register/list/enable/disable/remove/allow/deny.');
       await this.voice.ensureDaemon(); const live = await this.voice.accounts(); const exists = live.accounts.some(a => a.alias === alias);
-      if (exists) await this.voice.configureAccount({ alias, enabled:next.enabled, allowed:next.allowed, remove:action === 'remove' });
-      else if (next.enabled && action !== 'remove') await this.voice.registerAccount({ ...next, encrypted:undefined, session:this.decrypt(next.encrypted) });
+      if (exists) await this.voice.configureAccount({ alias, enabled:next.enabled, allowed:next.allowed, denied:next.denied, remove:action === 'remove' });
+      else if (next.enabled && action !== 'remove') await this.voice.registerAccount({ ...next, encrypted:undefined, session:this.decrypt(next.encrypted), allow_existing_member_groups:this.allowExistingMemberGroups });
       this.save(action === 'remove' ? records.filter(a => a.alias !== alias) : records.map(a => a.alias === alias ? next : a));
     });
   }

@@ -59,7 +59,8 @@ test('compact settings and all new view callbacks remain bounded and decodable',
   const screen=createMusicScreen({app:{}}),s={status:'idle',upcoming:[],loopMode:'off',volume:100};
   for(const rich of [screen.renderPlayer(s),screen.renderOptions(s),screen.renderListen(song(),'file_id')])
     for(const row of rich.blocks.filter(b=>b.type==='buttons'))for(const b of row.buttons){assert.ok(Buffer.byteLength(b.callback_data)<=64);assert.ok(decodeCallback(b.callback_data));}
-  assert.match(JSON.stringify(screen.renderOptions(s)),/Leave call/);
+  assert.match(JSON.stringify(screen.renderOptions(s)),/Stop & leave group/);
+  assert.match(JSON.stringify(screen.renderOptions({...s,isChannel:true})),/Stop & leave call/);
   assert.ok(!JSON.stringify(screen.renderPlayer(s)).includes('Leave call'));
 });
 test('download selection becomes the full-song rich card in the same message, never auto-joins VC',async t=>{

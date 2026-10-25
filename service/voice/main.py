@@ -6,6 +6,8 @@ import hmac
 import logging
 import os
 import signal
+import secrets
+import re
 import time
 from pathlib import Path
 from aiohttp import web
@@ -14,9 +16,11 @@ log = logging.getLogger('lancy.voice')
 
 MESSAGES = {
     'SESSION_NOT_READY': 'No authorized player account is ready. Ask the owner to register one.',
-    'POOL_EXHAUSTED': 'All accounts approved for this destination are busy. Try later or select another approved account.',
+    'ACCOUNT_IN_USE': 'Stop this account’s active calls and prepared destinations before changing or removing it.',
     'ACCOUNT_UNAVAILABLE': 'The selected account is disabled, unauthorized, or not approved for this destination.',
-    'NO_ACTIVE_CALL': 'Start a voice chat or channel live stream first. Lancy will not create one automatically.',
+    'NO_ACTIVE_CALL': 'No active call. A verified administrator can run /vc for audio or /vidc for video to prepare the assistant and create one.',
+    'JOIN_PENDING': 'Telegram requires approval before the assistant can join. Approve its join request, then retry /vc.',
+    'MEMBERSHIP_LEAVE_FAILED': 'The call stopped, but assistant group departure was not confirmed. Cleanup will retry.',
     'PERMISSION_DENIED': 'The playback account must be a member and allowed to speak in this call. Channel streams may require channel administrator/speaker rights.',
     'PUBLISHER_UNVERIFIED': 'Telegram publisher verification failed. The queue is retained. Check speaking permission and retry playback.',
     'MEDIA_INVALID': 'The media is outside the managed cache or lacks required streams.',
@@ -42,6 +46,9 @@ class Bridge:
         self.factory = factory
         self.accounts = {}
         self.calls = {}
+        self.prepared = {}
+        self.last_failures = {}
+        self.events = asyncio.Queue(maxsize=100)
         self.lock = asyncio.Lock()  # only lease assignment/configuration, never network I/O
         self.chat_locks = {}
         self.closing = False
@@ -55,7 +62,7 @@ class Bridge:
         async with self.lock:
             if alias in self.accounts: raise VoiceFailure('ACCOUNT_UNAVAILABLE')
             if len(self.accounts) >= 8: raise VoiceFailure('ACCOUNT_LIMIT')
-            self.accounts[alias] = {'alias': alias, 'enabled': bool(data.get('enabled', True)), 'allowed': list(data.get('allowed', [])), 'status': 'connecting', 'lease': None, 'client': None, 'engine': None}
+            self.accounts[alias] = {'alias': alias, 'enabled': bool(data.get('enabled', True)), 'allowed': list(data.get('allowed', [])), 'status': 'connecting', 'leases': set(), 'client': None, 'engine': None, 'managed': set(int(x) for x in data.get('managed_destinations', [])), 'denied': list(data.get('denied', [])), 'group_grants': set(), 'member_fallback_enabled': bool(data.get('allow_existing_member_groups', False))}
         account = self.accounts[alias]
         try:
             if self.factory:
@@ -83,7 +90,10 @@ class Bridge:
                             try:
                                 elapsed = await engine.time(event.chat_id)
                                 remaining = call['duration'] - call['offset'] if call['duration'] else None
-                                if remaining is not None and elapsed >= max(0, remaining - 2): call['status'] = 'ended'
+                                if remaining is not None and elapsed >= max(0, remaining - min(1.0, remaining / 2)):
+                                    call['status'] = 'ended'
+                                    if self.events.full(): self.events.get_nowait()
+                                    self.events.put_nowait({'chat_id': event.chat_id, 'playback_id': call['playback_id'], 'status': 'ended'})
                             except Exception:
                                 call['clock_errors'] += 1
                 await asyncio.wait_for(engine.start(), 30)
@@ -102,7 +112,7 @@ class Bridge:
 
     async def refresh_health(self):
         for account in list(self.accounts.values()):
-            if not account['enabled'] or account['lease'] is not None or not account['client']: continue
+            if not account['enabled'] or bool(account['leases']) or not account['client']: continue
             try:
                 me = await asyncio.wait_for(account['client'].get_me(), 8)
                 account['status'] = 'authentication_required' if me.is_bot else 'available'
@@ -110,33 +120,178 @@ class Bridge:
                 account['status'] = 'authentication_required'
 
     def public_accounts(self, chat=None):
-        return [{'alias': a['alias'], 'enabled': a['enabled'], 'status': 'disabled' if not a['enabled'] else 'busy' if a['lease'] is not None else a['status'], 'destination': a['lease'] if chat is None else None} for a in self.accounts.values() if chat is None or str(chat) in a['allowed'] or '*' in a['allowed']]
+        result = []
+        for a in self.accounts.values():
+            if chat is not None and not self.destination_authorized(a, chat): continue
+            destinations = sorted(c for c, call in self.calls.items() if call['alias'] == a['alias'])
+            result.append({'alias': a['alias'], 'enabled': a['enabled'],
+                           'status': 'disabled' if not a['enabled'] else a['status'],
+                           'active_calls': len(destinations) if chat is None else int(chat in destinations),
+                           'destinations': destinations if chat is None else None})
+        return result
 
     async def configure(self, data):
         alias = str(data.get('alias', ''))
         async with self.lock:
             a = self.accounts.get(alias)
             if not a: raise VoiceFailure('ACCOUNT_UNAVAILABLE')
-            if a['lease'] is not None: raise VoiceFailure('POOL_EXHAUSTED')
+            if a['leases'] or any(p['alias'] == alias for p in self.prepared.values()):
+                raise VoiceFailure('ACCOUNT_IN_USE')
             if 'allowed' in data: a['allowed'] = list(data['allowed'])
+            if 'denied' in data: a['denied'] = list(data['denied'])
             if 'enabled' in data: a['enabled'] = bool(data['enabled'])
             if data.get('remove'): self.accounts.pop(alias)
         if data.get('remove') and a['client']: await a['client'].stop()
         return {'ok': True}
 
+    def owner_allowed(self, a, chat):
+        return str(chat) not in a.get('denied', []) and (str(chat) in a['allowed'] or '*' in a['allowed'])
+
+    def destination_authorized(self, a, chat):
+        return str(chat) not in a.get('denied', []) and (self.owner_allowed(a, chat) or chat in a.get('group_grants', set()))
+
+    async def verify_existing_group_member(self, a, chat):
+        # Self-only read operations. Never join, invite, promote or create here.
+        await self.resolve_destination(a['client'], chat)
+        try:
+            info = await asyncio.wait_for(a['client'].get_chat(chat), 8)
+            kind = getattr(info.type, 'value', info.type)
+            if kind not in {'group', 'supergroup'}: raise VoiceFailure('PERMISSION_DENIED')
+        except Exception as error:
+            if self.factory or type(error).__name__ != 'AttributeError': raise
+        member = await asyncio.wait_for(a['client'].get_chat_member(chat, a['uid']), 8)
+        status = getattr(member.status, 'value', member.status)
+        if status not in {'owner', 'creator', 'administrator', 'member'} and not (status == 'restricted' and getattr(member, 'is_member', False)):
+            raise VoiceFailure('PERMISSION_DENIED')
+
+    async def existing_group_accounts(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0 or self.closing: raise VoiceFailure('INVALID_REQUEST')
+        limit = asyncio.Semaphore(4)
+        async def candidate(a):
+            if not a.get('member_fallback_enabled') or not a['enabled'] or a['status'] != 'available' or str(chat) in a.get('denied', []): return None
+            async with limit:
+                try: await asyncio.wait_for(self.verify_existing_group_member(a, chat), 25)
+                except Exception: return None
+            async with self.lock:
+                if self.accounts.get(a['alias']) is not a or not a['enabled']: return None
+                a['group_grants'].add(chat)
+            return {'alias': a['alias'], 'user_id': a['uid']}
+        results = await asyncio.gather(*(candidate(a) for a in list(self.accounts.values())))
+        return {'ok': True, 'accounts': [a for a in results if a]}
+
     async def lease(self, chat, alias=None):
         async with self.lock:
-            existing = self.calls.get(chat)
+            existing = self.calls.get(chat) or self.prepared.get(chat)
             if existing:
-                account = self.accounts[existing['alias']]
-                if alias and alias != account['alias']: raise VoiceFailure('ACCOUNT_UNAVAILABLE')
-                return account
-            candidates = [a for a in self.accounts.values() if a['enabled'] and a['status'] == 'available' and (str(chat) in a['allowed'] or '*' in a['allowed']) and (not alias or a['alias'] == alias)]
-            if not candidates: raise VoiceFailure('ACCOUNT_UNAVAILABLE' if alias else 'SESSION_NOT_READY')
-            account = next((a for a in candidates if a['lease'] is None), None)
-            if not account: raise VoiceFailure('POOL_EXHAUSTED')
-            account['lease'] = chat
+                account = self.accounts.get(existing['alias'])
+                if not account or (alias and alias != account['alias']): raise VoiceFailure('ACCOUNT_UNAVAILABLE')
+            else:
+                candidates = [a for a in self.accounts.values() if a['enabled'] and a['status'] == 'available' and self.destination_authorized(a, chat) and (not alias or a['alias'] == alias)]
+                if not candidates: raise VoiceFailure('ACCOUNT_UNAVAILABLE' if alias else 'SESSION_NOT_READY')
+                account = min(candidates, key=lambda a: len(a['leases']))
+            if not account['enabled'] or account['status'] != 'available' or not self.destination_authorized(account, chat): raise VoiceFailure('ACCOUNT_UNAVAILABLE')
+        if not self.owner_allowed(account, chat):
+            try: await asyncio.wait_for(self.verify_existing_group_member(account, chat), 25)
+            except Exception:
+                account['group_grants'].discard(chat)
+                raise VoiceFailure('PERMISSION_DENIED') from None
+        async with self.lock:
+            if self.accounts.get(account['alias']) is not account or not account['enabled'] or not self.destination_authorized(account, chat): raise VoiceFailure('ACCOUNT_UNAVAILABLE')
+            account['leases'].add(chat)
             return account
+
+    def remember_failure(self, chat, error):
+        if len(self.last_failures) >= 1000: self.last_failures.pop(next(iter(self.last_failures)))
+        self.last_failures[chat] = {'code': classify(error), 'kind': type(error).__name__, 'at': int(time.time())}
+
+    def release_destination(self, a, chat):
+        # Keep an uncertain/active call reserved; never touch a sibling chat.
+        if chat not in self.calls:
+            a['leases'].discard(chat)
+
+    async def native_call(self, client, chat):
+        from pyrogram import raw
+        peer = await asyncio.wait_for(client.resolve_peer(chat), 10)
+        if isinstance(peer, raw.types.InputPeerChannel):
+            request = raw.functions.channels.GetFullChannel(channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash))
+        elif isinstance(peer, raw.types.InputPeerChat):
+            request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
+        else: raise VoiceFailure('PERMISSION_DENIED')
+        full = await asyncio.wait_for(client.invoke(request, sleep_threshold=0), 10)
+        return peer, getattr(full.full_chat, 'call', None)
+
+    async def setup(self, data):
+        chat = int(data['chat_id']); stage = data.get('stage')
+        if chat >= 0 or self.closing: raise VoiceFailure('INVALID_REQUEST')
+        async with self.chat_lock(chat):
+            if stage == 'release':
+                if chat not in self.calls:
+                    p = self.prepared.pop(chat, None)
+                    if p:
+                        a = self.accounts[p['alias']]
+                        self.release_destination(a, chat)
+                return {'ok': True}
+            was_prepared = chat in self.prepared or chat in self.calls
+            a = await self.lease(chat, data.get('account_alias'))
+            self.prepared.setdefault(chat, {'alias': a['alias']})
+            if stage == 'identity':
+                try:
+                    me = await asyncio.wait_for(a['client'].get_me(), 10)
+                    if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
+                except Exception:
+                    if not was_prepared:
+                        self.prepared.pop(chat, None)
+                        self.release_destination(a, chat)
+                    raise
+                return {'ok': True, 'account_alias': a['alias'], 'user_id': me.id}
+            if stage == 'manage':
+                a['managed'].add(chat)
+                return {'ok': True, 'account_alias': a['alias']}
+            if stage == 'join':
+                if not self.owner_allowed(a, chat): raise VoiceFailure('PERMISSION_DENIED')
+                invite = str(data.get('invite_link', ''))
+                if not re.fullmatch(r'https://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]{8,200}', invite): raise VoiceFailure('INVALID_REQUEST')
+                try:
+                    joined = await asyncio.wait_for(a['client'].join_chat(invite), 25)
+                    if joined.id != chat: raise VoiceFailure('PERMISSION_DENIED')
+                except Exception as error:
+                    if type(error).__name__ == 'InviteRequestSent': raise VoiceFailure('JOIN_PENDING') from None
+                    if not self.factory and type(error).__name__ in {'AttributeError', 'InviteHashExpired', 'InviteHashInvalid'}:
+                        await self.resolve_destination(a['client'], chat)
+                    elif type(error).__name__ != 'UserAlreadyParticipant': raise
+                a['managed'].add(chat)
+                return {'ok': True, 'account_alias': a['alias']}
+            if stage != 'start' or data.get('create') is not True: raise VoiceFailure('INVALID_REQUEST')
+            await self.resolve_destination(a['client'], chat)
+            peer, call = await self.native_call(a['client'], chat)
+            created = False
+            if call is None:
+                from pyrogram import raw
+                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=0), 15)
+                _, call = await self.native_call(a['client'], chat)
+                if call is None and not self.factory:
+                    for _ in range(3):
+                        await asyncio.sleep(0.3)
+                        _, call = await self.native_call(a['client'], chat)
+                        if call is not None: break
+                if call is None: raise VoiceFailure('NO_ACTIVE_CALL')
+                created = True
+            a['managed'].add(chat)
+            # Setup is not an active media transport. Retain per-chat membership
+            # and routing metadata without reserving a native call.
+            self.release_destination(a, chat)
+            return {'ok': True, 'account_alias': a['alias'], 'call_ready': True, 'created': created}
+
+    async def leave_membership(self, a, chat):
+        if chat not in a.get('managed', set()): return
+        if not self.factory and os.environ.get('MUSIC_KEEP_GROUP_MEMBERSHIP', '1') == '1':
+            a['managed'].discard(chat)
+            return
+        try: await asyncio.wait_for(a['client'].leave_chat(chat, delete=False), 15)
+        except Exception as error:
+            if type(error).__name__ not in {'UserNotParticipant', 'UserNotParticipantError'}: raise VoiceFailure('MEMBERSHIP_LEAVE_FAILED') from None
+        a['managed'].discard(chat)
 
     def source(self, value):
         try:
@@ -199,7 +354,20 @@ class Bridge:
     async def stream(self, a, chat, call):
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, GroupCallConfig
         ff = f'-ss {call["offset"]:.3f}' if call['offset'] else ''
-        if call['bass']: ff += ' --audio ---mid -af volume=0.75,bass=g=3:f=100:w=0.5,alimiter=limit=0.95'
+        # Preserve 6 dB of headroom before PCM16/Opus conversion; no default EQ
+        # or loudness maximization. The limiter is a safety ceiling, not a cure
+        # for network loss, codec damage, or an already distorted recording.
+        eq_preset = str(call.get('eq') or ('bass' if call.get('bass') else 'off')).lower()
+        eq_map = {
+            'bass': 'bass=g=4:f=100:w=0.5,',
+            'vocal': 'highpass=f=160,equalizer=f=3000:width_type=q:w=1.2:g=3,',
+            'nightcore': 'asetrate=48000*1.18,aresample=48000,atempo=1.04,',
+            'vaporwave': 'asetrate=48000*0.85,aresample=48000,',
+            '8d': 'apulsator=hz=0.125,',
+        }
+        eq_filter = eq_map.get(eq_preset, 'bass=g=3:f=100:w=0.5,' if call.get('bass') else '')
+        filters = 'volume=0.5011872336,' + eq_filter + 'alimiter=limit=0.95:level=0,aresample=48000'
+        ff += ' --audio ---mid -af ' + filters
         stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=MediaStream.Flags.REQUIRED if call['video'] else MediaStream.Flags.IGNORE, ffmpeg_parameters=ff or None)
         await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 40)
         if call.get('status') != 'paused':
@@ -214,11 +382,21 @@ class Bridge:
             await asyncio.wait_for(client.get_chat(chat), 10)
             return
         except Exception as error:
-            if type(error).__name__ != 'PeerIdInvalid': raise
+            if not self.factory and type(error).__name__ == 'AttributeError':
+                try:
+                    await asyncio.wait_for(client.resolve_peer(chat), 5)
+                    return
+                except Exception:
+                    pass
+            if type(error).__name__ not in {'PeerIdInvalid', 'ChannelInvalid', 'ChannelPrivate', 'KeyError', 'ValueError', 'AttributeError'}: raise
         async def hydrate():
             async for dialog in client.get_dialogs(limit=500):
-                if dialog.chat.id == chat:
-                    await client.get_chat(chat)
+                if getattr(dialog, 'chat', None) and dialog.chat.id == chat:
+                    try:
+                        await client.get_chat(chat)
+                    except Exception as e:
+                        if not self.factory and type(e).__name__ == 'AttributeError': return True
+                        raise
                     return True
             return False
         if not await asyncio.wait_for(hydrate(), 15):
@@ -232,7 +410,7 @@ class Bridge:
             a = await self.lease(chat, data.get('account_alias'))
             previous = self.calls.get(chat)
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
-            call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
+            call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
             if previous and previous.get('native_call') is not None: call['native_call']=previous['native_call']
             try:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
@@ -240,14 +418,15 @@ class Bridge:
                 if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
                 if not self.factory: await self.resolve_destination(a['client'], chat)
                 await self.stream(a, chat, call)
-                call['status'] = 'playing'; self.calls[chat] = call
+                call['status'] = 'playing'; self.calls[chat] = call; self.last_failures.pop(chat, None)
                 return {'ok': True, 'account_alias': a['alias'], 'status': 'playing'}
             except Exception as error:
+                self.remember_failure(chat, error)
                 # A failed replacement can leave native media partially changed. Retain lease
-                # until leave is confirmed; never advertise that account as free prematurely.
+                # until this chat's leave is confirmed; sibling calls remain independent.
                 try:
                     await asyncio.wait_for(a['engine'].leave_call(chat), 15)
-                    self.calls.pop(chat, None); a['lease'] = None
+                    self.calls.pop(chat, None); self.release_destination(a, chat)
                 except Exception:
                     call['status'] = 'error'; self.calls[chat] = call
                 raise error
@@ -257,14 +436,21 @@ class Bridge:
         async with self.chat_lock(chat):
             call = self.calls.get(chat)
             if not call:
-                if op == 'stop': return {'ok': True, 'status': 'stopped'}
+                if op == 'stop':
+                    prepared = self.prepared.get(chat)
+                    a = self.accounts.get(prepared['alias']) if prepared else next((x for x in self.accounts.values() if chat in x.get('managed', set())), None)
+                    if a and data.get('leave_membership'): await self.leave_membership(a, chat)
+                    self.prepared.pop(chat, None)
+                    if a: self.release_destination(a, chat); a.get('group_grants', set()).discard(chat)
+                    return {'ok': True, 'status': 'stopped'}
                 raise VoiceFailure('NO_ACTIVE_CALL')
             a = self.accounts[call['alias']]; engine = a['engine']
             if op == 'stop':
                 try: await asyncio.wait_for(engine.leave_call(chat), 15)
                 except Exception as e:
                     if type(e).__name__ not in {'NotInCallError', 'NoActiveGroupCall'}: raise
-                self.calls.pop(chat); a['lease'] = None
+                if data.get('leave_membership'): await self.leave_membership(a, chat)
+                self.calls.pop(chat); self.prepared.pop(chat, None); self.release_destination(a, chat); a.get('group_grants', set()).discard(chat)
                 return {'ok': True, 'status': 'stopped'}
             if op == 'idle':
                 # Empty raw stream replaces FFmpeg sources without leaving the call.
@@ -283,7 +469,7 @@ class Bridge:
                 call['status'] = 'paused' if op == 'pause' else 'playing'; call['last_progress'] = time.monotonic()
             elif op == 'volume':
                 volume = int(data['volume'])
-                if not 0 <= volume <= 150: raise VoiceFailure('INVALID_REQUEST')
+                if not 0 <= volume <= 200: raise VoiceFailure('INVALID_REQUEST')
                 await asyncio.wait_for(engine.change_volume_call(chat, volume), 10); call['volume'] = volume
             elif op == 'seek':
                 position = float(data['seconds'])
@@ -300,7 +486,7 @@ class Bridge:
     async def status(self, chat):
         async with self.chat_lock(chat):
             call = self.calls.get(chat)
-            if not call: return {'ok': True, 'active': False}
+            if not call: return {'ok': True, 'active': False, 'last_failure': self.last_failures.get(chat)}
             a = self.accounts[call['alias']]
             if call['status'] in {'playing', 'paused'}:
                 try:
@@ -318,7 +504,7 @@ class Bridge:
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 10)
                         except Exception as leave_error:
                             if classify(leave_error) != 'NO_ACTIVE_CALL': raise
-                        self.calls.pop(chat, None); a['lease'] = None
+                        self.calls.pop(chat, None); self.release_destination(a, chat)
                         return {'ok': True, 'active': False}
                     call['clock_errors'] += 1; call['position_seconds'] = None
                     if call['clock_errors'] >= 3: call['status'] = 'error'
@@ -338,11 +524,12 @@ class Bridge:
                     await self.stream(a, chat, call)
                     call['status'] = 'playing'; call['clock_errors'] = 0
                     call['last_progress'] = time.monotonic()
-                except Exception:
-                    # Retain the lease while retrying; never hand an uncertain native call
-                    # to another destination. Node sees buffering, not a false success.
+                except Exception as error:
+                    self.remember_failure(chat, error)
+                    # Retain this destination's lease while retrying. Never mutate another
+                    # chat's source or state. Node sees buffering, not a false success.
                     if call['retries'] < 2: call['status'] = 'recovering'
-            return {'ok': True, 'active': True, 'info': {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted']}}
+            return {'ok': True, 'active': True, 'last_failure': self.last_failures.get(chat), 'info': {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted']}}
 
     async def shutdown(self):
         self.closing = True
@@ -369,17 +556,27 @@ def make_app(bridge, token):
             return web.json_response({'ok': False, 'error': code, 'message': MESSAGES.get(code, MESSAGES['CALL_FAILED']), 'error_kind':type(e).__name__}, status=503)
     app = web.Application(middlewares=[authenticate], client_max_size=32768)
     async def health(request): return web.json_response({'ok': True, 'protocol': 2, 'ready': any(a['status'] == 'available' and a['enabled'] for a in bridge.accounts.values()), 'active_calls_count': len(bridge.calls), 'session_configured': bool(bridge.accounts), 'mode': 'account_pool'})
+    async def events(request):
+        try: first = await asyncio.wait_for(bridge.events.get(), 20)
+        except asyncio.TimeoutError: return web.json_response({'ok': True, 'events': []})
+        batch = [first]
+        while not bridge.events.empty() and len(batch) < 16: batch.append(bridge.events.get_nowait())
+        return web.json_response({'ok': True, 'events': batch})
     async def accounts(request):
         chat = request.query.get('chat_id')
         if request.query.get('refresh') == '1': await bridge.refresh_health()
         return web.json_response({'ok': True, 'accounts': bridge.public_accounts(int(chat) if chat else None)})
     async def register(request): return web.json_response(await bridge.register(await request.json()))
     async def configure(request): return web.json_response(await bridge.configure(await request.json()))
+    async def existing(request): return web.json_response(await bridge.existing_group_accounts(await request.json()))
+    async def setup(request): return web.json_response(await bridge.setup(await request.json()))
     async def play(request): return web.json_response(await bridge.play(await request.json()))
     async def control(request): return web.json_response(await bridge.control(request.match_info['op'], await request.json()))
     async def status(request): return web.json_response(await bridge.status(int(request.query['chat_id'])))
+    app.router.add_get('/events', events)
     app.router.add_get('/health', health); app.router.add_get('/accounts', accounts)
     app.router.add_post('/accounts/register', register); app.router.add_post('/accounts/configure', configure)
+    app.router.add_post('/destination/setup', setup); app.router.add_post('/destination/existing-group', existing)
     app.router.add_post('/call/play', play); app.router.add_get('/call/status', status)
     app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek}', control)
     async def cleanup(_): await bridge.shutdown()

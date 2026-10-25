@@ -189,6 +189,7 @@ ${stickerSection}
       ]);
     } else {
       // In private chat: Full dashboard with Game Arena & Clone Bot
+      b.buttons([richButton.callback('Channel Play', encodeCallback('music', 'channels'))]);
       b.buttons([
         richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
         richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))

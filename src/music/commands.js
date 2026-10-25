@@ -4,6 +4,10 @@ export const PUBLIC_MUSIC_COMMANDS = [
   { command: 'lyrics', description: 'Find reliably matched recording lyrics' }
 ];
 export const ADMIN_MUSIC_COMMANDS = [
+  { command: 'vc', description: 'Admin: prepare assistant and start an audio voice chat' },
+  { command: 'vidc', description: 'Admin: prepare and stream actual video + audio' },
+  { command: 'stream', description: 'Admin: reply to audio/video to queue that file' },
+  { command: 'random', description: 'Admin: categories/custom infinite music radio' },
   { command: 'addq', description: 'Admin: select and queue audio for this destination' },
   { command: 'vplay', description: 'Admin: queue video + audio for the live call' },
   { command: 'player', description: 'Admin: open the persistent control dashboard' },

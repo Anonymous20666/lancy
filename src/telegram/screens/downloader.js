@@ -15,6 +15,7 @@ import { sleep, parseDurationToSeconds } from '../../utils/time.js';
 import { toTelegramStaticSticker, optimizePreviewImage, splitMatchingCollage } from '../../media/convert.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 import { PinterestWebProvider } from '../../pinterest/web.js';
+import { fitResultForTelegram, describeOversized } from '../../media/telegramLimits.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -1047,11 +1048,19 @@ export function createDownloaderScreen({ app }) {
     });
 
     try {
-      const result = await app.mediaDownloader.download(url, {
+      const rawResult = await app.mediaDownloader.download(url, {
         onProgress: (status) => {
           tracker.set({ stage: status });
         }
       });
+
+      // Telegram refuses bot uploads above its size limit. Compress watchable
+      // oversize videos; otherwise say exactly why instead of a silent failure.
+      const result = await fitResultForTelegram(rawResult, { onProgress: (status) => tracker.set({ stage: status }) });
+      const oversizeNote = describeOversized(result.oversized);
+      if (!result.mediaItems?.length && !result.audioTrack?.buffer && oversizeNote) {
+        throw new Error(oversizeNote);
+      }
 
       const { mediaItems = [], audioTrack = null, platform = 'Media', title = 'Downloaded Media' } = result;
       tracker.set({ stage: 'Delivering file to chat…', platform, total: mediaItems.length, current: mediaItems.length });
@@ -1185,6 +1194,11 @@ export function createDownloaderScreen({ app }) {
 
       if (!sent) {
         sent = await tracker.finish(rich, files);
+      }
+      if (oversizeNote && sent && !sent.permissionError) {
+        await (ctx.api || app.telegram?.api).sendMessage(ctx.chatId, `Some items were skipped:\n${oversizeNote}`, {
+          reply_to_message_id: sent.message_id || tracker.messageId
+        }).catch(() => null);
       }
       if (tracker.messageId && sent && !sent.permissionError) {
         (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(tracker.messageId);

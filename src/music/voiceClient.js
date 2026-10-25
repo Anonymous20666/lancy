@@ -36,19 +36,22 @@ export class VoiceClient {
     this.closed = true; const proc = this.process; if (!proc) return;
     await new Promise(resolve => { const timer = setTimeout(resolve, 20000); proc.once('exit', () => { clearTimeout(timer); resolve(); }); proc.kill('SIGTERM'); });
   }
-  async request(endpoint, { method = 'GET', body, timeoutMs = 10000 } = {}) {
+  async request(endpoint, { method = 'GET', body, timeoutMs = 10000, signal = null } = {}) {
     try {
-      const r = await fetch(`${this.baseUrl}${endpoint}`, { method, headers: { 'Content-Type':'application/json', Authorization: `Bearer ${this.token}` }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs) });
+      const r = await fetch(`${this.baseUrl}${endpoint}`, { method, headers: { 'Content-Type':'application/json', Authorization: `Bearer ${this.token}` }, body: body === undefined ? undefined : JSON.stringify(body), signal:signal?AbortSignal.any([signal,AbortSignal.timeout(timeoutMs)]):AbortSignal.timeout(timeoutMs) });
       if (r.status === 401) throw new MusicError('BRIDGE_INCOMPATIBLE', 'The existing voice bridge is not authorized for this process. Do not start a competing player; arrange a controlled restart.');
-      const data = await r.json(); if (!r.ok || !data.ok) { const error=new MusicError(data.error || 'BRIDGE_FAILURE', data.message || 'The playback engine rejected this operation.');if(data.publisher_state)error.publisherState=data.publisher_state;if(data.error_kind)error.backendKind=data.error_kind;throw error; } return data;
+      const data = await r.json(); if (!r.ok || !data.ok) { const error=new MusicError(data.error || 'BRIDGE_FAILURE', data.message || 'The playback engine rejected this operation.');if(data.publisher_state)error.publisherState=data.publisher_state;if(/^[A-Za-z0-9_]{1,80}$/.test(data.error_kind||'')){error.backendKind=data.error_kind;this.log.warn({code:error.code,backendKind:error.backendKind},'Native call operation failed');}throw error; } return data;
     } catch (error) { if (error instanceof MusicError) throw error; throw new MusicError('BRIDGE_UNAVAILABLE', 'The voice engine is unreachable or timed out. Check its status before retrying.'); }
   }
+  waitEvent(signal) { return this.request('/events',{timeoutMs:25000,signal}); }
   checkHealth() { return this.request('/health', { timeoutMs: 1500 }); }
-  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, bass:Boolean(opts.bass) }, timeoutMs:110000 }); }
+  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')) }, timeoutMs:110000 }); }
   control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 65000 : op === 'resume' ? 35000 : 20000 }); }
   pause(id) { return this.control('pause', id); }
   resume(id) { return this.control('resume', id); }
-  stop(id) { return this.control('stop', id); }
+  stop(id, options = {}) { return this.control('stop', id, { leave_membership: Boolean(options.leaveMembership) }); }
+  existingGroupAccounts(id){return this.request('/destination/existing-group',{method:'POST',body:{chat_id:Number(id)},timeoutMs:65000});}
+  async setup(id, stage, options = {}) { await this.ensureDaemon();return this.request('/destination/setup',{method:'POST',body:{chat_id:Number(id),stage,...options},timeoutMs:65000}); }
   idle(id) { return this.control('idle', id); }
   setVolume(id, volume) { return this.control('volume', id, { volume:Number(volume) }); }
   seek(id, seconds) { return this.control('seek', id, { seconds:Number(seconds) }); }

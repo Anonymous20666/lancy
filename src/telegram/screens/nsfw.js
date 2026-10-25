@@ -2,7 +2,7 @@ import { RichMessageBuilder, rt, richButton, encodeCallback, block } from '../ri
 import { navButtons, kvTable, banner } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { ProgressTracker } from '../progress.js';
-import { searchNsfw, NSFW_CATEGORIES, CATEGORY_SUGGESTIONS } from '../../wallpaper/nsfwSearch.js';
+import { searchNsfw, isBlockedNsfwQuery, NSFW_CATEGORIES, CATEGORY_SUGGESTIONS } from '../../wallpaper/nsfwSearch.js';
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice } from '../permissions.js';
 import { optimizePreviewImage } from '../../media/convert.js';
@@ -98,9 +98,73 @@ export function createNsfwScreen({ app }) {
   const id = 'nsfw';
   const activeSearches = new Map(); // tgId -> AbortController
 
+  function isGroupChat(ctx) {
+    return Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || Number(ctx.chatId) < 0);
+  }
+
+  function isGroupNsfwAllowed(ctx) {
+    if (!isGroupChat(ctx)) return true;
+    return app.db?.getSetting?.(`nsfw.groupEnabled.${ctx.chatId}`, true) !== false;
+  }
+
+  function isAgeGateRequired(ctx) {
+    return app.settings?.get?.('nsfw.requireAgeGate') === true && !app.db?.getSetting?.(`nsfw.ageVerified.${ctx.tgId}`, false);
+  }
+
+  function renderAgeGate() {
+    const b = new RichMessageBuilder();
+    b.header('🔞 AGE VERIFICATION REQUIRED', 1);
+    b.paragraph('This studio contains explicit 18+ adult and anime content. Confirm that you are at least 18 years old to proceed.');
+    b.divider();
+    b.buttons([
+      richButton.callback('🔞 I am 18+ — Enter Studio', encodeCallback(id, 'confirmAge'), { style: 'success' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderGroupLocked() {
+    const b = new RichMessageBuilder();
+    b.header('🔒 18+ STUDIO LOCKED IN THIS GROUP', 1);
+    b.paragraph('A group administrator has disabled 18+ content in this group chat. You can still use /nsfw in private DM with the bot, or a group admin can re-enable it with /nsfw on.');
+    b.divider();
+    b.buttons([
+      richButton.callback('🔓 Unlock 18+ (Admin Only)', encodeCallback(id, 'toggleGroup'), { style: 'primary' }),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'primary' })
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  async function toggleGroupNsfw(ctx, explicitState = null) {
+    const api = ctx.api || app.telegram?.api;
+    if (!isGroupChat(ctx)) {
+      await api?.sendMessage?.(ctx.chatId, 'ℹ️ Group 18+ lock applies to group chats only.').catch(() => {});
+      return false;
+    }
+    const member = await api?.getChatMember?.(ctx.chatId, Number(ctx.tgId)).catch(() => null);
+    const isAdmin = ['creator', 'administrator'].includes(member?.status) || (app.settings?.get?.('general.ownerIds') || []).map(String).includes(String(ctx.tgId));
+    if (!isAdmin) {
+      if (ctx.query?.id) await api?.answerCallbackQuery?.(ctx.query.id, { text: 'Only group administrators can change 18+ group settings.', show_alert: true }).catch(() => {});
+      else await api?.sendMessage?.(ctx.chatId, '🔒 Only verified group administrators can toggle 18+ access in this group.').catch(() => {});
+      return false;
+    }
+    const current = isGroupNsfwAllowed(ctx);
+    const next = explicitState !== null ? Boolean(explicitState) : !current;
+    app.db?.setSetting?.(`nsfw.groupEnabled.${ctx.chatId}`, next);
+    if (ctx.query?.id) {
+      await api?.answerCallbackQuery?.(ctx.query.id, { text: next ? '🔓 18+ Studio enabled in this group.' : '🔒 18+ Studio locked in this group.' }).catch(() => {});
+      await editOrSend(ctx, next ? renderMenu(ctx) : renderGroupLocked());
+    } else {
+      await api?.sendMessage?.(ctx.chatId, next ? '🔓 18+ Studio is now enabled in this group (with auto-spoiler protection).' : '🔒 18+ Studio is now locked in this group.').catch(() => {});
+    }
+    return next;
+  }
+
   // ── Main Menu ─────────────────────────────────────────────────────────────
   function renderMenu(ctx) {
-    const isGroup = Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup');
+    const isGroup = isGroupChat(ctx);
     const b = new RichMessageBuilder();
     b.header('𓆩♡𓆪 18+ ADULT & HENTAI STUDIO 𓆩♡𓆪', 1);
     b.paragraph(rt.italic('₊˚⊹♡ anime hentai, 4K adult wallpapers, aesthetic explicit art & videos ˙ᵕ˙'));
@@ -128,6 +192,11 @@ export function createNsfwScreen({ app }) {
       richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', 'all'), { style: 'primary' }),
       richButton.callback('🔍 Universal 18+ Search', encodeCallback(id, 'searchPrompt', 'all'), { style: 'primary' })
     ]);
+    if (isGroup) {
+      b.buttons([
+        richButton.callback(isGroupNsfwAllowed(ctx) ? '🔒 Lock 18+ in Group (Admin)' : '🔓 Unlock 18+ in Group (Admin)', encodeCallback(id, 'toggleGroup'), { style: 'primary' })
+      ]);
+    }
     b.divider();
     b.buttons(navButtons(id, { back: false, home: true }));
     b.footer(rt.italic('୨୧ multi-source adult engine • Wallhaven 4K, Yande.re, Nekobot & Spankbang ♡'));
@@ -308,6 +377,8 @@ export function createNsfwScreen({ app }) {
   }
 
   async function openMenu(ctx) {
+    if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+    if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
     await editOrSend(ctx, renderMenu(ctx));
   }
 
@@ -697,6 +768,21 @@ export function createNsfwScreen({ app }) {
     const isGroup = Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || Number(chatId) < 0);
     const replyToId = opts.replyToMessageId || ctx.message?.message_id || null;
 
+    if (isGroup && !isGroupNsfwAllowed(ctx)) {
+      return editOrSend(ctx, renderGroupLocked());
+    }
+    if (isAgeGateRequired(ctx)) {
+      return editOrSend(ctx, renderAgeGate());
+    }
+    if (isBlockedNsfwQuery(query)) {
+      const b = new RichMessageBuilder();
+      b.header('⚠️ QUERY BLOCKED BY SAFETY FILTER', 1);
+      b.paragraph('Your search query contains prohibited terms. Queries involving minors or non-consensual content are strictly blocked.');
+      b.buttons(navButtons(id, { back: true, home: true }));
+      b.validate();
+      return editOrSend(ctx, b.toJSON());
+    }
+
     // Delete user input message to keep chat totally clean & un-spammy in DM
     if (!isGroup && ctx.message?.message_id && app.settings?.get?.('telegram.messageCleanup')) {
       await api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
@@ -1025,7 +1111,11 @@ export function createNsfwScreen({ app }) {
   return {
     id,
     registerStateHandlers,
+    toggleGroupNsfw,
     async executeSearch(ctx, query, category = 'all', page = 0) {
+      const q = String(query || '').trim().toLowerCase();
+      if (q === 'off' || q === 'lock' || q === 'disable') return toggleGroupNsfw(ctx, false);
+      if (q === 'on' || q === 'unlock' || q === 'enable') return toggleGroupNsfw(ctx, true);
       return runSearch(ctx, query, category, 10);
     },
     async open(ctx) {
@@ -1034,6 +1124,12 @@ export function createNsfwScreen({ app }) {
     },
     async handle(ctx, action, args) {
       switch (action) {
+        case 'confirmAge':
+          app.db?.setSetting?.(`nsfw.ageVerified.${ctx.tgId}`, true);
+          if (ctx.query?.id) await (ctx.api || app.telegram?.api)?.answerCallbackQuery?.(ctx.query.id, { text: '🔞 Age verified!' }).catch(() => {});
+          return openMenu(ctx);
+        case 'toggleGroup':
+          return toggleGroupNsfw(ctx);
         case 'open':
         case 'menu':
           return openMenu(ctx);

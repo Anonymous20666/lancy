@@ -40,14 +40,24 @@ class TestBridge(unittest.IsolatedAsyncioTestCase):
         await self.bridge.register({'alias':'one', 'session':'fixture', 'allowed':['-1','-2']})
     async def asyncTearDown(self): await self.bridge.shutdown(); self.temp.cleanup()
     def body(self, chat=-1, playback='one'): return {'chat_id':chat, 'stream_url':str(self.file), 'playback_id':playback, 'duration_seconds':120}
-    async def test_exclusive_lease_race(self):
-        result = await asyncio.gather(self.bridge.play(self.body(-1)), self.bridge.play(self.body(-2)), return_exceptions=True)
-        self.assertEqual(sum(isinstance(r, dict) for r in result), 1)
-        self.assertEqual(sum(isinstance(r, VoiceFailure) and r.code == 'POOL_EXHAUSTED' for r in result), 1)
+    async def test_one_account_concurrently_serves_two_isolated_destinations(self):
+        result = await asyncio.gather(self.bridge.play(self.body(-1, 'first')), self.bridge.play(self.body(-2, 'second')))
+        self.assertTrue(all(r['ok'] for r in result))
+        self.assertEqual(self.bridge.accounts['one']['leases'], {-1, -2})
+        self.assertEqual(self.bridge.calls[-1]['playback_id'], 'first')
+        self.assertEqual(self.bridge.calls[-2]['playback_id'], 'second')
+        await self.bridge.control('pause', {'chat_id': -1})
+        await self.bridge.control('volume', {'chat_id': -1, 'volume': 70})
+        self.assertEqual(self.bridge.calls[-2]['status'], 'playing')
+        self.assertNotIn('volume', self.bridge.calls[-2])
+        await self.bridge.control('stop', {'chat_id': -1})
+        self.assertEqual(self.bridge.accounts['one']['leases'], {-2})
+        self.assertEqual(self.bridge.calls[-2]['playback_id'], 'second')
+        self.assertEqual(self.engine.left, [-1])
     async def test_same_destination_dedup(self):
         await asyncio.gather(self.bridge.play(self.body()), self.bridge.play(self.body()))
         self.assertEqual(len(self.bridge.calls), 1)
-        self.assertEqual(self.bridge.accounts['one']['lease'], -1)
+        self.assertEqual(self.bridge.accounts['one']['leases'], {-1})
     async def test_two_accounts_two_destinations(self):
         await self.bridge.register({'alias':'two','session':'fixture2','allowed':['-2']})
         await asyncio.gather(self.bridge.play(self.body(-1)), self.bridge.play(self.body(-2)))
@@ -59,17 +69,18 @@ class TestBridge(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(VoiceFailure): await self.bridge.play(self.body(-3))
         await self.bridge.configure({'alias':'one','enabled':False})
         with self.assertRaises(VoiceFailure): await self.bridge.play(self.body())
-    async def test_busy_account_cannot_be_removed_or_reassigned(self):
+    async def test_in_use_account_cannot_be_removed_but_can_serve_another_chat(self):
         await self.bridge.play(self.body())
         with self.assertRaises(VoiceFailure): await self.bridge.configure({'alias':'one','remove':True})
-        with self.assertRaises(VoiceFailure): await self.bridge.play(self.body(-2))
+        await self.bridge.play(self.body(-2))
+        self.assertEqual(self.bridge.accounts['one']['leases'], {-1,-2})
     async def test_release_only_after_confirmed_leave(self):
         await self.bridge.play(self.body()); self.engine.fail_leave = True
         with self.assertRaises(RuntimeError): await self.bridge.control('stop', {'chat_id':-1})
-        self.assertEqual(self.bridge.accounts['one']['lease'], -1)
+        self.assertEqual(self.bridge.accounts['one']['leases'], {-1})
         self.engine.fail_leave = False
         await self.bridge.control('stop', {'chat_id':-1})
-        self.assertIsNone(self.bridge.accounts['one']['lease'])
+        self.assertEqual(self.bridge.accounts['one']['leases'], set())
     async def test_clock_uses_native_seconds_not_wall_time(self):
         await self.bridge.play(self.body()); self.engine.position = 22
         status = await self.bridge.status(-1)
@@ -138,6 +149,8 @@ class MediaContract(unittest.IsolatedAsyncioTestCase):
             stream=engine.streams[-1][1]
             self.assertEqual(stream.kw['audio_flags'], 'required'); self.assertEqual(stream.kw['video_flags'], 'required')
             self.assertIn('alimiter', stream.kw['ffmpeg_parameters'])
+            self.assertIn('volume=0.5011872336', stream.kw['ffmpeg_parameters'])
+            self.assertNotIn('highpass', stream.kw['ffmpeg_parameters'])
             self.assertFalse(engine.streams[-1][2]['config'].kw['auto_start'])
             await bridge.stream({'engine':engine}, -1, {**base, 'video':False})
             self.assertEqual(engine.streams[-1][1].kw['video_flags'], 'ignore')
@@ -183,7 +196,7 @@ class NativeCallAbsenceTests(unittest.IsolatedAsyncioTestCase):
         status=await self.bridge.status(-1)
         self.assertFalse(status['active'])
         self.assertNotIn(-1,self.bridge.calls)
-        self.assertIsNone(self.bridge.accounts['one']['lease'])
+        self.assertEqual(self.bridge.accounts['one']['leases'], set())
 
 
 class PublisherVerificationTests(unittest.IsolatedAsyncioTestCase):
@@ -241,3 +254,33 @@ class ResumePublisherFailureTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.ensure_publisher=AsyncMock(side_effect=VoiceFailure('PERMISSION_DENIED'))
         with self.assertRaises(VoiceFailure):await self.bridge.control('resume',{'chat_id':-1})
         self.engine.pause.assert_awaited_once_with(-1);self.assertEqual(self.bridge.calls[-1]['status'],'paused')
+
+class ConcurrentDestinationSafetyTests(unittest.IsolatedAsyncioTestCase):
+    body=TestBridge.body
+    asyncSetUp=TestBridge.asyncSetUp
+    asyncTearDown=TestBridge.asyncTearDown
+    async def test_public_status_does_not_mark_reusable_account_busy_or_leak_sibling_destinations(self):
+        await asyncio.gather(self.bridge.play(self.body(-1,'first')),self.bridge.play(self.body(-2,'second')))
+        owner=self.bridge.public_accounts()[0];scoped=self.bridge.public_accounts(-1)[0]
+        self.assertEqual(owner['status'],'available');self.assertEqual(owner['active_calls'],2);self.assertEqual(owner['destinations'],[-2,-1])
+        self.assertIsNone(scoped['destinations']);self.assertEqual(scoped['active_calls'],1)
+    async def test_failure_or_failed_stop_in_one_chat_does_not_block_another_chat(self):
+        await self.bridge.play(self.body());self.engine.fail_leave=True
+        with self.assertRaises(RuntimeError):await self.bridge.control('stop',{'chat_id':-1})
+        await self.bridge.play(self.body(-2,'second'))
+        self.assertEqual(self.bridge.accounts['one']['leases'],{-1,-2});self.assertEqual(self.bridge.calls[-2]['status'],'playing')
+        self.engine.fail_leave=False
+    async def test_same_chat_cannot_switch_accounts_while_a_sibling_can_use_it(self):
+        await self.bridge.register({'alias':'two','session':'fixture','allowed':['-1','-2']})
+        await self.bridge.play({**self.body(-1),'account_alias':'one'})
+        with self.assertRaises(VoiceFailure):await self.bridge.play({**self.body(-1,'replacement'),'account_alias':'two'})
+        await self.bridge.play({**self.body(-2),'account_alias':'one'})
+        self.assertEqual(self.bridge.calls[-2]['alias'],'one')
+    async def test_existing_chat_authorization_is_rechecked_not_bypassed(self):
+        await self.bridge.play(self.body());self.bridge.accounts['one']['allowed']=['-2']
+        with self.assertRaises(VoiceFailure):await self.bridge.play(self.body(-1,'replacement'))
+        await self.bridge.play(self.body(-2,'second'))
+    async def test_prepared_destination_blocks_account_reconfiguration_even_without_a_live_lease(self):
+        self.bridge.prepared[-1]={'alias':'one'}
+        with self.assertRaises(VoiceFailure) as caught:await self.bridge.configure({'alias':'one','remove':True})
+        self.assertEqual(caught.exception.code,'ACCOUNT_IN_USE')
