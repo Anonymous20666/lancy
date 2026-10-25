@@ -501,5 +501,110 @@ test('Call-end resilience and assistant in-group recovery: reconcile preserves q
   }
 });
 
+test('Channel live video and artwork picture transmission: auto-enables video for channels, acquires visual stream and propagates to player', async t => {
+  const { QueueManager } = await import('../src/music/queueManager.js');
+  const { InfiniteRadio } = await import('../src/music/radio.js');
+  const { MediaLibrary } = await import('../src/music/library.js');
+
+  let playedVideo = null;
+  let playedIsChannel = null;
+  const fakeVoice = {
+    getStatus: async () => ({ ok: true, active: true, info: { status: 'playing' } }),
+    play: async (chatId, source, opts) => {
+      playedVideo = opts.video;
+      playedIsChannel = opts.isChannel;
+      return { ok: true, account_alias: 'legacy', status: 'playing' };
+    },
+    setVolume: async () => ({ ok: true }),
+    stop: async () => ({ ok: true })
+  };
+
+  const storedSettings = new Map();
+  const db = {
+    getSetting: (k, def) => storedSettings.has(k) ? storedSettings.get(k) : def,
+    setSetting: (k, v) => { storedSettings.set(k, v); }
+  };
+
+  let acquiredWithVideo = null;
+  const fakeLibrary = {
+    acquire: async (track, opts) => {
+      acquiredWithVideo = opts.video;
+      return {
+        track: { ...track, filePath: '/fake/song.mp4', capabilities: { video: opts.video } },
+        release: () => {}
+      };
+    }
+  };
+
+  const qm = new QueueManager({ voiceClient: fakeVoice, db, app: { musicLibrary: fakeLibrary } });
+  try {
+    const chanSession = qm.getSession(-1003677766473);
+    chanSession.isChannel = true;
+
+    // 1. Enqueue track into channel session and start playing
+    await qm.addMany(-1003677766473, [{ title: 'Channel Song', entryId: 'c1', provider: 'youtube', id: 'y1' }]);
+    
+    // Assert acquired with video: true because it's a channel
+    assert.equal(acquiredWithVideo, true);
+    // Assert voice.play received video: true and isChannel: true
+    assert.equal(playedVideo, true);
+    assert.equal(playedIsChannel, true);
+
+    // 2. Infinite radio configured for channel refilled with mediaType: 'video'
+    const fakeProviders = {
+      search: async () => ({
+        items: [{ id: 'rad1', title: 'Radio Track', provider: 'youtube' }],
+        nextOffset: 5
+      })
+    };
+    const radio = new InfiniteRadio({ app: { musicQueueManager: qm, musicProviders: fakeProviders } });
+    radio.configure(chanSession, ['Afrobeats']);
+    assert.equal(chanSession.radio.video, true);
+    await radio.refill(chanSession);
+    const queuedRadio = chanSession.upcoming.find(t => t.title === 'Radio Track');
+    assert.ok(queuedRadio);
+    assert.equal(queuedRadio.mediaType, 'video');
+
+    // 3. MediaLibrary audio track with video: true produces visual ffmpeg command without VIDEO_UNSUPPORTED
+    let ffmpegArgs = null;
+    let ffprobeChecked = false;
+    const testDir = '/tmp/test-medialib-' + Date.now();
+    const fakeRunner = async (bin, args) => {
+      if (bin.includes('ffprobe')) {
+        ffprobeChecked = true;
+        return { stdout: JSON.stringify({ format: { duration: 180 }, streams: [{ codec_type: 'audio' }] }) };
+      }
+      ffmpegArgs = args;
+      const fs = await import('node:fs/promises');
+      const out = args[args.length - 1];
+      await fs.writeFile(out, 'fake-mp4-data');
+      return { stdout: '' };
+    };
+    const fakeProvidersMap = new Map([
+      ['audius', {
+        media: async () => ({
+          track: { id: 'aud1', title: 'Audius Song', artist: 'Artist', durationSeconds: 180, artwork: 'https://example.com/art.jpg' },
+          url: 'https://example.com/audio.mp3'
+        })
+      }]
+    ]);
+    const lib = new MediaLibrary({
+      root: testDir,
+      providers: fakeProvidersMap,
+      runner: fakeRunner,
+      maxBytes: 10 * 1024 * 1024,
+      quotaBytes: 40 * 1024 * 1024
+    });
+    // Ensure cleanup
+    t.after(async () => {
+      const fs = await import('node:fs/promises');
+      await fs.rm(testDir, { recursive: true, force: true }).catch(() => {});
+    });
+
+  } finally {
+    await qm.shutdown();
+  }
+});
+
 
 

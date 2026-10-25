@@ -55,7 +55,8 @@ export class QueueManager extends EventEmitter {
     if(s.prefetched?.entryId===next.entryId)return;
     this.dropPrefetch(s);if(this.prefetchJobs>=2)return;
     const p={entryId:next.entryId,media:null,claimed:false};s.prefetched=p;this.prefetchJobs++;
-    p.promise=this.app.musicLibrary.acquire(next,{video:next.mediaType==='video'}).then(media=>{
+    const wantsVideo=next.mediaType==='video'||Boolean(s.isChannel);
+    p.promise=this.app.musicLibrary.acquire(next,{video:wantsVideo}).then(media=>{
       if(this.closed||s.prefetched!==p||(!p.claimed&&s.upcoming[0]?.entryId!==p.entryId)){media.release();return null;}
       p.media=media;return media;
     }).catch(()=>null).finally(()=>{this.prefetchJobs--;this.prefetchWork.delete(p.promise);});this.prefetchWork.add(p.promise);
@@ -82,13 +83,16 @@ export class QueueManager extends EventEmitter {
         if(entry.queuedMedia){media=entry.queuedMedia;entry.queuedMedia=null;}
         else if(warm){media=warm.media||await this.#awaitMedia(s,()=>warm.promise);if(s.prefetched===warm)s.prefetched=null;warm.media=null;}
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
-        if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram'].includes(entry.provider))media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:entry.mediaType==='video'}));
+        const wantsVideo=entry.mediaType==='video'||Boolean(s.isChannel);
+        if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram'].includes(entry.provider))media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
         const track=media?{...media.track,entryId:entry.entryId,requester:entry.requester}:entry;
+        if(wantsVideo&&track.capabilities)track.capabilities={...track.capabilities,video:true};
         const source=track.filePath||track.streamUrl||track.audioUrl;if(!source)throw new MusicError('NO_SOURCE','This track has no playable media.');
         const playbackId=randomUUID();calledNative=true;
         const eq=s.eqPreset||(s.bass?'bass':'off');
-        const r=this.#assert(await this.voice.play(s.chatId,source,{isChannel:s.isChannel,video:track.mediaType==='video',playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq}));
+        const isVideo=track.mediaType==='video'||Boolean(s.isChannel)||Boolean(track.capabilities?.video);
+        const r=this.#assert(await this.voice.play(s.chatId,source,{isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq}));
         if(previous){s.history.push(previous);if(s.history.length>25)s.history.shift();}
         this.#release(s);s.media=media;media=null;s.currentTrack=track;s.playbackId=playbackId;s.status='playing';s.connected=true;s.lastError=null;s.lastNotice=null;s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=null;s.failures=0;s.skipVotes=[];
         try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}

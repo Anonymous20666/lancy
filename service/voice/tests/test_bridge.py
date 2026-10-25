@@ -154,9 +154,11 @@ class MediaContract(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(engine.streams[-1][2]['config'].kw['auto_start'])
             await bridge.stream({'engine':engine}, -1, {**base, 'video':False})
             self.assertEqual(engine.streams[-1][1].kw['video_flags'], 'ignore')
-            self.assertEqual(bridge.ensure_publisher.await_count, 2)
+            await bridge.stream({'engine':engine}, -1, {**base, 'video':False, 'is_channel':True})
+            self.assertEqual(engine.streams[-1][1].kw['video_flags'], 'required')
+            self.assertEqual(bridge.ensure_publisher.await_count, 3)
             await bridge.stream({'engine':engine}, -1, {**base, 'status':'paused'})
-            self.assertEqual(bridge.ensure_publisher.await_count, 2, 'Seeking a paused source must not force an unmute')
+            self.assertEqual(bridge.ensure_publisher.await_count, 3, 'Seeking a paused source must not force an unmute')
 
 if __name__ == '__main__': unittest.main()
 

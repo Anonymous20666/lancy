@@ -378,7 +378,10 @@ class Bridge:
         eq_filter = eq_map.get(eq_preset, 'bass=g=3:f=100:w=0.5,' if call.get('bass') else '')
         filters = 'volume=0.5011872336,' + eq_filter + 'alimiter=limit=0.95:level=0,aresample=48000'
         ff += ' --audio ---mid -af ' + filters
-        stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=MediaStream.Flags.REQUIRED if call['video'] else MediaStream.Flags.IGNORE, ffmpeg_parameters=ff or None)
+        is_channel = bool(call.get('is_channel'))
+        has_video = bool(call.get('video') or (is_channel and str(call.get('path', '')).endswith('.mp4')))
+        video_flags = MediaStream.Flags.REQUIRED if has_video else MediaStream.Flags.IGNORE
+        stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
         await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 40)
         if call.get('status') != 'paused':
             try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)

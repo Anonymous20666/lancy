@@ -89,20 +89,45 @@ export class MediaLibrary {
           const files = await readdir(this.root); let used = 0; for (const f of files) used += (await stat(join(this.root, f))).size;
           if (used + Math.max(limit, this.maxBytes * 3) > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
           let meta;
+          let artworkFile = null;
           if (track.provider === 'youtube') meta = await adapter.download(track, source, { video, maxBytes: limit });
           else {
-            if (video) throw new MusicError('VIDEO_UNSUPPORTED', 'This source offers audio, not video.');
             const media = permitted || await adapter.media(track, { download }); meta = media.track;
             await boundedFetchFile(media.url, source, limit);
+            if (video && (meta.artwork || track.artwork)) {
+              artworkFile = `${prefix}.art`;
+              try { await boundedFetchFile(meta.artwork || track.artwork, artworkFile, 5 * 1024 * 1024); } catch { artworkFile = null; }
+            }
           }
           if (download && !meta.durationSeconds) throw new MusicError('DURATION_UNVERIFIED', 'The provider did not supply a reliable full duration. Choose another recording for full-song listening/download.');
           const candidates = (await readdir(this.root)).filter(f => f.startsWith(prefix.split('/').at(-1)) && f.includes('.source'));
           if (candidates.length !== 1) throw new MusicError('SOURCE_MISSING', 'The selected source did not produce one usable media file.');
           const input = join(this.root, candidates[0]);
           if ((await stat(input)).size > limit) throw new MusicError('FILE_TOO_LARGE', 'Media exceeds the file limit.');
-          const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y', '-i', input, '-t', '7200'];
-          if (video) args.push('-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=-2:360,fps=24', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
-          else args.push('-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2');
+          let hasVideoInSource = false;
+          if (video) {
+            try {
+              const probeIn = await this.runner(this.ffmpeg.replace(/ffmpeg$/, 'ffprobe'), ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', input], { timeout: 10000 });
+              const inInfo = JSON.parse(probeIn.stdout);
+              hasVideoInSource = Boolean(inInfo.streams?.some(s => s.codec_type === 'video'));
+            } catch { hasVideoInSource = false; }
+            if (!hasVideoInSource && !artworkFile && (meta.artwork || track.artwork)) {
+              artworkFile = `${prefix}.art`;
+              try { await boundedFetchFile(meta.artwork || track.artwork, artworkFile, 5 * 1024 * 1024); } catch { artworkFile = null; }
+            }
+          }
+          const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y'];
+          if (video) {
+            if (hasVideoInSource) {
+              args.push('-i', input, '-t', '7200', '-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=-2:360,fps=24', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
+            } else if (artworkFile && existsSync(artworkFile)) {
+              args.push('-loop', '1', '-i', artworkFile, '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,format=yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');
+            } else {
+              args.push('-f', 'lavfi', '-i', 'color=c=0x0f172a:s=640x360:r=24', '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');
+            }
+          } else {
+            args.push('-i', input, '-t', '7200', '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2');
+          }
           args.push('-ar', '48000', '-ac', '2', '-metadata', `title=${meta.title}`, '-metadata', `artist=${meta.artist || ''}`, '-fs', String(limit), output);
           await this.runner(this.ffmpeg, args, { timeout: 180000 + Math.min(7200, Number(meta.durationSeconds) || 0) * (video ? 1500 : 200), maxBuffer: 1024 * 1024 });
           const probe = await this.runner('ffprobe', ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', output], { timeout: 15000 });

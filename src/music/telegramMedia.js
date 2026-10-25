@@ -13,7 +13,7 @@ export class TelegramMedia {
   const audio=message?.audio||message?.voice||(/^audio\//.test(doc?.mime_type||'')?doc:null),file=visual||audio;
   if(!file?.file_id)throw new MusicError('REPLY_MEDIA','Reply /stream to an audio, voice message or video.');
   const max=api.isLocalServer?Math.max(this.library.maxBytes,this.library.videoMaxBytes||0):Math.min(this.library.maxBytes,20*1024*1024);if(file.file_size>max)throw new MusicError('FILE_TOO_LARGE',api.isLocalServer?`Reply with media up to ${Math.floor(max/1048576)} MB.`:'Reply with media up to 20 MB for Telegram cloud downloads.');
-  const wantsVideo=video===null?Boolean(visual):Boolean(video);if(wantsVideo&&!visual)throw new MusicError('VIDEO_REQUIRED','Reply /vidc to an actual video, or search for a permitted video.');
+  const wantsVideo=video===null?Boolean(visual):Boolean(video);
   const id=createHash('sha256').update(`${api.me?.id}:${file.file_unique_id||file.file_id}`).digest('hex');
   return this.library.locks.run('downloads',async()=>{
    if(this.library.closed)throw new MusicError('SHUTTING_DOWN','Music is shutting down.');
@@ -36,15 +36,17 @@ export class TelegramMedia {
      try{for await(const chunk of response.body){bytes+=chunk.length;if(bytes>max){await response.body.cancel?.().catch(()=>{});throw new MusicError('FILE_TOO_LARGE','Telegram media exceeded the size limit.');}await out.write(chunk);}}finally{await out.close();}
      }
     const checked=JSON.parse((await this.library.runner('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_type','-of','json',source],{timeout:15000})).stdout),duration=Number(checked.format?.duration);
-    if(!Number.isFinite(duration)||duration<=0||duration>7200||!checked.streams?.some(s=>s.codec_type==='audio')||(wantsVideo&&!checked.streams.some(s=>s.codec_type==='video')))throw new MusicError('INVALID_MEDIA','Media must have playable audio, a known duration up to two hours, and video when requested.');
+    const hasSourceVideo=Boolean(checked.streams?.some(s=>s.codec_type==='video'));
+    if(!Number.isFinite(duration)||duration<=0||duration>7200||!checked.streams?.some(s=>s.codec_type==='audio'))throw new MusicError('INVALID_MEDIA','Media must have playable audio and a known duration up to two hours.');
     const title=String(file.title||file.file_name||message.caption||'Shared recording').replace(/\.(mp3|mp4|ogg|m4a|wav|webm)$/i,'').slice(0,160),artist=String(file.performer||message.from?.first_name||'Shared in Telegram').slice(0,100);
     const records=this.items.get(id)||{};
     for(const isVideo of [false,...(wantsVideo?[true]:[])]){
      if(records[isVideo?'video':'audio']&&this.library.active.has(records[isVideo?'video':'audio'].key))continue;
      const key=createHash('sha256').update(`telegram:${id}:${isVideo}`).digest('hex'),ext=isVideo?'mp4':'mp3',tmp=prefix+'.'+ext,target=join(this.library.root,key+'.'+ext);
-     const args=['-nostdin','-hide_banner','-loglevel','error','-y','-i',source];
-     if(isVideo)args.push('-map','0:v:0','-map','0:a:0','-vf','scale=-2:360,fps=24','-c:v','libx264','-preset','veryfast','-crf','25','-c:a','aac','-b:a','160k','-movflags','+faststart');
-     else args.push('-map','0:a:0','-vn','-c:a','libmp3lame','-q:a','2');
+     const args=['-nostdin','-hide_banner','-loglevel','error','-y'];
+     if(isVideo&&hasSourceVideo)args.push('-i',source,'-map','0:v:0','-map','0:a:0','-vf','scale=-2:360,fps=24','-c:v','libx264','-preset','veryfast','-crf','25','-c:a','aac','-b:a','160k','-movflags','+faststart');
+     else if(isVideo)args.push('-f','lavfi','-i','color=c=0x0f172a:s=640x360:r=24','-i',source,'-map','0:v:0','-map','1:a:0','-c:v','libx264','-preset','veryfast','-crf','26','-c:a','aac','-b:a','160k','-shortest','-movflags','+faststart');
+     else args.push('-i',source,'-map','0:a:0','-vn','-c:a','libmp3lame','-q:a','2');
      args.push('-ar','48000','-ac','2','-fs',String(this.library.maxBytes),tmp);await this.library.runner(this.library.ffmpeg,args,{timeout:180000,maxBuffer:1024*1024});
      const verified=JSON.parse((await this.library.runner('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_type','-of','json',tmp],{timeout:15000})).stdout);
      if(!verified.streams?.some(s=>s.codec_type==='audio')||(isVideo&&!verified.streams.some(s=>s.codec_type==='video'))||Number(verified.format?.duration)<duration-1||(await stat(tmp)).size>=this.library.maxBytes)throw new MusicError('INVALID_MEDIA','The converted recording was incomplete.');
