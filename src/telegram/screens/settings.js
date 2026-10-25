@@ -104,6 +104,7 @@ const EDITABLE = {
     ['storage.persistentSearchHistory', 'Persistent history (true/false)']
   ],
   security: [
+    ['security.publicAccess', 'Public DM access (true/false)'],
     ['security.sessionCredentialPermissions', 'Credential permissions'],
     ['security.tokenProtection', 'Token protection (true/false)'],
     ['security.sessionIsolation', 'Session isolation (true/false)']

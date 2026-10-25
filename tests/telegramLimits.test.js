@@ -725,6 +725,36 @@ test('Instant processing indicator on Infinite Play, /channel routing in GC/chan
   }
 });
 
+test('public access in DM allows non-owner users when PUBLIC_ACCESS=true', async (t) => {
+  const { Database } = await import('../src/core/db.js');
+  const { SettingsManager } = await import('../src/config/settings.js');
+  const { TelegramController } = await import('../src/telegram/bot.js');
+
+  const db = new Database(':memory:');
+  t.after(() => db.close());
+
+  const fakeApi = {
+    answerCallbackQuery: async () => true,
+    sendMessage: async () => ({ message_id: 1 }),
+    getMe: async () => ({ id: 99, username: 'lancybot' })
+  };
+
+  // 1. By default without publicAccess, stranger is rejected
+  const privateSettings = new SettingsManager(db, { env: { OWNER_IDS: '1000' } });
+  const privateCtrl = new TelegramController({ api: fakeApi, db, settings: privateSettings, sm: { handleMessage: async () => false, state: () => 'IDLE' }, screens: new Map() });
+  assert.equal(privateCtrl.isAllowed(9999).ok, false);
+
+  // 2. With env PUBLIC_ACCESS=true, stranger is allowed in DM
+  const publicSettings = new SettingsManager(db, { env: { OWNER_IDS: '1000', PUBLIC_ACCESS: 'true' } });
+  const publicCtrl = new TelegramController({ api: fakeApi, db, settings: publicSettings, sm: { handleMessage: async () => false, state: () => 'IDLE' }, screens: new Map() });
+  assert.equal(publicCtrl.isAllowed(9999).ok, true);
+  assert.equal(publicCtrl.isAllowed(9999).role, 'allowed');
+
+  // 3. Setting hot-reload toggles publicAccess
+  await privateSettings.set('security.publicAccess', true);
+  assert.equal(privateCtrl.isAllowed(9999).ok, true);
+});
+
 
 
 

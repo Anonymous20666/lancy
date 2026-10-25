@@ -256,7 +256,8 @@ export class TelegramController extends EventEmitter {
     if (isGroup || isChannel) return { ok: true, role: 'member' };
 
     // Public platform access if enabled:
-    if (this.settings.get('security.publicAccess') === true) {
+    const pub = this.settings.get('security.publicAccess');
+    if (pub === true || String(pub).toLowerCase() === 'true') {
       return { ok: true, role: 'allowed' };
     }
 

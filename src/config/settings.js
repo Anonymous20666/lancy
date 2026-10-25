@@ -52,6 +52,14 @@ export class SettingsManager extends EventEmitter {
     if (this.env.AI_API_KEY) this.values.ai.apiKey = this.env.AI_API_KEY;
     if (this.env.PINTEREST_PROVIDER) this.values.pinterest.provider = this.env.PINTEREST_PROVIDER;
     if (this.env.FFMPEG_PATH) this.values.media.ffmpegPath = this.env.FFMPEG_PATH;
+    if (this.env.PUBLIC_ACCESS !== undefined || process.env.PUBLIC_ACCESS !== undefined) {
+      const raw = this.env.PUBLIC_ACCESS ?? process.env.PUBLIC_ACCESS;
+      this.values.security.publicAccess = String(raw).toLowerCase() === 'true';
+    }
+    if (this.env.SECURITY_PUBLIC_ACCESS !== undefined || process.env.SECURITY_PUBLIC_ACCESS !== undefined) {
+      const raw = this.env.SECURITY_PUBLIC_ACCESS ?? process.env.SECURITY_PUBLIC_ACCESS;
+      this.values.security.publicAccess = String(raw).toLowerCase() === 'true';
+    }
   }
 
   /** Get a value by dotted path ('whatsapp.physicalStickerPackLimit'). */
