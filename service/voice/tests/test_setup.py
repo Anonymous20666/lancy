@@ -35,6 +35,30 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
   self.bridge.native_call.side_effect=[(types.SimpleNamespace(),None),(types.SimpleNamespace(),types.SimpleNamespace(id=9))]
   result=await self.bridge.setup({'chat_id':-1,'stage':'start','create':True});self.assertTrue(result['created']);self.assertEqual(self.client.invoke.await_count,1)
   request=self.client.invoke.await_args.args[0];self.assertEqual(type(request).__name__,'CreateGroupCall')
+ async def test_join_when_already_participant_succeeds_and_resolves_destination(self):
+  err = Exception(); err.__class__.__name__ = 'UserAlreadyParticipant'
+  self.client.join_chat.side_effect = err
+  result = await self.bridge.setup({'chat_id': -1, 'stage': 'join', 'invite_link': 'https://t.me/+fixture_invite'})
+  self.assertTrue(result['ok'])
+  self.assertIn(-1, self.bridge.accounts['one']['managed'])
+  self.bridge.resolve_destination.assert_awaited()
+ async def test_play_auto_creates_group_call_when_native_call_is_none(self):
+  self.bridge.auto_create_call_in_tests = True
+  self.bridge.native_call = AsyncMock(side_effect=[(types.SimpleNamespace(), None), (types.SimpleNamespace(), types.SimpleNamespace(id=99))])
+  self.bridge.stream = AsyncMock()
+  f = Path(self.temp.name) / 'sample.mp3'; f.write_bytes(b'audio')
+  result = await self.bridge.play({'chat_id': -1, 'stream_url': str(f), 'playback_id': 'auto-call-test'})
+  self.assertTrue(result['ok'])
+  self.assertEqual(self.client.invoke.await_count, 1)
+  req = self.client.invoke.await_args.args[0]
+  self.assertEqual(type(req).__name__, 'CreateGroupCall')
+ def test_classify_handles_floodwait_and_rpc_groupcall_errors(self):
+  fw = Exception(); fw.__class__.__name__ = 'FloodWait'; fw.value = 3
+  self.assertEqual(MODULE.classify(fw), 'RATE_LIMITED')
+  rpc = Exception('GROUPCALL_ALREADY_DISCARDED')
+  self.assertEqual(MODULE.classify(rpc), 'NO_ACTIVE_CALL')
+  rpc_admin = Exception('CHAT_ADMIN_REQUIRED')
+  self.assertEqual(MODULE.classify(rpc_admin), 'PERMISSION_DENIED')
  async def test_idle_prepared_group_can_leave_without_a_playback_call(self):
   await self.bridge.setup({'chat_id':-1,'stage':'manage'});await self.bridge.control('stop',{'chat_id':-1,'leave_membership':True});self.client.leave_chat.assert_awaited_once_with(-1,delete=False);self.assertEqual(self.bridge.accounts['one']['leases'],set());self.assertNotIn(-1,self.bridge.prepared)
  async def test_channel_call_only_departure_does_not_leave_membership(self):

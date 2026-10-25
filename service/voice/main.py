@@ -24,6 +24,7 @@ MESSAGES = {
     'PERMISSION_DENIED': 'The playback account must be a member and allowed to speak in this call. Channel streams may require channel administrator/speaker rights.',
     'PUBLISHER_UNVERIFIED': 'Telegram publisher verification failed. The queue is retained. Check speaking permission and retry playback.',
     'MEDIA_INVALID': 'The media is outside the managed cache or lacks required streams.',
+    'RATE_LIMITED': 'Telegram rate-limited call operations for this chat. Retrying shortly.',
     'CALL_FAILED': 'Telegram could not complete the call operation. Check account health, membership and call permissions.',
     'INVALID_REQUEST': 'Invalid voice-engine request.',
     'ACCOUNT_LIMIT': 'The playback pool has reached its eight-account limit.',
@@ -35,9 +36,14 @@ class VoiceFailure(Exception):
 def classify(error):
     if isinstance(error, VoiceFailure): return error.code
     name = type(error).__name__
-    if name in {'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError'}: return 'NO_ACTIVE_CALL'
-    if name in {'ChatAdminRequired', 'UserNotParticipant', 'ChannelPrivate', 'PeerIdInvalid', 'Forbidden', 'ChatWriteForbidden'}: return 'PERMISSION_DENIED'
-    if name in {'AuthKeyUnregistered', 'SessionRevoked', 'UserDeactivated', 'Unauthorized', 'BotMethodInvalid'}: return 'SESSION_NOT_READY'
+    msg = str(getattr(error, 'MESSAGE', '') or getattr(error, 'message', '') or error).upper()
+    if name == 'FloodWait': return 'RATE_LIMITED'
+    if name in {'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected'} or any(x in msg for x in {'GROUPCALL_ALREADY_DISCARDED', 'GROUPCALL_INVALID', 'GROUPCALL_NOT_FOUND', 'NO_ACTIVE_GROUP_CALL', 'NO ACTIVE CALL'}):
+        return 'NO_ACTIVE_CALL'
+    if name in {'ChatAdminRequired', 'UserNotParticipant', 'ChannelPrivate', 'PeerIdInvalid', 'Forbidden', 'ChatWriteForbidden', 'ChatAdminInviteRequired'} or any(x in msg for x in {'CHAT_ADMIN_REQUIRED', 'USER_NOT_PARTICIPANT', 'FORBIDDEN', 'CHANNEL_PRIVATE', 'PEER_ID_INVALID'}):
+        return 'PERMISSION_DENIED'
+    if name in {'AuthKeyUnregistered', 'SessionRevoked', 'UserDeactivated', 'Unauthorized', 'BotMethodInvalid'} or any(x in msg for x in {'AUTH_KEY_UNREGISTERED', 'SESSION_REVOKED', 'USER_DEACTIVATED'}):
+        return 'SESSION_NOT_READY'
     return 'CALL_FAILED'
 
 class Bridge:
@@ -246,6 +252,8 @@ class Bridge:
                     raise
                 return {'ok': True, 'account_alias': a['alias'], 'user_id': me.id}
             if stage == 'manage':
+                if not self.factory:
+                    await self.resolve_destination(a['client'], chat)
                 a['managed'].add(chat)
                 return {'ok': True, 'account_alias': a['alias']}
             if stage == 'join':
@@ -260,6 +268,8 @@ class Bridge:
                     if not self.factory and type(error).__name__ in {'AttributeError', 'InviteHashExpired', 'InviteHashInvalid'}:
                         await self.resolve_destination(a['client'], chat)
                     elif type(error).__name__ != 'UserAlreadyParticipant': raise
+                if not self.factory:
+                    await self.resolve_destination(a['client'], chat)
                 a['managed'].add(chat)
                 return {'ok': True, 'account_alias': a['alias']}
             if stage != 'start' or data.get('create') is not True: raise VoiceFailure('INVALID_REQUEST')
@@ -416,8 +426,47 @@ class Bridge:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
                 me = await asyncio.wait_for(a['client'].get_me(), 10)
                 if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
-                if not self.factory: await self.resolve_destination(a['client'], chat)
-                await self.stream(a, chat, call)
+                if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
+                    await self.resolve_destination(a['client'], chat)
+                    try: peer, native = await self.native_call(a['client'], chat)
+                    except Exception: peer, native = None, None
+                    if peer is not None and native is None:
+                        from pyrogram import raw
+                        try:
+                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
+                            for _ in range(4):
+                                await asyncio.sleep(0.3)
+                                _, native = await self.native_call(a['client'], chat)
+                                if native is not None: break
+                        except Exception as create_err:
+                            if type(create_err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
+                                raise VoiceFailure('PERMISSION_DENIED') from None
+                            if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 5:
+                                await asyncio.sleep(getattr(create_err, 'value', 1))
+                                _, native = await self.native_call(a['client'], chat)
+                    if native is not None: call['native_call'] = native
+                try:
+                    await self.stream(a, chat, call)
+                except Exception as stream_err:
+                    if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and type(stream_err).__name__ in {'NoActiveGroupCall', 'GroupCallNotFound', 'NotInCallError', 'CallNotFound', 'CallAlreadyEnded', 'GroupCallInvalid', 'CallNotConnected'}:
+                        peer, native = await self.native_call(a['client'], chat)
+                        if native is None:
+                            from pyrogram import raw
+                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
+                            for _ in range(4):
+                                await asyncio.sleep(0.3)
+                                _, native = await self.native_call(a['client'], chat)
+                                if native is not None: break
+                        if native is not None:
+                            call['native_call'] = native
+                            await self.stream(a, chat, call)
+                        else:
+                            raise stream_err
+                    elif type(stream_err).__name__ == 'FloodWait' and getattr(stream_err, 'value', 0) <= 5:
+                        await asyncio.sleep(getattr(stream_err, 'value', 1))
+                        await self.stream(a, chat, call)
+                    else:
+                        raise stream_err
                 call['status'] = 'playing'; self.calls[chat] = call; self.last_failures.pop(chat, None)
                 return {'ok': True, 'account_alias': a['alias'], 'status': 'playing'}
             except Exception as error:

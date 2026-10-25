@@ -95,10 +95,10 @@ export class QueueManager extends EventEmitter {
         this.emit('track_start',{chatId:s.chatId,track:s.currentTrack,session:s});
         this.prefetch(s);await this.updatePlayerCard(s.chatId);return s.currentTrack;
       }catch(error){
-        if(media&&['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED'].includes(error.code)){entry.queuedMedia=media;media=null;}
+        if(media&&['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED','RATE_LIMITED'].includes(error.code)){entry.queuedMedia=media;media=null;}
         media?.release();s.lastError=error instanceof MusicError?error.message:'The call or media source failed. Check account membership and call permissions.';
         this.log.warn({chatId:s.chatId,code:error.code||'PLAY_FAILED',backendKind:/^[A-Za-z0-9_]{1,80}$/.test(error.backendKind||'')?error.backendKind:undefined},'Music track could not start');this.emit('track_error',{chatId:s.chatId,track:entry,code:error.code||'PLAY_FAILED'});s.lastNotice=`Could not start ${entry.title}.`;
-        if(['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED'].includes(error.code)){
+        if(['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED','RATE_LIMITED'].includes(error.code)){
           s.lastNotice+=' Your selection is retained in the queue.';s.upcoming.unshift(entry);if(previous&&calledNative&&!s.upcoming.some(t=>t.entryId===previous.entryId))s.upcoming.unshift(previous);
           if(calledNative){this.#release(s);s.currentTrack=null;s.playbackId=null;s.connected=false;s.status='error';}
           else if(!previous)s.status='error';
@@ -117,7 +117,29 @@ export class QueueManager extends EventEmitter {
   }
   #assert(r) { if (!r?.ok) throw new MusicError(r?.error || 'BRIDGE_FAILURE', r?.message || 'The playback engine did not confirm this operation.'); return r; }
   async pause(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); if (s.status !== 'playing') return false; this.#assert(await this.voice.pause(id)); s.status = 'paused'; await this.updatePlayerCard(id); return true; }); }
-  async resume(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); if (s.status !== 'paused') return false; this.#assert(await this.voice.resume(id)); this.#cancelIdle(s); s.status = 'playing'; await this.updatePlayerCard(id); return true; }); }
+  async resume(id) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      if (s.status !== 'paused') {
+        if ((s.status === 'idle' || s.status === 'error') && (s.currentTrack || s.upcoming.length)) {
+          return this.#next(s, { manual: true });
+        }
+        return false;
+      }
+      try {
+        this.#assert(await this.voice.resume(id));
+        this.#cancelIdle(s);
+        s.status = 'playing';
+        await this.updatePlayerCard(id);
+        return true;
+      } catch (err) {
+        if (['NO_ACTIVE_CALL', 'CALL_FAILED', 'RATE_LIMITED'].includes(err?.code)) {
+          return this.#next(s, { manual: true });
+        }
+        throw err;
+      }
+    });
+  }
   async skip(id) { return this.locks.run(Number(id), () => this.#next(this.getSession(id), { manual: true })); }
   async previous(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const track = s.history.at(-1); if (!track) return null; s.history.pop(); if (s.currentTrack) s.upcoming.unshift(s.currentTrack); s.upcoming=s.upcoming.filter(t=>t.entryId!==track.entryId); s.upcoming.unshift(track); return this.#next(s, { manual: true }); }); }
   async #finishStop(s) {
@@ -180,7 +202,16 @@ export class QueueManager extends EventEmitter {
       try {
         const r = this.#assert(await this.voice.getStatus(s.chatId));
         if (!r.active) {
-          s.status = 'error'; s.connected = false; this.#release(s); s.lastError = 'The account disconnected. Queue retained; use /player to inspect and /addq to retry.'; if(s.currentTrack)s.upcoming.unshift(s.currentTrack);s.currentTrack = null; s.playbackId = null;
+          s.connected = false;
+          this.#release(s);
+          if (s.currentTrack) {
+            s.upcoming.unshift(s.currentTrack);
+            s.currentTrack = null;
+          }
+          s.playbackId = null;
+          s.status = 'idle';
+          s.lastNotice = 'Voice chat ended. Tap ▶ Resume or send a song to start playback.';
+          s.lastError = null;
         } else if (r.info?.playback_id === s.playbackId) {
           s.positionSeconds = Number.isFinite(r.info.position_seconds) ? r.info.position_seconds : null;
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}

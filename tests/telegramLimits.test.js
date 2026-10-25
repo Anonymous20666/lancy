@@ -445,4 +445,61 @@ test('Direct Channel Music: in-channel commands, player rendering, controls and 
   }
 });
 
+test('Call-end resilience and assistant in-group recovery: reconcile preserves queue as idle and resume re-triggers playback', async t => {
+  const { QueueManager } = await import('../src/music/queueManager.js');
+  let activeState = true;
+  let playCalls = 0;
+  let resumeCalls = 0;
+
+  const fakeVoice = {
+    getStatus: async () => ({ ok: true, active: activeState, info: activeState ? { status: 'playing', playback_id: 'p1', volume: 100 } : null }),
+    play: async () => { playCalls++; return { ok: true, account_alias: 'legacy', status: 'playing' }; },
+    resume: async () => {
+      resumeCalls++;
+      if (!activeState) throw { code: 'NO_ACTIVE_CALL', message: 'No active call' };
+      return { ok: true };
+    },
+    setVolume: async () => ({ ok: true }),
+    stop: async () => ({ ok: true })
+  };
+
+  const storedSettings = new Map();
+  const db = {
+    getSetting: (k, def) => storedSettings.has(k) ? storedSettings.get(k) : def,
+    setSetting: (k, v) => { storedSettings.set(k, v); }
+  };
+
+  const qm = new QueueManager({ voiceClient: fakeVoice, db });
+  try {
+    const s = qm.getSession(-100999);
+    s.currentTrack = { title: 'Track 1', entryId: 'e1', filePath: '/fake/1.mp3' };
+    s.playbackId = 'p1';
+    s.status = 'playing';
+    s.connected = true;
+
+    // Simulate external participant ending video chat in Telegram
+    activeState = false;
+    await qm.reconcile();
+
+    // Verify session transitions to idle cleanly with retained queue and restart notice
+    assert.equal(s.connected, false);
+    assert.equal(s.status, 'idle');
+    assert.equal(s.lastError, null);
+    assert.match(s.lastNotice, /Voice chat ended.*Resume/);
+    assert.equal(s.upcoming.length, 1);
+    assert.equal(s.upcoming[0].entryId, 'e1');
+
+    // Simulate user tapping Resume / Play to restart playback
+    activeState = true;
+    const resumed = await qm.resume(-100999);
+    assert.ok(resumed);
+    assert.equal(playCalls, 1);
+    assert.equal(s.status, 'playing');
+    assert.equal(s.connected, true);
+  } finally {
+    await qm.shutdown();
+  }
+});
+
+
 
