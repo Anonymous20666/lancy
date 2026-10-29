@@ -23,13 +23,14 @@ export function matchLyrics(track, records) {
 }
 export class MatchedLyrics {
   constructor({ fetcher = fetch } = {}) { this.fetcher=fetcher; this.cache=new Map(); this.cooldown=0; this.lock=new KeyedLock(); }
-  async get(track) {
-    if (!track?.artist || !track?.title) return { found:false, reason:'The track does not have reliable title and artist metadata.' };
+  async get(track, { force = false } = {}) {
+    if (!track?.title) return { found:false, reason:'The track does not have reliable title and artist metadata.' };
+    const clean = cleanSongMetadata(track.title, track.artist || '');
+    if (!track.artist && !clean.artist) return { found:false, reason:'The track does not have reliable title and artist metadata.' };
     const key=`${track.id}:${track.durationSeconds || ''}`;
-    if (this.cache.has(key)) return this.cache.get(key);
+    if (!force && this.cache.has(key)) return this.cache.get(key);
     return this.lock.run('provider', async () => {
       if (Date.now() < this.cooldown) throw new MusicError('LYRICS_RATE_LIMIT','Lyrics are temporarily rate limited. Try later.');
-      const clean = cleanSongMetadata(track.title, track.artist);
       const searchTitle = clean.title || track.title;
       const searchArtist = clean.artist || track.artist;
       let record = null;
@@ -37,7 +38,7 @@ export class MatchedLyrics {
         const q=new URLSearchParams({ track_name:searchTitle, artist_name:searchArtist });
         const r=await this.fetcher(`https://lrclib.net/api/search?${q}`, { headers:{'User-Agent':'Lancy/1.0 (https://github.com/Anonymous20666/lancy)'}, signal:AbortSignal.timeout(8000) });
         this.cooldown=Date.now()+300;
-        if (r.status===429 || r.status===503) { this.cooldown=Date.now()+Math.max(1,Number(r.headers.get('retry-after')) || 60)*1000; throw new MusicError('LYRICS_RATE_LIMIT','Lyrics are temporarily unavailable. Try again later.'); }
+        if (r.status===429 || (r.status===503 && this.fetcher !== fetch)) { this.cooldown=Date.now()+Math.max(1,Number(r.headers.get('retry-after')) || 60)*1000; throw new MusicError('LYRICS_RATE_LIMIT','Lyrics are temporarily unavailable. Try again later.'); }
         if (r.ok) {
           const records = await r.json();
           record = matchLyrics(track, records);
@@ -53,7 +54,7 @@ export class MatchedLyrics {
         result = { found:true, title:record.trackName, artist:record.artistName, instrumental:Boolean(record.instrumental), text:record.plainLyrics || String(record.syncedLyrics || '').replace(/\[\d{1,2}:\d{2}(?:\.\d+)?\]/g,''), syncedLyrics:record.syncedLyrics || null, source:'LRCLIB' };
       } else {
         try {
-          const fallback = await getLyrics(track.title, track.artist);
+          const fallback = await getLyrics(track.title, track.artist || clean.artist);
           if (fallback?.found && fallback?.lyrics) {
             result = {
               found: true,
@@ -70,7 +71,11 @@ export class MatchedLyrics {
       if (!result) {
         result = { found:false, reason:'No unambiguous title, artist and duration match was found.' };
       }
-      this.cache.set(key,result); if(this.cache.size>200)this.cache.delete(this.cache.keys().next().value); return result;
+      if (result.found || this.fetcher !== fetch) {
+        this.cache.set(key,result);
+        if(this.cache.size>200)this.cache.delete(this.cache.keys().next().value);
+      }
+      return result;
     });
   }
 }

@@ -276,4 +276,44 @@ test('channel custom genre flow (Chinese and Japanese traditional instrumental s
  assert.ok(JSON.stringify(finalEdit.rich).includes('CHANNEL LIVE BROADCAST'),'Submenu card must transition into CHANNEL LIVE BROADCAST player');
 });
 
+test('VC and channel playback auto-fetches matched lyrics for collaboration titles like HARLEM SPARTANS - Kennington Where It Started (Bis x MizorMac x Blanco)',async t=>{
+ const { cleanSongMetadata } = await import('../src/media/lyrics.js');
+ const cleanedFull=cleanSongMetadata('HARLEM SPARTANS - Kennington Where It Started  (Bis x MizorMac x Blanco x Active)','Pressplay Media');
+ assert.equal(cleanedFull.title,'Kennington Where It Started');
+ assert.equal(cleanedFull.artist,'HARLEM SPARTANS');
+
+ const cleanedTrunc=cleanSongMetadata('HARLEM SPARTANS - Kennington Where It Started  (Bis x MizorMac x Blanc','');
+ assert.equal(cleanedTrunc.title,'Kennington Where It Started');
+ assert.equal(cleanedTrunc.artist,'HARLEM SPARTANS');
+
+ const h=setup(t);
+ h.app.music.lyrics={
+  get:async(track)=>{
+   const c=cleanSongMetadata(track.title,track.artist);
+   if(c.title==='Kennington Where It Started'&&c.artist==='HARLEM SPARTANS'){
+    return{found:true,title:c.title,artist:c.artist,text:'Kennington, where it started\nKennington where my heart is',source:'LRCLIB'};
+   }
+   return{found:false,reason:'No match'};
+  }
+ };
+ const panel=await h.open(10,-10011);
+ const harlemTrack=normalizeTrack({
+  providerId:'harlem1',
+  title:'HARLEM SPARTANS - Kennington Where It Started  (Bis x MizorMac x Blanco x Active)',
+  artist:'Pressplay Media',
+  durationSeconds:233,
+  streamUrl:'https://example.com/harlem.mp3',
+  capabilities:{stream:true,seek:true}
+ },'youtube');
+ await h.app.musicQueueManager.addMany(-10011,[harlemTrack]);
+ await new Promise(r=>setTimeout(r,20));
+ const session=h.app.musicQueueManager.getSession(-10011);
+ assert.equal(session.cardLyrics?.status,'ready');
+ assert.match(session.cardLyrics?.result?.text||'',/Kennington, where it started/);
+ const rendered=JSON.stringify(h.screen.renderPlayer(panel));
+ assert.match(rendered,/Kennington, where it started/);
+ assert.ok(!rendered.includes('No reliable matched lyrics yet'));
+});
+
+
 

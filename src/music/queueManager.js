@@ -170,6 +170,7 @@ export class QueueManager extends EventEmitter {
         this.#release(s);s.media=media;media=null;s.currentTrack=track;s.playbackId=playbackId;s.status='playing';s.connected=true;s.lastError=null;s.lastNotice=null;s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=null;s.failures=0;s.skipVotes=[];
         try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}
         this.emit('track_start',{chatId:s.chatId,track:s.currentTrack,session:s});
+        this.app?.music?.requestCardLyrics?.(s);
         this.prefetch(s);await this.updatePlayerCard(s.chatId);return s.currentTrack;
       }catch(error){
         if(media&&['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED','RATE_LIMITED'].includes(error.code)){entry.queuedMedia=media;media=null;}
@@ -322,7 +323,10 @@ export class QueueManager extends EventEmitter {
       if (!s.screenMessageId || !api || Date.now() < (s.editAfter || 0)) return false;
       const screen = this.app?.screens?.get('music'); if (!screen) return false;
       const previews = this.app?.music?.previews;
-      if (!preview) previews?.schedule(s);
+      if (!preview) {
+        previews?.schedule(s);
+        if (s.currentTrack) this.app?.music?.requestCardLyrics?.(s);
+      }
       if (preview && (!previews?.current(s, preview.request) || s.view !== 'player')) return false;
       const display = preview ? { ...s, fullPreview: { ...s.fullPreview, status: 'ready', fileId: 'attach://music_full_audio', track: preview.media.track } } : s;
       const rich = display.view === 'radio' ? screen.renderRadio(display) : display.view === 'queue' ? screen.renderQueue(display, display.page) : display.view === 'lyrics' ? screen.renderLyrics?.(display) : display.view === 'volume' ? screen.renderVolumePicker(display) : display.view === 'accounts' ? screen.renderAccounts(display) : display.view === 'options' ? screen.renderOptions(display) : screen.renderPlayer(display);

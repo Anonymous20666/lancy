@@ -45,8 +45,9 @@ export function cleanSongMetadata(rawTitle, rawArtist = '') {
   // 2. Remove unclosed opening brackets/parentheses at the end (e.g. "(Extended Versi", "[Official")
   raw = raw.replace(/\s*[([{][^)\]}]*$/, '').trim();
 
-  // 3. Strip featured artists in brackets first: (feat. ...) or [feat. ...]
-  raw = raw.replace(/\s*[([{\-]\s*(?:feat\.?|ft\.?)\s+.*?[)\]}]/gi, '');
+  // 3. Strip featured artists and multi-artist collaborations in brackets first: (feat. ...), (Bis x MizorMac x Blanco)
+  raw = raw.replace(/\s*[([{\-]\s*(?:feat\.?|ft\.?|with)\s+.*?[)\]}]/gi, '');
+  raw = raw.replace(/\s*[([{]\s*[^)\]}]*\b(?:x|vs\.?|prod\.?|dir\.?|shot\s+by|music\s+video|visuals?|freestyle|cypher|session|plugged\s+in|daily\s+duppy|mad\s+about\s+bars)\b[^)\]}]*[)\]}]/gi, '');
 
   // 4. Strip common tags like (Official Video), (Official Audio), (Audio), (Remastered), etc.
   raw = raw.replace(/\s*[([{\-]\s*(?:official\s*(?:music\s*)?(?:video|audio)|video|audio|extended(?:\s*version)?|lyric(?:s)?(?:\s*video)?|visualizer|remix|mv|hd|hq|4k|explicit|clean|remaster(?:ed)?|live)[^)\]}]*[)\]}]/gi, '');
@@ -74,11 +75,14 @@ export function cleanSongMetadata(rawTitle, rawArtist = '') {
     }
   }
 
-  // Clean trailing feat/ft and tags from title
+  // Clean trailing feat/ft, multi-artist x collaborations, unclosed parens and tags from title
   let title = raw
-    .replace(/\s*[([{\-]\s*(?:feat\.?|ft\.?)\s+.*?[)\]}]/gi, '')
+    .replace(/\s*[([{][^)\]}]*$/, '')
+    .replace(/\s*[([{\-]\s*(?:feat\.?|ft\.?|with)\s+.*?[)\]}]/gi, '')
+    .replace(/\s*[([{]\s*[^)\]}]*\b(?:x|vs\.?|prod\.?|dir\.?|shot\s+by|music\s+video|visuals?|freestyle|cypher|session|plugged\s+in|daily\s+duppy|mad\s+about\s+bars)\b[^)\]}]*[)\]}]/gi, '')
     .replace(/\s*[([{\-]\s*(?:official\s*(?:music\s*)?(?:video|audio)|video|audio|extended(?:\s*version)?|lyric(?:s)?(?:\s*video)?|visualizer|remix|mv|hd|hq|4k|explicit|clean|remaster(?:ed)?|live)[^)\]}]*[)\]}]/gi, '')
     .replace(/\s*\b(?:feat\.?|ft\.?)\s+.*$/i, '')
+    .replace(/\s+/g, ' ')
     .trim();
 
   // Clean artist
@@ -191,9 +195,10 @@ async function _doSearchSongByLyrics(snippet) {
           return match ? decodeURIComponent(match[1]) : m[1];
         });
 
+      const azFallbackUrl = urls.find((u) => u && u.includes('azlyrics.com/lyrics/')) || '';
       for (let i = 0; i < titles.length; i++) {
         const raw = titles[i];
-        const pageUrl = urls[i] || '';
+        const pageUrl = (urls[i] && urls[i].includes('azlyrics.com')) ? urls[i] : (azFallbackUrl || urls[i] || '');
 
         // Pattern 1: Title · Artist · LRCLIB
         const lrcMatch = raw.match(/^([^·•]+)\s*[·•]\s*([^·•]+)\s*[·•]\s*LRCLIB/i);
@@ -357,43 +362,59 @@ export async function getLyrics(rawTitle, rawArtist = '') {
   };
 
   let networkOffline = false;
+  const coreTitle = (title || '')
+    .replace(/\s*[\(\[][^\)\]]*[\)\]]/g, '')
+    .replace(/\s*[\(\[][^\)\]]*$/, '')
+    .replace(/\s+/g, ' ')
+    .trim() || title;
+  const candidateTitles = [...new Set([title, coreTitle].filter(Boolean))];
 
-  // 1. Try direct exact match via LRCLIB get API
-  if (title && artist) {
-    try {
-      const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(title)}&artist_name=${encodeURIComponent(artist)}`;
-      const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
-      if (res.ok) {
-        const data = await res.json();
-        const plain = (data.plainLyrics || '').trim();
-        const synced = stripLrcTimestamps(data.syncedLyrics || '').trim();
-        const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
-        if (text && text.length > 0) {
-          return wrapResult({
-            found: true,
-            title: data.trackName || title,
-            artist: data.artistName || artist,
-            album: data.albumName,
-            lyrics: text,
-            source: 'lrclib'
-          });
+  // 1. Try direct exact match via LRCLIB get API (with 1 fast retry on 503 ServerOverloaded)
+  if (candidateTitles.length && artist) {
+    for (const candTitle of candidateTitles) {
+      if (networkOffline) break;
+      try {
+        const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(candTitle)}&artist_name=${encodeURIComponent(artist)}`;
+        let res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+        if (res.status === 503) {
+          await new Promise((r) => setTimeout(r, 350));
+          res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
         }
+        if (res.ok) {
+          const data = await res.json();
+          const plain = (data.plainLyrics || '').trim();
+          const synced = stripLrcTimestamps(data.syncedLyrics || '').trim();
+          const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
+          if (text && text.length > 0) {
+            return wrapResult({
+              found: true,
+              title: data.trackName || candTitle,
+              artist: data.artistName || artist,
+              album: data.albumName,
+              lyrics: text,
+              syncedLyrics: data.syncedLyrics || null,
+              source: 'lrclib'
+            });
+          }
+        }
+      } catch (err) {
+        if (/fetch failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH/i.test(String(err?.message || err?.cause?.code || ''))) {
+          networkOffline = true;
+        }
+        log.debug({ err: err.message }, 'LRCLIB direct get failed');
       }
-    } catch (err) {
-      if (/fetch failed|ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ENETUNREACH/i.test(String(err?.message || err?.cause?.code || ''))) {
-        networkOffline = true;
-      }
-      log.debug({ err: err.message }, 'LRCLIB direct get failed');
     }
   }
 
   // 2. Try search by combined query on LRCLIB
   const searchQueries = networkOffline
     ? []
-    : [
-        artist ? `${artist} ${title}` : title,
-        title
-      ].filter(Boolean);
+    : [...new Set([
+        artist ? `${artist} ${coreTitle}` : coreTitle,
+        artist && coreTitle !== title ? `${artist} ${title}` : null,
+        coreTitle,
+        coreTitle !== title ? title : null
+      ].filter(Boolean))];
 
   for (const q of searchQueries) {
     try {
@@ -411,16 +432,15 @@ export async function getLyrics(rawTitle, rawArtist = '') {
               .trim();
           const stripEdition = (s) =>
             normalize(
-              String(s || '').replace(
-                /\s*[\(\[][^\)\]]*(?:feat|ft|with|prod|remix|version|remaster|deluxe|edit|audio|video|explicit|clean|live)[^\)\]]*[\)\]]/gi,
-                ''
-              )
+              String(s || '')
+                .replace(/\s*[\(\[][^\)\]]*[\)\]]/g, '')
+                .replace(/\s*[\(\[][^\)\]]*$/, '')
             );
 
           const normTitle = normalize(title);
-          const normTitleClean = stripEdition(title);
+          const normTitleClean = stripEdition(coreTitle || title);
           const normArtist = normalize(artist);
-          const normCombined = normalize(artist ? `${artist} ${title}` : title);
+          const normCombined = normalize(artist ? `${artist} ${coreTitle || title}` : (coreTitle || title));
           const combinedTokens = normCombined.split(/\s+/).filter(Boolean);
 
           const scored = [];
@@ -433,7 +453,7 @@ export async function getLyrics(rawTitle, rawArtist = '') {
 
             const titleExact =
               rTitle === normTitle ||
-              (normTitleClean && rTitleClean === normTitleClean);
+              (normTitleClean && (rTitle === normTitleClean || rTitleClean === normTitleClean));
             const titleClose =
               titleExact ||
               (normTitleClean &&
@@ -491,6 +511,7 @@ export async function getLyrics(rawTitle, rawArtist = '') {
               artist: match.artistName || artist,
               album: match.albumName,
               lyrics: text,
+              syncedLyrics: match.syncedLyrics || null,
               source: 'lrclib'
             });
           }
@@ -498,6 +519,25 @@ export async function getLyrics(rawTitle, rawArtist = '') {
       }
     } catch (err) {
       log.debug({ err: err.message, q }, 'LRCLIB search query failed');
+    }
+  }
+
+  // 2b. Direct AZLyrics slug lookup when artist & title are known (fast <200ms fallback when LRCLIB is 503/missing)
+  if (!networkOffline && artist && (coreTitle || title)) {
+    const artistSlug = String(artist).toLowerCase().replace(/^the\s+/, '').replace(/[^a-z0-9]/g, '');
+    const titleSlug = String(coreTitle || title).toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (artistSlug.length >= 2 && titleSlug.length >= 2) {
+      const directAzUrl = `https://www.azlyrics.com/lyrics/${artistSlug}/${titleSlug}.html`;
+      const azLyrics = await fetchAzLyrics(directAzUrl);
+      if (azLyrics && azLyrics.length > 0) {
+        return wrapResult({
+          found: true,
+          title: coreTitle || title,
+          artist,
+          lyrics: azLyrics,
+          source: 'azlyrics'
+        });
+      }
     }
   }
 
@@ -518,25 +558,28 @@ export async function getLyrics(rawTitle, rawArtist = '') {
   // 4. Try reverse-search if not already done
   if (!networkOffline && !isSnippet && rawTitle) {
     try {
-      const reverse = await searchSongByLyrics(`${artist} ${title}`.trim() || rawTitle);
-      if (reverse && (reverse.title !== title || reverse.artist !== artist)) {
-        // Try LRCLIB with identified metadata
-        const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(reverse.title)}&artist_name=${encodeURIComponent(reverse.artist)}`;
-        const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
-        if (res.ok) {
-          const data = await res.json();
-          const plain = (data.plainLyrics || '').trim();
-          const synced = stripLrcTimestamps(data.syncedLyrics || '').trim();
-          const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
-          if (text) {
-            return wrapResult({
-              found: true,
-              title: data.trackName || reverse.title,
-              artist: data.artistName || reverse.artist,
-              album: data.albumName,
-              lyrics: text,
-              source: 'lrclib'
-            });
+      const reverse = await searchSongByLyrics(`${artist} ${coreTitle || title}`.trim() || rawTitle);
+      if (reverse) {
+        if (reverse.title !== title || reverse.artist !== artist) {
+          // Try LRCLIB with identified metadata
+          const url = `https://lrclib.net/api/get?track_name=${encodeURIComponent(reverse.title)}&artist_name=${encodeURIComponent(reverse.artist)}`;
+          const res = await fetch(url, { headers, signal: AbortSignal.timeout(8000) });
+          if (res.ok) {
+            const data = await res.json();
+            const plain = (data.plainLyrics || '').trim();
+            const synced = stripLrcTimestamps(data.syncedLyrics || '').trim();
+            const text = plain.length >= synced.length ? (plain || synced) : (synced || plain);
+            if (text) {
+              return wrapResult({
+                found: true,
+                title: data.trackName || reverse.title,
+                artist: data.artistName || reverse.artist,
+                album: data.albumName,
+                lyrics: text,
+                syncedLyrics: data.syncedLyrics || null,
+                source: 'lrclib'
+              });
+            }
           }
         }
 
@@ -545,8 +588,8 @@ export async function getLyrics(rawTitle, rawArtist = '') {
           if (azLyrics && azLyrics.length > 0) {
             return wrapResult({
               found: true,
-              title: reverse.title,
-              artist: reverse.artist,
+              title: reverse.title || coreTitle || title,
+              artist: reverse.artist || artist,
               lyrics: azLyrics,
               source: 'azlyrics'
             });

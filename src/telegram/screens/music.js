@@ -38,11 +38,12 @@ export function createMusicScreen({ app }) {
     if(track.artwork){try{const u=new URL(track.artwork);if(u.protocol==='https:'&&!u.username&&!u.password&&u.hostname.includes('.')&&!/^(?:127\.|10\.|192\.168\.|169\.254\.)/.test(u.hostname))b.photo(u.href,'Recording artwork');}catch{}}
     b.quote(rt.concat(rt.bold(cut(track.title,160)),rt.text(`\n${cut(track.artist||'Artist not supplied',100)}${track.album?` · ${cut(track.album,60)}`:''}`)));
     b.table([['Artist',track.artist||'Not supplied'],['Album',track.album||'Not supplied'],['Length',durationText(track.durationSeconds)],['Source',track.provider],['Format',track.mediaType==='video'?'Video + audio':'Full audio']],{compact:true});
+    const fullLyrics=process.env.MUSIC_LYRICS_FULL_TEXT!=='false';
     const karaoke=vc&&lyrics?.syncedLyrics&&Number.isFinite(positionSeconds)?currentLyricWindow(lyrics.syncedLyrics,positionSeconds):null;
-    const baseText=lyrics?.found?(lyrics.instrumental?'Instrumental recording.':cut(lyrics.text,process.env.MUSIC_LYRICS_FULL_TEXT==='true'?1800:200)):(lyrics?.reason||'No reliable matched lyrics yet. Use Lyrics for a fresh check.');
+    const baseText=lyrics?.found?(lyrics.instrumental?'Instrumental recording.':cut(lyrics.text,fullLyrics?1800:200)):(lyrics?.reason||'No reliable matched lyrics yet. Use Lyrics for a fresh check.');
     const text=karaoke?`🎤 Live Karaoke:\n${karaoke}\n\n${baseText}`:baseText;
     b.expandableBlockquote(`Lyrics · ${cut(track.title,70)}\n\n${text}`);
-    if(lyrics?.found&&!lyrics.instrumental)b.paragraph(rt.italic(process.env.MUSIC_LYRICS_FULL_TEXT==='true'?'Matched lyrics · open Lyrics for remaining pages.':'Matched lyrics excerpt · extended display needs the operator’s display-rights setting.'));
+    if(lyrics?.found&&!lyrics.instrumental)b.paragraph(rt.italic(fullLyrics?'Matched lyrics · open Lyrics for remaining pages.':'Matched lyrics excerpt · extended display needs the operator’s display-rights setting.'));
   }
   function renderListen(track, media, {cardToken=null,lyrics=null}={}) {
     const b=card('Lancy · listen & download','Your full recording. No voice chat needed.');
@@ -258,7 +259,7 @@ export function createMusicScreen({ app }) {
     if(!l?.found)b.paragraph(rt.text(l?.reason||'Choose a track first.'));
     else if(l.instrumental)b.paragraph(rt.text('This recording is marked instrumental.'));
     else {
-      const full=process.env.MUSIC_LYRICS_FULL_TEXT==='true'; const text=full?l.text:cut(l.text,200);const pages=text.match(/[\s\S]{1,1800}/g)||[''];const p=Math.min(s.lyricsPage||0,pages.length-1);
+      const full=process.env.MUSIC_LYRICS_FULL_TEXT!=='false'; const text=full?l.text:cut(l.text,200);const pages=text.match(/[\s\S]{1,1800}/g)||[''];const p=Math.min(s.lyricsPage||0,pages.length-1);
       b.quote(rt.text(pages[p]));if(!full)b.paragraph(rt.italic('Excerpt · full display is disabled unless the operator has appropriate display rights.'));
       const row=[];if(p>0)row.push(controls(s,'Previous','lypage',p-1));if(p<pages.length-1)row.push(controls(s,'Next','lypage',p+1));if(row.length)b.buttons(row);
     }

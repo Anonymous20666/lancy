@@ -34,10 +34,12 @@ export class MusicService {
     const media=await this.app.musicLibrary.importTelegram(ctx.api,message,{video:wantsVideo});let transferred=false;
     try{this.assertQueueGeneration(id,generation);await this.app.musicQueueManager.addMany(id,[{...media.track,queuedMedia:media,requester:ctx.user?.first_name||'Member'}]);transferred=true;return await this.player(ctx,id);}finally{if(!transferred)media.release();}
   }
-  requestCardLyrics(s){
-    const track=s.currentTrack;if(!track||!this.lyrics?.get||s.cardLyrics?.trackId===track.id||this.lyricJobs.has(s.chatId))return;
-    const playback=s.playbackId;s.cardLyrics={trackId:track.id,status:'pending'};
-    const job=Promise.resolve(this.lyrics.get(track)).then(result=>{if(s.currentTrack?.id===track.id&&s.playbackId===playback)s.cardLyrics={trackId:track.id,status:'ready',result};}).catch(()=>{if(s.currentTrack?.id===track.id&&s.playbackId===playback)s.cardLyrics={trackId:track.id,status:'unavailable'};}).finally(()=>{this.lyricJobs.delete(s.chatId);if(!this.app.musicQueueManager.closed)void this.app.musicQueueManager.updatePlayerCard(s.chatId).catch(()=>{});});this.lyricJobs.set(s.chatId,job);
+  requestCardLyrics(s, { force = false } = {}){
+    const root=(s?.destination&&this.app?.musicQueueManager)?this.app.musicQueueManager.getSession(s.destination):s;
+    const track=root?.currentTrack;if(!track||!this.lyrics?.get)return;
+    if(!force&&(root.cardLyrics?.trackId===track.id||this.lyricJobs.has(root.chatId)))return;
+    const playback=root.playbackId;root.cardLyrics={trackId:track.id,status:'pending'};
+    const job=Promise.resolve(this.lyrics.get(track,{force})).then(result=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:result?.found?'ready':'unavailable',result};}).catch(()=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:'unavailable'};}).finally(()=>{this.lyricJobs.delete(root.chatId);if(!this.app.musicQueueManager.closed)void this.app.musicQueueManager.updatePlayerCard(root.chatId).catch(()=>{});});this.lyricJobs.set(root.chatId,job);
   }
   owner(ctx) { return isMusicOwner(this.app,ctx.tgId); }
   botKey(ctx) { return String(ctx.api?.me?.id || ctx.botUsername || ''); }
@@ -281,7 +283,15 @@ export class MusicService {
     else if(action==='volume'){s.view='volume';}
     else if(action==='accounts'){await this.accounts.sync();s.availableAccounts=(await this.app.voiceClient.accounts(id)).accounts;s.view='accounts';}
     else if(action==='queue'||action==='qpage'){s.view='queue';s.page=Math.max(0,Number(args[0])||0);}
-    else if(action==='lyrics'){ const result=await this.lyrics.get(s.currentTrack);s.lyrics=result;s.lyricsPage=0;s.view='lyrics'; }
+    else if(action==='lyrics'){
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🎶 Fetching lyrics…'}).catch(()=>{});
+      const result=s.currentTrack?await this.lyrics.get(s.currentTrack,{force:true}):{found:false,reason:'Choose a track first.'};
+      s.lyrics=result;s.lyricsPage=0;s.view='lyrics';
+      const root=qm.getSession(id);
+      if(root&&s.currentTrack&&root.currentTrack?.id===s.currentTrack.id){
+        root.cardLyrics={trackId:s.currentTrack.id,status:result?.found?'ready':'unavailable',result};
+      }
+    }
     else if(action==='lypage'){s.lyricsPage=Math.max(0,Number(args[0])||0);s.view='lyrics';}
     else if(action==='bass'){s.bass=!s.bass;s.eqPreset=s.bass?'bass':'off';this.app.db?.setSetting?.(`music.bass.${id}`,s.bass);this.app.db?.setSetting?.(`music.eq.${id}`,s.eqPreset);}
     else if(action==='eq'){
