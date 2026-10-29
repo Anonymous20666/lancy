@@ -541,16 +541,16 @@ test('Channel live video and artwork picture transmission: auto-enables video fo
     const chanSession = qm.getSession(-1003677766473);
     chanSession.isChannel = true;
 
-    // 1. Enqueue track into channel session and start playing
+    // 1. Enqueue standard music track into channel session and start playing (audio by default)
     await qm.addMany(-1003677766473, [{ title: 'Channel Song', entryId: 'c1', provider: 'youtube', id: 'y1' }]);
     
-    // Assert acquired with video: true because it's a channel
-    assert.equal(acquiredWithVideo, true);
-    // Assert voice.play received video: true and isChannel: true
-    assert.equal(playedVideo, true);
+    // Assert acquired as audio (video: false) for standard channel music
+    assert.equal(acquiredWithVideo, false);
+    // Assert voice.play received video: false and isChannel: true
+    assert.equal(playedVideo, false);
     assert.equal(playedIsChannel, true);
 
-    // 2. Infinite radio configured for channel refilled with mediaType: 'video'
+    // 2. Infinite radio configured for channel refilled with audio music by default
     const fakeProviders = {
       search: async () => ({
         items: [{ id: 'rad1', title: 'Radio Track', provider: 'youtube' }],
@@ -559,11 +559,15 @@ test('Channel live video and artwork picture transmission: auto-enables video fo
     };
     const radio = new InfiniteRadio({ app: { musicQueueManager: qm, musicProviders: fakeProviders } });
     radio.configure(chanSession, ['Afrobeats']);
-    assert.equal(chanSession.radio.video, true);
+    assert.equal(chanSession.radio.video, false);
     await radio.refill(chanSession);
     const queuedRadio = chanSession.upcoming.find(t => t.title === 'Radio Track');
     assert.ok(queuedRadio);
-    assert.equal(queuedRadio.mediaType, 'video');
+    assert.equal(queuedRadio.mediaType, 'audio');
+
+    // 2b. Explicit video option works when video: true is passed
+    radio.configure(chanSession, ['Afrobeats'], { video: true });
+    assert.equal(chanSession.radio.video, true);
 
     // 3. MediaLibrary audio track with video: true produces visual ffmpeg command without VIDEO_UNSUPPORTED
     let ffmpegArgs = null;

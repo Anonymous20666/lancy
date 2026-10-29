@@ -3,7 +3,7 @@ import {MusicError} from './model.js';
 export const RADIO_CATEGORIES=['Afrobeats','Afropop','Amapiano','Afro house','Highlife','Fuji','Gospel','Hip hop','Rap','Trap','Drill','R&B','Soul','Pop','Dance pop','K-pop','J-pop','Latin pop','Reggaeton','Dancehall','Reggae','Rock','Alternative rock','Indie rock','Metal','Punk','Jazz','Blues','Funk','Disco','House','Deep house','Techno','Trance','EDM','Dubstep','Drum and bass','UK garage','Lo-fi','Chillhop','Ambient','Classical','Piano','Instrumental','Acoustic','Country','Folk','World music','Bossa nova','Sad songs','Love songs','Heartbreak','Workout','Party','Sleep','Study','Gaming','Throwbacks','Phonk','Soundtracks'];
 export class InfiniteRadio {
  constructor({app}){this.app=app;}
- configure(s,queries,{video=null}={}){queries=[...new Set(queries.map(q=>String(q).trim().slice(0,120)).filter(Boolean))];if(!queries.length||queries.length>5)throw new MusicError('RADIO_SELECTION','Choose one to five categories/custom searches.');const wantsVideo=video!==null?Boolean(video):Boolean(s.isChannel||s.radioVideo);s.radio={enabled:true,queries,cursor:0,seen:[],offsets:{},misses:0,notice:null,video:wantsVideo};}
+ configure(s,queries,{video=null}={}){queries=[...new Set(queries.map(q=>String(q).trim().slice(0,120)).filter(Boolean))];if(!queries.length||queries.length>5)throw new MusicError('RADIO_SELECTION','Choose one to five categories/custom searches.');const wantsVideo=video!==null?Boolean(video):Boolean(s.radioVideo);s.radio={enabled:true,queries,cursor:0,seen:[],offsets:{},misses:0,notice:null,video:wantsVideo};}
  stop(s){if(s.radio)s.radio.enabled=false;}
  async refill(s){
   const r=s.radio;if(!r?.enabled||s.upcoming.length>=3)return;
@@ -12,7 +12,7 @@ export class InfiniteRadio {
    for(let attempt=0;attempt<Math.min(3,r.queries.length);attempt++){
     if(this.app.musicQueueManager.closed||!r.enabled||s.radio!==r)return;
     const query=r.queries[r.cursor++%r.queries.length],offset=r.offsets[query]||0;
-    const isVideo=Boolean(r.video||s.isChannel||s.radioVideo);
+    const isVideo=Boolean(r.video||s.radioVideo);
     const hasAdapters=Boolean(this.app.musicProviders?.adapters);
     const isCompilationTitle=title=>/\b([1-9]\s*hours?|full\s*album|compilation|non[\s-]*stop\s*mix|megamix|long\s*playlist)\b/i.test(String(title||''));
     const filterRadio=(items,maxSec=720)=>(items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false&&(!hasAdapters||((!t.durationSeconds||(t.durationSeconds>=40&&t.durationSeconds<=maxSec))&&!isCompilationTitle(t.title))));

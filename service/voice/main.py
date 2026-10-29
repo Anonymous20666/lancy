@@ -415,7 +415,7 @@ class Bridge:
         filters = 'volume=0.5011872336,' + eq_filter + 'alimiter=limit=0.95:level=0,aresample=48000'
         ff += ' --audio ---mid -af ' + filters
         is_channel = bool(call.get('is_channel'))
-        has_video = bool(call.get('video') or (is_channel and str(call.get('path', '')).endswith('.mp4')))
+        has_video = bool(call.get('video'))
         video_flags = MediaStream.Flags.REQUIRED if has_video else MediaStream.Flags.IGNORE
         stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
         await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 25)

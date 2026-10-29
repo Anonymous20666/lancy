@@ -264,10 +264,10 @@ test('channel custom genre flow (Chinese and Japanese traditional instrumental s
  const staleError=h.sent.find(m=>String(m.text||'').includes('Open your current channel dashboard'));
  assert.equal(staleError,undefined,'Must NEVER send STALE_PLAYER error when starting custom genre from submenu card');
 
- // Verify full custom genre was configured in video mode and playback started on -10011
+ // Verify full custom genre was configured as audio music and playback started on -10011
  assert.equal(configuredGenres.length,1);
  assert.deepEqual(configuredGenres[0].cats,[customText]);
- assert.equal(configuredGenres[0].opts?.video,true);
+ assert.equal(configuredGenres[0].opts?.video,false);
  assert.deepEqual(h.calls.filter(x=>x[0]==='play'),[['play',-10011]]);
 
  // Verify submenu message was updated in-place into the live channel broadcast player card

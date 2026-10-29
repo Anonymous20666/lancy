@@ -64,7 +64,7 @@ export class QueueManager extends EventEmitter {
         if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram'].includes(u.provider)){
           s.warmedIds.add(u.entryId);
           if(s.warmedIds.size>50)s.warmedIds.delete(s.warmedIds.values().next().value);
-          const uVid=u.mediaType==='video'||Boolean(s.isChannel);
+          const uVid=u.mediaType==='video';
           void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
         }
       }
@@ -72,7 +72,7 @@ export class QueueManager extends EventEmitter {
     if(s.prefetched?.entryId===next.entryId)return;
     this.dropPrefetch(s);if(this.prefetchJobs>=5)return;
     const p={entryId:next.entryId,media:null,claimed:false};s.prefetched=p;this.prefetchJobs++;
-    const wantsVideo=next.mediaType==='video'||Boolean(s.isChannel);
+    const wantsVideo=next.mediaType==='video';
     p.promise=this.app.musicLibrary.acquire(next,{video:wantsVideo}).then(media=>{
       if(this.closed||s.prefetched!==p||(!p.claimed&&s.upcoming[0]?.entryId!==p.entryId)){media.release();return null;}
       p.media=media;
@@ -100,7 +100,7 @@ export class QueueManager extends EventEmitter {
         for(const u of s.upcoming.slice(0,2)){
           if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram'].includes(u.provider)){
             s.warmedIds.add(u.entryId);
-            const uVid=u.mediaType==='video'||Boolean(s.isChannel);
+            const uVid=u.mediaType==='video';
             void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
           }
         }
@@ -112,7 +112,7 @@ export class QueueManager extends EventEmitter {
         if(entry.queuedMedia){media=entry.queuedMedia;entry.queuedMedia=null;}
         else if(warm){media=warm.media||await this.#awaitMedia(s,()=>warm.promise);if(s.prefetched===warm)s.prefetched=null;warm.media=null;}
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
-        const wantsVideo=entry.mediaType==='video'||Boolean(s.isChannel);
+        const wantsVideo=entry.mediaType==='video';
         if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram'].includes(entry.provider)){
           try {
             media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
@@ -153,7 +153,7 @@ export class QueueManager extends EventEmitter {
         const source=track.filePath||track.streamUrl||track.audioUrl;if(!source)throw new MusicError('NO_SOURCE','This track has no playable media.');
         const playbackId=randomUUID();calledNative=true;
         const eq=s.eqPreset||(s.bass?'bass':'off');
-        const isVideo=track.mediaType==='video'||Boolean(s.isChannel)||Boolean(track.capabilities?.video);
+        const isVideo=track.mediaType==='video';
         const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq};
         let r;
         try {
