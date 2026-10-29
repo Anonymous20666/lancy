@@ -1056,6 +1056,10 @@ export class TelegramController extends EventEmitter {
 
       if (!fileId) {
         try {
+          // If VideoStreamingServer is already downloading this exact videoId for Telegram's inline fetch, await it instead of starting a duplicate yt-dlp process
+          if (videoId && this.app?.videoStreamer?.activeAudioDownloads?.has(videoId)) {
+            await this.app.videoStreamer.activeAudioDownloads.get(videoId).catch(() => null);
+          }
           const cachedAudioPath = videoId ? `/data/audio_cache/${videoId}.mp3` : null;
           let audioBuffer = null;
           let resDur = durSec;
@@ -1898,13 +1902,6 @@ export class TelegramController extends EventEmitter {
   }
 
   async #fetchInlineMusicSearch(queryTopic, offset = 0) {
-    if (this.app?.music) {
-      try {
-        const page = await this.app.musicProviders.search(queryTopic, { offset: Math.max(0, Number(offset) || 0), limit: 5 });
-        return { results: page.items.map(t => ({ type: 'article', id: t.id, title: t.title, description: `${t.artist || 'Artist not supplied'} · ${t.provider} · select to open download search`, input_message_content: { message_text: `/play ${t.sourceRef && t.provider === 'youtube' ? t.sourceRef : `audius: ${t.title} ${t.artist || ''}`}` } })), nextOffset: page.nextOffset == null ? '' : String(page.nextOffset) };
-      } catch { return { results: [], nextOffset: '' }; }
-    }
-
     if (!queryTopic) return { results: [], nextOffset: '' };
     try {
       const botUser = this.botUsername || 'Lancy_easy_bot';
@@ -2059,6 +2056,48 @@ export class TelegramController extends EventEmitter {
         } catch (searchErr) {
           this.log?.debug?.({ err: searchErr?.message, cleanTopic }, 'fast youtube music search error');
         }
+
+        // Supplement with multi-provider catalog (YouTube + Audius) if fast search returned fewer than PAGE_SIZE items
+        if (cached.items.length < (offset + PAGE_SIZE) && this.app?.musicProviders?.search) {
+          try {
+            const page = await this.app.musicProviders.search(cleanTopic, { offset: 0, limit: 12 });
+            for (const t of (page?.items || [])) {
+              const videoId = t.provider === 'youtube' && t.providerId ? String(t.providerId) : null;
+              const itemId = videoId || String(t.id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+              if (!itemId || !t?.title) continue;
+              const normTitle = String(t.title || '').toLowerCase().trim();
+              const normArtist = String(t.artist || 'Music').toLowerCase().trim();
+              const normKey = `${normTitle} ${normArtist}`.trim();
+              if (cached.seenKeys.has(itemId) || cached.seenKeys.has(normKey) || cached.seenKeys.has(normTitle)) continue;
+
+              cached.seenKeys.add(itemId);
+              if (normKey) cached.seenKeys.add(normKey);
+              if (normTitle) cached.seenKeys.add(normTitle);
+
+              const durSec = Number(t.durationSeconds) || parseDurationToSeconds(t.duration) || 180;
+              const safeArt = String(t.artist || 'Music').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
+              const safeTit = String(t.title || 'Track').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
+              const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
+              const streamUrl = videoId
+                ? (existsSync(`/data/audio_cache/${videoId}.mp3`)
+                  ? `https://pappysonghttps.duckdns.org/audio/${videoId}.mp3`
+                  : `https://pappysonghttps.duckdns.org/audio/live/${videoId}/${cleanSlug}`)
+                : (t.streamUrl || null);
+              if (!streamUrl) continue;
+
+              cached.items.push({
+                source: 'youtube_audio',
+                id: itemId,
+                videoId: videoId || itemId,
+                audioUrl: streamUrl,
+                title: t.title,
+                artist: t.artist || 'Music',
+                duration: durSec,
+                thumb: t.artwork || null
+              });
+            }
+          } catch {}
+        }
       }
 
       inlineMusicCache.set(legacyKey, cached.items);
@@ -2181,6 +2220,15 @@ export class TelegramController extends EventEmitter {
             parse_mode: 'HTML',
             reply_markup: { inline_keyboard: keyboard }
           });
+        }
+      }
+
+      // Pre-warm top 2 uncached audio tracks in background so inline selection plays & upgrades immediately
+      if (Number(offset) === 0 && this.app?.mediaDownloader) {
+        for (let i = 0; i < Math.min(paged.length, 2); i++) {
+          if (!paged[i]?.fileId && paged[i]?.videoId) {
+            this.#cacheAudioTrack(`${paged[i].title || ''} ${paged[i].artist || ''}`.trim(), 25000, paged[i].videoId).catch(() => {});
+          }
         }
       }
 
@@ -3617,6 +3665,28 @@ export class TelegramController extends EventEmitter {
     // Commands
     const rawText = message.text ?? message.caption ?? '';
     let text = rawText.trim();
+
+    // Prevent inline query results dropped into chat (message.via_bot) from conflicting with
+    // active search prompts (States.MUSIC_SEARCH_INPUT), Shazam audio recognition, or the AI assistant!
+    if (message.via_bot && !text.startsWith('/')) {
+      if (message.message_id) {
+        this.markMediaDeliveryMessage(message.message_id);
+      }
+      const activeState = this.sm?.state?.(tgId) ?? this.sm?.for?.(tgId)?.state;
+      if (
+        activeState === States.MUSIC_SEARCH_INPUT ||
+        activeState === States.MUSIC_QUEUE_INPUT ||
+        activeState === States.PINTEREST_SEARCH ||
+        activeState === States.NSFW_SEARCH_INPUT ||
+        activeState === States.URL_DOWNLOADER_INPUT ||
+        activeState === States.TIKTOK_SEARCH_INPUT ||
+        activeState === States.PFP_SEARCH_INPUT
+      ) {
+        await this.sm.reset(tgId, { reason: 'inline_via_bot' }).catch(() => {});
+      }
+      return;
+    }
+
     if (/^(rm\s*bot|remove\s*bot|delete\s*bot)(\s+.*)?$/i.test(text)) {
       text = text.replace(/^(rm\s*bot|remove\s*bot|delete\s*bot)/i, '/rmbot');
     }
@@ -4144,7 +4214,7 @@ export class TelegramController extends EventEmitter {
         if (targetUrl) {
           await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), targetUrl);
         } else if (rest.length > 0 && isMusicCommand) {
-          const query = rest.join(' ').trim();
+          const query = rest.join(' ').replace(/^(audius|youtube|soundcloud):\s*/i, '').trim();
           await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), query);
         } else if (rest.length > 0 && !isMusicCommand) {
           await this.api.sendMessage(

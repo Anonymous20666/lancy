@@ -11,72 +11,104 @@ import { logger } from '../../core/logger.js';
 const log = logger().child({ module: 'nsfw-screen' });
 
 /**
- * Fetch HD buffers for preview slideshow (1080p+ quality, no 150px thumbnails).
+ * Infer required Referer header for adult CDNs so HD MP4 streams never return 403.
+ */
+function buildMediaHeaders(url = '', itemHeaders = null) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    ...(itemHeaders || {})
+  };
+  if (!headers.Referer) {
+    if (/eporner\.com/i.test(url)) headers.Referer = 'https://www.eporner.com/';
+    else if (/redgifs\.com/i.test(url)) headers.Referer = 'https://www.redgifs.com/';
+    else if (/xvideos/i.test(url)) headers.Referer = 'https://www.xvideos.com/';
+    else if (/yande\.re/i.test(url)) headers.Referer = 'https://yande.re/';
+    else if (/konachan\.com/i.test(url)) headers.Referer = 'https://konachan.com/';
+  }
+  return headers;
+}
+
+/**
+ * Fetch HD buffers for preview slideshow (1080p/720p full playable MP4 videos with audio & 4K/HD photos).
  */
 async function fetchPreviewBuffers(items, max = 10) {
   const previewBlocks = [];
   const mediaFiles = {};
   let idx = 0;
 
+  const MAX_VIDEO_BYTES = 48 * 1024 * 1024; // 48 MB Telegram Bot API upload safety cap
   const topItems = (items || []).slice(0, max);
+
   const promises = topItems.map(async (it) => {
     const isVideo = it.type === 'video';
-    // For videos, ALWAYS fetch genuine playable video stream (data-pvv / td.mp4 / direct mp4)
-    // NEVER prioritize thumbUrl over video stream!
-    const targetUrl = isVideo
-      ? (it.videoUrl || it.mediaUrl || it.media_url)
-      : (it.thumbUrl || it.media_url || it.mediaUrl);
-    if (!targetUrl) return null;
-    try {
-      const res = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36' },
-        signal: AbortSignal.timeout(7000)
-      });
-      if (!res.ok) return null;
-      const arrayBuf = await res.arrayBuffer();
-      const rawBuf = Buffer.from(arrayBuf);
-      if (rawBuf.length < 50) return null;
+    // For videos, try full HD video streams in order (videoUrl -> mediaUrl -> fallbackUrls)
+    const candidateUrls = isVideo
+      ? [...new Set([it.videoUrl, it.mediaUrl, it.media_url, ...(Array.isArray(it.fallbackUrls) ? it.fallbackUrls : [])].filter(Boolean))]
+      : [...new Set([it.mediaUrl, it.media_url, it.thumbUrl].filter(Boolean))];
 
-      if (isVideo) {
-        // Inspect magic bytes:
-        // JPEG starts with 0xFF 0xD8
-        // PNG starts with 0x89 0x50 0x4E 0x47
-        // GIF starts with GIF8
-        const isImage = (rawBuf[0] === 0xff && rawBuf[1] === 0xd8) ||
-                        (rawBuf[0] === 0x89 && rawBuf[1] === 0x50) ||
-                        (rawBuf[0] === 0x47 && rawBuf[1] === 0x49 && rawBuf[2] === 0x46);
+    if (candidateUrls.length === 0) return null;
 
-        if (isImage) {
-          // If server returned an image instead of a video, deliver it as photo
-          // so Telegram mobile player never fails with "App was unable to play this video"
-          const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1280, quality: 88 });
-          return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+    for (const targetUrl of candidateUrls) {
+      try {
+        const res = await fetch(targetUrl, {
+          headers: buildMediaHeaders(targetUrl, it.headers),
+          signal: AbortSignal.timeout(isVideo ? 16000 : 8500)
+        });
+        if (!res.ok) continue;
+
+        const contentLength = Number(res.headers?.get?.('content-length') || 0);
+        if (isVideo && contentLength > MAX_VIDEO_BYTES && candidateUrls.length > 1) {
+          // Stream exceeds 48 MB; step down to next resolution in fallbackUrls (e.g. 720p / 480p)
+          try { await res.body?.cancel?.(); } catch {}
+          continue;
         }
 
-        // Genuine playable MP4 video!
-        return { type: 'video', buffer: rawBuf, mime: 'video/mp4' };
-      }
+        const arrayBuf = await res.arrayBuffer();
+        const rawBuf = Buffer.from(arrayBuf);
+        if (rawBuf.length < 50) continue;
+        if (isVideo && rawBuf.length > MAX_VIDEO_BYTES && candidateUrls.length > 1) {
+          continue;
+        }
 
-      // Crisp 1280px HD optimization for photos
-      const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1280, quality: 88 });
-      return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
-    } catch {
-      // Fallback: If video download timed out or failed, try its preview thumbnail as photo
-      if (isVideo && it.thumbUrl && it.thumbUrl !== targetUrl) {
-        try {
-          const tRes = await fetch(it.thumbUrl, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-            signal: AbortSignal.timeout(4000)
-          });
-          if (tRes.ok) {
-            const tBuf = Buffer.from(await tRes.arrayBuffer());
-            const optBuf = await optimizePreviewImage(tBuf, { maxDimension: 1280, quality: 88 });
+        if (isVideo) {
+          const isImage = (rawBuf[0] === 0xff && rawBuf[1] === 0xd8) ||
+                          (rawBuf[0] === 0x89 && rawBuf[1] === 0x50) ||
+                          (rawBuf[0] === 0x47 && rawBuf[1] === 0x49 && rawBuf[2] === 0x46);
+
+          if (isImage) {
+            // If this candidate URL was an image, try the next candidate URL before settling for photo
+            if (targetUrl !== candidateUrls[candidateUrls.length - 1]) continue;
+            const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1600, quality: 90 });
             return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
           }
-        } catch {}
+
+          // Genuine playable HD MP4 video with audio!
+          return { type: 'video', buffer: rawBuf, mime: 'video/mp4' };
+        }
+
+        // Crisp 1600px HD optimization for 4K wallpapers
+        const optBuf = await optimizePreviewImage(rawBuf, { maxDimension: 1600, quality: 90 });
+        return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+      } catch {
+        // Try next candidate URL
       }
-      return null;
     }
+
+    // Final fallback: If all video stream URLs failed, try its preview thumbnail as photo
+    if (isVideo && it.thumbUrl && !candidateUrls.includes(it.thumbUrl)) {
+      try {
+        const tRes = await fetch(it.thumbUrl, {
+          headers: buildMediaHeaders(it.thumbUrl, it.headers),
+          signal: AbortSignal.timeout(5000)
+        });
+        if (tRes.ok) {
+          const tBuf = Buffer.from(await tRes.arrayBuffer());
+          const optBuf = await optimizePreviewImage(tBuf, { maxDimension: 1600, quality: 90 });
+          return { type: 'photo', buffer: optBuf, mime: 'image/jpeg' };
+        }
+      } catch {}
+    }
+    return null;
   });
 
   const loaded = await Promise.all(promises);
@@ -741,7 +773,7 @@ export function createNsfwScreen({ app }) {
 
     let stepLabel = 'Connecting to sources...';
     if (stage === 'searching') {
-      stepLabel = `Searching Wallhaven 4K, Yande.re, Nekobot & Spankbang...`;
+      stepLabel = 'Searching Eporner 1080p HD, RedGifs 4K, Konachan & Wallhaven...';
     } else if (stage === 'validating') {
       stepLabel = `Validating HD streams (${p.valid ?? 0}/${numericGoal} picks)`;
     } else if (stage === 'done') {
@@ -874,7 +906,7 @@ export function createNsfwScreen({ app }) {
               app.pinterest.db.run(
                 `INSERT INTO pinterest_media (search_id, user_id, media_url, type, width, height, quality_score, status, is_duplicate)
                  VALUES (?, ?, ?, ?, ?, ?, ?, 'valid', 0)`,
-                searchDbId, userId, it.mediaUrl, it.type, it.width || 1280, it.height || 720, 95
+                searchDbId, userId, it.videoUrl || it.mediaUrl, it.type, it.width || 1920, it.height || 1080, 95
               );
             }
           }
@@ -963,7 +995,7 @@ export function createNsfwScreen({ app }) {
             app.pinterest.db.run(
               `INSERT INTO pinterest_media (search_id, user_id, media_url, type, width, height, quality_score, status, is_duplicate)
                VALUES (?, ?, ?, ?, ?, ?, ?, 'valid', 0)`,
-              searchDbId, searchRow.user_id, it.mediaUrl, it.type, it.width || 1280, it.height || 720, 95
+              searchDbId, searchRow.user_id, it.videoUrl || it.mediaUrl, it.type, it.width || 1920, it.height || 1080, 95
             );
           }
           nextMedia = app.pinterest.db.all(

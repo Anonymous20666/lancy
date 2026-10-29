@@ -592,4 +592,107 @@ test('nsfwSearch: smart query routing delivers accurate pussy photos and tifa he
   assert.match(tifaRes.results[0].title.toLowerCase(), /tifa|final fantasy/);
 });
 
+test('TelegramController: live music search returns playable audio (not article cards) even with app.music enabled, and via_bot drops never trigger Shazam or state conflicts', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [77777];
+  settings.values.security.publicAccess = true;
+  const sm = new StateMachine({ db });
+
+  db.run(`
+    CREATE TABLE IF NOT EXISTS cached_audio_tracks (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      query TEXT UNIQUE,
+      file_id TEXT NOT NULL,
+      title TEXT,
+      artist TEXT,
+      duration INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+  `);
+  db.run(
+    `INSERT INTO cached_audio_tracks (query, file_id, title, artist, duration)
+     VALUES ('burna boy city boys', 'CQACAgIAAxkBAAIB_city_boys_file_id', 'City Boys', 'Burna Boy', 153)`
+  );
+
+  let inlineAnswers = [];
+  let shazamTriggered = false;
+  let stateInputHandled = false;
+
+  const mockApi = {
+    sendMessage: async () => ({ message_id: 1 }),
+    sendRichMessage: async () => ({ message_id: 2 }),
+    editMessageRich: async () => ({ message_id: 2 }),
+    deleteMessage: async () => true,
+    answerCallbackQuery: async () => true,
+    call: async (method, payload) => {
+      if (method === 'answerInlineQuery') {
+        inlineAnswers.push(payload);
+        return true;
+      }
+      return {};
+    }
+  };
+
+  sm.register(States.MUSIC_SEARCH_INPUT, async () => {
+    stateInputHandled = true;
+    return true;
+  });
+
+  const app = {
+    telegram: { api: mockApi },
+    settings,
+    music: {}, // Production has app.music initialized
+    musicProviders: {
+      search: async () => ({
+        items: [{ id: 'yt:abc123xyz', provider: 'youtube', providerId: 'abc123xyz', title: 'City Boys', artist: 'Burna Boy', durationSeconds: 153 }]
+      })
+    }
+  };
+
+  const controller = new TelegramController({
+    api: mockApi,
+    db,
+    settings,
+    stateMachine: sm,
+    sm,
+    screens: new Map(),
+    app
+  });
+  controller.handleAudioRecognition = async () => {
+    shazamTriggered = true;
+  };
+
+  // 1. Inline music search with app.music present MUST return type: 'audio', never type: 'article'
+  await controller.handleInlineQuery({
+    id: 'iq_music_live_1',
+    from: { id: 77777 },
+    query: 'burna boy city boys',
+    offset: '0'
+  });
+
+  assert.equal(inlineAnswers.length, 1);
+  assert.ok(inlineAnswers[0].results.length > 0);
+  assert.ok(inlineAnswers[0].results.every(r => r.type === 'audio'), 'All inline music results must be playable audio items');
+
+  // 2. When user is in MUSIC_SEARCH_INPUT and selects an inline audio result (message.via_bot is present):
+  await sm.transition(77777, States.MUSIC_SEARCH_INPUT, { chatId: 77777 });
+  await controller.handleUpdate({
+    update_id: 99,
+    message: {
+      message_id: 909,
+      from: { id: 77777, first_name: 'Tester' },
+      chat: { id: 77777, type: 'private' },
+      via_bot: { id: 88888, is_bot: true, username: 'Lancy_easy_bot' },
+      audio: { file_id: 'CQACAgIAAxkBAAIB_city_boys_file_id', duration: 153, title: 'City Boys', performer: 'Burna Boy' },
+      caption: '🎵 City Boys — Burna Boy\n✨ Full Audio (100%) via @Lancy_easy_bot ♡'
+    }
+  });
+
+  assert.equal(shazamTriggered, false, 'Inline audio drop must not trigger Shazam audio recognition');
+  assert.equal(stateInputHandled, false, 'Inline audio drop must not trigger MUSIC_SEARCH_INPUT state handler');
+  assert.equal(sm.for(77777).state, States.IDLE, 'Active input state should be cleanly reset after inline media drop');
+});
+
+
 

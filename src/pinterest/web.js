@@ -45,34 +45,190 @@ export class PinterestWebProvider extends PinterestProvider {
    * @returns {Promise<{ items: object[], bookmark: string|null, page: number }>}
    */
   async search({ query, bookmark = null, signal } = {}) {
+    const pageNum = bookmark && /^\d+$/.test(String(bookmark)) ? Number(bookmark) : (bookmark ? 2 : 1);
+    const isNumericBookmark = bookmark && /^\d+$/.test(String(bookmark));
+
+    // Run multi-source 4K wallpaper booster (Wallhaven Safe 4K + Konachan Safe 4K + Safebooru HD) in parallel
+    const multiSourcePromise = this.#searchMultiSource4K({ query, page: pageNum, signal }).catch(() => []);
+
     // 1. Try Pinterest BaseSearchResource API (modern public JSON endpoint)
-    try {
-      const apiResult = await this.#searchViaResourceApi({ query, bookmark, signal });
-      if (apiResult?.items?.length > 0) {
-        this.log.debug({ query, found: apiResult.items.length, hasMore: !!apiResult.bookmark }, 'pinterest resource api success');
-        return apiResult;
+    if (!isNumericBookmark) {
+      try {
+        const [apiResult, extra4k] = await Promise.all([
+          this.#searchViaResourceApi({ query, bookmark, signal }),
+          multiSourcePromise
+        ]);
+        if (apiResult?.items?.length > 0) {
+          const merged = this.#mergeUniqueCandidates(apiResult.items, extra4k, query);
+          this.log.debug({ query, found: merged.length, hasMore: !!apiResult.bookmark }, 'pinterest + 4k multi-source success');
+          return {
+            items: merged,
+            bookmark: apiResult.bookmark || (extra4k.length > 0 ? String(pageNum + 1) : null),
+            page: pageNum
+          };
+        }
+      } catch (err) {
+        if (err.name === 'AbortError' || signal?.aborted) throw err;
+        this.log.debug({ err: err.message }, 'resource api failed, trying html + 4k fallback');
       }
-    } catch (err) {
-      if (err.name === 'AbortError' || signal?.aborted) throw err;
-      this.log.debug({ err: err.message }, 'resource api failed, trying html fallback');
     }
 
-    // 2. HTML extraction fallback
-    const url = new URL(SEARCH_URL);
-    url.searchParams.set('q', query);
-    if (bookmark) url.searchParams.set('bookmark', bookmark);
+    // 2. HTML extraction fallback + 4K multi-source providers
+    let htmlItems = [];
+    let nextBookmark = null;
+    if (!isNumericBookmark) {
+      try {
+        const url = new URL(SEARCH_URL);
+        url.searchParams.set('q', query);
+        if (bookmark) url.searchParams.set('bookmark', bookmark);
 
-    const html = await this.#fetchPage(url, signal);
-    const state = this.#extractState(html);
-    const pins = this.#collectPins(state);
-    const items = [];
-    for (const pin of pins) {
-      const item = this.#pinToCandidate(pin);
-      if (item) items.push(item);
+        const html = await this.#fetchPage(url, signal);
+        const state = this.#extractState(html);
+        const pins = this.#collectPins(state);
+        for (const pin of pins) {
+          const item = this.#pinToCandidate(pin);
+          if (item) htmlItems.push(item);
+        }
+        nextBookmark = this.#extractBookmark(state) ?? null;
+      } catch (err) {
+        if (err.name === 'AbortError' || signal?.aborted) throw err;
+        this.log.debug({ err: err.message }, 'pinterest html fallback failed, relying on 4k wallpaper sources');
+      }
     }
-    const nextBookmark = this.#extractBookmark(state) ?? null;
-    this.log.debug({ query, found: items.length, hasMore: !!nextBookmark }, 'pinterest page parsed');
-    return { items, bookmark: nextBookmark, page: bookmark ? 2 : 1 };
+
+    const extra4k = await multiSourcePromise;
+    const merged = this.#mergeUniqueCandidates(htmlItems, extra4k, query);
+    this.log.debug({ query, found: merged.length, hasMore: !!(nextBookmark || extra4k.length) }, 'multi-source wallpaper page parsed');
+    return {
+      items: merged,
+      bookmark: nextBookmark || (extra4k.length >= 6 ? String(pageNum + 1) : null),
+      page: pageNum
+    };
+  }
+
+  #mergeUniqueCandidates(primary = [], secondary = [], query = '') {
+    const isWallpaperQuery = /\b(wallpaper|wallpapers|4k|8k|hd|uhd|desktop|background)\b/i.test(String(query || ''));
+    const ordered = isWallpaperQuery ? [...secondary, ...primary] : [...primary, ...secondary];
+    const seen = new Set();
+    const out = [];
+    for (const item of ordered) {
+      if (!item?.mediaUrl) continue;
+      const key = item.mediaUrl;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  }
+
+  /**
+   * Fetch high-resolution 4K/HD safe wallpapers from Wallhaven (purity=100), Konachan Safe (rating:safe), and Safebooru HD.
+   */
+  async #searchMultiSource4K({ query = '', page = 1, signal } = {}) {
+    const cleanQ = String(query || '')
+      .replace(/\b(pinterest|pint|pin|pins|wallpaper|wallpapers|4k|hd|photo|photos|pic|pics|image|images)\b/gi, '')
+      .trim() || String(query || '').trim();
+    if (!cleanQ) return [];
+
+    const isMatchingPfp = /\b(pfp|couple|matching|duo|icon|icons|avatar)\b/i.test(String(query || ''));
+    if (isMatchingPfp) return []; // Keep PFP album searches strictly focused on Pinterest carousels/avatars
+
+    const booruTag = cleanQ.toLowerCase().replace(/[\s\-]+/g, '_').replace(/[^a-z0-9_*]/g, '');
+
+    const [whItems, konaItems, sbItems] = await Promise.all([
+      // 1. Wallhaven Safe 4K Studio (purity=100, general + anime + people)
+      (async () => {
+        try {
+          const whUrl = `https://wallhaven.cc/api/v1/search?q=${encodeURIComponent(cleanQ)}&purity=100&categories=111&page=${page}&sorting=relevance`;
+          const res = await fetch(whUrl, {
+            headers: { 'User-Agent': USER_AGENT },
+            signal: signal || AbortSignal.timeout(5500)
+          });
+          if (!res.ok) return [];
+          const data = await res.json();
+          return (data?.data || []).slice(0, 12).map((it) => ({
+            pinId: `wh_${it.id}`,
+            sourceUrl: it.url || it.short_url || null,
+            mediaUrl: it.path,
+            thumbnailUrl: it.thumbs?.large || it.thumbs?.original || it.path,
+            type: 'image',
+            width: it.dimension_x || 3840,
+            height: it.dimension_y || 2160,
+            isAlbum: false,
+            albumImages: [it.path],
+            albumCount: 1
+          })).filter(x => x.mediaUrl);
+        } catch {
+          return [];
+        }
+      })(),
+      // 2. Konachan Safe 4K Widescreen Anime Studio
+      (async () => {
+        if (!booruTag || booruTag.length < 2) return [];
+        try {
+          const tags = `rating:safe *${booruTag}*`;
+          const konaUrl = `https://konachan.com/post.json?limit=10&page=${page}&tags=${encodeURIComponent(tags)}`;
+          const res = await fetch(konaUrl, {
+            headers: { 'User-Agent': USER_AGENT },
+            signal: signal || AbortSignal.timeout(5500)
+          });
+          if (!res.ok) return [];
+          const posts = await res.json();
+          if (!Array.isArray(posts)) return [];
+          return posts.slice(0, 10).map((post) => {
+            const mediaUrl = post.file_url || post.jpeg_url || post.sample_url;
+            return mediaUrl ? {
+              pinId: `kona_s_${post.id}`,
+              sourceUrl: `https://konachan.com/post/show/${post.id}`,
+              mediaUrl,
+              thumbnailUrl: post.sample_url || post.preview_url || mediaUrl,
+              type: 'image',
+              width: post.width || 1920,
+              height: post.height || 1080,
+              isAlbum: false,
+              albumImages: [mediaUrl],
+              albumCount: 1
+            } : null;
+          }).filter(Boolean);
+        } catch {
+          return [];
+        }
+      })(),
+      // 3. Safebooru HD Anime & Art Studio
+      (async () => {
+        if (!booruTag || booruTag.length < 2) return [];
+        try {
+          const sbUrl = `https://safebooru.org/index.php?page=dapi&s=post&q=index&json=1&limit=10&pid=${Math.max(0, page - 1)}&tags=${encodeURIComponent(`*${booruTag}*`)}`;
+          const res = await fetch(sbUrl, {
+            headers: { 'User-Agent': USER_AGENT },
+            signal: signal || AbortSignal.timeout(5500)
+          });
+          if (!res.ok) return [];
+          const posts = await res.json();
+          if (!Array.isArray(posts)) return [];
+          return posts.slice(0, 10).map((post) => {
+            if (!post?.directory || !post?.image) return null;
+            const mediaUrl = post.file_url || `https://safebooru.org/images/${post.directory}/${post.image}`;
+            return {
+              pinId: `sb_s_${post.id}`,
+              sourceUrl: `https://safebooru.org/index.php?page=post&s=view&id=${post.id}`,
+              mediaUrl,
+              thumbnailUrl: mediaUrl,
+              type: 'image',
+              width: Number(post.width) || 1920,
+              height: Number(post.height) || 1080,
+              isAlbum: false,
+              albumImages: [mediaUrl],
+              albumCount: 1
+            };
+          }).filter(Boolean);
+        } catch {
+          return [];
+        }
+      })()
+    ]);
+
+    return [...whItems, ...konaItems, ...sbItems];
   }
 
   async #searchViaResourceApi({ query, bookmark = null, signal } = {}) {
