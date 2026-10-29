@@ -187,7 +187,16 @@ export class MusicService {
       }else if(action==='pause'){
         if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏸ Paused'}).catch(()=>{});
       }else if(action==='resume'){
-        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Resumed'}).catch(()=>{});
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Resuming playback…'}).catch(()=>{});
+        if(!s.connected){
+          s.lastNotice='⏳ Reconnecting to call & starting playback…';
+          if(s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
+        }
+      }
+      if(action!=='pause'&&!s.connected&&typeof this.app.voiceClient?.setup==='function'){
+        const generation=this.queueGeneration(id);
+        await this.prepare(ctx,id);
+        this.assertQueueGeneration(id,generation);
       }
       await qm[action](id);
     }
@@ -241,6 +250,11 @@ export class MusicService {
       }
       s.lastNotice='▶ Switching track…';
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Switching track…'}).catch(()=>{});
+      if(!s.connected&&typeof this.app.voiceClient?.setup==='function'){
+        const generation=this.queueGeneration(id);
+        await this.prepare(ctx,id);
+        this.assertQueueGeneration(id,generation);
+      }
       await qm.playNow(id,entry);
       s.view='player';
     }

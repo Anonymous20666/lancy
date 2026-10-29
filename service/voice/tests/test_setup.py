@@ -53,6 +53,20 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
   self.assertEqual(self.client.invoke.await_count, 1)
   req = self.client.invoke.await_args.args[0]
   self.assertEqual(type(req).__name__, 'CreateGroupCall')
+ async def test_play_replaces_track_in_place_without_leaving_active_call_and_recovers_after_hangup(self):
+  self.bridge.auto_create_call_in_tests = True
+  self.bridge.stream = AsyncMock()
+  f = Path(self.temp.name) / 'sample.mp3'; f.write_bytes(b'audio')
+  self.bridge.native_call = AsyncMock(return_value=(types.SimpleNamespace(), types.SimpleNamespace(id=77)))
+  await self.bridge.play({'chat_id': -1, 'stream_url': str(f), 'playback_id': 'track-1'})
+  self.engine.leave_call.reset_mock()
+  await self.bridge.play({'chat_id': -1, 'stream_url': str(f), 'playback_id': 'track-2'})
+  self.engine.leave_call.assert_not_awaited()
+  # Simulate manual hangup (native_call returns None, then new call id=88 after CreateGroupCall)
+  self.bridge.native_call = AsyncMock(side_effect=[(types.SimpleNamespace(), None), (types.SimpleNamespace(), types.SimpleNamespace(id=88))])
+  await self.bridge.play({'chat_id': -1, 'stream_url': str(f), 'playback_id': 'track-3'})
+  self.engine.leave_call.assert_awaited_once_with(-1)
+  self.assertEqual(self.bridge.calls[-1]['native_call'].id, 88)
  def test_classify_handles_floodwait_and_rpc_groupcall_errors(self):
   FloodWait = type('FloodWait', (Exception,), {'value': 3})
   self.assertEqual(MODULE.classify(FloodWait()), 'RATE_LIMITED')

@@ -50,7 +50,7 @@ export class MediaLibrary {
     // hold up the next VC track. Revalidate even for a cached downloadable file.
     const permitted = download && track.provider === 'audius' ? await adapter.media(track, { download: true }) : null;
     let key = createHash('sha256').update(`${track.id}:${video}:${download}`).digest('hex');
-    return this.locks.run('downloads', async () => {
+    return this.locks.run(key, async () => {
       if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
       await mkdir(this.root, { recursive: true, mode: 0o700 });
       const filePath = join(this.root, `${key}.${video ? 'mp4' : 'mp3'}`);
@@ -86,7 +86,7 @@ export class MediaLibrary {
         const limit = video ? this.videoMaxBytes : this.maxBytes; const prefix = join(this.root, `.partial-${randomUUID()}`); const source = `${prefix}.source`; const output = `${prefix}.${video ? 'mp4' : 'mp3'}`;
         try {
           const required = Math.max(limit, this.maxBytes * 3);
-          const used = await this.cleanup(required);
+          const used = await this.locks.run('cleanup', () => this.cleanup(required));
           if (used + required > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
           let meta;
           let artworkFile = null;
@@ -119,11 +119,11 @@ export class MediaLibrary {
           const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y'];
           if (video) {
             if (hasVideoInSource) {
-              args.push('-i', input, '-t', '7200', '-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=-2:360,fps=24', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '25', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
+              args.push('-i', input, '-t', '7200', '-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=-2:360,fps=24', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '25', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
             } else if (artworkFile && existsSync(artworkFile)) {
-              args.push('-loop', '1', '-i', artworkFile, '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,format=yuv420p', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');
+              args.push('-loop', '1', '-r', '15', '-i', artworkFile, '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');
             } else {
-              args.push('-f', 'lavfi', '-i', 'color=c=0x0f172a:s=640x360:r=24', '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');
+              args.push('-f', 'lavfi', '-i', 'color=c=0x0f172a:s=640x360:r=15', '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');
             }
           } else {
             args.push('-i', input, '-t', '7200', '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2');
@@ -146,6 +146,11 @@ export class MediaLibrary {
       let released = false;
       return { ...result, release: () => { if (!released) { released = true; this.refs.set(key, Math.max(0, (this.refs.get(key) || 1) - 1)); } } };
     });
+  }
+  async warm(track, options = {}) {
+    const m = await this.acquire(track, options);
+    m.release();
+    return m;
   }
   async cleanup(requiredBytes = 0) {
     await mkdir(this.root, { recursive: true, mode: 0o700 });

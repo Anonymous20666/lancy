@@ -1,7 +1,15 @@
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 
 /** Minimal .env loader (no dependency). */
 export function loadEnvFile(path = '.env') {
+  if (existsSync('/data')) {
+    try {
+      mkdirSync('/data/tmp', { recursive: true });
+      mkdirSync('/data/cache', { recursive: true });
+      if (!process.env.TMPDIR) process.env.TMPDIR = '/data/tmp';
+      if (!process.env.XDG_CACHE_HOME) process.env.XDG_CACHE_HOME = '/data/cache';
+    } catch {}
+  }
   if (!existsSync(path)) return {};
   const out = {};
   for (const line of readFileSync(path, 'utf8').split('\n')) {

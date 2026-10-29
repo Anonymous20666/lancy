@@ -1,6 +1,8 @@
 import { execFile } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { promisify } from 'node:util';
 import { normalizeTrack, MusicError } from './model.js';
+import { searchYouTubeFast } from '../media/youtubeSearch.js';
 const exec = promisify(execFile);
 const UA = 'Lancy/1.0 (https://github.com/Anonymous20666/lancy)';
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
@@ -20,21 +22,66 @@ export class YouTubeProvider {
     const end = Math.min(offset + limit + 1, 30);
     const target = direct ? `https://www.youtube.com/watch?v=${direct}` : `ytsearch${end}:${String(query).slice(0, 180)}`;
     if (direct && offset) return { items: [], nextOffset: null };
+    if (this.runner === exec && !direct) {
+      try {
+        const fastRaw = await searchYouTubeFast(String(query).slice(0, 180), 'NG', { wide: true });
+        const fastItems = (fastRaw || [])
+          .filter(x => /^[\w-]{11}$/.test(x?.videoId || '') && !/^short$/i.test(String(x?.duration || '')))
+          .map(x => normalizeTrack({
+            providerId: x.videoId,
+            title: x.title,
+            artist: x.author,
+            duration: x.duration,
+            artwork: x.thumb || `https://i.ytimg.com/vi/${x.videoId}/hqdefault.jpg`,
+            sourceRef: `https://www.youtube.com/watch?v=${x.videoId}`,
+            availability: 'unresolved'
+          }, this.id))
+          .filter(t => !t.durationSeconds || (t.durationSeconds >= 30 && t.durationSeconds <= 7200));
+        if (fastItems.length > offset) {
+          return {
+            items: fastItems.slice(offset, offset + limit),
+            nextOffset: fastItems.length > offset + limit && offset + limit < 30 ? offset + limit : null
+          };
+        }
+      } catch {}
+    }
     const { stdout } = await this.runner('yt-dlp', ['--ignore-config', '--no-warnings', '--skip-download', '--flat-playlist', '--dump-single-json', '--playlist-start', String(offset + 1), '--playlist-end', String(end), '--socket-timeout', '10', '--', target], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
     const info = JSON.parse(stdout); const entries = info.entries || [info];
-    const items = entries.filter(x => /^[\w-]{11}$/.test(x?.id || '')).map(x => normalizeTrack({ providerId: x.id, title: x.track || x.title, artist: x.artist || x.uploader || x.channel, durationSeconds: x.duration, artwork: x.thumbnail || x.thumbnails?.at(-1)?.url, sourceRef: `https://www.youtube.com/watch?v=${x.id}`, availability: 'unresolved' }, this.id));
+    const items = entries.filter(x => /^[\w-]{11}$/.test(x?.id || '')).map(x => normalizeTrack({ providerId: x.id, title: x.track || x.title, artist: x.artist || x.uploader || x.channel, durationSeconds: x.duration, artwork: x.thumbnail || x.thumbnails?.at(-1)?.url || `https://i.ytimg.com/vi/${x.id}/hqdefault.jpg`, sourceRef: `https://www.youtube.com/watch?v=${x.id}`, availability: 'unresolved' }, this.id));
     return { items: items.slice(0, limit), nextOffset: !direct && items.length > limit && offset + limit < 30 ? offset + limit : null };
   }
   async download(track, path, { video = false, maxBytes = 48 * 1024 * 1024 } = {}) {
     this.assertEnabled();
     if (!/^[\w-]{11}$/.test(track.providerId)) throw new MusicError('INVALID_TRACK', 'Invalid track identifier.');
     const target = `https://www.youtube.com/watch?v=${track.providerId}`;
-    const args = ['--ignore-config', '--no-playlist', '--no-warnings', '--no-progress', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2', '--max-filesize', String(maxBytes), '--match-filter', 'duration <= 7200 & !is_live', '--restrict-filenames', '-f', video ? 'bv*[height<=360]+ba/b[height<=360]' : 'bestaudio/best', '-o', path, '--print', 'after_move:%()j', '--', target];
-    if (video) args.splice(args.length - 2, 0, '--merge-output-format', 'mp4');
-    const { stdout } = await this.runner('yt-dlp', args, { timeout: 180000, maxBuffer: 4 * 1024 * 1024 });
+    const buildArgs = (fmt, { useCookies = false, useAndroidClient = false } = {}) => {
+      const a = ['--ignore-config', '--no-playlist', '--no-warnings', '--no-progress', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2', '--max-filesize', String(maxBytes), '--match-filter', 'duration <= 7200 & !is_live', '--restrict-filenames', '-f', fmt, '-o', path, '--print', 'after_move:%()j'];
+      if (this.runner === exec) {
+        if (existsSync('/usr/bin/node')) a.push('--js-runtimes', 'node:/usr/bin/node');
+        if (existsSync('/data/cache/yt-dlp')) a.push('--cache-dir', '/data/cache/yt-dlp');
+        if (useCookies && existsSync('/data/youtube_cookies.txt')) a.push('--cookies', '/data/youtube_cookies.txt');
+        if (useAndroidClient) a.push('--extractor-args', 'youtube:player_client=android,web');
+      }
+      if (video) a.push('--merge-output-format', 'mp4');
+      a.push('--', target);
+      return a;
+    };
+    const primaryFmt = video ? 'bv*[height<=360]+ba/b[height<=360]' : 'bestaudio/best';
+    let stdout;
+    if (this.runner !== exec) {
+      ({ stdout } = await this.runner('yt-dlp', buildArgs(primaryFmt), { timeout: 180000, maxBuffer: 4 * 1024 * 1024 }));
+    } else {
+      const hasCookies = existsSync('/data/youtube_cookies.txt');
+      try {
+        ({ stdout } = await this.runner('yt-dlp', buildArgs(primaryFmt, { useCookies: hasCookies }), { timeout: 120000, maxBuffer: 4 * 1024 * 1024 }));
+      } catch (firstErr) {
+        const fallbackFmt = video ? 'b[height<=480]/bv*[height<=480]+ba/bestaudio/best' : 'bestaudio/best';
+        ({ stdout } = await this.runner('yt-dlp', buildArgs(fallbackFmt, { useCookies: !hasCookies, useAndroidClient: true }), { timeout: 120000, maxBuffer: 4 * 1024 * 1024 }).catch(() => { throw firstErr; }));
+      }
+    }
     const info = JSON.parse(stdout.trim().split('\n').at(-1));
     if (info.id !== track.providerId) throw new MusicError('TRACK_MISMATCH', 'The media provider returned a different recording.');
-    return normalizeTrack({ ...track, title: info.track || info.title || track.title, artist: info.artist || info.uploader || track.artist, album: info.album, durationSeconds: info.duration, availability: 'resolved', capabilities: { stream: true, download: true, seek: true, video } }, this.id);
+    return normalizeTrack({ ...track, title: info.track || info.title || track.title, artist: info.artist || info.uploader || track.artist, album: info.album, durationSeconds: info.duration, artwork: info.thumbnail || info.thumbnails?.at(-1)?.url || track.artwork || `https://i.ytimg.com/vi/${track.providerId}/hqdefault.jpg`, availability: 'resolved', capabilities: { stream: true, download: true, seek: true, video } }, this.id);
   }
 }
 export class AudiusProvider {
@@ -73,11 +120,11 @@ export class ProviderRegistry {
     const q = m ? m[2] : query;
     try {
       const res = await this.get(provider).search(q, options);
-      if ((res.items && res.items.length > 0) || explicit || options?.video || youtubeId(query)) {
+      if ((res.items && res.items.length > 0) || explicit || youtubeId(query)) {
         return { ...res, provider };
       }
     } catch (err) {
-      if (explicit || options?.video || youtubeId(query)) throw err;
+      if (explicit || youtubeId(query)) throw err;
       const fallback = provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null);
       if (fallback) {
         try {

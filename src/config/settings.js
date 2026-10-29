@@ -36,6 +36,11 @@ export class SettingsManager extends EventEmitter {
       this.values.music.idleLeaveSeconds = seconds;
     }
     if (process.env.MUSIC_YTDLP_ENABLED) this.values.music.allowYtDlp = process.env.MUSIC_YTDLP_ENABLED === 'true';
+    if (process.env.MUSIC_MAX_CACHE_MIB && Number.isFinite(Number(process.env.MUSIC_MAX_CACHE_MIB))) {
+      this.values.music.maxCacheMiB = Math.max(512, Number(process.env.MUSIC_MAX_CACHE_MIB));
+    } else if ((Number(this.values.music.maxCacheMiB) || 0) < 4096) {
+      this.values.music.maxCacheMiB = 8192;
+    }
     // Env wins for secrets / identity.
     if (this.env.BOT_TOKEN) this.values.telegram.botToken = this.env.BOT_TOKEN;
     if (this.env.OWNER_IDS) {

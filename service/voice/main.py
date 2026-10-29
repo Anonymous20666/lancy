@@ -286,11 +286,16 @@ class Bridge:
             peer, call = await self.native_call(a['client'], chat)
             created = False
             if call is None:
+                if not self.factory:
+                    clear_engine_cache(a['engine'], chat)
+                    try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                    except Exception: pass
+                    self.calls.pop(chat, None)
                 from pyrogram import raw
                 await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=0), 15)
                 _, call = await self.native_call(a['client'], chat)
                 if call is None and not self.factory:
-                    for _ in range(3):
+                    for _ in range(6):
                         await asyncio.sleep(0.3)
                         _, call = await self.native_call(a['client'], chat)
                         if call is not None: break
@@ -440,10 +445,6 @@ class Bridge:
             previous = self.calls.get(chat)
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
             call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
-            if previous:
-                clear_engine_cache(a['engine'], chat)
-                try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
-                except Exception: pass
             try:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
                 me = await asyncio.wait_for(a['client'].get_me(), 10)
@@ -452,11 +453,18 @@ class Bridge:
                     await self.resolve_destination(a['client'], chat)
                     try: peer, native = await self.native_call(a['client'], chat)
                     except Exception: peer, native = None, None
+                    prev_id = getattr(previous.get('native_call'), 'id', None) if previous else None
+                    curr_id = getattr(native, 'id', None) if native else None
+                    need_reset = (not self.factory and previous is None) or native is None or (prev_id is not None and curr_id != prev_id)
+                    if need_reset:
+                        clear_engine_cache(a['engine'], chat)
+                        try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                        except Exception: pass
                     if peer is not None and native is None:
                         from pyrogram import raw
                         try:
                             await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
-                            for _ in range(4):
+                            for _ in range(6):
                                 await asyncio.sleep(0.3)
                                 _, native = await self.native_call(a['client'], chat)
                                 if native is not None: break
@@ -479,7 +487,7 @@ class Bridge:
                 try:
                     await self.stream(a, chat, call)
                 except Exception as stream_err:
-                    if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) == 'NO_ACTIVE_CALL':
+                    if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) in {'NO_ACTIVE_CALL', 'CALL_FAILED', 'PUBLISHER_UNVERIFIED'}:
                         clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                         except Exception: pass
@@ -488,7 +496,7 @@ class Bridge:
                             from pyrogram import raw
                             try:
                                 await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
-                                for _ in range(4):
+                                for _ in range(6):
                                     await asyncio.sleep(0.3)
                                     _, native = await self.native_call(a['client'], chat)
                                     if native is not None: break

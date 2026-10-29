@@ -51,18 +51,33 @@ export class QueueManager extends EventEmitter {
   dropPrefetch(s) { const p=s.prefetched;s.prefetched=null;p?.media?.release?.();if(p)p.media=null; }
   prefetch(s) {
     if(this.closed||s.status!=='playing')return;
-    if(s.radio?.enabled&&s.upcoming.length<3){
-      void this.app?.music?.radio?.refill(s).catch(()=>{}).then(()=>this.prefetch(s));
+    if(s.radio?.enabled&&!s.upcoming.length&&this.app?.musicLibrary&&s.lastRadioPrefetchId!==s.playbackId){
+      s.lastRadioPrefetchId=s.playbackId;
+      void this.app?.music?.radio?.refill(s).catch(()=>{});
+      return;
     }
     const next=s.upcoming[0];
     if(!next||!['youtube','audius','telegram'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
+    if(typeof this.app.musicLibrary.warm==='function'){
+      if(!s.warmedIds)s.warmedIds=new Set();
+      for(const u of s.upcoming.slice(1,3)){
+        if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram'].includes(u.provider)){
+          s.warmedIds.add(u.entryId);
+          if(s.warmedIds.size>50)s.warmedIds.delete(s.warmedIds.values().next().value);
+          const uVid=u.mediaType==='video'||Boolean(s.isChannel);
+          void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
+        }
+      }
+    }
     if(s.prefetched?.entryId===next.entryId)return;
     this.dropPrefetch(s);if(this.prefetchJobs>=5)return;
     const p={entryId:next.entryId,media:null,claimed:false};s.prefetched=p;this.prefetchJobs++;
     const wantsVideo=next.mediaType==='video'||Boolean(s.isChannel);
     p.promise=this.app.musicLibrary.acquire(next,{video:wantsVideo}).then(media=>{
       if(this.closed||s.prefetched!==p||(!p.claimed&&s.upcoming[0]?.entryId!==p.entryId)){media.release();return null;}
-      p.media=media;return media;
+      p.media=media;
+      void this.updatePlayerCard(s.chatId).catch(()=>{});
+      return media;
     }).catch(()=>null).finally(()=>{this.prefetchJobs=Math.max(0,this.prefetchJobs-1);this.prefetchWork.delete(p.promise);});this.prefetchWork.add(p.promise);
   }
   async #next(s, { manual = false } = {}) {
@@ -74,16 +89,25 @@ export class QueueManager extends EventEmitter {
       if(!manual&&s.loopMode==='track')s.upcoming.unshift(previous);
       else if(s.loopMode==='queue'&&!s.upcoming.some(t=>t.entryId===previous.entryId))s.upcoming.push(previous);
     }
-    if(s.radio?.enabled&&s.upcoming.length<3)await this.app?.music?.radio?.refill(s);
     if(s.radio?.enabled&&!s.upcoming.length)await this.app?.music?.radio?.refill(s);
     if(this.closed||(s.stopGeneration||0)!==cancel)return null;
     const attempts=s.upcoming.length;
     for(let n=0;n<attempts;n++){
       const entry=s.upcoming.shift();let media=null,calledNative=false;
       const warm=s.prefetched?.entryId===entry.entryId?s.prefetched:null;if(warm)warm.claimed=true;
+      if(typeof this.app?.musicLibrary?.warm==='function'){
+        if(!s.warmedIds)s.warmedIds=new Set();
+        for(const u of s.upcoming.slice(0,2)){
+          if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram'].includes(u.provider)){
+            s.warmedIds.add(u.entryId);
+            const uVid=u.mediaType==='video'||Boolean(s.isChannel);
+            void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
+          }
+        }
+      }
       // Keep the old recording/title truthful during preparation. There is no
       // intentional empty-stream gap before an already prepared replacement.
-      if(!previous)s.status='buffering';s.lastNotice=`Preparing ${entry.title}…`;await this.updatePlayerCard(s.chatId);
+      if(!previous)s.status='buffering';s.lastNotice=`⏳ Preparing ${entry.title}…`;await this.updatePlayerCard(s.chatId);
       try{
         if(entry.queuedMedia){media=entry.queuedMedia;entry.queuedMedia=null;}
         else if(warm){media=warm.media||await this.#awaitMedia(s,()=>warm.promise);if(s.prefetched===warm)s.prefetched=null;warm.media=null;}
@@ -94,13 +118,29 @@ export class QueueManager extends EventEmitter {
             media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
           } catch(acquireErr) {
             if(this.app?.musicProviders&&entry.provider!=='telegram'){
-              const altProvider=entry.provider==='youtube'?'audius':(this.app.musicProviders.get('youtube')?.enabled?'youtube':null);
-              if(altProvider&&(!wantsVideo||altProvider==='youtube')){
-                const query=`${entry.title} ${entry.artist||''}`.trim();
-                const altRes=await this.app.musicProviders.get(altProvider).search(query,{limit:1}).catch(()=>null);
-                if(altRes?.items?.[0]){
-                  const altTrack={...altRes.items[0],entryId:entry.entryId,requester:entry.requester};
-                  media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(altTrack,{video:wantsVideo})).catch(()=>null);
+              const query=`${entry.title} ${entry.artist||''}`.trim();
+              try {
+                const sameProvider=this.app.musicProviders.get(entry.provider);
+                if(sameProvider&&(!sameProvider. assertEnabled||sameProvider.enabled!==false)){
+                  const sameRes=await sameProvider.search(query,{limit:3}).catch(()=>null);
+                  for(const cand of (sameRes?.items||[]).filter(x=>x.providerId!==entry.providerId).slice(0,2)){
+                    if(this.closed||(s.stopGeneration||0)!==cancel)break;
+                    const candTrack={...cand,entryId:entry.entryId,requester:entry.requester};
+                    media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(candTrack,{video:wantsVideo})).catch(()=>null);
+                    if(media)break;
+                  }
+                }
+              } catch {}
+              if(!media){
+                const altProvider=entry.provider==='youtube'?'audius':(this.app.musicProviders.get('youtube')?.enabled?'youtube':null);
+                if(altProvider){
+                  const altRes=await this.app.musicProviders.get(altProvider).search(query,{limit:3}).catch(()=>null);
+                  for(const cand of (altRes?.items||[]).slice(0,2)){
+                    if(this.closed||(s.stopGeneration||0)!==cancel)break;
+                    const altTrack={...cand,entryId:entry.entryId,requester:entry.requester};
+                    media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(altTrack,{video:wantsVideo})).catch(()=>null);
+                    if(media)break;
+                  }
                 }
               }
             }
@@ -114,7 +154,18 @@ export class QueueManager extends EventEmitter {
         const playbackId=randomUUID();calledNative=true;
         const eq=s.eqPreset||(s.bass?'bass':'off');
         const isVideo=track.mediaType==='video'||Boolean(s.isChannel)||Boolean(track.capabilities?.video);
-        const r=this.#assert(await this.voice.play(s.chatId,source,{isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq}));
+        const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq};
+        let r;
+        try {
+          r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
+        } catch(playErr) {
+          if(['NO_ACTIVE_CALL','CALL_FAILED'].includes(playErr?.code)&&typeof this.voice?.setup==='function'){
+            await this.voice.setup(s.chatId,'start',{create:true,account_alias:s.preferredAccount||s.accountAlias||undefined}).catch(()=>null);
+            r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
+          } else {
+            throw playErr;
+          }
+        }
         if(previous){s.history.push(previous);if(s.history.length>25)s.history.shift();}
         this.#release(s);s.media=media;media=null;s.currentTrack=track;s.playbackId=playbackId;s.status='playing';s.connected=true;s.lastError=null;s.lastNotice=null;s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=null;s.failures=0;s.skipVotes=[];
         try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}

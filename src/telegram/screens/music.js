@@ -56,7 +56,7 @@ export function createMusicScreen({ app }) {
     const b=card(s.isChannel?'Lancy · CHANNEL LIVE BROADCAST':'Lancy · music',`${s.isChannel?'Channel broadcast':'Voice chat'} · ${s.destinationTitle || (s.isChannel?'Channel':'Group')} · ${s.status}`);
     if(s.status==='stopped'){b.quote(rt.text('Playback service stopped. Open the current player after restart.'));if(s.lastError)b.paragraph(rt.text(s.lastError));b.buttons([s.panelToken?controls(s,'Open current player','player'):button('Open current player','openplayer')]);return finish(b);}
     const t=s.currentTrack;
-    if(!t){ b.quote(rt.text(s.status==='error'&&s.upcoming?.length?'Playback could not start. Your queued recording is retained; use Retry queued track.':s.connected?'Queue complete. After ten uninterrupted idle minutes the assistant leaves the call and, for groups, the group.':'No active playback. Use Add tracks for VC, or Listen / download without joining a call.')); }
+    if(!t){ b.quote(rt.text(s.status==='buffering'?(s.lastNotice||'⏳ Preparing media stream & connecting to call…'):s.status==='error'&&s.upcoming?.length?'Playback could not start. Your queued recording is retained; use Retry queued track.':s.connected?'Queue complete. After ten uninterrupted idle minutes the assistant leaves the call and, for groups, the group.':'No active playback. Use Add tracks for VC, or Listen / download without joining a call.')); }
     else {
       const preview=s.fullPreview?.trackId===t.id?s.fullPreview:null;
       if(preview?.status==='ready'&&preview.fileId)trackAudio(b,preview.track||t,preview.fileId,true);
@@ -67,7 +67,7 @@ export function createMusicScreen({ app }) {
       b.paragraph(rt.text(`VC · ${durationText(s.positionSeconds)} / ${durationText(t.durationSeconds)} · ${t.mediaType==='video'?'Video + audio':'Audio'}${eqLabel}`));
       if(Number.isFinite(s.positionSeconds)&&t.durationSeconds){const n=Math.max(0,Math.min(10,Math.floor(s.positionSeconds/t.durationSeconds*10)));b.paragraph(rt.text('━'.repeat(n)+'─'.repeat(10-n)));}
       b.paragraph(rt.text(`VC volume ${s.volumeConfirmed===false?'unconfirmed':`${s.volume}%`} · Repeat ${s.loopMode} · ${s.upcoming?.length||0} queued`));
-      if(s.upcoming?.[0])b.paragraph(rt.text(`Up next · ${cut(s.upcoming[0].title)}`));
+      if(s.upcoming?.[0])b.paragraph(rt.text(`Up next · ${cut(s.upcoming[0].title)}${s.prefetched?.entryId===s.upcoming[0].entryId&&s.prefetched?.media?' · ⚡ Ready':''}`));
       if(['playing','paused'].includes(s.status))b.buttons([controls(s,'Previous','previous'),controls(s,s.status==='paused'?'Resume VC':'Pause VC',s.status==='paused'?'resume':'pause'),controls(s,'Skip','skip'),controls(s,'Stop','stop')]);
       const extraRow=[];
       if(t.capabilities?.seek&&Number.isFinite(s.positionSeconds))extraRow.push(controls(s,'−10 sec','seekby',-10),controls(s,'+10 sec','seekby',10));
@@ -77,7 +77,7 @@ export function createMusicScreen({ app }) {
     if(!t&&s.upcoming?.length){
       if(s.status==='error')b.buttons([controls(s,'Retry queued track','retry'),controls(s,'Stop & clear','stop')]);
       else b.buttons([controls(s,'Resume playback','resume'),controls(s,'Stop & clear','stop')]);
-    } else if(!t&&!s.upcoming?.length&&(s.connected||s.prepared)){
+    } else if(!t&&!s.upcoming?.length&&(s.connected||s.prepared||s.status==='buffering')){
       b.buttons([controls(s,s.isChannel?'Stop & leave call':'Stop & leave group','stop')]);
     }
     if(s.radio?.enabled)b.paragraph(rt.text(`Infinite radio · ${s.radio.queries.join(' + ')}`));
@@ -616,7 +616,7 @@ export function createMusicScreen({ app }) {
   function registerStateHandlers(sm){
     sm.register(States.MUSIC_QUEUE_INPUT,{onCleanup:ctx=>temporary.remove(ctx.context?.temporaryToken),onMessage:async(ctx,message)=>{
       const record=sm.get(ctx.tgId);if(Number(record.chatId)!==Number(ctx.chatId)||record.context.botKey!==app.music.botKey(ctx))return false;
-      if(record.context.mode==='channel'){try{const value=message.text||message.caption||'',id=await app.music.bind({...ctx,message},value);await sm.reset(ctx.tgId);await channels(ctx);return id;}catch(e){await error(ctx,e);return true;}}
+      if(record.context.mode==='channel'){try{const value=message.text||message.caption||'',id=await app.music.bind({...ctx,message},value);await sm.reset(ctx.tgId);await channels(ctx);return Boolean(id)||true;}catch(e){await error(ctx,e);return true;}}
       if(!message.text||(Number(ctx.chatId)<0&&message.reply_to_message?.message_id!==record.context.promptMessageId))return false;
       const mode=record.context.mode,panelToken=record.context.panelToken;
       try{const panel=panelToken?await app.music.channelPanels.resolve(ctx,panelToken,{requireMessage:false}):null;await sm.reset(ctx.tgId);if(mode==='radio'){const scoped=panel?{...ctx,musicPanel:panel}:ctx,id=await app.music.authorize(scoped,true),state=panel||app.musicQueueManager.getSession(id);const customArtist=String(message.text).trim().slice(0,120);state.radioCustom=customArtist;state.view='player';const rich=renderGenreSubmenu(customArtist,'queue',panelToken);const sent=await ctx.api.sendRichMessage(ctx.chatId,rich).catch(()=>null);if(sent)temporary.remember(ctx,sent,{ttlMs:120000});}else await search(panel?{...ctx,musicPanel:panel}:ctx,message.text,mode);}
