@@ -105,11 +105,14 @@ export class MediaLibrary {
           const input = join(this.root, candidates[0]);
           if ((await stat(input)).size > limit) throw new MusicError('FILE_TOO_LARGE', 'Media exceeds the file limit.');
           let hasVideoInSource = false;
+          let canStreamCopyVideo = false;
           if (video) {
             try {
-              const probeIn = await this.runner(this.ffmpeg.replace(/ffmpeg$/, 'ffprobe'), ['-v', 'error', '-show_entries', 'stream=codec_type', '-of', 'json', input], { timeout: 10000 });
+              const probeIn = await this.runner(this.ffmpeg.replace(/ffmpeg$/, 'ffprobe'), ['-v', 'error', '-show_entries', 'stream=codec_type,codec_name,height', '-of', 'json', input], { timeout: 10000 });
               const inInfo = JSON.parse(probeIn.stdout);
-              hasVideoInSource = Boolean(inInfo.streams?.some(s => s.codec_type === 'video'));
+              const vStream = inInfo.streams?.find(s => s.codec_type === 'video');
+              hasVideoInSource = Boolean(vStream);
+              canStreamCopyVideo = Boolean(vStream && vStream.codec_name === 'h264' && Number(vStream.height) > 0 && Number(vStream.height) <= 480);
             } catch { hasVideoInSource = false; }
             if (!hasVideoInSource && !artworkFile && (meta.artwork || track.artwork)) {
               artworkFile = `${prefix}.art`;
@@ -118,7 +121,9 @@ export class MediaLibrary {
           }
           const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y'];
           if (video) {
-            if (hasVideoInSource) {
+            if (hasVideoInSource && canStreamCopyVideo) {
+              args.push('-i', input, '-t', '7200', '-map', '0:v:0', '-map', '0:a:0', '-c:v', 'copy', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
+            } else if (hasVideoInSource) {
               args.push('-i', input, '-t', '7200', '-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=-2:360,fps=24', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '25', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart');
             } else if (artworkFile && existsSync(artworkFile)) {
               args.push('-loop', '1', '-r', '15', '-i', artworkFile, '-i', input, '-t', '7200', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '26', '-c:a', 'aac', '-b:a', '128k', '-shortest', '-movflags', '+faststart');

@@ -66,7 +66,7 @@ export class YouTubeProvider {
       a.push('--', target);
       return a;
     };
-    const primaryFmt = video ? 'bv*[height<=360]+ba/b[height<=360]' : 'bestaudio/best';
+    const primaryFmt = video ? (this.runner === exec ? 'b[ext=mp4][vcodec^=avc1][height<=360]/bv*[vcodec^=avc1][height<=360]+ba[acodec^=mp4a]/bv*[height<=360]+ba/b[height<=360]' : 'bv*[height<=360]+ba/b[height<=360]') : 'bestaudio/best';
     let stdout;
     if (this.runner !== exec) {
       ({ stdout } = await this.runner('yt-dlp', buildArgs(primaryFmt), { timeout: 180000, maxBuffer: 4 * 1024 * 1024 }));
@@ -79,7 +79,9 @@ export class YouTubeProvider {
         ({ stdout } = await this.runner('yt-dlp', buildArgs(fallbackFmt, { useCookies: !hasCookies, useAndroidClient: true }), { timeout: 120000, maxBuffer: 4 * 1024 * 1024 }).catch(() => { throw firstErr; }));
       }
     }
-    const info = JSON.parse(stdout.trim().split('\n').at(-1));
+    const lastLine = String(stdout || '').trim().split('\n').filter(Boolean).at(-1);
+    if (!lastLine) throw new MusicError('DOWNLOAD_FAILED', 'The provider could not deliver a playable file within the size limit.');
+    const info = JSON.parse(lastLine);
     if (info.id !== track.providerId) throw new MusicError('TRACK_MISMATCH', 'The media provider returned a different recording.');
     return normalizeTrack({ ...track, title: info.track || info.title || track.title, artist: info.artist || info.uploader || track.artist, album: info.album, durationSeconds: info.duration, artwork: info.thumbnail || info.thumbnails?.at(-1)?.url || track.artwork || `https://i.ytimg.com/vi/${track.providerId}/hqdefault.jpg`, availability: 'resolved', capabilities: { stream: true, download: true, seek: true, video } }, this.id);
   }

@@ -315,5 +315,77 @@ test('VC and channel playback auto-fetches matched lyrics for collaboration titl
  assert.ok(!rendered.includes('No reliable matched lyrics yet'));
 });
 
+test('InfiniteRadio skips multi-hour compilation mixes and MediaLibrary stream-copies 360p H.264 video without slow re-encode',async t=>{
+ const { InfiniteRadio } = await import('../src/music/radio.js');
+ const { MediaLibrary } = await import('../src/music/library.js');
+ const { mkdtemp, rm, writeFile } = await import('node:fs/promises');
+ const { join } = await import('node:path');
+ const { tmpdir } = await import('node:os');
+
+ const h=setup(t);
+ const queriesSeen=[];
+ h.app.musicProviders={
+  adapters:new Map([['youtube',{}]]),
+  search:async(q)=>{
+   queriesSeen.push(q);
+   if(q==='J-pop'){
+    return {
+     items:[
+      normalizeTrack({providerId:'comp1',title:'putting you on to 90s/00s japanese r&b (1 hour compilation)',artist:'eze',durationSeconds:4320},'youtube'),
+      normalizeTrack({providerId:'comp2',title:'Relaxing soul music - The best soul music compilation',artist:'Soul On',durationSeconds:6400},'youtube'),
+     ],
+     nextOffset:10
+    };
+   }
+   return {
+    items:[
+     normalizeTrack({providerId:'song1',title:'First Love',artist:'Hikaru Utada',durationSeconds:257},'youtube'),
+     normalizeTrack({providerId:'song2',title:'Automatic',artist:'Hikaru Utada',durationSeconds:312},'youtube'),
+    ],
+    nextOffset:10
+   };
+  }
+ };
+ const radio=new InfiniteRadio({app:h.app});
+ const s=h.app.musicQueueManager.getSession(-10011);
+ s.isChannel=true;
+ radio.configure(s,['J-pop'],{video:true});
+ await radio.refill(s);
+ assert.equal(s.upcoming.length,2);
+ assert.ok(s.upcoming.every(tr=>tr.durationSeconds<=720),'Radio must only queue individual songs, not multi-hour compilations');
+ assert.ok(queriesSeen.includes('J-pop songs'));
+
+ // Verify MediaLibrary uses -c:v copy when source is already h264 <= 480p
+ const root=await mkdtemp(join(tmpdir(),'lancy-fastcopy-'));
+ t.after(()=>rm(root,{recursive:true,force:true}));
+ let ffmpegArgs=null;
+ const lib=new MediaLibrary({
+  root,
+  providers:{
+   get:()=>({
+    assertEnabled:()=>{},
+    download:async(tr,dest)=>{
+     await writeFile(dest,'fake-h264-mp4-data');
+     return {...tr,durationSeconds:210};
+    }
+   })
+  },
+  runner:async(bin,args)=>{
+   if(String(bin).includes('ffprobe')){
+    return {stdout:JSON.stringify({format:{duration:210},streams:[{codec_type:'video',codec_name:'h264',height:360},{codec_type:'audio',codec_name:'aac'}]})};
+   }
+   ffmpegArgs=args;
+   await writeFile(args.at(-1),'fake-output-mp4-data');
+   return {stdout:''};
+  }
+ });
+ const media=await lib.acquire(normalizeTrack({providerId:'vid12345678',title:'Fast Video',durationSeconds:210},'youtube'),{video:true});
+ assert.ok(ffmpegArgs,'ffmpeg must be invoked');
+ const cvIdx=ffmpegArgs.indexOf('-c:v');
+ assert.ok(cvIdx>=0&&ffmpegArgs[cvIdx+1]==='copy','MediaLibrary must stream-copy h264 <=480p video instead of re-encoding with libx264');
+ media.release();
+});
+
+
 
 

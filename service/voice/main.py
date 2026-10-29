@@ -227,13 +227,14 @@ class Bridge:
 
     async def native_call(self, client, chat):
         from pyrogram import raw
-        peer = await asyncio.wait_for(client.resolve_peer(chat), 10)
+        peer = await asyncio.wait_for(client.resolve_peer(chat), 15)
         if isinstance(peer, raw.types.InputPeerChannel):
             request = raw.functions.channels.GetFullChannel(channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash))
         elif isinstance(peer, raw.types.InputPeerChat):
             request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
         else: raise VoiceFailure('PERMISSION_DENIED')
-        full = await asyncio.wait_for(client.invoke(request, sleep_threshold=0), 10)
+        threshold = 0 if self.factory else 10
+        full = await asyncio.wait_for(client.invoke(request, sleep_threshold=threshold), 15)
         return peer, getattr(full.full_chat, 'call', None)
 
     async def setup(self, data):
@@ -252,8 +253,11 @@ class Bridge:
             self.prepared.setdefault(chat, {'alias': a['alias']})
             if stage == 'identity':
                 try:
+                    if not self.factory and a.get('uid') and time.monotonic() - a.get('me_checked_at', 0) < 60:
+                        return {'ok': True, 'account_alias': a['alias'], 'user_id': a['uid']}
                     me = await asyncio.wait_for(a['client'].get_me(), 10)
                     if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
+                    a['me_checked_at'] = time.monotonic()
                 except Exception:
                     if not was_prepared:
                         self.prepared.pop(chat, None)
@@ -268,13 +272,21 @@ class Bridge:
             if stage == 'join':
                 if not self.owner_allowed(a, chat): raise VoiceFailure('PERMISSION_DENIED')
                 invite = str(data.get('invite_link', ''))
-                if not re.fullmatch(r'https://t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]{8,200}', invite): raise VoiceFailure('INVALID_REQUEST')
+                m_inv = re.fullmatch(r'https://t\.me/(?:\+|joinchat/)([A-Za-z0-9_-]{8,200})', invite)
+                if not m_inv: raise VoiceFailure('INVALID_REQUEST')
                 try:
                     joined = await asyncio.wait_for(a['client'].join_chat(invite), 25)
                     if joined.id != chat: raise VoiceFailure('PERMISSION_DENIED')
                 except Exception as error:
                     if type(error).__name__ == 'InviteRequestSent': raise VoiceFailure('JOIN_PENDING') from None
-                    if not self.factory and type(error).__name__ in {'AttributeError', 'InviteHashExpired', 'InviteHashInvalid'}:
+                    if not self.factory and type(error).__name__ in {'AttributeError', 'UserAlreadyParticipant', 'InviteHashExpired', 'InviteHashInvalid'}:
+                        try:
+                            from pyrogram import raw
+                            chk = await asyncio.wait_for(a['client'].invoke(raw.functions.messages.CheckChatInvite(hash=m_inv.group(1)), sleep_threshold=10), 10)
+                            if getattr(chk, 'chat', None) is not None and hasattr(a['client'], 'fetch_peers'):
+                                await a['client'].fetch_peers([chk.chat])
+                        except Exception:
+                            pass
                         await self.resolve_destination(a['client'], chat)
                     elif type(error).__name__ != 'UserAlreadyParticipant': raise
                 if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
@@ -292,7 +304,8 @@ class Bridge:
                     except Exception: pass
                     self.calls.pop(chat, None)
                 from pyrogram import raw
-                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=0), 15)
+                threshold = 0 if self.factory else 10
+                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=threshold), 15)
                 _, call = await self.native_call(a['client'], chat)
                 if call is None and not self.factory:
                     for _ in range(6):
@@ -336,6 +349,7 @@ class Bridge:
         """Fresh, self-only Telegram publisher state; never enumerate listener identities."""
         from pyrogram import raw
         client = a['client']
+        threshold = 0 if self.factory else 10
         if input_call is None:
             peer = await self.publisher_step(client.resolve_peer(chat), 'resolve_peer')
             if isinstance(peer, raw.types.InputPeerChannel):
@@ -344,10 +358,10 @@ class Bridge:
                 request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
             else:
                 raise VoiceFailure('PERMISSION_DENIED')
-            full = await self.publisher_step(client.invoke(request, sleep_threshold=0), 'call_state')
+            full = await self.publisher_step(client.invoke(request, sleep_threshold=threshold), 'call_state')
             input_call = getattr(full.full_chat, 'call', None)
             if input_call is None: raise VoiceFailure('NO_ACTIVE_CALL')
-        result = await self.publisher_step(client.invoke(raw.functions.phone.GetGroupParticipants(call=input_call, ids=[raw.types.InputPeerSelf()], sources=[], offset='', limit=1), sleep_threshold=0), 'self_participant')
+        result = await self.publisher_step(client.invoke(raw.functions.phone.GetGroupParticipants(call=input_call, ids=[raw.types.InputPeerSelf()], sources=[], offset='', limit=1), sleep_threshold=threshold), 'self_participant')
         participant = next((p for p in result.participants if getattr(p, 'is_self', False) or getattr(p.peer, 'user_id', None) == a['uid']), None)
         return input_call, participant
 
@@ -373,7 +387,8 @@ class Bridge:
         if state is None or getattr(state,'muted',True):
             await self.publisher_step(a['engine'].unmute(chat),'local_unmute')
         if getattr(participant, 'muted', False):
-            await self.publisher_step(a['client'].invoke(raw.functions.phone.EditGroupCallParticipant(call=input_call, participant=raw.types.InputPeerSelf(), muted=False), sleep_threshold=0),'self_unmute')
+            threshold = 0 if self.factory else 10
+            await self.publisher_step(a['client'].invoke(raw.functions.phone.EditGroupCallParticipant(call=input_call, participant=raw.types.InputPeerSelf(), muted=False), sleep_threshold=threshold),'self_unmute')
         for attempt in range(3):
             input_call, participant = await self.native_publisher(a, chat, input_call)
             if participant is not None and not getattr(participant, 'left', False) and not getattr(participant, 'muted', False) and getattr(participant, 'source', 0):
@@ -403,15 +418,22 @@ class Bridge:
         has_video = bool(call.get('video') or (is_channel and str(call.get('path', '')).endswith('.mp4')))
         video_flags = MediaStream.Flags.REQUIRED if has_video else MediaStream.Flags.IGNORE
         stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
-        await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 15)
+        await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 25)
         if call.get('status') != 'paused':
-            try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
+            try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 15)
             except VoiceFailure: raise
             except Exception as error: raise VoiceFailure('PUBLISHER_UNVERIFIED', {'stage':'publisher_check','kind':type(error).__name__}) from None
 
     async def resolve_destination(self, client, chat):
         # String sessions do not contain a peer/access-hash cache. Resolve only
         # existing dialog membership; never join/promote an account automatically.
+        if not self.factory:
+            try:
+                await asyncio.wait_for(client.resolve_peer(chat), 5)
+                return
+            except Exception as peer_err:
+                if type(peer_err).__name__ not in {'PeerIdInvalid', 'ChannelInvalid', 'ChannelPrivate', 'KeyError', 'ValueError', 'AttributeError'}:
+                    raise
         try:
             await asyncio.wait_for(client.get_chat(chat), 10)
             return
@@ -424,6 +446,37 @@ class Bridge:
                     pass
             if type(error).__name__ not in {'PeerIdInvalid', 'ChannelInvalid', 'ChannelPrivate', 'KeyError', 'ValueError', 'AttributeError'}: raise
         async def hydrate():
+            if not self.factory:
+                from pyrogram import raw
+                offset_date = 0
+                offset_id = 0
+                offset_peer = raw.types.InputPeerEmpty()
+                for _ in range(5):
+                    r = await client.invoke(
+                        raw.functions.messages.GetDialogs(
+                            offset_date=offset_date,
+                            offset_id=offset_id,
+                            offset_peer=offset_peer,
+                            limit=100,
+                            hash=0,
+                        ),
+                        sleep_threshold=10,
+                    )
+                    try:
+                        await client.resolve_peer(chat)
+                        return True
+                    except Exception:
+                        pass
+                    dialogs = getattr(r, 'dialogs', None) or []
+                    messages = getattr(r, 'messages', None) or []
+                    if not dialogs or not messages:
+                        break
+                    last_msg = next((m for m in reversed(messages) if getattr(m, 'date', None)), None)
+                    if not last_msg:
+                        break
+                    offset_id = getattr(last_msg, 'id', 0) or 0
+                    offset_date = getattr(last_msg, 'date', 0) or 0
+                return False
             async for dialog in client.get_dialogs(limit=500):
                 if getattr(dialog, 'chat', None) and dialog.chat.id == chat:
                     try:
@@ -433,7 +486,7 @@ class Bridge:
                         raise
                     return True
             return False
-        if not await asyncio.wait_for(hydrate(), 15):
+        if not await asyncio.wait_for(hydrate(), 25):
             raise VoiceFailure('PERMISSION_DENIED')
 
     async def play(self, data):
@@ -447,8 +500,10 @@ class Bridge:
             call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
             try:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
-                me = await asyncio.wait_for(a['client'].get_me(), 10)
-                if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
+                if self.factory or not a.get('uid') or time.monotonic() - a.get('me_checked_at', 0) >= 60:
+                    me = await asyncio.wait_for(a['client'].get_me(), 10)
+                    if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
+                    a['me_checked_at'] = time.monotonic()
                 if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
                     await self.resolve_destination(a['client'], chat)
                     try: peer, native = await self.native_call(a['client'], chat)
@@ -463,7 +518,7 @@ class Bridge:
                     if peer is not None and native is None:
                         from pyrogram import raw
                         try:
-                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
+                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=10), 15)
                             for _ in range(6):
                                 await asyncio.sleep(0.3)
                                 _, native = await self.native_call(a['client'], chat)
@@ -471,7 +526,7 @@ class Bridge:
                         except Exception as create_err:
                             if type(create_err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
                                 raise VoiceFailure('PERMISSION_DENIED') from None
-                            if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 5:
+                            if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 10:
                                 await asyncio.sleep(getattr(create_err, 'value', 1))
                                 _, native = await self.native_call(a['client'], chat)
                     if native is not None:
@@ -495,7 +550,7 @@ class Bridge:
                         if native is None:
                             from pyrogram import raw
                             try:
-                                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=5), 15)
+                                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=10), 15)
                                 for _ in range(6):
                                     await asyncio.sleep(0.3)
                                     _, native = await self.native_call(a['client'], chat)
@@ -512,7 +567,7 @@ class Bridge:
                             await self.stream(a, chat, call)
                         else:
                             raise stream_err
-                    elif type(stream_err).__name__ == 'FloodWait' and getattr(stream_err, 'value', 0) <= 5:
+                    elif type(stream_err).__name__ == 'FloodWait' and getattr(stream_err, 'value', 0) <= 10:
                         await asyncio.sleep(getattr(stream_err, 'value', 1))
                         await self.stream(a, chat, call)
                     else:

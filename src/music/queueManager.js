@@ -162,6 +162,9 @@ export class QueueManager extends EventEmitter {
           if(['NO_ACTIVE_CALL','CALL_FAILED'].includes(playErr?.code)&&typeof this.voice?.setup==='function'){
             await this.voice.setup(s.chatId,'start',{create:true,account_alias:s.preferredAccount||s.accountAlias||undefined}).catch(()=>null);
             r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
+          } else if(playErr?.code==='RATE_LIMITED'&&this.app?.musicProviders?.adapters){
+            await new Promise(res=>setTimeout(res,2000));
+            r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
           } else {
             throw playErr;
           }

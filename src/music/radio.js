@@ -13,23 +13,29 @@ export class InfiniteRadio {
     if(this.app.musicQueueManager.closed||!r.enabled||s.radio!==r)return;
     const query=r.queries[r.cursor++%r.queries.length],offset=r.offsets[query]||0;
     const isVideo=Boolean(r.video||s.isChannel||s.radioVideo);
+    const hasAdapters=Boolean(this.app.musicProviders?.adapters);
+    const isCompilationTitle=title=>/\b([1-9]\s*hours?|full\s*album|compilation|non[\s-]*stop\s*mix|megamix|long\s*playlist)\b/i.test(String(title||''));
+    const filterRadio=(items,maxSec=720)=>(items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false&&(!hasAdapters||((!t.durationSeconds||(t.durationSeconds>=40&&t.durationSeconds<=maxSec))&&!isCompilationTitle(t.title))));
     let page;
     try {
-      page=await this.app.musicProviders.search(query,{offset,limit:5,video:isVideo});
+      page=await this.app.musicProviders.search(query,{offset,limit:hasAdapters?10:5,video:isVideo});
     } catch(searchErr) {
-      if(this.app.musicProviders?.adapters){
-        page=await this.app.musicProviders.search(`${query} hits`,{offset:0,limit:5}).catch(()=>null);
+      if(hasAdapters){
+        page=await this.app.musicProviders.search(`${query} hits`,{offset:0,limit:10}).catch(()=>null);
       }
       if(!page)throw searchErr;
     }
     if(!r.enabled||s.radio!==r||this.app.musicQueueManager.closed)return;
     r.offsets[query]=page.nextOffset??0;
-    let tracks=(page.items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false);
-    if(!tracks.length&&this.app.musicProviders?.adapters){
-      for(const suffix of ['hits','mix','songs']){
-        const altPage=await this.app.musicProviders.search(`${query} ${suffix}`,{offset:0,limit:8}).catch(()=>null);
-        tracks=(altPage?.items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false);
+    let tracks=filterRadio(page.items,720);
+    if(!tracks.length&&hasAdapters){
+      for(const suffix of ['songs','hits','official audio']){
+        const altPage=await this.app.musicProviders.search(`${query} ${suffix}`,{offset:0,limit:10,video:isVideo}).catch(()=>null);
+        tracks=filterRadio(altPage?.items,720);
         if(tracks.length)break;
+      }
+      if(!tracks.length){
+        tracks=(page.items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false&&(!t.durationSeconds||t.durationSeconds<=1200));
       }
     }
     for(let i=tracks.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[tracks[i],tracks[j]]=[tracks[j],tracks[i]];}
