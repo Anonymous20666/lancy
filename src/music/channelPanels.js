@@ -20,7 +20,8 @@ export class ChannelPanels {
         if (!r.panelToken || this.panels.has(r.panelToken)) continue;
         const p = {
           ...r, api: this.app?.telegram?.api || null, page: 0, lyricsPage: 0,
-          panelActive: true, checkedAt: Date.now(), fullPreview: null
+          panelActive: true, checkedAt: Date.now(), fullPreview: null,
+          allowedMessageIds: Array.isArray(r.allowedMessageIds) ? r.allowedMessageIds : (r.screenMessageId ? [r.screenMessageId] : [])
         };
         this.panels.set(r.panelToken, p);
       }
@@ -31,10 +32,28 @@ export class ChannelPanels {
       const records = [...this.panels.values()].filter(p => p.panelActive).map(p => ({
         key: p.key, destination: p.destination, userId: p.userId, botKey: p.botKey,
         panelToken: p.panelToken, playerChatId: p.playerChatId, screenMessageId: p.screenMessageId,
-        pinned: p.pinned, view: p.view
+        allowedMessageIds: Array.isArray(p.allowedMessageIds) ? p.allowedMessageIds.slice(-10) : [],
+        pinned: p.pinned, view: p.view, radioCustom: p.radioCustom || null
       }));
       this.app?.db?.setSetting?.('music.activePanels', records);
     } catch {}
+  }
+  registerMessage(token, messageId) {
+    const p = this.panels.get(token);
+    if (!p || !messageId) return;
+    if (!Array.isArray(p.allowedMessageIds)) p.allowedMessageIds = [];
+    if (p.screenMessageId && !p.allowedMessageIds.includes(p.screenMessageId)) {
+      p.allowedMessageIds.push(p.screenMessageId);
+    }
+    if (!p.allowedMessageIds.includes(messageId)) {
+      p.allowedMessageIds.push(messageId);
+    }
+    if (p.allowedMessageIds.length > 10) {
+      p.allowedMessageIds = p.allowedMessageIds.slice(-10);
+    }
+    p.screenMessageId = messageId;
+    p.lastRender = null;
+    this.savePersistedPanels();
   }
   key(ctx, destination) { return `${this.service.botKey(ctx)}:${ctx.tgId}:${destination}`; }
   find(ctx, destination) { return [...this.panels.values()].find(p => p.key === this.key(ctx, destination)); }
@@ -84,7 +103,7 @@ export class ChannelPanels {
         const rich = this.app.screens.get('music').renderPlayer(state);
         try {
           const sent = await api.sendRichMessage(p.playerChatId, rich);
-          p.screenMessageId = sent.message_id;
+          this.registerMessage(p.panelToken, sent.message_id);
           p.lastRender = JSON.stringify(rich);
           p.pinned = false;
         } catch (error) {
@@ -117,13 +136,18 @@ export class ChannelPanels {
     }
     const isDirectChannel = Boolean(p && Number(ctx.chatId) === Number(p.destination));
     const validCaller = Boolean(p && (isDirectChannel || (p.userId === String(ctx.tgId) && p.playerChatId === Number(ctx.chatId))));
-    const validMessage = Boolean(!requireMessage || isDirectChannel || (p && p.screenMessageId === ctx.messageId));
+    const isKnownMessage = Boolean(p && (p.screenMessageId === ctx.messageId || (Array.isArray(p.allowedMessageIds) && p.allowedMessageIds.includes(ctx.messageId))));
+    const validMessage = Boolean(!requireMessage || isDirectChannel || isKnownMessage);
     const validBot = Boolean(p && p.botKey === this.service.botKey(ctx));
     if (!p || !validCaller || !validBot || !validMessage) {
       const msg = Number(ctx.chatId) < 0
         ? 'Use the live controls in this channel, or /vplay.'
         : 'Open your current channel dashboard with /channel.';
       throw new MusicError('STALE_PLAYER', msg);
+    }
+    if (ctx.messageId && isKnownMessage && p.screenMessageId !== ctx.messageId) {
+      p.screenMessageId = ctx.messageId;
+      p.lastRender = null;
     }
     await this.service.authorize(ctx, true, p.destination);
     p.panelActive = true; p.checkedAt = Date.now(); return this.state(p);

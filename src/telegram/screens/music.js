@@ -146,25 +146,29 @@ export function createMusicScreen({ app }) {
   }
   const QUICK_GENRES = ['Afrobeats', 'Amapiano', 'Hip hop', 'Trap', 'R&B', 'Pop', 'Lo-fi', 'Drill', 'Gospel', 'Party'];
   function resolveGenre(ref, s=null){
-    if(ref==='custom')return s?.radioCustom || 'Afrobeats';
+    if(ref==='custom'){
+      const qmSession=(s?.destination||s?.chatId)?app.musicQueueManager?.getSession?.(s.destination||s.chatId):null;
+      return s?.radioCustom || qmSession?.radioCustom || 'Afrobeats';
+    }
     if(typeof ref==='number'||/^\d+$/.test(ref)){
       const idx=Number(ref);
       if(QUICK_GENRES[idx])return QUICK_GENRES[idx];
       if(RADIO_CATEGORIES[idx])return RADIO_CATEGORIES[idx];
     }
-    return String(ref||'Afrobeats').trim().slice(0,100);
+    return String(ref||'Afrobeats').trim().slice(0,120);
   }
-  function renderGenreSubmenu(genre, mode='queue', panelToken=null){
+  function renderGenreSubmenu(genre, mode='queue', panelToken=null, isCustom=false){
     const cleanGenre=resolveGenre(genre);
+    const refArg=(isCustom||cleanGenre.length>20)?'custom':cut(cleanGenre,20);
     const b=card(`Lancy · ${cut(cleanGenre,50)}`,`Infinite non-stop streaming or queueing`);
     b.quote(rt.text(`🎵 ${cleanGenre}\nChoose whether to stream non-stop now or add to upcoming queue:`));
     if(panelToken){
       b.buttons([
-        button(`▶ Start Non-stop ${cut(cleanGenre,12)}`,'pc',panelToken,PANEL_ACTIONS.indexOf('infinact').toString(36),mode,'start',cut(cleanGenre,24)),
-        button(`➕ Queue ${cut(cleanGenre,12)}`,'pc',panelToken,PANEL_ACTIONS.indexOf('infinact').toString(36),mode,'queue',cut(cleanGenre,24))
+        button(`▶ Start Non-stop ${cut(cleanGenre,12)}`,'pc',panelToken,PANEL_ACTIONS.indexOf('infinact').toString(36),mode,'start',refArg),
+        button(`➕ Queue ${cut(cleanGenre,12)}`,'pc',panelToken,PANEL_ACTIONS.indexOf('infinact').toString(36),mode,'queue',refArg)
       ]);
       b.buttons([
-        button('🔍 Browse Songs','pc',panelToken,PANEL_ACTIONS.indexOf('catpick').toString(36),mode,cut(cleanGenre,24)),
+        button('🔍 Browse Songs','pc',panelToken,PANEL_ACTIONS.indexOf('catpick').toString(36),mode,refArg),
         button('🎨 Custom Artist','pc',panelToken,PANEL_ACTIONS.indexOf('prompt').toString(36),'radio')
       ]);
       b.buttons([
@@ -173,11 +177,11 @@ export function createMusicScreen({ app }) {
       ]);
     }else{
       b.buttons([
-        button(`▶ Start Non-stop ${cut(cleanGenre,12)}`,'infinact',mode,'start',cut(cleanGenre,24)),
-        button(`➕ Queue ${cut(cleanGenre,12)}`,'infinact',mode,'queue',cut(cleanGenre,24))
+        button(`▶ Start Non-stop ${cut(cleanGenre,12)}`,'infinact',mode,'start',refArg),
+        button(`➕ Queue ${cut(cleanGenre,12)}`,'infinact',mode,'queue',refArg)
       ]);
       b.buttons([
-        button('🔍 Browse Songs','catpick',mode,cut(cleanGenre,24)),
+        button('🔍 Browse Songs','catpick',mode,refArg),
         button('🎨 Custom Artist','prompt','radio')
       ]);
       b.buttons([
@@ -300,6 +304,7 @@ export function createMusicScreen({ app }) {
   async function handleInfiniteAction(ctx,args,panelToken=null){
     const [mode='queue',op='start',genreRef='0']=args;
     const panel=panelToken?await app.music.channelPanels.resolve(ctx,panelToken,{requireMessage:false}):ctx.musicPanel;
+    if(panelToken&&ctx.messageId)app.music.channelPanels?.registerMessage?.(panelToken,ctx.messageId);
     const targetCtx=panel?{...ctx,musicPanel:panel}:ctx;
     const destination=app.music.destination(targetCtx);
     const s=panel||app.musicQueueManager.getSession(destination);
@@ -312,6 +317,8 @@ export function createMusicScreen({ app }) {
     procMsg.buttons([button('⏳ Processing…','noop')]);
     if(ctx.messageId&&ctx.query)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,finish(procMsg)).catch(()=>{});
     else if(ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,finish(procMsg)).catch(()=>{});
+    s.lastRender=null;
+    if(panel)panel.lastRender=null;
     s.lastNotice=op==='start'?`⏳ Starting non-stop ${genre} streaming…`:`⏳ Adding ${genre} to queue…`;
     if(s.screenMessageId&&!panelToken)void app.musicQueueManager.updatePlayerCard(destination).catch(()=>{});
     if(op==='start'){
@@ -325,6 +332,8 @@ export function createMusicScreen({ app }) {
       await app.music.radio.refill(app.musicQueueManager.getSession(destination));
       await app.musicQueueManager.ensurePlaying(destination);
       s.view='player';
+      s.lastRender=null;
+      if(panel){panel.view='player';panel.lastRender=null;}
       if(panelToken)await app.music.channelPanels.update(destination,{panelToken});
       else if(!s.screenMessageId&&Number(ctx.chatId)<0)await app.music.player(targetCtx,destination);
       else {
@@ -354,6 +363,8 @@ export function createMusicScreen({ app }) {
         await app.musicQueueManager.ensurePlaying(destination);
       }
       s.view='player';
+      s.lastRender=null;
+      if(panel){panel.view='player';panel.lastRender=null;}
       if(panelToken)await app.music.channelPanels.update(destination,{panelToken});
       else if(!s.screenMessageId&&Number(ctx.chatId)<0)await app.music.player(targetCtx,destination);
       else {
@@ -385,20 +396,25 @@ export function createMusicScreen({ app }) {
         }
       });
       if(action==='listenq'){const c=app.music.listenCard(ctx,args[0]);if(!c.destination)return channels(ctx,c.token);return await app.music.queueListen(ctx,c.token);}
-      if(action==='catmenu'){const [mode='queue',page=0]=args;const rich=renderCategoryPicker(mode,null,Number(page)||0);if(ctx.query&&ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,rich);else await ctx.api.sendRichMessage(ctx.chatId,rich);return;}
-      if(action==='genresub'){const [mode='queue',genreRef]=args;const genre=resolveGenre(genreRef);const rich=renderGenreSubmenu(genre,mode,null);if(ctx.query&&ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,rich);else await ctx.api.sendRichMessage(ctx.chatId,rich);return;}
-      if(action==='catpick'){const [mode='queue',genreRef]=args;const genre=resolveGenre(genreRef);if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Loading ${genre}…`}).catch(()=>{});return await search(ctx,genre,mode);}
+      if(action==='catmenu'){const [mode='queue',page=0]=args;try{const dest=app.music.destination(ctx);const s=app.musicQueueManager?.getSession?.(dest);if(s)s.lastRender=null;}catch{}const rich=renderCategoryPicker(mode,null,Number(page)||0);if(ctx.query&&ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,rich);else await ctx.api.sendRichMessage(ctx.chatId,rich);return;}
+      if(action==='genresub'){const [mode='queue',genreRef]=args;let s=null;try{const dest=app.music.destination(ctx);s=app.musicQueueManager?.getSession?.(dest);}catch{}const genre=resolveGenre(genreRef,s);if(s){s.radioCustom=genre;s.lastRender=null;}const rich=renderGenreSubmenu(genre,mode,null,genreRef==='custom'||genre.length>20);if(ctx.query&&ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,rich);else await ctx.api.sendRichMessage(ctx.chatId,rich);return;}
+      if(action==='catpick'){const [mode='queue',genreRef]=args;let s=null;try{const dest=app.music.destination(ctx);s=app.musicQueueManager?.getSession?.(dest);}catch{}const genre=resolveGenre(genreRef,s);if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Loading ${genre}…`}).catch(()=>{});return await search(ctx,genre,mode);}
       if(action==='infinact')return await handleInfiniteAction(ctx,args,null);
       if(action==='openradio'){const state=await app.music.player(ctx);return await app.music.control({...ctx,query:null,messageId:null,musicPanel:state.panelToken?state:undefined},'radio',[]);}
       if(action==='pc'){
         const [token,wire,...controlArgs]=args;
         const command=PANEL_ACTIONS[parseInt(wire,36)];
         if(!command)throw new MusicError('STALE_PLAYER','Open your current channel dashboard.');
-        const panel=await app.music.channelPanels.resolve(ctx,token);
+        const relaxMessage=['infinact','catmenu','genresub','catpick','prompt','channels'].includes(command);
+        const panel=await app.music.channelPanels.resolve(ctx,token,{requireMessage:!relaxMessage});
+        if(ctx.messageId&&['infinact','catmenu','genresub','player'].includes(command)){
+          app.music.channelPanels?.registerMessage?.(token,ctx.messageId);
+        }
         if(command==='channels')return await channels(ctx);
         if(command==='prompt')return await prompt({...ctx,musicPanel:panel},controlArgs[0]||'queue');
         if(command==='catmenu'){
           const [mode=panel?.isChannel?'video':'queue',page=0]=controlArgs;
+          if(panel)panel.lastRender=null;
           const rich=renderCategoryPicker(mode,token,Number(page)||0);
           if(ctx.query&&ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,rich);
           else await ctx.api.sendRichMessage(ctx.chatId,rich);
@@ -407,7 +423,10 @@ export function createMusicScreen({ app }) {
         if(command==='genresub'){
           const [mode='queue',genreRef]=controlArgs;
           const genre=resolveGenre(genreRef,panel);
-          const rich=renderGenreSubmenu(genre,mode,token);
+          if(panel){panel.radioCustom=genre;panel.lastRender=null;}
+          const qmS=app.musicQueueManager?.getSession?.(panel?.destination);
+          if(qmS)qmS.radioCustom=genre;
+          const rich=renderGenreSubmenu(genre,mode,token,genreRef==='custom'||genre.length>20);
           if(ctx.query&&ctx.messageId)await ctx.api.editMessageRich(ctx.chatId,ctx.messageId,rich);
           else await ctx.api.sendRichMessage(ctx.chatId,rich);
           return;
@@ -422,6 +441,8 @@ export function createMusicScreen({ app }) {
           return await handleInfiniteAction({...ctx,musicPanel:panel},controlArgs,token);
         }
         if(command==='player'){
+          if(panel)panel.lastRender=null;
+          if(!controlArgs.length)controlArgs.push(Number(panel?.controlRevision||0).toString(36));
           const dest=panel?.destination||app.music.destination(ctx);
           if(dest){
             const s=app.musicQueueManager.getSession(dest);
@@ -619,7 +640,26 @@ export function createMusicScreen({ app }) {
       if(record.context.mode==='channel'){try{const value=message.text||message.caption||'',id=await app.music.bind({...ctx,message},value);await sm.reset(ctx.tgId);await channels(ctx);return Boolean(id)||true;}catch(e){await error(ctx,e);return true;}}
       if(!message.text||(Number(ctx.chatId)<0&&message.reply_to_message?.message_id!==record.context.promptMessageId))return false;
       const mode=record.context.mode,panelToken=record.context.panelToken;
-      try{const panel=panelToken?await app.music.channelPanels.resolve(ctx,panelToken,{requireMessage:false}):null;await sm.reset(ctx.tgId);if(mode==='radio'){const scoped=panel?{...ctx,musicPanel:panel}:ctx,id=await app.music.authorize(scoped,true),state=panel||app.musicQueueManager.getSession(id);const customArtist=String(message.text).trim().slice(0,120);state.radioCustom=customArtist;state.view='player';const rich=renderGenreSubmenu(customArtist,'queue',panelToken);const sent=await ctx.api.sendRichMessage(ctx.chatId,rich).catch(()=>null);if(sent)temporary.remember(ctx,sent,{ttlMs:120000});}else await search(panel?{...ctx,musicPanel:panel}:ctx,message.text,mode);}
+      try{
+        const panel=panelToken?await app.music.channelPanels.resolve(ctx,panelToken,{requireMessage:false}):null;
+        await sm.reset(ctx.tgId);
+        if(mode==='radio'){
+          const scoped=panel?{...ctx,musicPanel:panel}:ctx,id=await app.music.authorize(scoped,true),qmSession=app.musicQueueManager.getSession(id),state=panel||qmSession;
+          const customArtist=String(message.text).trim().slice(0,120);
+          state.radioCustom=customArtist;
+          if(qmSession)qmSession.radioCustom=customArtist;
+          state.view='player';
+          const subMode=(panel?.isChannel||qmSession?.isChannel)?'video':'queue';
+          const rich=renderGenreSubmenu(customArtist,subMode,panelToken,true);
+          const sent=await ctx.api.sendRichMessage(ctx.chatId,rich).catch(()=>null);
+          if(sent&&panelToken){
+            app.music.channelPanels?.registerMessage?.(panelToken,sent.message_id);
+          }else if(sent&&qmSession){
+            qmSession.screenMessageId=sent.message_id;
+            qmSession.lastRender=null;
+          }
+        }else await search(panel?{...ctx,musicPanel:panel}:ctx,message.text,mode);
+      }
       catch(e){await sm.reset(ctx.tgId);await error(ctx,e);}return true;
     }});
     // Recover persisted legacy login flows safely; never accept or forward their secrets.

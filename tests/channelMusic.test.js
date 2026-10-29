@@ -217,3 +217,63 @@ test('repeated /channel command always posts a fresh dashboard at the bottom of 
  assert.ok(h.pins.some(p=>p.method==='unpinChatMessage'&&p.message_id===firstId));
 });
 
+test('channel custom genre flow (Chinese and Japanese traditional instrumental songs) starts non-stop broadcast without STALE_PLAYER error',async t=>{
+ const h=setup(t),db=new Database(':memory:');t.after(()=>db.close());
+ const settings=new SettingsManager(db,{env:{OWNER_IDS:'1000'}});h.app.settings=settings;h.app.db=db;
+ h.api.answerCallbackQuery=async()=>true;
+ const configuredGenres=[];
+ h.app.music.radio={
+  configure:(s,cats,opts)=>{s.radioEnabled=true;s.radioCategories=cats;configuredGenres.push({cats,opts});},
+  refill:async(s)=>{await h.app.musicQueueManager.addMany(s.chatId,[song(88)]);}
+ };
+ const panel=await h.open(10,-10011);
+ const c=new TelegramController({api:h.api,db,settings,sm:h.app.sm,screens:h.app.screens,app:h.app});
+ const from={id:10,is_bot:false,first_name:'Admin'},chat={id:10,type:'private'};
+
+ // 1. Tap "♾️ Infinite / Genre" on the channel player card
+ const playerRich=h.screen.renderPlayer(panel);
+ const catBtn=playerRich.blocks.flatMap(b=>b.buttons||[]).find(b=>b.text.includes('Infinite'));
+ assert.ok(catBtn,'Infinite / Genre button must exist on channel dashboard');
+ h.app.music.rates.clear();
+ await c.handleUpdate({callback_query:{id:'cb-catmenu',from,message:{message_id:panel.screenMessageId,chat,from:{id:99,is_bot:true}},data:catBtn.callback_data}});
+
+ // 2. Tap "🎨 Custom Artist / Genre" on the category picker
+ const catEdit=h.edits.at(-1);
+ const customBtn=catEdit.rich.blocks.flatMap(b=>b.buttons||[]).find(b=>b.text.includes('Custom Artist'));
+ assert.ok(customBtn,'Custom Artist / Genre button must exist on category picker');
+ h.app.music.rates.clear();
+ await c.handleUpdate({callback_query:{id:'cb-custom',from,message:{message_id:panel.screenMessageId,chat,from:{id:99,is_bot:true}},data:customBtn.callback_data}});
+
+ // 3. User sends custom genre text: "Chinese and Japanese traditional instrumental songs"
+ const customText='Chinese and Japanese traditional instrumental songs';
+ h.app.music.rates.clear();
+ await c.handleUpdate({message:{message_id:901,from,chat,text:customText}});
+
+ // Verify submenu card was sent and registered on the panel
+ const submenuMsg=h.sent.at(-1);
+ assert.ok(submenuMsg?.rich,'Custom genre submenu card must be sent');
+ assert.ok(JSON.stringify(submenuMsg.rich).includes(customText),'Submenu quote must show full untruncated genre');
+ const startBtn=submenuMsg.rich.blocks.flatMap(b=>b.buttons||[]).find(b=>b.text.includes('Start Non-stop'));
+ assert.ok(startBtn,'Start Non-stop button must exist on submenu card');
+
+ // 4. User taps "▶ Start Non-stop" on the new submenu message
+ h.app.music.rates.clear();
+ await c.handleUpdate({callback_query:{id:'cb-start-nonstop',from,message:{message_id:submenuMsg.message_id,chat,from:{id:99,is_bot:true}},data:startBtn.callback_data}});
+
+ // Verify NO stale player error was sent
+ const staleError=h.sent.find(m=>String(m.text||'').includes('Open your current channel dashboard'));
+ assert.equal(staleError,undefined,'Must NEVER send STALE_PLAYER error when starting custom genre from submenu card');
+
+ // Verify full custom genre was configured in video mode and playback started on -10011
+ assert.equal(configuredGenres.length,1);
+ assert.deepEqual(configuredGenres[0].cats,[customText]);
+ assert.equal(configuredGenres[0].opts?.video,true);
+ assert.deepEqual(h.calls.filter(x=>x[0]==='play'),[['play',-10011]]);
+
+ // Verify submenu message was updated in-place into the live channel broadcast player card
+ const finalEdit=h.edits.filter(e=>e.message_id===submenuMsg.message_id).at(-1);
+ assert.ok(finalEdit,'Submenu card message must be edited in-place');
+ assert.ok(JSON.stringify(finalEdit.rich).includes('CHANNEL LIVE BROADCAST'),'Submenu card must transition into CHANNEL LIVE BROADCAST player');
+});
+
+
