@@ -64,7 +64,7 @@ export class MediaLibrary {
               const info = JSON.parse(probe.stdout);
               const duration = Number(info.format?.duration);
               if (Number.isFinite(duration) && duration > 0 && info.streams?.some(s => s.codec_type === 'audio')) {
-                result = { key, filePath, track: { ...track, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || track.provider === 'youtube', seek: true, video } } };
+                result = { key, filePath, track: { ...track, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || ['youtube', 'music'].includes(track.provider), seek: true, video } } };
                 this.active.set(key, result);
               }
             }
@@ -78,7 +78,7 @@ export class MediaLibrary {
         // Video is never passed off as an MP3; its audio is resolved separately.
         const knownDuration = cached && (Object.hasOwn(cached.track, 'sourceDurationSeconds') ? cached.track.sourceDurationSeconds : cached.track.durationSeconds);
         const complete = cached && (!permitted?.track.durationSeconds || Math.abs(permitted.track.durationSeconds - cached.track.durationSeconds) <= 4);
-        if (complete && (track.provider === 'youtube' || permitted) && (permitted?.track.durationSeconds || knownDuration)) {
+        if (complete && (['youtube', 'music'].includes(track.provider) || permitted) && (permitted?.track.durationSeconds || knownDuration)) {
           result = cached; key = streamKey;
         }
       }
@@ -90,7 +90,7 @@ export class MediaLibrary {
           if (used + required > this.quotaBytes) throw new MusicError('CACHE_FULL', 'Music storage is busy. Try again after active tracks finish.');
           let meta;
           let artworkFile = null;
-          if (track.provider === 'youtube') meta = await adapter.download(track, source, { video, maxBytes: limit });
+          if (['youtube', 'music'].includes(track.provider)) meta = await adapter.download(track, source, { video, maxBytes: limit });
           else {
             const media = permitted || await adapter.media(track, { download }); meta = media.track;
             await boundedFetchFile(media.url, source, limit);
@@ -139,7 +139,7 @@ export class MediaLibrary {
           const info = JSON.parse(probe.stdout); const duration = Number(info.format?.duration); const size = (await stat(output)).size;
           if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (video && !info.streams.some(s => s.codec_type === 'video')) || size >= limit || (meta.durationSeconds && duration < Math.min(meta.durationSeconds - 20, meta.durationSeconds * 0.7))) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
           await rename(output, filePath);
-          result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || track.provider === 'youtube', seek: true, video } } }; this.active.set(key, result);
+          result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: video ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || ['youtube', 'music'].includes(track.provider), seek: true, video } } }; this.active.set(key, result);
         } catch (error) {
           if (error instanceof MusicError) throw error;
           throw new MusicError('RESOLUTION_FAILED', 'The selected recording could not be downloaded or decoded. Try another permitted result.');

@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { normalizeTrack, MusicError } from './model.js';
 import { searchYouTubeFast } from '../media/youtubeSearch.js';
@@ -111,15 +112,125 @@ export class AudiusProvider {
     return { track: meta, url: `${this.base}/tracks/${track.providerId}/${download ? 'download' : 'stream'}?app_name=Lancy` };
   }
 }
+export class PlayMusicProvider {
+  constructor({ runner = exec } = {}) {
+    this.id = 'music';
+    this.runner = runner;
+  }
+  async search(query, { offset = 0, limit = 5 } = {}) {
+    const clean = String(query || '')
+      .replace(/^(music|song|track|audio|play):\s*/i, '')
+      .trim();
+    if (!clean) throw new MusicError('EMPTY_QUERY', 'Search by song title, artist, or music genre.');
+    try {
+      const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(clean)}&entity=song&limit=30`, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(5000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const items = (data?.results || [])
+          .filter(t => t?.trackName && t?.artistName && t?.trackTimeMillis >= 40000 && t?.trackTimeMillis <= 900000)
+          .map(t => normalizeTrack({
+            providerId: String(t.trackId || createHash('sha256').update(`${t.artistName}-${t.trackName}`).digest('hex').slice(0, 16)),
+            title: t.trackName,
+            artist: t.artistName,
+            album: t.collectionName || null,
+            durationSeconds: Math.round(t.trackTimeMillis / 1000),
+            artwork: t.artworkUrl100?.replace('100x100bb', '600x600bb') || t.artworkUrl100 || null,
+            sourceRef: t.trackViewUrl || null,
+            availability: 'unresolved',
+            capabilities: { stream: true, download: true, seek: true, video: false }
+          }, this.id));
+        if (items.length > offset) {
+          return {
+            items: items.slice(offset, offset + limit),
+            nextOffset: items.length > offset + limit && offset + limit < 30 ? offset + limit : null
+          };
+        }
+      }
+    } catch {}
+    return { items: [], nextOffset: null };
+  }
+  async download(track, path, { video = false, maxBytes = 48 * 1024 * 1024 } = {}) {
+    const cleanQuery = `${track.artist || ''} ${track.title}`.trim();
+    const diskCachePattern = `/data/audio_cache/${track.providerId}.mp3`;
+    if (existsSync(diskCachePattern) && statSync(diskCachePattern).size > 40000) {
+      const buf = readFileSync(diskCachePattern);
+      writeFileSync(path, buf);
+      return normalizeTrack({ ...track, filePath: path, availability: 'resolved' }, this.id);
+    }
+    let matchedVideoId = null;
+    try {
+      const fastItems = await searchYouTubeFast(`${cleanQuery} official audio`, 'NG', { wide: true });
+      const best = (fastItems || []).find(v => !v.isLive && v.duration !== 'LIVE' && v.duration !== 'HD');
+      if (best?.videoId) matchedVideoId = best.videoId;
+    } catch {}
+
+    const targetUrl = matchedVideoId ? `https://www.youtube.com/watch?v=${matchedVideoId}` : `ytsearch1:${cleanQuery} audio`;
+    const cookieArgs = existsSync('/data/youtube_cookies.txt') ? ['--cookies', '/data/youtube_cookies.txt'] : [];
+
+    const buildArgs = (target) => {
+      const a = [
+        '--ignore-config',
+        '--no-playlist',
+        '--no-warnings',
+        '--no-progress',
+        '--socket-timeout', '15',
+        '--retries', '2',
+        '--fragment-retries', '2',
+        '--max-filesize', String(maxBytes),
+        '--match-filter', 'duration <= 900 & !is_live',
+        '--restrict-filenames',
+        '-f', 'ba/b',
+        '-o', path,
+        '--print', 'after_move:%()j'
+      ];
+      if (this.runner === exec) {
+        if (existsSync('/usr/bin/node')) a.push('--js-runtimes', 'node:/usr/bin/node');
+        if (existsSync('/data/cache/yt-dlp')) a.push('--cache-dir', '/data/cache/yt-dlp');
+        if (cookieArgs.length) a.push(...cookieArgs);
+      }
+      a.push('--', target);
+      return a;
+    };
+
+    try {
+      await this.runner('yt-dlp', buildArgs(targetUrl), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+    } catch (ytErr) {
+      try {
+        await this.runner('yt-dlp', buildArgs(`scsearch1:${cleanQuery}`), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+      } catch {
+        throw ytErr;
+      }
+    }
+    return normalizeTrack({
+      ...track,
+      filePath: path,
+      availability: 'resolved',
+      capabilities: { stream: true, download: true, seek: true, video: false }
+    }, this.id);
+  }
+}
 export class ProviderRegistry {
-  constructor(providers = [new AudiusProvider(), new YouTubeProvider()]) { this.adapters = new Map(providers.map(p => [p.id, p])); }
+  constructor(providers = [new PlayMusicProvider(), new AudiusProvider(), new YouTubeProvider()]) { this.adapters = new Map(providers.map(p => [p.id, p])); }
   get(id) { const p = this.adapters.get(id); if (!p) throw new MusicError('UNSUPPORTED_PROVIDER', 'Unsupported music provider.'); return p; }
   async search(query, options) {
-    const m = String(query).match(/^(youtube|yt|audius):\s*(.+)$/i);
+    const m = String(query).match(/^(youtube|yt|audius|music|itunes):\s*(.+)$/i);
     const explicit = Boolean(m);
-    const provider = explicit ? (m[1].toLowerCase() === 'yt' ? 'youtube' : m[1].toLowerCase()) : (options?.video||youtubeId(query)) ? 'youtube' : this.get('youtube').enabled ? 'youtube' : 'audius';
-    if(options?.video&&provider!=='youtube')throw new MusicError('VIDEO_UNSUPPORTED','Choose a permitted YouTube video, or reply /vidc to a video file. Audius is audio-only.');
-    if(options?.video&&!this.get('youtube').enabled)throw new MusicError('PROVIDER_DISABLED','Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
+    const prefix = m ? m[1].toLowerCase() : null;
+    let provider;
+    if (explicit) {
+      provider = prefix === 'yt' ? 'youtube' : (prefix === 'itunes' ? 'music' : prefix);
+    } else if (options?.video || youtubeId(query)) {
+      provider = 'youtube';
+    } else if (options?.radio || options?.filterDuration === 'song' || options?.filterDuration === 'medium') {
+      provider = this.adapters.has('music') ? 'music' : (this.get('youtube').enabled ? 'youtube' : 'audius');
+    } else {
+      provider = this.adapters.has('music') ? 'music' : (this.get('youtube').enabled ? 'youtube' : 'audius');
+    }
+    if (options?.video && provider !== 'youtube') throw new MusicError('VIDEO_UNSUPPORTED', 'Choose a permitted YouTube video, or reply /vidc to a video file. Audius and Music are audio-only.');
+    if (options?.video && !this.get('youtube').enabled) throw new MusicError('PROVIDER_DISABLED', 'Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
     const q = m ? m[2] : query;
     try {
       const res = await this.get(provider).search(q, options);
@@ -128,8 +239,8 @@ export class ProviderRegistry {
       }
     } catch (err) {
       if (explicit || youtubeId(query)) throw err;
-      const fallback = provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null);
-      if (fallback) {
+      const fallback = provider === 'music' ? (this.adapters.get('youtube')?.enabled ? 'youtube' : 'audius') : (provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null));
+      if (fallback && this.adapters.has(fallback)) {
         try {
           const fallbackRes = await this.get(fallback).search(q, options);
           if (fallbackRes.items && fallbackRes.items.length > 0) return { ...fallbackRes, provider: fallback };
@@ -137,8 +248,8 @@ export class ProviderRegistry {
       }
       throw err;
     }
-    const fallback = provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null);
-    if (fallback) {
+    const fallback = provider === 'music' ? (this.adapters.get('youtube')?.enabled ? 'youtube' : 'audius') : (provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null));
+    if (fallback && this.adapters.has(fallback)) {
       try {
         const fallbackRes = await this.get(fallback).search(q, options);
         if (fallbackRes.items && fallbackRes.items.length > 0) return { ...fallbackRes, provider: fallback };

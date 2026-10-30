@@ -57,11 +57,11 @@ export class QueueManager extends EventEmitter {
       return;
     }
     const next=s.upcoming[0];
-    if(!next||!['youtube','audius','telegram'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
+    if(!next||!['youtube','audius','telegram','music'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
     if(typeof this.app.musicLibrary.warm==='function'){
       if(!s.warmedIds)s.warmedIds=new Set();
       for(const u of s.upcoming.slice(1,3)){
-        if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram'].includes(u.provider)){
+        if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram','music'].includes(u.provider)){
           s.warmedIds.add(u.entryId);
           if(s.warmedIds.size>50)s.warmedIds.delete(s.warmedIds.values().next().value);
           const uVid=u.mediaType==='video';
@@ -103,7 +103,7 @@ export class QueueManager extends EventEmitter {
       if(typeof this.app?.musicLibrary?.warm==='function'){
         if(!s.warmedIds)s.warmedIds=new Set();
         for(const u of s.upcoming.slice(0,2)){
-          if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram'].includes(u.provider)){
+          if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram','music'].includes(u.provider)){
             s.warmedIds.add(u.entryId);
             const uVid=u.mediaType==='video';
             void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
@@ -118,7 +118,7 @@ export class QueueManager extends EventEmitter {
         else if(warm){media=warm.media||await this.#awaitMedia(s,()=>warm.promise);if(s.prefetched===warm)s.prefetched=null;warm.media=null;}
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
         const wantsVideo=entry.mediaType==='video';
-        if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram'].includes(entry.provider)){
+        if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram','music'].includes(entry.provider)){
           try {
             media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
           } catch(acquireErr) {
