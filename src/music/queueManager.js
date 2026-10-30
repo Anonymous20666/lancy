@@ -91,8 +91,13 @@ export class QueueManager extends EventEmitter {
     }
     if(s.radio?.enabled&&!s.upcoming.length)await this.app?.music?.radio?.refill(s);
     if(this.closed||(s.stopGeneration||0)!==cancel)return null;
-    const attempts=s.upcoming.length;
-    for(let n=0;n<attempts;n++){
+    let refillTries=0;
+    while(s.upcoming.length||(s.radio?.enabled&&refillTries<2)){
+      if(!s.upcoming.length&&s.radio?.enabled&&refillTries<2){
+        refillTries++;
+        await this.app?.music?.radio?.refill(s).catch(()=>{});
+        if(!s.upcoming.length)break;
+      }
       const entry=s.upcoming.shift();let media=null,calledNative=false;
       const warm=s.prefetched?.entryId===entry.entryId?s.prefetched:null;if(warm)warm.claimed=true;
       if(typeof this.app?.musicLibrary?.warm==='function'){
@@ -185,6 +190,7 @@ export class QueueManager extends EventEmitter {
           else if(!previous)s.status='error';
           await this.updatePlayerCard(s.chatId);return null;
         }
+        if(s.radio?.seen&&entry?.id){s.radio.seen.push(entry.id);}
       }
     }
     if(s.connected&&this.voice.idle){

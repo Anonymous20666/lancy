@@ -386,6 +386,89 @@ test('InfiniteRadio skips multi-hour compilation mixes and MediaLibrary stream-c
  media.release();
 });
 
+test('InfiniteRadio filters out 24/7 Zen sleep livestreams and queueManager auto-refills without stalling in idle', async t => {
+ const { InfiniteRadio } = await import('../src/music/radio.js');
+ const h = setup(t);
+
+ let searchCalls = 0;
+ h.app.musicProviders = {
+  adapters: new Map([['youtube', {}]]),
+  search: async (q, opts) => {
+   searchCalls++;
+   if (searchCalls === 1) {
+    return {
+     items: [
+      normalizeTrack({
+       providerId: 'live247',
+       title: '🌸 24/7 Japanese Zen Music | Relaxing Koto & Shakuhachi for Meditation, Mindfulness & Stress Relief',
+       artist: 'Zen Garden',
+       duration: 'HD',
+       durationSeconds: null,
+       isLive: true
+      }, 'youtube'),
+      normalizeTrack({
+       providerId: 'comp3h',
+       title: 'Beautiful Asian Music - 3 Hours Sleep Music',
+       artist: 'Lotus',
+       duration: '3:03:24',
+       durationSeconds: 11004
+      }, 'youtube')
+     ],
+     nextOffset: 5
+    };
+   }
+   return {
+    items: [
+     normalizeTrack({
+      providerId: 'zen_song_1',
+      title: 'Classic Chinese Bamboo Flute Music',
+      artist: 'Chen Yue',
+      duration: '4:43',
+      durationSeconds: 283
+     }, 'youtube'),
+     normalizeTrack({
+      providerId: 'zen_song_2',
+      title: 'Tibetan Dream Flute',
+      artist: 'Tibetan Sound',
+      duration: '3:20',
+      durationSeconds: 200
+     }, 'youtube')
+    ],
+    nextOffset: 10
+   };
+  }
+ };
+
+ const radio = new InfiniteRadio({ app: h.app });
+ const s = h.app.musicQueueManager.getSession(-10011);
+ s.isChannel = true;
+ radio.configure(s, ['Asian sleep music']);
+
+ // Refill should skip the 24/7 live stream and 3-hour compilation, querying fallback suffix
+ await radio.refill(s);
+ assert.ok(s.upcoming.length >= 1, 'Radio must find valid tracks and skip livestreams');
+ assert.ok(s.upcoming.every(tr => !tr.isLive && tr.durationSeconds >= 40 && tr.durationSeconds <= 720));
+ assert.ok(!s.upcoming.some(tr => tr.title.includes('24/7')), '24/7 live stream must be excluded');
+
+ // Next: verify that if a track in upcoming fails to acquire, queueManager auto-refills rather than halting in idle
+ h.app.musicLibrary = {
+  acquire: async (tr) => {
+   if (tr.providerId === 'zen_song_1') {
+    throw new Error('The provider could not deliver a playable file within the size limit.');
+   }
+   return {
+    track: { ...tr, filePath: '/fake/playable.mp3', capabilities: { stream: true } },
+    release: () => {}
+   };
+  }
+ };
+
+ // Trigger #next: zen_song_1 fails, queueManager must auto-advance to zen_song_2 without setting status to idle
+ await h.app.musicQueueManager.playNext(-10011);
+ assert.equal(s.currentTrack?.providerId, 'zen_song_2', 'QueueManager must auto-advance to next valid track on track failure');
+ assert.equal(s.status, 'playing', 'Playback status must remain playing');
+});
+
 
 
 

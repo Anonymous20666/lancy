@@ -37,12 +37,18 @@ async function fetchInnerTubePage(query, gl = 'US', sp = null) {
       if (vid.length === 11 && !seen.has(vid)) {
         seen.add(vid);
         const title = node.title?.runs?.[0]?.text || node.title?.simpleText || node.headline?.simpleText || '';
-        const duration = node.lengthText?.simpleText || 'HD';
+        const isLive = Boolean(
+          node.badges?.some(b => /live/i.test(b?.metadataBadgeRenderer?.label || b?.label || '')) ||
+          node.thumbnailOverlays?.some(o => o?.thumbnailOverlayTimeStatusRenderer?.style === 'LIVE') ||
+          /watching/i.test(node.viewCountText?.runs?.[0]?.text || node.viewCountText?.simpleText || '') ||
+          /\b(24\/7|\blive\s*(now|stream)?\b)/i.test(title)
+        );
+        const duration = isLive ? 'LIVE' : (node.lengthText?.simpleText || 'HD');
         const views = node.viewCountText?.simpleText || node.shortViewCountText?.simpleText || '';
         const author = node.ownerText?.runs?.[0]?.text || node.shortBylineText?.runs?.[0]?.text || 'Music';
         const thumb = node.thumbnail?.thumbnails?.pop()?.url || `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
         if (title) {
-          videos.push({ videoId: vid, title, duration, views, author, thumb });
+          videos.push({ videoId: vid, title, duration, views, author, thumb, isLive });
         }
       }
     } else if (node.shortsLockupViewModel) {
@@ -70,22 +76,25 @@ async function fetchInnerTubePage(query, gl = 'US', sp = null) {
   return videos;
 }
 
-export async function searchYouTubeFast(query, gl = 'US', { wide = true } = {}) {
+export async function searchYouTubeFast(query, gl = 'US', { wide = true, radio = false, filterDuration = null } = {}) {
   const clean = String(query || '').trim();
   if (!clean) return [];
 
   try {
     const isTikTokOrClip = /\b(tiktok|shorts|reel|reels|clip|compilation|edit|dance)\b/i.test(clean);
+    const isAmbientOrSleep = /\b(sleep|relax|chill|ambient|zen|meditation|koto|guzheng|flute|instrumental|study|lo-fi|lofi|bgm|piano)\b/i.test(clean);
+    const useDurationFilter = filterDuration === 'medium' || radio || isAmbientOrSleep;
+
     const tasks = [
-      fetchInnerTubePage(clean, gl)
+      fetchInnerTubePage(clean, gl, useDurationFilter ? 'EgIYAw%3D%3D' : null)
     ];
 
     if (wide) {
       // Concurrently query Nigeria (Afrobeats/regional) + US/Global + audio-enriched query for wider results in the same ~150ms window!
       const altGl = String(gl || 'US').toUpperCase() === 'NG' ? 'US' : 'NG';
-      tasks.push(fetchInnerTubePage(clean, altGl));
-      if (!isTikTokOrClip && !/\b(song|audio|official|lyrics)\b/i.test(clean)) {
-        tasks.push(fetchInnerTubePage(`${clean} official audio`, gl));
+      tasks.push(fetchInnerTubePage(clean, altGl, useDurationFilter ? 'EgIYAw%3D%3D' : null));
+      if (!isTikTokOrClip && !/\b(song|audio|official|lyrics|track)\b/i.test(clean)) {
+        tasks.push(fetchInnerTubePage(`${clean} official audio`, gl, useDurationFilter ? 'EgIYAw%3D%3D' : null));
       }
     }
 

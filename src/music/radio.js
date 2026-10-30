@@ -14,14 +14,14 @@ export class InfiniteRadio {
     const query=r.queries[r.cursor++%r.queries.length],offset=r.offsets[query]||0;
     const isVideo=Boolean(r.video||s.radioVideo);
     const hasAdapters=Boolean(this.app.musicProviders?.adapters);
-    const isCompilationTitle=title=>/\b([1-9]\s*hours?|full\s*album|compilation|non[\s-]*stop\s*mix|megamix|long\s*playlist)\b/i.test(String(title||''));
-    const filterRadio=(items,maxSec=720)=>(items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false&&(!hasAdapters||((!t.durationSeconds||(t.durationSeconds>=40&&t.durationSeconds<=maxSec))&&!isCompilationTitle(t.title))));
+    const isCompilationOrLive=title=>/\b(24\/7|\d+\s*hours?|full\s*album|compilation|non[\s-]*stop|megamix|long\s*playlist|livestream|\blive\s*(now|stream)?\b|meditation\s*music\b.*relaxing|zen\s*music\b.*relaxing|relaxing\s*music.*hours?|sleep\s*music.*hours?)\b/i.test(String(title||''));
+    const filterRadio=(items,maxSec=720)=>(items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false&&!t.isLive&&t.duration!=='LIVE'&&t.duration!=='HD'&&!isCompilationOrLive(t.title)&&(!hasAdapters||(Number.isFinite(t.durationSeconds)&&t.durationSeconds>=40&&t.durationSeconds<=maxSec)));
     let page;
     try {
-      page=await this.app.musicProviders.search(query,{offset,limit:hasAdapters?10:5,video:isVideo});
+      page=await this.app.musicProviders.search(query,{offset,limit:hasAdapters?10:5,video:isVideo,radio:true,filterDuration:'medium'});
     } catch(searchErr) {
       if(hasAdapters){
-        page=await this.app.musicProviders.search(`${query} hits`,{offset:0,limit:10}).catch(()=>null);
+        page=await this.app.musicProviders.search(`${query} hits`,{offset:0,limit:10,radio:true,filterDuration:'medium'}).catch(()=>null);
       }
       if(!page)throw searchErr;
     }
@@ -29,13 +29,14 @@ export class InfiniteRadio {
     r.offsets[query]=page.nextOffset??0;
     let tracks=filterRadio(page.items,720);
     if(!tracks.length&&hasAdapters){
-      for(const suffix of ['songs','hits','official audio']){
-        const altPage=await this.app.musicProviders.search(`${query} ${suffix}`,{offset:0,limit:10,video:isVideo}).catch(()=>null);
+      for(const suffix of ['songs','hits','track','official audio']){
+        const altPage=await this.app.musicProviders.search(`${query} ${suffix}`,{offset:0,limit:10,video:isVideo,radio:true,filterDuration:'medium'}).catch(()=>null);
         tracks=filterRadio(altPage?.items,720);
         if(tracks.length)break;
       }
       if(!tracks.length){
-        tracks=(page.items||[]).filter(t=>!excluded.has(t.id)&&t.availability!=='unavailable'&&t.streamable!==false&&(!t.durationSeconds||t.durationSeconds<=1200));
+        const altPage=await this.app.musicProviders.search(`${query} instrumental track`,{offset:0,limit:10,video:isVideo,radio:true,filterDuration:'medium'}).catch(()=>null);
+        tracks=filterRadio(altPage?.items,900);
       }
     }
     for(let i=tracks.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[tracks[i],tracks[j]]=[tracks[j],tracks[i]];}

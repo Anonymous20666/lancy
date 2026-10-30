@@ -15,7 +15,7 @@ export function youtubeId(value) {
 export class YouTubeProvider {
   constructor({ enabled = process.env.MUSIC_YTDLP_ENABLED === 'true', runner = exec } = {}) { this.id = 'youtube'; this.enabled = enabled; this.runner = runner; }
   assertEnabled() { if (!this.enabled) throw new MusicError('PROVIDER_DISABLED', 'YouTube resolution is disabled. The owner may enable MUSIC_YTDLP_ENABLED only for material they are permitted to download/stream. Try an Audius search.'); }
-  async search(query, { offset = 0, limit = 5 } = {}) {
+  async search(query, { offset = 0, limit = 5, video = false, radio = false, filterDuration = null } = {}) {
     this.assertEnabled();
     const direct = youtubeId(query);
     if (/^https?:/i.test(query) && !direct) throw new MusicError('UNSUPPORTED_URL', 'Use a supported HTTPS YouTube video URL; playlists and arbitrary URLs are not accepted.');
@@ -24,9 +24,9 @@ export class YouTubeProvider {
     if (direct && offset) return { items: [], nextOffset: null };
     if (this.runner === exec && !direct) {
       try {
-        const fastRaw = await searchYouTubeFast(String(query).slice(0, 180), 'NG', { wide: true });
+        const fastRaw = await searchYouTubeFast(String(query).slice(0, 180), 'NG', { wide: true, radio, filterDuration });
         const fastItems = (fastRaw || [])
-          .filter(x => /^[\w-]{11}$/.test(x?.videoId || '') && !/^short$/i.test(String(x?.duration || '')))
+          .filter(x => /^[\w-]{11}$/.test(x?.videoId || '') && !/^short$/i.test(String(x?.duration || '')) && !x?.isLive && x?.duration !== 'LIVE')
           .map(x => normalizeTrack({
             providerId: x.videoId,
             title: x.title,
@@ -34,9 +34,10 @@ export class YouTubeProvider {
             duration: x.duration,
             artwork: x.thumb || `https://i.ytimg.com/vi/${x.videoId}/hqdefault.jpg`,
             sourceRef: `https://www.youtube.com/watch?v=${x.videoId}`,
-            availability: 'unresolved'
+            availability: 'unresolved',
+            isLive: Boolean(x.isLive || x.duration === 'LIVE')
           }, this.id))
-          .filter(t => !t.durationSeconds || (t.durationSeconds >= 30 && t.durationSeconds <= 7200));
+          .filter(t => !t.isLive && t.duration !== 'LIVE' && (!t.durationSeconds || (t.durationSeconds >= 30 && t.durationSeconds <= 7200)));
         if (fastItems.length > offset) {
           return {
             items: fastItems.slice(offset, offset + limit),
