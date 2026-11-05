@@ -48,12 +48,14 @@ export class CinemaDestinationManager {
     try {
       chat = await api.getChat(chatId);
     } catch (err) {
-      throw new CinemaDestinationError('CHAT_NOT_FOUND', 'Could not locate chat. Make sure the bot has been added to it.');
+      throw new CinemaDestinationError('CHAT_NOT_FOUND', `Could not locate chat "${chatId}". Make sure the bot has been added to it.`);
     }
+
+    const realChatId = Number(chat.id);
 
     let member;
     try {
-      member = await api.getChatMember(chatId, botId);
+      member = await api.getChatMember(realChatId, botId);
     } catch (err) {
       throw new CinemaDestinationError('BOT_NOT_MEMBER', 'Bot is not a member of the selected channel or group.');
     }
@@ -94,9 +96,8 @@ export class CinemaDestinationManager {
     };
   }
 
-  async registerDestination(chatId, registeredByUserId) {
-    const numChatId = Number(chatId);
-    const verification = await this.verifyBotPermissions(numChatId);
+  async registerDestination(chatIdentifier, registeredByUserId) {
+    const verification = await this.verifyBotPermissions(chatIdentifier);
     if (!verification.isValid) {
       throw new CinemaDestinationError(
         'MISSING_PERMISSIONS',
@@ -105,6 +106,7 @@ export class CinemaDestinationManager {
     }
 
     const chat = verification.chat;
+    const numChatId = Number(chat.id);
     const token = this.generateToken(numChatId);
     const tokenHash = createHmac('sha256', this.tokenSecret).update(token).digest('hex');
 

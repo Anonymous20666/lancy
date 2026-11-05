@@ -162,3 +162,43 @@ test('Cinema: SynchronizedPollManager ties deadline to media clock and determini
   const finalized = await pollMgr.finalizePoll(poll.pollSessionId);
   assert.equal(finalized.status, 'closed');
 });
+
+test('Cinema: DestinationManager registers by @handle and verifies permissions without AI collision', async () => {
+  const db = new Database(':memory:');
+
+  const mockApp = {
+    telegram: {
+      api: {
+        me: { id: 8859351350 },
+        getChat: async (target) => {
+          if (target === '@pappygcs' || target === -1002345678) {
+            return { id: -1002345678, type: 'channel', title: 'Pappy GCS Official', username: 'pappygcs' };
+          }
+          throw new Error('Chat not found');
+        },
+        getChatMember: async (chatId, botId) => {
+          return {
+            status: 'administrator',
+            can_manage_video_chats: true,
+            can_post_messages: true,
+            can_edit_messages: true
+          };
+        }
+      }
+    }
+  };
+
+  const dm = new CinemaDestinationManager({ db, app: mockApp });
+  const reg = await dm.registerDestination('@pappygcs', 99999);
+
+  assert.ok(reg.destination);
+  assert.equal(reg.destination.chatId, -1002345678);
+  assert.equal(reg.destination.username, 'pappygcs');
+  assert.equal(reg.destination.title, 'Pappy GCS Official');
+  assert.ok(reg.token);
+  assert.ok(reg.miniAppUrl.includes(reg.token));
+
+  // Verify authorization
+  const auth = dm.isAuthorized(-1002345678, 99999);
+  assert.equal(auth, true);
+});

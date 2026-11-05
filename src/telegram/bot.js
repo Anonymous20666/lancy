@@ -4558,9 +4558,52 @@ export class TelegramController extends EventEmitter {
             }
           }
 
-          // AI assistant: responds in private DM and in group chat when tagged, quoted, or called by name
+          // Telegram Destination (Channel / Group / Invite Link / @username / Chat ID / Forwarded Channel Post):
+          const tgLinkMatch = text.match(/https?:\/\/(?:www\.)?(?:t\.me|telegram\.me)\/(?:joinchat\/|c\/)?([a-zA-Z0-9_+-]+)/i) ||
+                              text.match(/^(?:t\.me|telegram\.me)\/(?:joinchat\/|c\/)?([a-zA-Z0-9_+-]+)/i);
+          const tgHandleMatch = text.match(/^@([a-zA-Z0-9_]{4,32})$/);
+          const tgChatIdMatch = text.match(/^(-?100\d{6,16})$/);
+          const forwardedChat = message.forward_origin?.chat || message.forward_from_chat || null;
+          const isTelegramDestination = Boolean(tgLinkMatch || tgHandleMatch || tgChatIdMatch || forwardedChat);
+
+          if (isPrivate && isTelegramDestination) {
+            const destTarget = forwardedChat
+              ? (forwardedChat.username ? `@${forwardedChat.username}` : String(forwardedChat.id))
+              : (tgLinkMatch ? (tgLinkMatch[1].startsWith('+') ? text.trim() : `@${tgLinkMatch[1]}`) : (tgHandleMatch ? tgHandleMatch[0] : tgChatIdMatch[0]));
+
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(banner([
+              '𓆩♡𓆪 TELEGRAM DESTINATION 𓆩♡𓆪',
+              destTarget
+            ])));
+            b.divider();
+            b.quote(rt.concat(
+              rt.bold(`Detected: ${destTarget}\n\n`),
+              rt.text('What would you like to connect this channel/group to?\n')
+            ));
+            b.divider();
+            b.buttons([
+              richButton.callback('🎬 Connect to Cinema (Stream Movies)', encodeCallback('cinema', 'connect_dest', encodeURIComponent(destTarget)), { style: 'success' })
+            ]);
+            b.buttons([
+              richButton.callback('🔒 Add to Force-Join Channels', 'fj_add:global', { style: 'primary' }),
+              richButton.callback('📢 Channel Auto-Post', encodeCallback('channel_post', 'open'))
+            ]);
+            b.buttons([
+              richButton.callback('✕ Cancel', encodeCallback('dashboard', 'open'))
+            ]);
+            b.validate();
+            await this.api.sendRichMessage(chatId, b.toJSON()).catch(() => {});
+            return;
+          }
+
+          // AI assistant: responds in private DM and in group chat when tagged, quoted, or called by name.
+          // NEVER let AI Assistant interrupt settings, cloner, cinema, force-join, or other active states,
+          // and NEVER trigger AI Assistant on Telegram destination links/handles or bot command prefixes!
+          const currentState = this.sm.state(tgId);
+          const isIdleOrAiChat = !currentState || currentState === States.IDLE || currentState === States.AI_CHAT;
           const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
-          if (enabled && this.app?.assistant) {
+          if (enabled && this.app?.assistant && isIdleOrAiChat && !isTelegramDestination && !/^[/.!]/i.test(text)) {
             const isGcPlayMusic = isGroup && isReplyToThisBot && /^\s*play\b/i.test(text);
             const shouldReply = isGroup ? isGcPlayMusic : (isPrivate || isReplyToThisBot || isTag || isNameTriggered);
             if (shouldReply) {

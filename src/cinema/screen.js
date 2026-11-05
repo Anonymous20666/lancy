@@ -349,6 +349,54 @@ export function createCinemaScreen({ app }) {
           return ctx.editScreen(renderMainMenu(ctx));
         }
 
+        case 'connect_dest': {
+          const rawTarget = args[0] ? decodeURIComponent(args[0]) : '';
+          if (!rawTarget) return ctx.editScreen(renderMainMenu(ctx));
+          try {
+            const res = await app.cinemaDestinations.registerDestination(rawTarget, ctx.tgId);
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(banner([
+              '🎉 DESTINATION CONNECTED',
+              res.destination.title
+            ])));
+            b.divider();
+            b.quote(rt.concat(
+              rt.bold(`✅ ${res.destination.title} is now ACTIVE!\n\n`),
+              rt.text(`• Chat Type: ${res.destination.chatType}\n`),
+              rt.text(`• Chat ID: ${res.destination.chatId}\n`),
+              rt.text(`• Video Chat Control: Verified ✅\n\n`),
+              rt.italic('Tap below to open the Cinema Mini App or manage your destination.')
+            ));
+            b.buttons([
+              { text: rt.text('🍿 Open Cinema Mini App'), web_app: { url: res.miniAppUrl }, style: 'success' },
+              richButton.callback('⚙️ Destination Settings', encodeCallback(id, 'select', res.destination.chatId))
+            ]);
+            b.buttons([
+              richButton.callback('« Cinema Hub', encodeCallback(id, 'open'))
+            ]);
+            b.validate();
+            return ctx.editScreen(b.toJSON());
+          } catch (err) {
+            const b = new RichMessageBuilder();
+            b.paragraph(rt.bold(banner([
+              '⚠️ REGISTRATION WARNING',
+              'permissions required'
+            ])));
+            b.divider();
+            b.quote(rt.concat(
+              rt.bold('Could not activate destination:\n\n'),
+              rt.text(`${err.message}\n\n`),
+              rt.italic('Please ensure the bot is added as an Administrator with "Manage Video Chats" permission, then try again.')
+            ));
+            b.buttons([
+              richButton.callback('🔄 Try Again', encodeCallback(id, 'connect_dest', encodeURIComponent(rawTarget))),
+              richButton.callback('« Back to Cinema', encodeCallback(id, 'open'))
+            ]);
+            b.validate();
+            return ctx.editScreen(b.toJSON());
+          }
+        }
+
         default:
           return ctx.editScreen(renderMainMenu(ctx));
       }
@@ -357,17 +405,21 @@ export function createCinemaScreen({ app }) {
     registerStateHandlers(sm) {
       sm.register(States.CINEMA_DESTINATION_INPUT, {
         onMessage: async (sctx, message) => {
-          const text = (message.text || '').trim();
-          if (!text) return false;
+          const text = (message.text || message.caption || '').trim();
+          const forwardedChat = message.forward_origin?.chat || message.forward_from_chat || null;
+          if (!text && !forwardedChat) return false;
           if (text === '/cancel') {
             await sctx.cancel?.();
-            return sctx.editScreen?.(renderMainMenu(sctx));
+            if (sctx.editScreen) await sctx.editScreen(renderMainMenu(sctx));
+            return true;
           }
 
-          let target = text;
-          const linkMatch = text.match(/t\.me\/(?:joinchat\/|c\/)?([a-zA-Z0-9_+-]+)/i);
-          if (linkMatch) {
-            target = linkMatch[1].startsWith('+') ? text : `@${linkMatch[1]}`;
+          let target = forwardedChat ? (forwardedChat.username ? `@${forwardedChat.username}` : String(forwardedChat.id)) : text;
+          if (typeof target === 'string') {
+            const linkMatch = target.match(/(?:t\.me|telegram\.me)\/(?:joinchat\/|c\/)?([a-zA-Z0-9_+-]+)/i);
+            if (linkMatch) {
+              target = linkMatch[1].startsWith('+') ? target : `@${linkMatch[1]}`;
+            }
           }
 
           try {
@@ -394,7 +446,9 @@ export function createCinemaScreen({ app }) {
               richButton.callback('« Cinema Hub', encodeCallback(id, 'open'))
             ]);
             b.validate();
-            return sctx.replyRich ? sctx.replyRich(b.toJSON()) : sctx.editScreen(b.toJSON());
+            if (sctx.replyRich) await sctx.replyRich(b.toJSON());
+            else if (sctx.editScreen) await sctx.editScreen(b.toJSON());
+            return true;
           } catch (err) {
             const b = new RichMessageBuilder();
             b.paragraph(rt.bold(banner([
@@ -412,7 +466,9 @@ export function createCinemaScreen({ app }) {
               richButton.callback('« Back to Cinema', encodeCallback(id, 'open'))
             ]);
             b.validate();
-            return sctx.replyRich ? sctx.replyRich(b.toJSON()) : sctx.editScreen(b.toJSON());
+            if (sctx.replyRich) await sctx.replyRich(b.toJSON());
+            else if (sctx.editScreen) await sctx.editScreen(b.toJSON());
+            return true;
           }
         }
       });

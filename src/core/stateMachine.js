@@ -233,7 +233,7 @@ export class StateMachine extends EventEmitter {
     const baseCtx = this.#ctx(key, record);
     const ctx = extraCtx && typeof extraCtx === 'object' ? Object.assign(baseCtx, extraCtx) : baseCtx;
     const handled = await handler.onMessage(ctx, message);
-    return handled === true;
+    return handled === true || (handled != null && typeof handled === 'object' && handled !== false);
   }
 
   /** Route an incoming callback query to the current state. Returns true if handled. */
