@@ -154,6 +154,45 @@ export class CinemaPlaybackAdapter {
     const dest = this.db.get('SELECT id FROM cinema_destinations WHERE chat_id = ?', numChat);
     const destinationId = dest?.id || 1;
 
+    // Check if source is a web-only embed player rather than direct FFmpeg media stream
+    const isDirect = this.resolver?.isDirectMedia?.(resolvedSource) || /\.(m3u8|mp4|webm|mkv|ts)(\?|$)/i.test(resolvedSource) || (!isHttp && existsSync(resolvedSource));
+    if (!isDirect && isHttp && (resolvedSource.includes('/embed/') || resolvedSource.includes('player.') || resolvedSource.includes('embed'))) {
+      this.db.run(
+        `INSERT INTO cinema_playback_sessions 
+         (destination_id, session_id, media_type, media_id, title, season, episode, playback_state, position_seconds, duration_seconds, started_at, revision)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'PLAYING', 0, ?, CURRENT_TIMESTAMP, 1)
+         ON CONFLICT(session_id) DO UPDATE SET playback_state = 'PLAYING', updated_at = CURRENT_TIMESTAMP`,
+        destinationId, sessionId, mediaType, String(mediaId || '0'), title || 'Untitled Stream', season, episode, duration
+      );
+
+      const sessionObj = {
+        sessionId,
+        playbackId,
+        chatId: numChat,
+        destinationId,
+        mediaType,
+        mediaId: String(mediaId || '0'),
+        title: title || 'Untitled Stream',
+        season,
+        episode,
+        source: resolvedSource,
+        duration,
+        position: 0,
+        state: 'PLAYING',
+        isWebEmbed: true,
+        startedAt: Date.now(),
+        lastUpdated: Date.now()
+      };
+
+      this.activeSessions.set(numChat, sessionObj);
+
+      if (this.app?.cinemaCards?.postOrUpdateCard) {
+        this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
+      }
+
+      return sessionObj;
+    }
+
     this.db.run(
       `INSERT INTO cinema_playback_sessions 
        (destination_id, session_id, media_type, media_id, title, season, episode, playback_state, position_seconds, duration_seconds, started_at, revision)

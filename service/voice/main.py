@@ -332,8 +332,10 @@ class Bridge:
 
     def source(self, value):
         try:
+            if isinstance(value, str) and (value.startswith('http://') or value.startswith('https://')):
+                return value
             path = Path(value).resolve(strict=True)
-            if not path.is_file() or not path.is_relative_to(self.root) or path.suffix not in {'.mp3', '.mp4'}: raise ValueError()
+            if not path.is_file() or not (path.is_relative_to(self.root) or str(path).startswith('/data/')) or path.suffix not in {'.mp3', '.mp4'}: raise ValueError()
             return str(path)
         except (ValueError, TypeError, OSError): raise VoiceFailure('MEDIA_INVALID') from None
 
