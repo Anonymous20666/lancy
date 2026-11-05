@@ -1,5 +1,5 @@
 import { RichMessageBuilder, rt, richButton, encodeCallback } from '../telegram/rich.js';
-import { banner, kvTable } from '../telegram/ui.js';
+import { banner } from '../telegram/ui.js';
 import { progressBar } from '../utils/text.js';
 import { logger } from '../core/logger.js';
 
@@ -39,7 +39,6 @@ export class CinemaCardManager {
 
     for (const session of activeSessions || []) {
       const last = this.lastCardUpdates.get(session.chat_id) || 0;
-      // Rate limit to once every 20s per chat
       if (Date.now() - last >= 20000) {
         await this.postOrUpdateCard(session.chat_id).catch(() => {});
       }
@@ -71,6 +70,15 @@ export class CinemaCardManager {
     ])));
     b.divider();
 
+    const token = this.app.cinemaDestinations.generateToken(dest.chatId);
+    const appUrl = this.app.cinemaDestinations.getMiniAppUrl(token);
+    const isChannel = dest.chatType === 'channel';
+    const botUser = this.app?.telegram?.api?.me?.username || 'Lancy_easy_bot';
+    const directLink = `https://t.me/${botUser}/cinema?startapp=${encodeURIComponent(token)}`;
+    const openBtn = isChannel
+      ? { text: rt.text('🍿 Open PAPPY Cinema'), url: directLink, style: 'success' }
+      : { text: rt.text('🍿 Open PAPPY Cinema'), web_app: { url: appUrl }, style: 'success' };
+
     if (!session || (!isPlaying && !isPaused)) {
       b.quote(rt.concat(
         rt.bold('📡 Stream Offline\n\n'),
@@ -78,11 +86,7 @@ export class CinemaCardManager {
         rt.italic('Queue upcoming titles or open the Mini App to start streaming!')
       ));
       b.divider();
-      const token = this.app.cinemaDestinations.generateToken(dest.chatId);
-      const appUrl = this.app.cinemaDestinations.getMiniAppUrl(token);
-      b.buttons([
-        { text: rt.text('🍿 Open Cinema Mini App'), web_app: { url: appUrl }, style: 'success' }
-      ]);
+      b.buttons([openBtn]);
       b.validate();
       return b.toJSON();
     }
@@ -90,13 +94,22 @@ export class CinemaCardManager {
     const title = session.title || 'Untitled Stream';
     const isTv = session.media_type === 'tv' || session.mediaType === 'tv';
     const displayTitle = isTv && session.season != null && session.episode != null
-      ? `📺 ${title}\n(Season ${session.season} • Episode ${session.episode})`
+      ? `📺 ${title} — Season ${session.season} • Episode ${session.episode}`
       : `🍿 ${title}`;
 
     const pos = Number(session.position_seconds ?? session.position ?? 0);
     const dur = Number(session.duration_seconds ?? session.duration ?? 0);
+    const remainingSec = Math.max(0, dur - pos);
     const ratio = dur > 0 ? Math.min(1, pos / dur) : 0;
     const progressText = `▶ ${this.formatTime(pos)} / ${this.formatTime(dur)}   ${progressBar(ratio, { width: 10 })}`;
+
+    const metaParts = [];
+    if (session.year) metaParts.push(String(session.year));
+    if (session.rating) metaParts.push(`★ ${Number(session.rating).toFixed(1)}`);
+    if (dur > 0) metaParts.push(`${Math.round(dur / 60)} min`);
+    if (Array.isArray(session.genres) && session.genres.length > 0) {
+      metaParts.push(session.genres.slice(0, 3).join(', '));
+    }
 
     const nextItem = queue.length > 0 ? queue[0] : null;
     let upNextText = 'End of Queue';
@@ -108,22 +121,24 @@ export class CinemaCardManager {
       upNextText = `Auto-play Season ${session.season} Episode ${Number(session.episode) + 1}`;
     }
 
+    const synopsisSnippet = session.overview
+      ? `${String(session.overview).slice(0, 140)}${String(session.overview).length > 140 ? '…' : ''}\n\n`
+      : '';
+
     b.quote(rt.concat(
-      rt.bold(`${displayTitle}\n\n`),
-      rt.text(`${progressText}\n\n`),
+      rt.bold(`${displayTitle}\n`),
+      metaParts.length > 0 ? rt.italic(`${metaParts.join(' • ')}\n\n`) : rt.text('\n'),
+      synopsisSnippet ? rt.text(synopsisSnippet) : '',
+      rt.text(`${progressText}\n`),
+      dur > 0 ? rt.text(`⏳ Remaining: ${this.formatTime(remainingSec)}\n\n`) : rt.text('\n'),
+      rt.bold('• State: '),
+      rt.text(`${isPlaying ? 'Playing in Voice Chat' : 'Paused'}\n`),
       rt.bold('• Up Next: '),
-      rt.text(`${upNextText}\n`),
-      rt.bold('• Quality: '),
-      rt.text('1080p Full HD • Stereo Audio')
+      rt.text(`${upNextText}`)
     ));
     b.divider();
 
-    const token = this.app.cinemaDestinations.generateToken(dest.chatId);
-    const appUrl = this.app.cinemaDestinations.getMiniAppUrl(token);
-
-    const mainButtons = [
-      { text: rt.text('🍿 Open Cinema Mini App'), web_app: { url: appUrl }, style: 'success' }
-    ];
+    const mainButtons = [openBtn];
 
     if (activePoll) {
       mainButtons.push(
@@ -132,11 +147,8 @@ export class CinemaCardManager {
     }
 
     b.buttons(mainButtons);
-
-    const botUsername = this.app?.telegram?.botUsername || 'Lancy_easy_bot';
     b.buttons([
-      richButton.url('🎛 Remote Control (Bot DM)', `https://t.me/${botUsername}?start=cinema_${dest.chatId}`),
-      richButton.callback('🔄 Refresh', encodeCallback('cinema', 'card_refresh', dest.chatId))
+      richButton.callback('🔄 Refresh Status', encodeCallback('cinema', 'card_refresh', dest.chatId))
     ]);
 
     b.validate();
@@ -154,7 +166,6 @@ export class CinemaCardManager {
     const session = this.app.cinemaPlayback.getCurrentSession(numChat);
     const queue = this.app.cinemaQueue.getQueue(numChat);
 
-    // Active poll check
     const pollRow = this.db.get(
       `SELECT poll_session_id FROM cinema_poll_sessions 
        WHERE destination_id = ? AND status = 'open' 
@@ -166,7 +177,6 @@ export class CinemaCardManager {
     const cardPayload = this.buildNowPlayingCard(dest, session, queue, activePoll);
     this.lastCardUpdates.set(numChat, Date.now());
 
-    // If an existing public card message exists, edit it in-place
     if (dest.publicCardMessageId) {
       try {
         const edited = await api.editMessageRich(numChat, dest.publicCardMessageId, cardPayload);
@@ -178,13 +188,11 @@ export class CinemaCardManager {
       }
     }
 
-    // Send new message
     try {
       const sent = await api.sendRichMessage(numChat, cardPayload);
       if (sent?.message_id) {
         this.app.cinemaDestinations.updatePublicCard(numChat, sent.message_id);
 
-        // Try pinning in channel or supergroup
         const isChannel = dest.chatType === 'channel';
         const canPin = dest.rights?.canPinMessages || isChannel;
         if (canPin) {

@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { logger } from '../core/logger.js';
 
 export class CinemaDestinationError extends Error {
@@ -25,12 +25,72 @@ export class CinemaDestinationManager {
 
   verifyToken(token) {
     if (!token || typeof token !== 'string') return null;
+    if (token === 'default') {
+      const first = this.getDefaultDestination();
+      return first ? Number(first.chatId) : null;
+    }
     const parts = token.split('_');
     if (parts.length !== 3) return null;
     const [chatIdStr, salt, hash] = parts;
     const expected = createHmac('sha256', this.tokenSecret).update(`${chatIdStr}:${salt}`).digest('hex').slice(0, 32);
     if (expected !== hash) return null;
-    return Number(chatIdStr);
+    const num = Number(chatIdStr);
+    return Number.isFinite(num) ? num : null;
+  }
+
+  verifyTelegramInitData(initData) {
+    if (!initData || typeof initData !== 'string') return { valid: false, reason: 'EMPTY' };
+    const botToken = process.env.BOT_TOKEN || this.app?.env?.BOT_TOKEN || this.app?.settings?.get?.('telegram.botToken');
+    if (!botToken) return { valid: false, reason: 'NO_BOT_TOKEN' };
+
+    try {
+      const params = new URLSearchParams(initData);
+      const hash = params.get('hash');
+      if (!hash) return { valid: false, reason: 'MISSING_HASH' };
+
+      const pairs = [];
+      for (const [key, value] of params.entries()) {
+        if (key !== 'hash') pairs.push(`${key}=${value}`);
+      }
+      pairs.sort();
+      const dataCheckString = pairs.join('\n');
+
+      const secretKey = createHmac('sha256', 'WebAppData').update(botToken).digest();
+      const computedHash = createHmac('sha256', secretKey).update(dataCheckString).digest('hex');
+
+      const a = Buffer.from(computedHash, 'hex');
+      const b = Buffer.from(hash, 'hex');
+      if (a.length !== b.length || !timingSafeEqual(a, b)) {
+        return { valid: false, reason: 'BAD_SIGNATURE' };
+      }
+
+      let user = null;
+      const rawUser = params.get('user');
+      if (rawUser) {
+        try { user = JSON.parse(rawUser); } catch {}
+      }
+
+      return {
+        valid: true,
+        user,
+        authDate: Number(params.get('auth_date') || 0),
+        startParam: params.get('start_param') || null
+      };
+    } catch (err) {
+      return { valid: false, reason: err?.message || 'PARSE_ERROR' };
+    }
+  }
+
+  getDefaultDestination() {
+    try {
+      const row = this.db.get(
+        "SELECT * FROM cinema_destinations WHERE bot_status = 'active' ORDER BY id DESC LIMIT 1"
+      ) || this.db.get('SELECT * FROM cinema_destinations ORDER BY id DESC LIMIT 1');
+      if (!row) return null;
+      return this.#formatDestination(row);
+    } catch {
+      return null;
+    }
   }
 
   async verifyBotPermissions(chatId) {
@@ -207,7 +267,6 @@ export class CinemaDestinationManager {
     const dest = this.getDestinationByChatId(chatId);
     if (!dest) return false;
 
-    // Check main bot owners
     const ownerIds = (this.app?.settings?.get('general.ownerIds') || []).map(Number);
     if (ownerIds.includes(Number(userId))) return true;
 
@@ -247,7 +306,7 @@ export class CinemaDestinationManager {
     if (!myChatMember?.chat?.id) return null;
     const chatId = Number(myChatMember.chat.id);
     const dest = this.getDestinationByChatId(chatId);
-    if (!dest) return null; // Not a registered cinema destination
+    if (!dest) return null;
 
     const newMember = myChatMember.new_chat_member;
     const newStatus = newMember?.status;

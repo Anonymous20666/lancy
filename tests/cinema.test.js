@@ -560,3 +560,130 @@ test('Cinema: Admin Demotion & Bot Removal Invalidation terminates playback and 
   dest = destinations.getDestinationByChatId(chatId);
   assert.equal(dest.botStatus, 'revoked');
 });
+
+test('Cinema: QueueManager supports moveToTop, reorderQueue, season batching, and rich metadata persistence', async () => {
+  const db = new Database(':memory:');
+  const chatId = -100444555;
+  db.run(`
+    INSERT INTO cinema_destinations (chat_id, chat_type, title, token_hash)
+    VALUES (?, 'channel', 'Queue Advanced Channel', 'tok444');
+  `, chatId);
+
+  const mockApi = {
+    getTvSeason: async (tvId, seasonNum) => ({
+      series_id: tvId,
+      season_number: seasonNum,
+      episodes: [
+        { episode_number: 1, title: 'Pilot', runtime: 58, thumbnail: 'https://img.test/ep1.jpg' },
+        { episode_number: 2, title: 'Cat in the Bag', runtime: 48, thumbnail: 'https://img.test/ep2.jpg' },
+        { episode_number: 3, title: 'And the Bag in the River', runtime: 48, thumbnail: 'https://img.test/ep3.jpg' }
+      ]
+    })
+  };
+
+  const qm = new CinemaQueueManager({ db, api: mockApi });
+  const r1 = await qm.addToQueue(chatId, {
+    mediaType: 'movie',
+    mediaId: 'm1',
+    title: 'Dune: Part One',
+    poster: 'https://img.test/dune1.jpg',
+    year: '2021',
+    rating: 8.0,
+    duration: 9300
+  });
+  const r2 = await qm.addToQueue(chatId, {
+    mediaType: 'movie',
+    mediaId: 'm2',
+    title: 'Dune: Part Two',
+    poster: 'https://img.test/dune2.jpg',
+    year: '2024',
+    rating: 8.5,
+    duration: 9960
+  });
+  const r3 = await qm.addToQueue(chatId, {
+    mediaType: 'movie',
+    mediaId: 'm3',
+    title: 'Blade Runner 2049',
+    poster: 'https://img.test/br2049.jpg',
+    year: '2017',
+    rating: 8.1,
+    duration: 9840
+  });
+
+  // Verify metadata persisted
+  let list = qm.getQueue(chatId);
+  assert.equal(list.length, 3);
+  assert.equal(list[0].poster, 'https://img.test/dune1.jpg');
+  assert.equal(list[0].year, '2021');
+
+  // Move third item to top
+  qm.moveToTop(chatId, r3.queueItemId);
+  list = qm.getQueue(chatId);
+  assert.equal(list[0].queue_item_id, r3.queueItemId);
+  assert.equal(list[0].title, 'Blade Runner 2049');
+
+  // Reorder explicitly: [r2, r1, r3]
+  qm.reorderQueue(chatId, [r2.queueItemId, r1.queueItemId, r3.queueItemId]);
+  list = qm.getQueue(chatId);
+  assert.deepEqual(list.map(i => i.queue_item_id), [r2.queueItemId, r1.queueItemId, r3.queueItemId]);
+
+  // Add entire TV season
+  const seasonAdd = await qm.addSeasonToQueue(chatId, {
+    mediaId: 'tv_bb',
+    seriesTitle: 'Breaking Bad',
+    season: 1,
+    poster: 'https://img.test/bb.jpg'
+  });
+  assert.equal(seasonAdd.ok, true);
+  assert.equal(seasonAdd.addedCount, 3);
+  list = qm.getQueue(chatId);
+  assert.equal(list.length, 6);
+});
+
+test('Cinema: SynchronizedPollManager pauses/resumes with playback and recalculates on seek', async () => {
+  const db = new Database(':memory:');
+  const chatId = -100888999;
+  db.run(`
+    INSERT INTO cinema_destinations (chat_id, chat_type, title, token_hash, voting_enabled)
+    VALUES (?, 'channel', 'Clock Sync Channel', 'tok888', 1);
+  `, chatId);
+
+  const qm = new CinemaQueueManager({ db });
+  await qm.addToQueue(chatId, { mediaType: 'movie', mediaId: '1', title: 'Movie Alpha' });
+  await qm.addToQueue(chatId, { mediaType: 'movie', mediaId: '2', title: 'Movie Beta' });
+
+  const mockPlayback = {
+    getCurrentSession: () => ({
+      sessionId: 'sess_sync',
+      title: 'Currently Playing',
+      state: 'PLAYING',
+      duration: 600,
+      position: 100
+    })
+  };
+
+  const pollMgr = new SynchronizedPollManager({
+    db,
+    queueManager: qm,
+    playbackAdapter: mockPlayback
+  });
+
+  const poll = await pollMgr.startPoll(chatId, { durationSeconds: 120 });
+  assert.ok(poll);
+
+  // Pause playback -> poll should pause
+  pollMgr.pausePollForChat(chatId);
+  let active = pollMgr.getActivePoll(chatId);
+  assert.equal(active.paused, true);
+
+  // Resume playback -> poll should resume
+  pollMgr.resumePollForChat(chatId);
+  active = pollMgr.getActivePoll(chatId);
+  assert.equal(active.paused, false);
+
+  // Seek near the end of media -> poll deadline adjusts
+  const recalc = pollMgr.recalculatePollOnSeek(chatId, 520, 600);
+  assert.ok(recalc);
+  assert.ok(recalc.remainingSeconds <= 55);
+});
+

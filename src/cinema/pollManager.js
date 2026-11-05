@@ -9,6 +9,19 @@ export class SynchronizedPollManager {
     this.playback = playbackAdapter;
     this.log = log || logger().child({ module: 'cinema:poll' });
     this.activePollTimers = new Map(); // pollSessionId -> timeout
+    this.pausedPolls = new Map(); // pollSessionId -> remainingMs
+  }
+
+  #scheduleTimer(pollSessionId, delayMs) {
+    const existing = this.activePollTimers.get(pollSessionId);
+    if (existing) clearTimeout(existing);
+
+    const safeDelay = Math.max(1000, Math.round(delayMs));
+    const timer = setTimeout(() => {
+      this.finalizePoll(pollSessionId).catch(() => {});
+    }, safeDelay);
+    timer?.unref?.();
+    this.activePollTimers.set(pollSessionId, timer);
   }
 
   async startPoll(chatId, { durationSeconds = null } = {}) {
@@ -19,11 +32,9 @@ export class SynchronizedPollManager {
     // Close any previous open poll for this destination
     this.closePollForChat(numChat, 'superseded');
 
-    // Get current playback session
     const currentSession = this.playback.getCurrentSession(numChat);
     const sessionId = currentSession?.sessionId || `adhoc_${Date.now()}`;
 
-    // Get candidate items from upcoming queue (up to 10 candidates)
     const upcoming = this.queue.getQueue(numChat).slice(0, 10);
     if (upcoming.length === 0) {
       this.log.debug({ numChat }, 'Cannot start poll: Queue is empty');
@@ -32,14 +43,12 @@ export class SynchronizedPollManager {
 
     const pollSessionId = `poll_${randomUUID().slice(0, 12)}`;
 
-    // Compute closing time: either based on remaining media duration or default
     let secondsUntilClose = durationSeconds;
     if (!secondsUntilClose && currentSession?.duration > 0) {
-      const remaining = currentSession.duration - currentSession.position;
-      // Close voting 60 seconds before stream ends, minimum 30s
+      const remaining = currentSession.duration - (currentSession.position || 0);
       secondsUntilClose = Math.max(30, remaining - 60);
     }
-    if (!secondsUntilClose) secondsUntilClose = 300; // default 5 mins
+    if (!secondsUntilClose) secondsUntilClose = 300;
 
     const closesAt = new Date(Date.now() + secondsUntilClose * 1000).toISOString();
 
@@ -48,8 +57,10 @@ export class SynchronizedPollManager {
       queueItemId: item.queue_item_id,
       title: item.title,
       mediaType: item.media_type,
+      mediaId: item.media_id,
       season: item.season,
-      episode: item.episode
+      episode: item.episode,
+      poster: item.poster || null
     }));
 
     this.db.run(
@@ -59,24 +70,77 @@ export class SynchronizedPollManager {
       dest.id, pollSessionId, sessionId, closesAt, JSON.stringify(candidates)
     );
 
-    // Schedule finalization
-    const timer = setTimeout(() => {
-      this.finalizePoll(pollSessionId).catch(() => {});
-    }, secondsUntilClose * 1000);
-    timer?.unref?.();
-
-    this.activePollTimers.set(pollSessionId, timer);
+    if (currentSession?.state === 'PAUSED') {
+      this.pausedPolls.set(pollSessionId, secondsUntilClose * 1000);
+    } else {
+      this.#scheduleTimer(pollSessionId, secondsUntilClose * 1000);
+    }
 
     return {
       pollSessionId,
       closesAt,
       secondsUntilClose,
+      isPaused: currentSession?.state === 'PAUSED',
       candidates
     };
   }
 
+  pausePollForChat(chatId) {
+    const active = this.getActivePoll(chatId);
+    if (!active) return;
+    const { pollSessionId, closesAt } = active;
+    const timer = this.activePollTimers.get(pollSessionId);
+    if (timer) {
+      clearTimeout(timer);
+      this.activePollTimers.delete(pollSessionId);
+    }
+    const remainingMs = Math.max(5000, new Date(closesAt).getTime() - Date.now());
+    this.pausedPolls.set(pollSessionId, remainingMs);
+  }
+
+  resumePollForChat(chatId) {
+    const active = this.getActivePoll(chatId);
+    if (!active) return;
+    const { pollSessionId, closesAt } = active;
+    const remainingMs = this.pausedPolls.get(pollSessionId) ?? Math.max(5000, new Date(closesAt).getTime() - Date.now());
+    this.pausedPolls.delete(pollSessionId);
+
+    const newClosesAt = new Date(Date.now() + remainingMs).toISOString();
+    this.db.run('UPDATE cinema_poll_sessions SET closes_at = ? WHERE poll_session_id = ?', newClosesAt, pollSessionId);
+    this.#scheduleTimer(pollSessionId, remainingMs);
+  }
+
+  recalculatePollOnSeek(chatId, positionSeconds, durationSeconds) {
+    const active = this.getActivePoll(chatId);
+    if (!active || !durationSeconds || durationSeconds <= 0) return null;
+
+    const { pollSessionId } = active;
+    const remainingMediaSec = Math.max(0, durationSeconds - positionSeconds);
+    const secondsUntilClose = Math.max(15, remainingMediaSec - 60);
+    const remainingMs = secondsUntilClose * 1000;
+    const newClosesAt = new Date(Date.now() + remainingMs).toISOString();
+
+    this.db.run('UPDATE cinema_poll_sessions SET closes_at = ? WHERE poll_session_id = ?', newClosesAt, pollSessionId);
+    if (this.pausedPolls.has(pollSessionId)) {
+      this.pausedPolls.set(pollSessionId, remainingMs);
+    } else {
+      this.#scheduleTimer(pollSessionId, remainingMs);
+    }
+    return {
+      pollSessionId,
+      closesAt: newClosesAt,
+      remainingSeconds: secondsUntilClose
+    };
+  }
+
+  async finalizePollForChat(chatId) {
+    const active = this.getActivePoll(chatId);
+    if (!active) return null;
+    return this.finalizePoll(active.pollSessionId);
+  }
+
   async vote(pollSessionId, userId, queueItemId) {
-    const numUser = Number(userId);
+    const numUser = Number(userId || 0);
     const poll = this.db.get("SELECT * FROM cinema_poll_sessions WHERE poll_session_id = ? AND status = 'open'", pollSessionId);
     if (!poll) return { ok: false, message: 'This poll is already closed.' };
 
@@ -93,7 +157,11 @@ export class SynchronizedPollManager {
       pollSessionId, numUser, queueItemId
     );
 
-    return { ok: true, message: 'Vote recorded!' };
+    return {
+      ok: true,
+      message: 'Vote recorded!',
+      poll: this.getPollResults(pollSessionId)
+    };
   }
 
   getActivePoll(chatId) {
@@ -106,12 +174,16 @@ export class SynchronizedPollManager {
       numChat
     );
     if (!row) return null;
+    const isPaused = this.pausedPolls.has(row.poll_session_id);
     return {
       pollSessionId: row.poll_session_id,
       playbackSessionId: row.playback_session_id,
       status: row.status,
       openedAt: row.opened_at,
       closesAt: row.closes_at,
+      isPaused,
+      paused: isPaused,
+      pausedRemainingMs: this.pausedPolls.get(row.poll_session_id) || null,
       candidates: JSON.parse(row.candidates_json || '[]')
     };
   }
@@ -140,9 +212,14 @@ export class SynchronizedPollManager {
       pollSessionId: poll.poll_session_id,
       status: poll.status,
       closesAt: poll.closes_at,
+      isPaused: this.pausedPolls.has(poll.poll_session_id),
+      pausedRemainingMs: this.pausedPolls.get(poll.poll_session_id) || null,
       totalVotes,
       tally,
-      winner: poll.winner_queue_item_id ? candidates.find(c => c.queueItemId === poll.winner_queue_item_id) : (tally[0]?.votes > 0 ? tally[0] : null)
+      candidates: tally,
+      winner: poll.winner_queue_item_id
+        ? candidates.find(c => c.queueItemId === poll.winner_queue_item_id)
+        : (tally[0]?.votes > 0 ? tally[0] : null)
     };
   }
 
@@ -152,6 +229,7 @@ export class SynchronizedPollManager {
       clearTimeout(timer);
       this.activePollTimers.delete(pollSessionId);
     }
+    this.pausedPolls.delete(pollSessionId);
 
     const poll = this.db.get("SELECT * FROM cinema_poll_sessions WHERE poll_session_id = ? AND status = 'open'", pollSessionId);
     if (!poll) return null;
@@ -166,16 +244,18 @@ export class SynchronizedPollManager {
       winner?.queueItemId || null, pollSessionId
     );
 
-    // If there is a winner, promote it to position 1 in the queue
     if (winner?.queueItemId) {
       const dest = this.db.get('SELECT chat_id FROM cinema_destinations WHERE id = ?', poll.destination_id);
       if (dest?.chat_id) {
-        // Shift winner to position 1
-        this.db.run(
-          `UPDATE cinema_queue_items SET position = 1 
-           WHERE destination_id = ? AND queue_item_id = ?`,
-          poll.destination_id, winner.queueItemId
-        );
+        if (typeof this.queue?.moveToTop === 'function') {
+          this.queue.moveToTop(dest.chat_id, winner.queueItemId);
+        } else {
+          this.db.run(
+            `UPDATE cinema_queue_items SET position = 1 
+             WHERE destination_id = ? AND queue_item_id = ?`,
+            poll.destination_id, winner.queueItemId
+          );
+        }
         this.log.info({ pollSessionId, winnerTitle: winner.title }, 'Poll winner promoted to queue position 1');
       }
     }
@@ -195,6 +275,7 @@ export class SynchronizedPollManager {
         clearTimeout(timer);
         this.activePollTimers.delete(p.poll_session_id);
       }
+      this.pausedPolls.delete(p.poll_session_id);
       this.db.run('UPDATE cinema_poll_sessions SET status = ? WHERE poll_session_id = ?', reason, p.poll_session_id);
     }
   }

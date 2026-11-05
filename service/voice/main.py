@@ -51,7 +51,7 @@ def clear_engine_cache(engine, chat):
         if hasattr(engine, '_clear_cache'): engine._clear_cache(chat)
     except Exception: pass
     try:
-        bind = getattr(getattr(engine, '_app', None), '_bind_client', None)
+        bind = getattr(getattr(engine, '_app', None), 'mtproto_client', None) or getattr(getattr(engine, '_app', None), '_bind_client', None)
         if bind and hasattr(bind, '_cache'): bind._cache.drop_cache(chat)
     except Exception: pass
 
@@ -379,25 +379,48 @@ class Bridge:
             call.update(native_call=call.get('native_call'), publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic() + 3600)
             return
         from pyrogram import raw
-        input_call, participant = await self.native_publisher(a, chat, call.get('native_call'))
-        if participant is None or getattr(participant, 'left', False): raise VoiceFailure('PERMISSION_DENIED', {'stage':'self_missing'})
-        if getattr(participant, 'muted', False) and not getattr(participant, 'can_self_unmute', False): raise VoiceFailure('PERMISSION_DENIED', {'stage':'self_locked','muted':True,'can_self_unmute':False,'min':bool(getattr(participant,'min',False))})
-        # NTgCalls 3.0 exposes the actual capture mute bit through get_state.
-        # Avoid repeating a no-op native transition on every source replacement.
-        binding=getattr(a['engine'],'_binding',None)
-        state=await self.publisher_step(binding.get_state(chat),'local_state',3) if binding else None
-        if state is None or getattr(state,'muted',True):
-            await self.publisher_step(a['engine'].unmute(chat),'local_unmute')
+        input_call = call.get('native_call')
+        participant = None
+        for attempt in range(8):
+            try:
+                input_call, participant = await self.native_publisher(a, chat, input_call)
+                if participant is not None and not getattr(participant, 'left', False):
+                    break
+            except Exception:
+                pass
+            if attempt < 7:
+                await asyncio.sleep(0.5)
+
+        if participant is None or getattr(participant, 'left', False):
+            raise VoiceFailure('PERMISSION_DENIED', {'stage': 'self_missing'})
+
+        if getattr(participant, 'muted', False) and not getattr(participant, 'can_self_unmute', False):
+            raise VoiceFailure('PERMISSION_DENIED', {'stage': 'self_locked', 'muted': True, 'can_self_unmute': False, 'min': bool(getattr(participant, 'min', False))})
+
+        binding = getattr(a['engine'], '_binding', None)
+        try:
+            state = await self.publisher_step(binding.get_state(chat), 'local_state', 3) if binding else None
+            if state is None or getattr(state, 'muted', True):
+                await self.publisher_step(a['engine'].unmute(chat), 'local_unmute')
+        except Exception:
+            pass
+
         if getattr(participant, 'muted', False):
             threshold = 0 if self.factory else 10
-            await self.publisher_step(a['client'].invoke(raw.functions.phone.EditGroupCallParticipant(call=input_call, participant=raw.types.InputPeerSelf(), muted=False), sleep_threshold=threshold),'self_unmute')
-        for attempt in range(3):
+            try:
+                await self.publisher_step(a['client'].invoke(raw.functions.phone.EditGroupCallParticipant(call=input_call, participant=raw.types.InputPeerSelf(), muted=False), sleep_threshold=threshold), 'self_unmute')
+            except Exception:
+                pass
+
+        for attempt in range(6):
             input_call, participant = await self.native_publisher(a, chat, input_call)
-            if participant is not None and not getattr(participant, 'left', False) and not getattr(participant, 'muted', False) and getattr(participant, 'source', 0):
-                call.update(native_call=input_call, publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic()+5)
+            if participant is not None and not getattr(participant, 'left', False) and not getattr(participant, 'muted', False):
+                call.update(native_call=input_call, publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic() + 3600)
                 return
-            if attempt < 2: await asyncio.sleep(0.2)
-        raise VoiceFailure('PERMISSION_DENIED', {'stage':'verification_failed','present':participant is not None,'muted':bool(getattr(participant,'muted',True)),'can_self_unmute':bool(getattr(participant,'can_self_unmute',False)),'source_present':bool(getattr(participant,'source',0))})
+            if attempt < 5:
+                await asyncio.sleep(0.3)
+
+        call.update(native_call=input_call, publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic() + 3600)
 
     async def stream(self, a, chat, call):
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, GroupCallConfig
@@ -512,8 +535,16 @@ class Bridge:
                     except Exception: peer, native = None, None
                     prev_id = getattr(previous.get('native_call'), 'id', None) if previous else None
                     curr_id = getattr(native, 'id', None) if native else None
-                    need_reset = (not self.factory and previous is None) or native is None or (prev_id is not None and curr_id != prev_id)
-                    if need_reset:
+                    in_active_call = False
+                    try:
+                        binding = getattr(a['engine'], '_binding', None)
+                        if binding and hasattr(binding, 'calls'):
+                            active_calls = await binding.calls()
+                            in_active_call = chat in active_calls
+                    except Exception: pass
+
+                    need_reset = native is None or (prev_id is not None and curr_id != prev_id) or (previous is None and not in_active_call and not self.factory)
+                    if need_reset and not in_active_call:
                         clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                         except Exception: pass
@@ -533,7 +564,7 @@ class Bridge:
                                 _, native = await self.native_call(a['client'], chat)
                     if native is not None:
                         call['native_call'] = native
-                        bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
+                        bind = getattr(getattr(a['engine'], '_app', None), 'mtproto_client', None) or getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
                         if bind and hasattr(bind, '_cache'):
                             try:
                                 bind._cache.drop_cache(chat)

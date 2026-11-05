@@ -1,0 +1,1204 @@
+PAPPY ×͜× CINEMA
+
+THE COMPLETE MINI APP REBUILD — PREMIUM STREAMING PLATFORM EDITION
+
+You are Gemini 4 Argon operating as an elite product engineering team.
+
+Your roles include:
+
+- Principal frontend architect.
+- Senior React and TypeScript engineer.
+- Premium streaming-platform UI/UX designer.
+- Telegram Mini App specialist.
+- Movie discovery and recommendation engineer.
+- Media streaming integration engineer.
+- Backend integration architect.
+- Performance and accessibility engineer.
+- Software testing and regression specialist.
+
+You are not being asked to make a few cosmetic changes.
+
+You are being asked to transform the existing PAPPY Movie Mini App into a complete, premium, modern movie and television discovery and streaming-control platform.
+
+I want an exceptionally good result.
+
+The quality of the UI, content presentation, interactions, navigation, responsiveness, streaming integration and attention to detail matters enormously.
+
+Do not produce an ordinary dashboard.
+
+Do not produce an ordinary Telegram bot web panel.
+
+Build something that feels like a real cinema streaming product.
+
+---
+
+1. UNDERSTAND THE PRODUCT FIRST
+
+The application belongs to PAPPY ×͜× and is connected to an existing Telegram bot that already supports:
+
+- Telegram music streaming.
+- Telegram video streaming.
+- Voice-chat streaming.
+- Existing stream controls.
+- Existing playback/session infrastructure.
+- Telegram group and channel integrations.
+
+Movie streaming is being introduced as an additional module.
+
+The Mini App is NOT responsible for transmitting the actual movie video through the browser.
+
+The Mini App is the discovery platform, movie selection interface, playlist manager and remote-control interface.
+
+The existing Telegram streaming engine remains responsible for joining the appropriate Telegram voice chat and transmitting media.
+
+The intended experience:
+
+1. The administrator opens the Telegram bot.
+2. The administrator selects STREAM MOVIES.
+3. The bot displays previously registered channels and groups.
+4. The administrator selects a destination.
+5. The bot opens that destination's unique Mini App URL.
+6. The Mini App loads that destination's independent cinema environment.
+7. The administrator explores movies, TV shows, anime, categories, genres and recommendations.
+8. The administrator selects a movie.
+9. The administrator views its complete information.
+10. The administrator presses PLAY NOW.
+11. The Mini App sends the playback request to the backend.
+12. The backend instructs the existing bot/streaming engine to connect to the selected destination's voice chat and start the movie.
+13. The Mini App immediately becomes a synchronized remote control.
+14. The movie continues playing in the Telegram VC even when the administrator navigates around the Mini App or closes it.
+
+The application must never confuse the Mini App's browser session with the actual streaming session.
+
+The backend owns playback state.
+
+The existing stream engine owns media transmission.
+
+The Mini App controls and observes playback.
+
+This separation is fundamental.
+
+2. FIRST: INSPECT THE EXISTING PROJECT
+
+Before editing anything, inspect the current repository.
+
+Understand:
+
+- Existing React application.
+- Frontend framework and version.
+- Current routing.
+- Existing design system.
+- Existing API integration.
+- Existing Telegram Web Apps SDK integration.
+- Existing bot/backend communication.
+- Current Mini App destination identification.
+- Existing authentication and authorization.
+- Existing playback-control endpoints.
+- Existing queue functionality.
+- Existing real-time communication.
+- Existing movie API integration.
+- Existing build and deployment setup.
+
+Do not invent endpoints or backend functions.
+
+Identify which functionality already exists and which needs implementation.
+
+The goal is to rebuild and elevate the Mini App experience while preserving working functionality.
+
+You may redesign the frontend substantially.
+
+You may restructure frontend components where necessary.
+
+However, do not casually replace working backend services, rewrite the existing streaming engine, break existing bot commands or remove working integrations.
+
+Create a clear integration map.
+
+Use the project's actual conventions and dependencies where sensible.
+
+Do not upgrade working dependencies without a specific reason.
+
+Do not stop after writing a design proposal. Once you understand the project, implement the actual improvements.
+
+3. PRODUCT IDENTITY AND VISUAL DIRECTION
+
+Product name:
+
+PAPPY CINEMA
+
+Brand identity:
+
+PAPPY ×͜×.
+
+Design objective:
+
+A premium, cinematic streaming platform that feels modern, immersive, youthful and exceptionally organized.
+
+Visual references should include the quality of discovery and browsing found in premium streaming services, while establishing an original PAPPY design identity.
+
+Do not copy another product's interface pixel-for-pixel.
+
+Overall appearance
+
+Use a sophisticated dark cinematic design.
+
+Recommended design foundation:
+
+- Deep charcoal and near-black surfaces.
+- Carefully selected accent color.
+- High-contrast text.
+- Strong cinematic artwork.
+- Clean typography.
+- Elegant section headings.
+- Beautiful poster compositions.
+- Subtle motion.
+- Proper visual hierarchy.
+- Consistent spacing.
+- Refined controls.
+
+The design must look sharp rather than blurry.
+
+Avoid:
+
+- Excessive glassmorphism.
+- Cheap gradients.
+- Random neon glows.
+- Excessive rounded cards.
+- Oversized empty areas.
+- Excessive emoji.
+- Generic admin-dashboard templates.
+- Unnecessary borders around everything.
+- Tiny unreadable text.
+- Excessively large headings on mobile.
+- Animation that interferes with normal navigation.
+
+Every visual element must have a purpose.
+
+The result should feel like a real product designed by an experienced entertainment-platform team.
+
+4. BUILD A REAL CINEMA HOME PAGE
+
+The home screen is the most important visual experience.
+
+I want an immersive, content-rich home page that immediately feels like a movie platform.
+
+It must not look like a static API listing.
+
+4.1 Cinematic hero area
+
+Build a large featured-content area.
+
+It should feature:
+
+- High-quality backdrop artwork.
+- Cinematic image composition.
+- Subtle dark overlays for readable text.
+- Movie or series title.
+- Short synopsis.
+- Release year.
+- Genres.
+- Rating, if returned by the API.
+- Runtime where available.
+- Movie/TV indicator.
+- PLAY NOW.
+- MORE INFO.
+- ADD TO QUEUE.
+
+Dynamic hero rotation
+
+The featured area must dynamically change between available titles.
+
+Use actual movies and series returned by the API.
+
+Build a smooth, professional hero carousel with:
+
+- Automatic content rotation.
+- Manual previous/next navigation.
+- Position indicators.
+- Smooth transitions.
+- Appropriate preloading of the next hero image.
+- Graceful fallback when artwork is unavailable.
+
+Where a valid trailer or preview video exists, allow a muted cinematic preview to play after an appropriate delay.
+
+Requirements:
+
+- Never autoplay audible video.
+- Respect mobile autoplay restrictions.
+- Stop the previous preview before starting another.
+- Fall back to artwork when a trailer is unavailable.
+- Never invent a trailer URL.
+- Avoid loading multiple large video previews simultaneously.
+
+The hero must remain lightweight enough for ordinary Android phones and Telegram WebView.
+
+4.2 Content shelves
+
+Below the hero, build beautiful horizontally browsable movie shelves.
+
+The home page should dynamically organize content into sections such as:
+
+1. Trending Now.
+2. Popular Movies.
+3. Popular TV Series.
+4. Latest Movie Releases.
+5. Newly Released Episodes.
+6. Top Rated Movies.
+7. Top Rated Series.
+8. Anime Universe.
+9. Korean Dramas.
+10. Nollywood Cinema.
+11. Hollywood Hits.
+12. Bollywood.
+13. Action and Adventure.
+14. Horror and Thriller.
+15. Romance.
+16. Sci-Fi and Fantasy.
+17. Continue Watching.
+18. Recently Explored.
+19. Recommended for You.
+
+Important:
+
+These must use real API results and the actual categories and genres available from the movie API.
+
+Do not hardcode fake movie catalogues.
+
+If a category has no results, handle it gracefully rather than displaying an empty decorative section.
+
+Allow the user to scroll horizontally through content shelves.
+
+Support:
+
+- Smooth touch scrolling.
+- Scroll snapping.
+- Desktop navigation arrows.
+- Mouse/touchpad scrolling where practical.
+- Responsive card sizing.
+
+Do not autoplay every carousel.
+
+Do not automatically hijack the user's scroll position.
+
+The home page must remain smooth when many sections are present.
+
+5. DISCOVERY AND BROWSING EXPERIENCE
+
+Create a dedicated Movies page.
+
+Create a dedicated TV Series page.
+
+Create a dedicated Anime discovery experience where real category/genre data supports it.
+
+Create a Genres page.
+
+Create a Categories page.
+
+The user must be able to move naturally between these sections.
+
+Movies
+
+Support:
+
+- Trending.
+- Popular.
+- Latest.
+- Top rated.
+- Genre filtering.
+- Category filtering.
+- Search.
+- Sorting where supported.
+- Pagination/infinite scrolling.
+
+TV Series
+
+Support:
+
+- Trending series.
+- Popular series.
+- Recently updated shows.
+- Latest episodes.
+- Top rated series.
+- Series search.
+- Genre browsing.
+
+Anime
+
+Give anime meaningful visual prominence.
+
+Create an Anime Universe page with suitable shelves, such as:
+
+- Trending Anime.
+- Popular Anime.
+- Recently Released Anime.
+- Anime Movies.
+- Top Rated Anime.
+- Action Anime.
+- Romance Anime.
+- Fantasy Anime.
+
+Only use real data returned by the API.
+
+Make anime browsing feel like a dedicated entertainment destination, not an ordinary genre filter hidden in a menu.
+
+Categories
+
+Use the API's category endpoint.
+
+Display category cards with appropriate imagery where available.
+
+Categories should be visually differentiated, clean and easy to explore.
+
+Genres
+
+Use the actual genre endpoint.
+
+Display genres as elegant chips, tiles or filters.
+
+Support selecting multiple filters only where the backend API supports them or where the frontend can safely combine results.
+
+6. SEARCH EXPERIENCE
+
+Search must be fast, beautiful and genuinely useful.
+
+Create:
+
+- Prominent search access.
+- Search input.
+- Debounced requests.
+- Clear search.
+- Movie/TV filter.
+- Search suggestions where real data is available.
+- Recent searches stored appropriately.
+- Loading skeletons.
+- Empty-result explanations.
+- Error states.
+- Pagination.
+
+Search should not reload the entire application.
+
+A user should be able to search for a title, open its details, add it to the queue, and return to their previous discovery position.
+
+Avoid unnecessary repeated network requests.
+
+Do not lose the user's current browsing state.
+
+7. MOVIE POSTER AND ARTWORK QUALITY
+
+Artwork quality is a priority.
+
+The Mini App must not look blurry or cheap.
+
+Use the highest useful image variants actually supplied by the API.
+
+Use the correct image treatment for:
+
+- Movie posters.
+- Backdrop images.
+- Episode stills.
+- Featured previews.
+- Category artwork.
+
+Build reusable image components with:
+
+- Lazy loading.
+- Appropriate sizing.
+- Aspect-ratio preservation.
+- Responsive resolution selection where supported.
+- Error fallbacks.
+- Smooth image loading.
+- Correct object positioning.
+
+Do not stretch portrait artwork into landscape shapes.
+
+Do not upscale tiny images and present them as genuine HD artwork.
+
+Do not replace missing official artwork with random unrelated images.
+
+Show a clean fallback where necessary.
+
+Use poster artwork in browsing cards and wide cinematic backdrops in hero/detail areas.
+
+8. MOVIE CARDS
+
+Design highly polished movie cards.
+
+Each card should display useful information without becoming cluttered.
+
+Include, where available:
+
+- Poster.
+- Title.
+- Release year.
+- Rating.
+- Movie or TV badge.
+- Quality badge only when verified.
+- Playback/queue state.
+
+On desktop hover, provide useful quick actions.
+
+On mobile, provide clean tap interactions.
+
+Quick actions:
+
+- Details.
+- Play Now.
+- Play Next.
+- Add to Queue.
+
+Avoid requiring users to open multiple screens just to perform a simple queue action.
+
+Cards must have consistent dimensions, appropriate typography and high-quality artwork.
+
+9. COMPLETE MOVIE DETAILS EXPERIENCE
+
+When the administrator selects a movie, open a premium movie-detail screen.
+
+This screen should feel like a proper streaming-service title page.
+
+Show:
+
+- Large backdrop.
+- Poster.
+- Movie title.
+- Release date/year.
+- Runtime.
+- Genres.
+- Rating.
+- Synopsis.
+- Director.
+- Main cast.
+- Trailer.
+- Relevant additional metadata.
+- Playback availability status where appropriate.
+
+Primary actions:
+
+PLAY NOW.
+
+PLAY NEXT.
+
+ADD TO QUEUE.
+
+WATCH TRAILER.
+
+MORE DETAILS.
+
+The actual movie must not start playing merely because someone opened its detail page.
+
+Only trigger playback when the user explicitly requests it.
+
+Display useful availability feedback when playback cannot be started.
+
+Do not falsely display HD or working status without validation.
+
+10. FULL TV SERIES AND EPISODE EXPERIENCE
+
+A proper series experience is essential.
+
+On a series detail page, clearly display:
+
+- Series overview.
+- Artwork.
+- Release information.
+- Genres.
+- Rating.
+- Creators.
+- Cast.
+- Season selector.
+- Episode count.
+- Episode list.
+
+Season selector should be elegant and easy to use.
+
+Episodes should display:
+
+- Episode number.
+- Thumbnail.
+- Episode title.
+- Runtime.
+- Overview.
+- Air date.
+- Queue/playback state.
+
+Support:
+
+- Play Episode.
+- Play Next.
+- Add Episode to Queue.
+- Add Season to Queue.
+- Play Season.
+- Continue Series.
+
+Use the actual API's next_episode and prev_episode data where available.
+
+The playback engine must progress episode-by-episode and season-by-season.
+
+Never assume every season has the same episode count.
+
+Do not fabricate missing episodes.
+
+Do not lose the current episode position when navigating to other parts of the Mini App.
+
+11. THE PERSISTENT MINI PLAYER
+
+This is a critical design feature.
+
+When a movie or episode starts in the Telegram VC, a compact player dock should appear at the bottom of the Mini App.
+
+This must remain available throughout normal browsing navigation.
+
+Example information:
+
+- Current poster.
+- Movie or episode title.
+- Playing/paused status.
+- Current position.
+- Remaining time.
+- Play/pause control.
+- Expand control.
+
+Use a compact, refined design.
+
+Do not let the dock cover the bottom of important content.
+
+Respect mobile safe areas.
+
+The user must be able to:
+
+- Open Home.
+- Search other movies.
+- Browse genres.
+- View other series.
+- Explore recommendations.
+- Open the queue.
+
+WITHOUT stopping the active stream.
+
+The Mini App must never own the media lifecycle.
+
+Refreshing the browser must not restart the movie.
+
+Leaving the detail page must not interrupt playback.
+
+Closing the Mini App must not automatically stop the VC.
+
+The persistent dock should reconnect to the existing playback session when reopened.
+
+12. PROFESSIONAL REMOTE CONTROL
+
+Build a dedicated expanded player-control interface.
+
+This is not a browser video player.
+
+It is a remote control for the existing Telegram VC streaming engine.
+
+Include:
+
+- Play.
+- Pause.
+- Resume.
+- Previous.
+- Next.
+- Rewind.
+- Fast-forward.
+- Seek timeline, when supported.
+- Volume control, when supported.
+- Skip Intro, when valid.
+- Current duration.
+- Remaining duration.
+- Current playback state.
+- Current destination.
+- Queue shortcut.
+- Next episode information.
+- Streaming connection state.
+
+The interface must visually distinguish:
+
+- Connecting.
+- Preparing movie.
+- Starting stream.
+- Playing.
+- Paused.
+- Buffering.
+- Switching source.
+- Playback completed.
+- Error.
+
+Only show a control as enabled when the backend confirms the relevant operation is supported.
+
+Never make decorative controls that do nothing.
+
+All actions must be authenticated and sent through the existing bot/streaming backend.
+
+The actual stream is started and managed by the bot's existing streaming integration.
+
+13. QUEUE AND PLAYLIST MANAGEMENT
+
+Build a dedicated Queue page.
+
+This is a real persistent playlist per Telegram destination.
+
+Display:
+
+- Currently playing item.
+- Up Next.
+- Upcoming queue.
+- Item type.
+- Movie poster.
+- TV episode information.
+- Added-by information where available.
+
+Actions:
+
+- Play Now.
+- Play Next.
+- Add to Queue.
+- Remove.
+- Move Up.
+- Move Down.
+- Move to Top.
+- Reorder.
+- Clear Queue.
+
+Use clear drag-and-drop interactions where practical.
+
+Provide accessible alternatives for reordering.
+
+The queue should update in real time when an administrator or an authorized user changes it.
+
+Prevent duplicate queue inserts from retries.
+
+Keep automatic episode progression consistent with the configured queue policy.
+
+When a poll is enabled, its winner must be integrated into the queue without disrupting the currently playing item.
+
+14. INTELLIGENT PLAYBACK AND EPISODE PROGRESSION
+
+Integrate with the existing bot playback engine.
+
+Do not implement a separate browser-based streaming system.
+
+The expected sequence for a series:
+
+Season 1 Episode 1 → Episode 2 → Episode 3 → Last Episode → Season 2 Episode 1 → Continue until completion.
+
+Use real API episode relationships and validated episode ordering.
+
+Implement next-item preparation through the existing backend's bounded preload pipeline.
+
+The current movie must retain playback priority.
+
+Do not consume excessive disk space or memory.
+
+Use suitable media validation and source compatibility checks before preparing the next stream.
+
+Skip Intro must only use reliable timestamps or administrator-supplied markers.
+
+Never guess movie intro timestamps.
+
+A failed next-item preparation must not interrupt the current movie.
+
+15. CHANNEL-SPECIFIC EXPERIENCE
+
+Every Mini App launch is associated with one verified Telegram destination.
+
+The UI should show the destination identity discreetly:
+
+- Channel/group name.
+- Destination type.
+- Connection/verification status.
+- Current VC status.
+
+A user must not accidentally control another destination.
+
+Do not trust user-provided chat IDs or query parameters.
+
+Resolve the destination from the authenticated Telegram Mini App context and server-side token mapping.
+
+Validate initData on the backend.
+
+Perform destination-specific authorization on every sensitive request.
+
+The same frontend may be used for many destinations, but their queues, player states, settings and permissions remain isolated.
+
+16. TELEGRAM BOT INTEGRATION
+
+The Mini App must remain tightly connected to the existing bot.
+
+The primary launch flow:
+
+Telegram bot → STREAM MOVIES → Select Destination → Open Mini App.
+
+The selected destination should be loaded automatically.
+
+When the administrator presses PLAY NOW:
+
+1. Confirm the selected destination.
+2. Validate the user's permissions.
+3. Validate that the bot/streaming account can access the VC.
+4. Check whether the destination has an active playback session.
+5. Resolve the movie's compatible media source.
+6. Prepare the stream through the existing backend.
+7. Ask the existing streaming engine to join/start in the appropriate VC.
+8. Confirm actual stream startup.
+9. Update persistent playback state.
+10. Update the public now-playing card.
+11. Update every connected administrator dashboard.
+
+Do not show "Playing" merely because an API request was submitted.
+
+Only show successful playback once the real streaming engine confirms it.
+
+The existing PAPPY Rich Message formatter must be reused for the public now-playing cards.
+
+Do not rebuild public Telegram cards as unrelated basic messages.
+
+17. PUBLIC NOW-PLAYING INFORMATION
+
+The Mini App is the admin control surface, while the Telegram destination can have a public now-playing card.
+
+The public card should include:
+
+- Movie or series artwork.
+- Movie/series title.
+- Description.
+- Genre.
+- Release year.
+- Rating.
+- Runtime.
+- Current playback state.
+- Remaining time/expected completion.
+- Current season/episode for TV.
+- Next item where appropriate.
+
+The card should be updated through the existing Rich Message infrastructure.
+
+Do not publish admin-only playback controls into the public channel.
+
+Use the supported quote style and card formatting where the existing renderer provides it.
+
+Do not make Telegram message edits every second.
+
+Use sensible periodic updates plus immediate updates when playback state changes.
+
+18. LIVE COMMUNITY VOTING
+
+Where voting is enabled for a destination, provide an attractive voting area.
+
+Show candidate titles, vote counts, closing time and winner status.
+
+Use backend-managed voting if precise synchronization with playback is required.
+
+The voting timer must follow the actual server playback clock.
+
+Pause freezes it.
+
+Resume continues it.
+
+Seek recalculates the closing deadline.
+
+If the movie finishes before the poll deadline, finalize the voting session immediately.
+
+If a new movie is manually started, close the previous voting session.
+
+The poll winner must never terminate current playback.
+
+Voting must never be allowed to modify a different destination's queue.
+
+19. DESKTOP AND MOBILE WEB EXPERIENCE
+
+This is a web application running inside Telegram, but the design must also work as a responsive web application.
+
+Target environments:
+
+- Telegram Android WebView.
+- Telegram iOS WebView.
+- Mobile Chrome.
+- Desktop Chrome.
+- Desktop Edge.
+- Modern Safari where supported.
+
+Mobile is the primary priority, but desktop must not look like an enlarged phone interface.
+
+Mobile
+
+Design for practical screen sizes.
+
+Include:
+
+- Comfortable touch targets.
+- Bottom navigation where suitable.
+- Good poster sizing.
+- Compact player dock.
+- Proper safe-area spacing.
+- Smooth vertical scrolling.
+- Swipe-friendly content rails.
+- Readable movie details.
+- Easy search access.
+
+Desktop
+
+Use the extra space intelligently.
+
+Provide:
+
+- Stronger content-grid layouts.
+- Suitable side navigation.
+- Wider hero composition.
+- Better carousel controls.
+- Keyboard navigation.
+- Proper desktop search layout.
+- Larger detail-page composition.
+
+Do not simply stretch the mobile layout.
+
+20. DESIGN SYSTEM AND ANIMATION
+
+Build a reusable design system.
+
+Define:
+
+- Colors.
+- Typography.
+- Spacing.
+- Layout widths.
+- Border radii.
+- Shadows.
+- Buttons.
+- Input styles.
+- Card variants.
+- Modal styles.
+- Skeleton loaders.
+- Status indicators.
+- Navigation patterns.
+- Responsive breakpoints.
+
+Use consistent React components.
+
+Motion should be intentional.
+
+Good animation examples:
+
+- Hero crossfade.
+- Poster hover elevation.
+- Smooth drawer opening.
+- Search result entry.
+- Page transitions.
+- Player dock appearance.
+- Queue reorder animation.
+- Skeleton-to-image transition.
+- Elegant loading indicators.
+
+Avoid constant unnecessary motion.
+
+Respect prefers-reduced-motion.
+
+Avoid heavy animation libraries unless justified.
+
+21. REAL API INTEGRATION
+
+Use this existing movie API:
+
+BASE URL:
+
+https://pappy-hosting.duckdns.org/media/api/v1/movies
+
+Swagger:
+
+https://pappy-hosting.duckdns.org/media/api/v1/docs
+
+Health:
+
+/health
+
+Discovery:
+
+/home
+
+/trending?window=day&type=all
+
+/latest/movies?page=1
+
+/latest/episodes?page=1
+
+/popular?type=movie&page=1
+
+/top-rated?type=movie&page=1
+
+Search:
+
+/search?q={query}&type=movie
+
+/search?q={query}&type=tv
+
+Categories:
+
+/genres
+
+/categories
+
+/browse?category={category}&type={type}
+
+/browse?genreId={genreId}&type={type}&sortBy=popularity.desc
+
+Details:
+
+/movie/{movie_id}
+
+/tv/{tv_id}
+
+/tv/{tv_id}/seasons
+
+/tv/{tv_id}/season/{season_number}
+
+/tv/{tv_id}/season/{season_number}/episode/{episode_number}
+
+Playback resolution:
+
+/playback/{movie_id}?type=movie
+
+/playback/{tv_id}?type=tv&season={season}&episode={episode}
+
+Inspect actual response structures.
+
+Create typed API models.
+
+Do not assume every endpoint returns the same pagination or artwork fields.
+
+Do not build around fabricated API data.
+
+Use mock data only for isolated development and never silently ship it as production content.
+
+Implement:
+
+- Debounced search.
+- Caching.
+- Request deduplication.
+- Pagination.
+- Error handling.
+- Loading states.
+- Image fallbacks.
+- Safe playback resolution.
+- Appropriate timeouts.
+
+Keep API credentials and sensitive provider information on the backend.
+
+Never expose private media-source credentials in the frontend.
+
+22. PERFORMANCE REQUIREMENTS
+
+The platform must feel smooth and responsive.
+
+Pay particular attention to low-to-mid-range Android devices.
+
+Implement:
+
+- Code splitting.
+- Lazy-loaded routes.
+- Lazy-loaded artwork.
+- Responsive images.
+- Virtualized long lists when needed.
+- Debounced API calls.
+- Caching.
+- Request cancellation.
+- Image placeholder transitions.
+- Lightweight animations.
+- Proper memory cleanup.
+- Realtime reconnect handling.
+
+Avoid:
+
+- Huge initial JavaScript bundles.
+- Loading hundreds of large posters immediately.
+- Repeated API calls during rerenders.
+- Multiple video previews playing simultaneously.
+- Expensive blur effects.
+- Unnecessary component remounts.
+- Lost scroll position.
+- UI blocking during unrelated API requests.
+
+The actual movie stream must never depend on the Mini App staying open.
+
+23. RELIABILITY AND SECURITY
+
+Preserve the existing backend architecture wherever possible.
+
+Use the backend as the authority for:
+
+- Telegram authentication.
+- Destination selection.
+- Authorization.
+- Queue state.
+- Current playback.
+- Playback commands.
+- Voting.
+- Preload status.
+- Public card updates.
+
+Do not allow browser-side code to directly run stream commands.
+
+Validate every action.
+
+Prevent:
+
+- Unauthorized control.
+- Cross-channel commands.
+- Duplicate requests.
+- Stale playback commands.
+- Queue race conditions.
+- Invalid media sources.
+- Fake playback status.
+- Expired sessions.
+- Leaked secrets.
+
+If a feature isn't supported by the existing engine, present an honest disabled/unavailable state rather than pretending it works.
+
+24. VISUAL QUALITY ASSURANCE
+
+Do not approve the UI simply because the React code compiles.
+
+Actually review the application in its rendered state.
+
+Inspect these screens individually:
+
+1. Initial loading.
+2. Home hero.
+3. Home content shelves.
+4. Movies browse page.
+5. TV Series page.
+6. Anime page.
+7. Search.
+8. Genre filters.
+9. Movie details.
+10. TV details.
+11. Season selector.
+12. Episode list.
+13. Queue.
+14. Persistent mini-player.
+15. Expanded remote control.
+16. Voting interface.
+17. Destination unavailable state.
+18. Unauthorized user state.
+19. API loading/error state.
+20. Mobile and desktop layouts.
+
+Check that:
+
+- No text is clipped.
+- No cards overlap.
+- Posters retain their proportions.
+- Images are sharp.
+- Buttons have readable labels.
+- Scroll containers behave correctly.
+- Mobile bottom navigation doesn't cover content.
+- Player dock doesn't hide the queue.
+- Hero text has adequate contrast.
+- Empty states are designed.
+- Loading states don't flash unnecessarily.
+- Layout is consistent.
+
+Use actual screenshots or browser inspection if available.
+
+Iterate on visual issues rather than accepting the first result.
+
+25. ACCEPTANCE CRITERIA
+
+The rebuild is not finished simply because the homepage looks attractive.
+
+It must satisfy all of these:
+
+A. The home page uses real movie content.
+
+B. Hero content changes dynamically.
+
+C. The featured area uses valid artwork and supported previews.
+
+D. Movie shelves are browsable and responsive.
+
+E. Anime and category navigation work.
+
+F. Search works.
+
+G. Movie detail screens work.
+
+H. TV season and episode navigation work.
+
+I. PLAY NOW reaches the existing streaming backend.
+
+J. The correct Telegram destination is used.
+
+K. The bot starts streaming through the existing engine.
+
+L. The persistent player reflects real playback state.
+
+M. Browsing does not stop playback.
+
+N. Queue commands work.
+
+O. Episode progression works.
+
+P. Real-time updates synchronize connected administrators.
+
+Q. Public now-playing cards are updated through the existing renderer.
+
+R. Unauthorized users cannot control playback.
+
+S. Existing music/video streaming functionality is not broken.
+
+T. The application works in Telegram Android WebView and ordinary mobile/desktop browsers.
+
+26. FINAL DELIVERY
+
+I expect an actual implemented product, not a design explanation.
+
+Provide:
+
+1. Repository audit summary.
+2. New application architecture.
+3. Updated design system.
+4. List of new and modified components.
+5. Updated routes and pages.
+6. API integration details.
+7. Bot/streaming integration details.
+8. Security and authorization checks.
+9. Performance improvements.
+10. Visual QA screenshots where available.
+11. Build and deployment results.
+12. Actual functional test results.
+13. Remaining limitations.
+
+Distinguish implemented and tested functionality from planned functionality.
+
+Do not claim success without verification.
+
+Do not remove existing capabilities simply to make the new frontend easier to build.
+
+---
+
+YOUR EXECUTION MINDSET
+
+I want you to think beyond a typical AI-generated dashboard.
+
+Imagine a person opening this application for the first time.
+
+Within seconds, they should understand what is trending, where to discover movies, how to search, how to explore anime and TV series, how to view details and how to start a movie in the selected Telegram VC.
+
+The experience must feel alive, premium and effortless.
+
+Make the content the hero.
+
+Make the artwork sharp.
+
+Make the navigation obvious.
+
+Make the player controls dependable.
+
+Make the bot integration invisible in the best possible way: the user presses Play, the bot handles the actual Telegram streaming work, and the interface clearly communicates what is happening.
+
+This is PAPPY CINEMA.
+
+I want a complete streaming-platform experience, not a collection of pretty screens.
+
+Inspect the existing project, make the architecture safe, and then execute the rebuild to production-quality standards.
+
+Do not stop at the planning stage.
