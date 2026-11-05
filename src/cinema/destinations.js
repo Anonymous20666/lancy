@@ -242,4 +242,69 @@ export class CinemaDestinationManager {
       Number(chatId)
     );
   }
+
+  async handleChatMemberUpdated(myChatMember) {
+    if (!myChatMember?.chat?.id) return null;
+    const chatId = Number(myChatMember.chat.id);
+    const dest = this.getDestinationByChatId(chatId);
+    if (!dest) return null; // Not a registered cinema destination
+
+    const newMember = myChatMember.new_chat_member;
+    const newStatus = newMember?.status;
+
+    if (newStatus === 'kicked' || newStatus === 'left') {
+      this.log.warn({ chatId, status: newStatus }, 'Bot removed from cinema destination; revoking and stopping stream');
+      this.db.run(
+        "UPDATE cinema_destinations SET bot_status = 'revoked', last_verified_at = CURRENT_TIMESTAMP WHERE id = ?",
+        dest.id
+      );
+      if (this.app?.cinemaPlayback) {
+        await this.app.cinemaPlayback.stop(chatId).catch(() => {});
+      }
+      return { status: 'revoked' };
+    }
+
+    if (newStatus === 'administrator') {
+      const canManageVideo = Boolean(newMember.can_manage_video_chats || newMember.can_manage_voice_chats);
+      if (!canManageVideo) {
+        this.log.warn({ chatId }, 'Bot demoted / video chat rights revoked; suspending cinema destination');
+        this.db.run(
+          "UPDATE cinema_destinations SET bot_status = 'restricted', last_verified_at = CURRENT_TIMESTAMP WHERE id = ?",
+          dest.id
+        );
+        if (this.app?.cinemaPlayback) {
+          await this.app.cinemaPlayback.stop(chatId).catch(() => {});
+        }
+        return { status: 'restricted' };
+      } else {
+        const rights = {
+          isAdmin: true,
+          canManageVideoChats: true,
+          canPostMessages: Boolean(newMember.can_post_messages),
+          canEditMessages: Boolean(newMember.can_edit_messages),
+          canPinMessages: Boolean(newMember.can_pin_messages)
+        };
+        this.db.run(
+          "UPDATE cinema_destinations SET bot_status = 'active', verified_rights_json = ?, last_verified_at = CURRENT_TIMESTAMP WHERE id = ?",
+          JSON.stringify(rights),
+          dest.id
+        );
+        return { status: 'active', rights };
+      }
+    }
+
+    if (newStatus === 'member' || newStatus === 'restricted') {
+      this.log.warn({ chatId, status: newStatus }, 'Bot demoted from admin; revoking cinema destination');
+      this.db.run(
+        "UPDATE cinema_destinations SET bot_status = 'demoted', last_verified_at = CURRENT_TIMESTAMP WHERE id = ?",
+        dest.id
+      );
+      if (this.app?.cinemaPlayback) {
+        await this.app.cinemaPlayback.stop(chatId).catch(() => {});
+      }
+      return { status: 'demoted' };
+    }
+
+    return null;
+  }
 }

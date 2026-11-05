@@ -3,6 +3,15 @@ import { banner, ACCENT, SPARK } from '../telegram/ui.js';
 import { States } from '../core/stateMachine.js';
 import { logger } from '../core/logger.js';
 
+function makeProgressBar(current, total, width = 10) {
+  if (!total || total <= 0) return '🔴 [LIVE STREAM]';
+  const progress = Math.min(1, Math.max(0, current / total));
+  const filled = Math.round(progress * width);
+  const empty = width - filled;
+  const pct = Math.round(progress * 100);
+  return `[${'█'.repeat(filled)}${'░'.repeat(empty)}] ${pct}%`;
+}
+
 export function createCinemaScreen({ app }) {
   const id = 'cinema';
   const log = logger().child({ module: 'screen:cinema' });
@@ -43,11 +52,17 @@ export function createCinemaScreen({ app }) {
     b.divider();
     b.heading('୨୧ destinations & controls', 3);
 
-    // List destination buttons
+    // List destination buttons with active playback status indicator
     for (const dest of destinations.slice(0, 5)) {
+      const session = app.cinemaPlayback.getCurrentSession(dest.chatId);
+      const isPlaying = session?.state === 'PLAYING';
+      const isPaused = session?.state === 'PAUSED';
+      const statusIcon = isPlaying ? '▶️' : (isPaused ? '⏸️' : '⚙️');
+      const streamHint = session ? ` (${session.title.slice(0, 8)})` : '';
+      const buttonLabel = `${statusIcon} ${dest.title.slice(0, 14)}${streamHint}`;
       const miniAppUrl = app.cinemaDestinations.getMiniAppUrl(app.cinemaDestinations.generateToken(dest.chatId));
       b.buttons([
-        richButton.callback(`⚙️ ${dest.title.slice(0, 16)}`, encodeCallback(id, 'select', dest.chatId)),
+        richButton.callback(buttonLabel, encodeCallback(id, 'select', dest.chatId)),
         { text: rt.text('🍿 Open Cinema'), web_app: { url: miniAppUrl }, style: 'success' }
       ]);
     }
@@ -88,9 +103,16 @@ export function createCinemaScreen({ app }) {
     ];
 
     if (session) {
-      info.push(`• Current Title: ${session.title}`);
+      info.push(`• Current Title: 🎬 ${session.title}`);
       if (session.season && session.episode) {
         info.push(`• Episode: S${String(session.season).padStart(2, '0')}E${String(session.episode).padStart(2, '0')}`);
+      }
+      if (session.duration > 0) {
+        const curMin = Math.floor((session.position || 0) / 60);
+        const curSec = String(Math.floor((session.position || 0) % 60)).padStart(2, '0');
+        const totMin = Math.floor(session.duration / 60);
+        const totSec = String(Math.floor(session.duration % 60)).padStart(2, '0');
+        info.push(`• Progress: ${makeProgressBar(session.position || 0, session.duration)} (${curMin}:${curSec} / ${totMin}:${totSec})`);
       }
     }
 

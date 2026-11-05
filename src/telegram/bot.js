@@ -521,6 +521,12 @@ export class TelegramController extends EventEmitter {
     if (myChatMember.from && !myChatMember.from.is_bot) {
       this.db.recordGroupMember(chatId, myChatMember.from);
     }
+
+    if (this.app?.cinemaDestinations?.handleChatMemberUpdated) {
+      this.app.cinemaDestinations.handleChatMemberUpdated(myChatMember).catch(err => {
+        this.log.warn?.({ err: err?.message, chatId }, 'cinema destination member update handling failed');
+      });
+    }
   }
 
   #handleChatJoinRequest(joinRequest) {

@@ -334,3 +334,229 @@ test('Cinema: CinemaStreamResolver resolves direct media and caches server strea
   assert.equal(cached.cached, true);
   assert.equal(cached.streamUrl, resolved.streamUrl);
 });
+
+test('Cinema: Multi-Destination Concurrency maintains strictly isolated sessions, queues, and polls', async () => {
+  const db = new Database(':memory:');
+
+  const channelA = -100111222;
+  const channelB = -100333444;
+  const groupC = -100555666;
+
+  // 1. Register destinations
+  db.run(`
+    INSERT INTO cinema_destinations (chat_id, chat_type, title, token_hash, voting_enabled)
+    VALUES (?, 'channel', 'Channel Alpha', 'token_hash_a', 1),
+           (?, 'channel', 'Channel Beta', 'token_hash_b', 1),
+           (?, 'supergroup', 'Group Gamma', 'token_hash_c', 0);
+  `, channelA, channelB, groupC);
+
+  const stoppedChats = new Set();
+  const mockVoice = {
+    setup: async () => ({ ok: true }),
+    play: async () => ({ ok: true }),
+    pause: async () => ({ ok: true }),
+    resume: async () => ({ ok: true }),
+    seek: async () => ({ ok: true }),
+    stop: async (c) => { stoppedChats.add(c); return { ok: true }; }
+  };
+
+  const mockApp = {
+    db,
+    settings: { get: () => [] },
+    cinemaCards: { postOrUpdateCard: async () => {} }
+  };
+
+  const destinations = new CinemaDestinationManager({ app: mockApp, db });
+  const playback = new CinemaPlaybackAdapter({ app: mockApp, db, voiceClient: mockVoice });
+  const queue = new CinemaQueueManager({ app: mockApp, db, playbackAdapter: playback });
+  const poll = new SynchronizedPollManager({ app: mockApp, db, queueManager: queue, playbackAdapter: playback });
+
+  mockApp.cinemaDestinations = destinations;
+  mockApp.cinemaPlayback = playback;
+  mockApp.cinemaQueue = queue;
+  mockApp.cinemaPoll = poll;
+
+  // 2. Start independent streams on Channel A, Channel B, and Group C
+  await playback.play(channelA, {
+    mediaType: 'movie',
+    mediaId: '10',
+    title: 'Inception',
+    source: 'https://cdn.example.com/inception.m3u8',
+    duration: 7200,
+    offset: 500
+  });
+
+  await playback.play(channelB, {
+    mediaType: 'movie',
+    mediaId: '20',
+    title: 'Interstellar',
+    source: 'https://cdn.example.com/interstellar.m3u8',
+    duration: 10000,
+    offset: 120
+  });
+
+  await playback.play(groupC, {
+    mediaType: 'tv',
+    mediaId: '30',
+    title: 'Breaking Bad',
+    season: 1,
+    episode: 1,
+    source: 'https://cdn.example.com/breakingbad.m3u8',
+    duration: 3600,
+    offset: 30
+  });
+
+  // Verify independent session states
+  const sessionA = playback.getCurrentSession(channelA);
+  const sessionB = playback.getCurrentSession(channelB);
+  const sessionC = playback.getCurrentSession(groupC);
+
+  assert.equal(sessionA.title, 'Inception');
+  assert.equal(sessionA.position, 500);
+  assert.equal(sessionA.state, 'PLAYING');
+
+  assert.equal(sessionB.title, 'Interstellar');
+  assert.equal(sessionB.position, 120);
+  assert.equal(sessionB.state, 'PLAYING');
+
+  assert.equal(sessionC.title, 'Breaking Bad');
+  assert.equal(sessionC.season, 1);
+  assert.equal(sessionC.episode, 1);
+
+  // 3. Independent Queues
+  await queue.addToQueue(channelA, { mediaType: 'movie', mediaId: '101', title: 'The Matrix', addedByUserId: 1 });
+  await queue.addToQueue(channelB, { mediaType: 'movie', mediaId: '201', title: 'Oppenheimer', addedByUserId: 2 });
+  await queue.addToQueue(channelB, { mediaType: 'movie', mediaId: '202', title: 'Dunkirk', addedByUserId: 2 });
+
+  const queueA = queue.getQueue(channelA);
+  const queueB = queue.getQueue(channelB);
+  const queueC = queue.getQueue(groupC);
+
+  assert.equal(queueA.length, 1);
+  assert.equal(queueA[0].title, 'The Matrix');
+
+  assert.equal(queueB.length, 2);
+  assert.equal(queueB[0].title, 'Oppenheimer');
+  assert.equal(queueB[1].title, 'Dunkirk');
+
+  assert.equal(queueC.length, 0);
+
+  // 4. Token isolation check
+  const tokenA = destinations.generateToken(channelA);
+  const tokenB = destinations.generateToken(channelB);
+  assert.notEqual(tokenA, tokenB);
+  assert.equal(destinations.verifyToken(tokenA), channelA);
+  assert.equal(destinations.verifyToken(tokenB), channelB);
+
+  // 5. Mutate Channel A (pause + seek) -> Channel B and Group C must be completely unchanged
+  await playback.pause(channelA);
+  await playback.seek(channelA, 900);
+
+  const updatedA = playback.getCurrentSession(channelA);
+  const checkB = playback.getCurrentSession(channelB);
+  const checkC = playback.getCurrentSession(groupC);
+
+  assert.equal(updatedA.state, 'PAUSED');
+  assert.equal(updatedA.position, 900);
+
+  assert.equal(checkB.state, 'PLAYING');
+  assert.equal(checkB.position, 120); // completely untouched
+
+  assert.equal(checkC.state, 'PLAYING');
+  assert.equal(checkC.position, 30); // completely untouched
+
+  // 6. Synchronized Poll in Channel A only
+  await queue.addToQueue(channelA, { mediaType: 'movie', mediaId: '102', title: 'Avatar', addedByUserId: 1 });
+  const pollSession = await poll.startPoll(channelA, { durationSeconds: 60 });
+  assert.ok(pollSession?.pollSessionId);
+
+  // Active poll exists in Channel A, not in Channel B
+  assert.ok(poll.getActivePoll(channelA));
+  assert.equal(poll.getActivePoll(channelB), null);
+
+  // Cast vote in Channel A
+  const candidateItem = pollSession.candidates[0];
+  await poll.vote(pollSession.pollSessionId, 999, candidateItem.queueItemId);
+  const tallyA = poll.getPollResults(pollSession.pollSessionId);
+  assert.equal(tallyA.totalVotes, 1);
+  assert.equal(tallyA.tally[0].votes, 1);
+
+  // 7. Stop Channel A -> Channel B and Group C remain actively playing
+  await playback.stop(channelA);
+  assert.ok(stoppedChats.has(channelA));
+  assert.equal(playback.getCurrentSession(channelA), null);
+
+  assert.equal(playback.getCurrentSession(channelB)?.state, 'PLAYING');
+  assert.equal(playback.getCurrentSession(groupC)?.state, 'PLAYING');
+});
+
+test('Cinema: Admin Demotion & Bot Removal Invalidation terminates playback and revokes status', async () => {
+  const db = new Database(':memory:');
+  const chatId = -100777888;
+
+  // Insert active destination
+  db.run(`
+    INSERT INTO cinema_destinations (chat_id, chat_type, title, bot_status, token_hash, voting_enabled)
+    VALUES (?, 'channel', 'Security Test Channel', 'active', 'tok777', 1);
+  `, chatId);
+
+  let stoppedChat = null;
+  const mockPlayback = {
+    stop: async (c) => { stoppedChat = c; return { ok: true }; }
+  };
+
+  const mockApp = {
+    db,
+    cinemaPlayback: mockPlayback
+  };
+
+  const destinations = new CinemaDestinationManager({ app: mockApp, db });
+
+  // 1. Admin demotion: Video chat permission stripped
+  const demotionUpdate = {
+    chat: { id: chatId, type: 'channel' },
+    new_chat_member: {
+      status: 'administrator',
+      can_manage_video_chats: false,
+      can_post_messages: true
+    }
+  };
+
+  const demoteRes = await destinations.handleChatMemberUpdated(demotionUpdate);
+  assert.equal(demoteRes.status, 'restricted');
+  assert.equal(stoppedChat, chatId);
+
+  let dest = destinations.getDestinationByChatId(chatId);
+  assert.equal(dest.botStatus, 'restricted');
+
+  // 2. Re-granting video chat permissions restores active status
+  const restoreUpdate = {
+    chat: { id: chatId, type: 'channel' },
+    new_chat_member: {
+      status: 'administrator',
+      can_manage_video_chats: true,
+      can_post_messages: true
+    }
+  };
+
+  const restoreRes = await destinations.handleChatMemberUpdated(restoreUpdate);
+  assert.equal(restoreRes.status, 'active');
+  dest = destinations.getDestinationByChatId(chatId);
+  assert.equal(dest.botStatus, 'active');
+
+  // 3. Bot kicked / removed from channel
+  stoppedChat = null;
+  const kickUpdate = {
+    chat: { id: chatId, type: 'channel' },
+    new_chat_member: {
+      status: 'kicked'
+    }
+  };
+
+  const kickRes = await destinations.handleChatMemberUpdated(kickUpdate);
+  assert.equal(kickRes.status, 'revoked');
+  assert.equal(stoppedChat, chatId);
+
+  dest = destinations.getDestinationByChatId(chatId);
+  assert.equal(dest.botStatus, 'revoked');
+});

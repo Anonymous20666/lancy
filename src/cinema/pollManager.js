@@ -63,6 +63,7 @@ export class SynchronizedPollManager {
     const timer = setTimeout(() => {
       this.finalizePoll(pollSessionId).catch(() => {});
     }, secondsUntilClose * 1000);
+    timer?.unref?.();
 
     this.activePollTimers.set(pollSessionId, timer);
 
@@ -93,6 +94,26 @@ export class SynchronizedPollManager {
     );
 
     return { ok: true, message: 'Vote recorded!' };
+  }
+
+  getActivePoll(chatId) {
+    const numChat = Number(chatId);
+    const row = this.db.get(
+      `SELECT p.* FROM cinema_poll_sessions p
+       JOIN cinema_destinations d ON p.destination_id = d.id
+       WHERE d.chat_id = ? AND p.status = 'open'
+       ORDER BY p.id DESC LIMIT 1`,
+      numChat
+    );
+    if (!row) return null;
+    return {
+      pollSessionId: row.poll_session_id,
+      playbackSessionId: row.playback_session_id,
+      status: row.status,
+      openedAt: row.opened_at,
+      closesAt: row.closes_at,
+      candidates: JSON.parse(row.candidates_json || '[]')
+    };
   }
 
   getPollResults(pollSessionId) {
