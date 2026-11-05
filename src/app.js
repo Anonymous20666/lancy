@@ -44,6 +44,7 @@ import { createMusicScreen } from './telegram/screens/music.js';
 import { createCinemaScreen } from './cinema/screen.js';
 import { MovieApiClient } from './cinema/movieApi.js';
 import { CinemaDestinationManager } from './cinema/destinations.js';
+import { CinemaStreamResolver } from './cinema/streamResolver.js';
 import { CinemaPlaybackAdapter } from './cinema/playbackAdapter.js';
 import { CinemaQueueManager } from './cinema/queueManager.js';
 import { SynchronizedPollManager } from './cinema/pollManager.js';
@@ -175,7 +176,8 @@ export class LancyApp {
     // ── Cinema Streaming Module ──
     this.movieApi = new MovieApiClient({ log: this.log });
     this.cinemaDestinations = new CinemaDestinationManager({ app: this, db: this.db, log: this.log });
-    this.cinemaPlayback = new CinemaPlaybackAdapter({ app: this, db: this.db, voiceClient: this.voiceClient, log: this.log });
+    this.cinemaResolver = new CinemaStreamResolver({ app: this, log: this.log });
+    this.cinemaPlayback = new CinemaPlaybackAdapter({ app: this, db: this.db, voiceClient: this.voiceClient, streamResolver: this.cinemaResolver, log: this.log });
     this.cinemaQueue = new CinemaQueueManager({ app: this, db: this.db, api: this.movieApi, playbackAdapter: this.cinemaPlayback, log: this.log });
     this.cinemaPoll = new SynchronizedPollManager({ app: this, db: this.db, queueManager: this.cinemaQueue, playbackAdapter: this.cinemaPlayback, log: this.log });
     this.cinemaCards = new CinemaCardManager({ app: this, db: this.db, log: this.log });

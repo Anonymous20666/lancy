@@ -8,6 +8,7 @@ import { SynchronizedPollManager } from '../src/cinema/pollManager.js';
 import { CinemaPlaybackAdapter } from '../src/cinema/playbackAdapter.js';
 import { CinemaApiRouter } from '../src/cinema/apiRouter.js';
 import { CinemaCardManager } from '../src/cinema/cardManager.js';
+import { CinemaStreamResolver } from '../src/cinema/streamResolver.js';
 
 test('Cinema: MovieApiClient queries live API and caches results', async () => {
   const client = new MovieApiClient();
@@ -297,4 +298,39 @@ test('Cinema: CinemaPlaybackAdapter streams media and executes TV progression on
   assert.ok(nextSession);
   assert.equal(nextSession.episode, 2);
   assert.equal(nextSession.title, 'Episode 2');
+});
+
+test('Cinema: CinemaStreamResolver resolves direct media and caches server streams', async () => {
+  const mockApp = {
+    movieApi: {
+      getPlayback: async (id) => ({
+        available: true,
+        embed_url: `https://player.cinezo.live/embed/movie/${id}`,
+        servers: [
+          { id: 'cinezo', url: `https://player.cinezo.live/embed/movie/${id}` },
+          { id: 'direct_hls', url: `https://cdn.movies.test/${id}/master.m3u8` }
+        ]
+      })
+    }
+  };
+
+  const resolver = new CinemaStreamResolver({ app: mockApp, cacheTtlMs: 60000 });
+
+  // 1. Direct media URL pass-through
+  const direct = await resolver.resolve({ sourceUrl: 'https://cdn.example.com/stream.m3u8' });
+  assert.equal(direct.ok, true);
+  assert.equal(direct.streamUrl, 'https://cdn.example.com/stream.m3u8');
+  assert.equal(direct.isHls, true);
+
+  // 2. Resolve via movie API
+  const resolved = await resolver.resolve({ mediaType: 'movie', mediaId: '100' });
+  assert.equal(resolved.ok, true);
+  assert.ok(resolved.streamUrl);
+  assert.equal(resolved.cached, false);
+
+  // 3. Cache hit on second call
+  const cached = await resolver.resolve({ mediaType: 'movie', mediaId: '100' });
+  assert.equal(cached.ok, true);
+  assert.equal(cached.cached, true);
+  assert.equal(cached.streamUrl, resolved.streamUrl);
 });

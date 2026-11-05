@@ -15,10 +15,11 @@ export class CinemaPlaybackError extends Error {
 }
 
 export class CinemaPlaybackAdapter {
-  constructor({ app, db, voiceClient, cacheDir, log } = {}) {
+  constructor({ app, db, voiceClient, streamResolver, cacheDir, log } = {}) {
     this.app = app;
     this.db = db || app?.db;
     this.voice = voiceClient || app?.voiceClient;
+    this.resolver = streamResolver || app?.cinemaResolver;
     this.cacheDir = cacheDir || join(process.cwd(), 'data/cache/music');
     this.log = log || logger().child({ module: 'cinema:playback-adapter' });
     this.activeSessions = new Map(); // chatId -> sessionState
@@ -102,7 +103,26 @@ export class CinemaPlaybackAdapter {
     const numChat = Number(chatId);
     let resolvedSource = source || filePath;
 
-    // If no direct source, attempt resolution from Movie API
+    // Use CinemaStreamResolver if available
+    const resolver = this.resolver || this.app?.cinemaResolver;
+    if (!resolvedSource && resolver) {
+      try {
+        const res = await resolver.resolve({
+          mediaType,
+          mediaId,
+          season,
+          episode,
+          sourceUrl: source
+        });
+        if (res?.streamUrl) {
+          resolvedSource = res.streamUrl;
+        }
+      } catch (err) {
+        this.log.warn({ err: err?.message, mediaId }, 'Stream resolver error');
+      }
+    }
+
+    // Direct fallback to Movie API if resolver didn't provide
     if (!resolvedSource && mediaId && this.app?.movieApi) {
       try {
         const pb = await this.app.movieApi.getPlayback(mediaId, { type: mediaType, season, episode });
