@@ -315,7 +315,7 @@ export class CinemaPlaybackAdapter {
       this.log.info({ numChat, title, resolvedSource, offset }, 'Starting Cinema stream via VoiceClient');
 
       const playOpts = {
-        isChannel: Boolean(isChannel),
+        isChannel: isChannelDest,
         video: true,
         playbackId,
         durationSeconds: duration || finalDuration,

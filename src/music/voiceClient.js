@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { logger } from '../core/logger.js';
@@ -10,7 +10,16 @@ export class VoiceClient {
     this.app = app; this.port = Number(process.env.VOICE_BRIDGE_PORT || port); this.host = process.env.VOICE_BRIDGE_HOST || host;
     if (!['127.0.0.1','::1'].includes(this.host)) throw new Error('Voice bridge must use loopback');
     this.baseUrl = `http://${this.host === '::1' ? '[::1]' : this.host}:${this.port}`;
-    this.token = process.env.VOICE_BRIDGE_TOKEN || randomBytes(32).toString('hex');
+    let token = process.env.VOICE_BRIDGE_TOKEN;
+    const tokenPath = join(this.app?.root || './data', 'secrets', 'voice-bridge.token');
+    if (existsSync(tokenPath)) {
+      try { token = readFileSync(tokenPath, 'utf8').trim(); } catch {}
+    }
+    if (!token) {
+      token = randomBytes(32).toString('hex');
+      try { writeFileSync(tokenPath, token, { mode: 0o600 }); } catch {}
+    }
+    this.token = token;
     this.log = log || logger().child({ module: 'voice-client' }); this.process = null; this.starting = null; this.closed = false;
   }
   async ensureDaemon() {

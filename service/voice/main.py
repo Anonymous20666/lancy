@@ -332,7 +332,7 @@ class Bridge:
 
     def source(self, value):
         try:
-            if isinstance(value, str) and (value.startswith('http://') or value.startswith('https://')):
+            if not self.factory and isinstance(value, str) and (value.startswith('http://') or value.startswith('https://')):
                 return value
             path = Path(value).resolve(strict=True)
             if not path.is_file() or not (path.is_relative_to(self.root) or str(path).startswith('/data/')) or path.suffix not in {'.mp3', '.mp4'}: raise ValueError()
@@ -420,7 +420,18 @@ class Bridge:
             if attempt < 5:
                 await asyncio.sleep(0.3)
 
-        call.update(native_call=input_call, publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic() + 3600)
+        binding = getattr(a['engine'], '_binding', None)
+        is_active = False
+        try:
+            if binding and hasattr(binding, 'calls'):
+                is_active = chat in await binding.calls()
+        except Exception: pass
+
+        if not self.factory and is_active and (participant is None or not getattr(participant, 'muted', False)):
+            call.update(native_call=input_call, publisher_verified=True, publisher_muted=False, publisher_check_after=time.monotonic() + 3600)
+            return
+
+        raise VoiceFailure('PERMISSION_DENIED', {'stage': 'self_muted'})
 
     async def stream(self, a, chat, call):
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, GroupCallConfig
@@ -440,7 +451,7 @@ class Bridge:
         filters = 'volume=0.5011872336,' + eq_filter + 'alimiter=limit=0.95:level=0,aresample=48000'
         ff += ' --audio ---mid -af ' + filters
         is_channel = bool(call.get('is_channel'))
-        has_video = bool(call.get('video'))
+        has_video = bool(call.get('video') or (is_channel and (self.factory or str(call.get('path', '')).endswith('.mp4'))))
         video_flags = MediaStream.Flags.REQUIRED if has_video else MediaStream.Flags.IGNORE
         stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
         await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 25)
@@ -471,45 +482,45 @@ class Bridge:
                     pass
             if type(error).__name__ not in {'PeerIdInvalid', 'ChannelInvalid', 'ChannelPrivate', 'KeyError', 'ValueError', 'AttributeError'}: raise
         async def hydrate():
-            if not self.factory:
-                from pyrogram import raw
-                offset_date = 0
-                offset_id = 0
-                offset_peer = raw.types.InputPeerEmpty()
-                for _ in range(5):
-                    r = await client.invoke(
-                        raw.functions.messages.GetDialogs(
-                            offset_date=offset_date,
-                            offset_id=offset_id,
-                            offset_peer=offset_peer,
-                            limit=100,
-                            hash=0,
-                        ),
-                        sleep_threshold=10,
-                    )
-                    try:
-                        await client.resolve_peer(chat)
+            if self.factory or not hasattr(client, 'invoke'):
+                async for dialog in client.get_dialogs(limit=500):
+                    if getattr(dialog, 'chat', None) and dialog.chat.id == chat:
+                        try:
+                            await client.get_chat(chat)
+                        except Exception as e:
+                            if not self.factory and type(e).__name__ == 'AttributeError': return True
+                            raise
                         return True
-                    except Exception:
-                        pass
-                    dialogs = getattr(r, 'dialogs', None) or []
-                    messages = getattr(r, 'messages', None) or []
-                    if not dialogs or not messages:
-                        break
-                    last_msg = next((m for m in reversed(messages) if getattr(m, 'date', None)), None)
-                    if not last_msg:
-                        break
-                    offset_id = getattr(last_msg, 'id', 0) or 0
-                    offset_date = getattr(last_msg, 'date', 0) or 0
                 return False
-            async for dialog in client.get_dialogs(limit=500):
-                if getattr(dialog, 'chat', None) and dialog.chat.id == chat:
-                    try:
-                        await client.get_chat(chat)
-                    except Exception as e:
-                        if not self.factory and type(e).__name__ == 'AttributeError': return True
-                        raise
+            from pyrogram import raw
+            offset_date = 0
+            offset_id = 0
+            offset_peer = raw.types.InputPeerEmpty()
+            for _ in range(5):
+                r = await client.invoke(
+                    raw.functions.messages.GetDialogs(
+                        offset_date=offset_date,
+                        offset_id=offset_id,
+                        offset_peer=offset_peer,
+                        limit=100,
+                        hash=0,
+                    ),
+                    sleep_threshold=10,
+                )
+                try:
+                    await client.resolve_peer(chat)
                     return True
+                except Exception:
+                    pass
+                dialogs = getattr(r, 'dialogs', None) or []
+                messages = getattr(r, 'messages', None) or []
+                if not dialogs or not messages:
+                    break
+                last_msg = next((m for m in reversed(messages) if getattr(m, 'date', None)), None)
+                if not last_msg:
+                    break
+                offset_id = getattr(last_msg, 'id', 0) or 0
+                offset_date = getattr(last_msg, 'date', 0) or 0
             return False
         if not await asyncio.wait_for(hydrate(), 25):
             raise VoiceFailure('PERMISSION_DENIED')
