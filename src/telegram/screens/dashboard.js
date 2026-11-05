@@ -170,15 +170,15 @@ ${stickerSection}
     // Primary navigation — grouped rows.
     b.heading('୨୧ quick actions', 3);
     if (isGroup) {
-      // In groups: WhatsApp and AI are omitted; highlight Game Arena!
+      // In groups: WhatsApp and AI are omitted; highlight Game Arena & Cinema!
       b.buttons([
+        richButton.callback('🎬 Cinema', encodeCallback('cinema', 'open'), { style: 'primary' }),
         richButton.callback('🎮 Game Arena', 'game_hub:visual', { style: 'success' }),
-        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
-        richButton.callback('Player', encodeCallback('music', 'openplayer'))
+        richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play'))
       ]);
       b.buttons([
-        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open')),
-        richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open'))
+        richButton.callback('Player', encodeCallback('music', 'openplayer')),
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
       ]);
       b.buttons([
         richButton.callback('🏆 Leaderboard', 'game_lb:group'),
@@ -188,8 +188,11 @@ ${stickerSection}
         richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
       ]);
     } else {
-      // In private chat: Full dashboard with Game Arena & Clone Bot
-      b.buttons([richButton.callback('Channel Play', encodeCallback('music', 'channels'))]);
+      // In private chat: Full dashboard with Cinema & Game Arena
+      b.buttons([
+        richButton.callback('🎬 STREAM MOVIES', encodeCallback('cinema', 'open'), { style: 'primary' }),
+        richButton.callback('Channel Play', encodeCallback('music', 'channels'))
+      ]);
       b.buttons([
         richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
         richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))

@@ -383,4 +383,87 @@ CREATE TABLE IF NOT EXISTS group_members (
   PRIMARY KEY (chat_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_group_members_chat ON group_members(chat_id);
+
+-- PAPPY CINEMA TABLES --
+CREATE TABLE IF NOT EXISTS cinema_destinations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL UNIQUE,
+  chat_type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  username TEXT,
+  bot_status TEXT NOT NULL DEFAULT 'active',
+  verified_rights_json TEXT NOT NULL DEFAULT '{}',
+  public_card_msg_id INTEGER,
+  token_hash TEXT NOT NULL,
+  voting_enabled INTEGER NOT NULL DEFAULT 0,
+  settings_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  last_verified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cinema_authorized_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_id INTEGER NOT NULL REFERENCES cinema_destinations(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  role TEXT NOT NULL DEFAULT 'dj',
+  granted_by INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  revoked_at TEXT,
+  UNIQUE(destination_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS cinema_playback_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_id INTEGER NOT NULL REFERENCES cinema_destinations(id) ON DELETE CASCADE,
+  session_id TEXT NOT NULL UNIQUE,
+  media_type TEXT NOT NULL,
+  media_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  season INTEGER,
+  episode INTEGER,
+  playback_state TEXT NOT NULL DEFAULT 'IDLE',
+  position_seconds REAL NOT NULL DEFAULT 0.0,
+  duration_seconds REAL NOT NULL DEFAULT 0.0,
+  started_at TEXT,
+  ends_at TEXT,
+  revision INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cinema_queue_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_id INTEGER NOT NULL REFERENCES cinema_destinations(id) ON DELETE CASCADE,
+  queue_item_id TEXT NOT NULL UNIQUE,
+  media_type TEXT NOT NULL,
+  media_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  season INTEGER,
+  episode INTEGER,
+  position INTEGER NOT NULL,
+  origin TEXT NOT NULL DEFAULT 'manual',
+  added_by INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cinema_poll_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  destination_id INTEGER NOT NULL REFERENCES cinema_destinations(id) ON DELETE CASCADE,
+  poll_session_id TEXT NOT NULL UNIQUE,
+  playback_session_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  opened_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  closes_at TEXT,
+  candidates_json TEXT NOT NULL DEFAULT '[]',
+  winner_queue_item_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cinema_votes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  poll_session_id TEXT NOT NULL REFERENCES cinema_poll_sessions(poll_session_id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL,
+  queue_item_id TEXT NOT NULL,
+  voted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(poll_session_id, user_id)
+);
 `;

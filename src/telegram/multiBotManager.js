@@ -18,6 +18,7 @@ import { createCloneScreen } from './screens/clone.js';
 import { createChannelPostScreen } from './screens/channelPost.js';
 import { createAutoPostScreen } from './screens/autoPost.js';
 import { createNsfwScreen } from './screens/nsfw.js';
+import { createCinemaScreen } from '../cinema/screen.js';
 
 const SCREEN_FACTORIES = [
   createDashboardScreen,
@@ -31,7 +32,8 @@ const SCREEN_FACTORIES = [
   createCloneScreen,
   createChannelPostScreen,
   createAutoPostScreen,
-  createNsfwScreen
+  createNsfwScreen,
+  createCinemaScreen
 ];
 
 /**

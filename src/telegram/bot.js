@@ -4346,6 +4346,12 @@ export class TelegramController extends EventEmitter {
         updateScreenMsg(sent);
         return;
       }
+      if (command === '/cinema' || command === '/movies' || command === '/movie') {
+        const cinema = this.screens.get('cinema');
+        const sent = await cinema?.open(this.#ctx(tgId, { message }, { forceNew: true }));
+        updateScreenMsg(sent);
+        return;
+      }
       if (command === '/help' || command === '/commands' || command === '/cmds') {
         if (isGroup) {
           await this.handleCommandSuggestions(message, activePrefix);

@@ -41,6 +41,12 @@ import { createChannelPostScreen } from './telegram/screens/channelPost.js';
 import { createAutoPostScreen } from './telegram/screens/autoPost.js';
 import { createNsfwScreen } from './telegram/screens/nsfw.js';
 import { createMusicScreen } from './telegram/screens/music.js';
+import { createCinemaScreen } from './cinema/screen.js';
+import { MovieApiClient } from './cinema/movieApi.js';
+import { CinemaDestinationManager } from './cinema/destinations.js';
+import { CinemaPlaybackAdapter } from './cinema/playbackAdapter.js';
+import { CinemaQueueManager } from './cinema/queueManager.js';
+import { SynchronizedPollManager } from './cinema/pollManager.js';
 import { MultiBotManager } from './telegram/multiBotManager.js';
 import { VoiceClient } from './music/voiceClient.js';
 import { QueueManager as MusicQueueManager } from './music/queueManager.js';
@@ -165,6 +171,13 @@ export class LancyApp {
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
 
+    // ── Cinema Streaming Module ──
+    this.movieApi = new MovieApiClient({ log: this.log });
+    this.cinemaDestinations = new CinemaDestinationManager({ app: this, db: this.db, log: this.log });
+    this.cinemaPlayback = new CinemaPlaybackAdapter({ app: this, db: this.db, voiceClient: this.voiceClient, log: this.log });
+    this.cinemaQueue = new CinemaQueueManager({ app: this, db: this.db, api: this.movieApi, playbackAdapter: this.cinemaPlayback, log: this.log });
+    this.cinemaPoll = new SynchronizedPollManager({ app: this, db: this.db, queueManager: this.cinemaQueue, playbackAdapter: this.cinemaPlayback, log: this.log });
+
     // ── Screens ──
     this.screens = new Map();
   }
@@ -212,7 +225,7 @@ export class LancyApp {
       createDashboardScreen, createPinterestScreen, createStickersScreen,
       createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
       createDownloaderScreen, createCloneScreen, createChannelPostScreen,
-      createAutoPostScreen, createNsfwScreen, createMusicScreen
+      createAutoPostScreen, createNsfwScreen, createMusicScreen, createCinemaScreen
     ];
     for (const factory of factories) {
       const screen = factory({ app: this });

@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import { parseDurationToSeconds } from '../utils/time.js';
 import { optimizeVideoForTelegram, getCookieArgs, getAudioDurationSeconds } from './downloader.js';
 import { resolveAndDownloadAudio } from './musicResolver.js';
+import { CinemaApiRouter } from '../cinema/apiRouter.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -24,6 +25,7 @@ export class VideoStreamingServer {
     this.server = null;
     this.activeDownloads = new Map();
     this.activeAudioDownloads = new Map();
+    this.cinemaRouter = new CinemaApiRouter({ app: this.app, log: this.log });
 
     try {
       mkdirSync(this.cacheDir, { recursive: true });
@@ -72,6 +74,11 @@ export class VideoStreamingServer {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
       res.end(JSON.stringify({ ok: true, service: 'video-streamer', time: Date.now() }));
       return;
+    }
+
+    // Cinema Mini App API handler
+    if (pathname.startsWith('/cinema/api')) {
+      return this.cinemaRouter.handle(req, res, parsedUrl);
     }
 
     // 1. Audio stream request (/audio/:id/:filename? or /audio/live/:id/:filename?)
