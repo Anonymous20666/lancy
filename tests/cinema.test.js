@@ -7,6 +7,7 @@ import { CinemaQueueManager } from '../src/cinema/queueManager.js';
 import { SynchronizedPollManager } from '../src/cinema/pollManager.js';
 import { CinemaPlaybackAdapter } from '../src/cinema/playbackAdapter.js';
 import { CinemaApiRouter } from '../src/cinema/apiRouter.js';
+import { CinemaCardManager } from '../src/cinema/cardManager.js';
 
 test('Cinema: MovieApiClient queries live API and caches results', async () => {
   const client = new MovieApiClient();
@@ -201,4 +202,99 @@ test('Cinema: DestinationManager registers by @handle and verifies permissions w
   // Verify authorization
   const auth = dm.isAuthorized(-1002345678, 99999);
   assert.equal(auth, true);
+});
+
+test('Cinema: CinemaCardManager builds Bot API 10.3 compliant Now Playing card', () => {
+  const db = new Database(':memory:');
+  const app = {
+    cinemaDestinations: {
+      generateToken: (cid) => `${cid}_token`,
+      getMiniAppUrl: (t) => `https://test.app/cinema/?dest=${t}`
+    },
+    telegram: { botUsername: 'Lancy_easy_bot' }
+  };
+
+  const cardMgr = new CinemaCardManager({ app, db });
+  const dest = { chatId: -100123456, title: 'Cinema Supergroup' };
+  const session = {
+    title: 'Interstellar',
+    mediaType: 'movie',
+    state: 'PLAYING',
+    position: 1800,
+    duration: 7200
+  };
+  const queue = [{ title: 'Inception', media_type: 'movie' }];
+
+  const card = cardMgr.buildNowPlayingCard(dest, session, queue);
+  assert.ok(card);
+  assert.ok(Array.isArray(card.blocks));
+  // Verify Mini App button is present in buttons block
+  const buttonBlock = card.blocks.find(b => b.type === 'buttons');
+  assert.ok(buttonBlock);
+  assert.ok(buttonBlock.buttons[0].web_app?.url);
+});
+
+test('Cinema: CinemaPlaybackAdapter streams media and executes TV progression on stream end', async () => {
+  const db = new Database(':memory:');
+  let playedSource = null;
+  let playedOpts = null;
+
+  const mockVoice = {
+    play: async (chatId, source, opts) => {
+      playedSource = source;
+      playedOpts = opts;
+      return { ok: true };
+    },
+    pause: async () => ({ ok: true }),
+    resume: async () => ({ ok: true }),
+    seek: async () => ({ ok: true }),
+    stop: async () => ({ ok: true })
+  };
+
+  const mockApp = {
+    db,
+    cinemaCards: { postOrUpdateCard: async () => {} },
+    movieApi: {
+      getPlayback: async () => ({ embed_url: 'https://cdn.streams.test/breaking_bad_s01e02.m3u8' })
+    },
+    cinemaQueue: {
+      getNextItem: async () => null,
+      resolveNextEpisode: async (tvId, s, e) => {
+        if (s === 1 && e === 1) return { mediaId: tvId, season: 1, episode: 2, title: 'Episode 2' };
+        return null;
+      },
+      removeFromQueue: () => {}
+    }
+  };
+
+  const adapter = new CinemaPlaybackAdapter({ app: mockApp, db, voiceClient: mockVoice });
+  const chatId = -100999888;
+
+  // Insert destination
+  db.run("INSERT INTO cinema_destinations (chat_id, chat_type, title, token_hash) VALUES (?, 'channel', 'Test Channel', 'thash')", chatId);
+
+  // Play TV Series episode
+  const session = await adapter.play(chatId, {
+    mediaType: 'tv',
+    mediaId: '500',
+    title: 'Breaking Bad',
+    season: 1,
+    episode: 1,
+    source: 'https://cdn.streams.test/breaking_bad_s01e01.m3u8',
+    duration: 3600
+  });
+
+  assert.equal(session.state, 'PLAYING');
+  assert.equal(playedSource, 'https://cdn.streams.test/breaking_bad_s01e01.m3u8');
+  assert.equal(playedOpts.video, true);
+  assert.equal(playedOpts.isChannel, true);
+
+  // Trigger stream end event
+  await adapter.handleStreamEnded(chatId, session.playbackId);
+
+  // Verify progression: episode 2 should now be playing!
+  const nextSession = adapter.getCurrentSession(chatId);
+  assert.ok(nextSession);
+  assert.equal(nextSession.episode, 2);
+  assert.equal(nextSession.title, 'Episode 2');
 });

@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync, statSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -22,6 +22,35 @@ export class CinemaPlaybackAdapter {
     this.cacheDir = cacheDir || join(process.cwd(), 'data/cache/music');
     this.log = log || logger().child({ module: 'cinema:playback-adapter' });
     this.activeSessions = new Map(); // chatId -> sessionState
+    this.eventAbort = null;
+  }
+
+  startEventListener() {
+    if (!this.voice?.waitEvent || this.eventAbort) return;
+    this.eventAbort = new AbortController();
+    const loop = async () => {
+      while (!this.eventAbort?.signal?.aborted) {
+        try {
+          const result = await this.voice.waitEvent(this.eventAbort.signal);
+          for (const event of result?.events || []) {
+            if (event.status === 'ended' && String(event.playback_id || '').startsWith('pb_cinema_')) {
+              await this.handleStreamEnded(event.chat_id, event.playback_id).catch(() => {});
+            }
+          }
+        } catch (err) {
+          if (this.eventAbort?.signal?.aborted) break;
+          await new Promise(r => setTimeout(r, 2000));
+        }
+      }
+    };
+    loop().catch(() => {});
+  }
+
+  stopEventListener() {
+    if (this.eventAbort) {
+      this.eventAbort.abort();
+      this.eventAbort = null;
+    }
   }
 
   async probeMedia(filePath) {
@@ -64,14 +93,38 @@ export class CinemaPlaybackAdapter {
     title,
     season = null,
     episode = null,
-    filePath,
+    source = null,
+    filePath = null,
     duration = 0,
     offset = 0.0,
     isChannel = true
   } = {}) {
     const numChat = Number(chatId);
-    if (!filePath || !existsSync(filePath)) {
-      throw new CinemaPlaybackError('MEDIA_NOT_READY', 'The media file is not prepared for playback.');
+    let resolvedSource = source || filePath;
+
+    // If no direct source, attempt resolution from Movie API
+    if (!resolvedSource && mediaId && this.app?.movieApi) {
+      try {
+        const pb = await this.app.movieApi.getPlayback(mediaId, { type: mediaType, season, episode });
+        if (pb?.embed_url) {
+          resolvedSource = pb.embed_url;
+        } else if (pb?.servers?.[0]?.url) {
+          resolvedSource = pb.servers[0].url;
+        } else if (pb?.viewing_url) {
+          resolvedSource = pb.viewing_url;
+        }
+      } catch (err) {
+        this.log.warn({ err: err?.message, mediaId }, 'Could not resolve playback URL from Movie API');
+      }
+    }
+
+    if (!resolvedSource) {
+      throw new CinemaPlaybackError('MEDIA_NOT_READY', 'The media source is not available for playback.');
+    }
+
+    const isHttp = /^https?:\/\//i.test(resolvedSource);
+    if (!isHttp && !existsSync(resolvedSource)) {
+      throw new CinemaPlaybackError('FILE_NOT_FOUND', 'Local media file not found on disk.');
     }
 
     const sessionId = `cinema_${numChat}_${Date.now()}`;
@@ -84,30 +137,41 @@ export class CinemaPlaybackAdapter {
     this.db.run(
       `INSERT INTO cinema_playback_sessions 
        (destination_id, session_id, media_type, media_id, title, season, episode, playback_state, position_seconds, duration_seconds, started_at, revision)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARING', ?, ?, datetime('now'), 1)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'PREPARING', ?, ?, CURRENT_TIMESTAMP, 1)
        ON CONFLICT(session_id) DO UPDATE SET
          playback_state = 'PREPARING',
-         updated_at = datetime('now')`,
-      destinationId, sessionId, mediaType, String(mediaId), title, season, episode, offset, duration
+         updated_at = CURRENT_TIMESTAMP`,
+      destinationId, sessionId, mediaType, String(mediaId || '0'), title || 'Untitled Stream', season, episode, offset, duration
     );
 
     try {
-      this.log.info({ numChat, title, filePath, offset }, 'Starting Cinema stream via VoiceClient');
+      this.log.info({ numChat, title, resolvedSource, offset }, 'Starting Cinema stream via VoiceClient');
 
-      // Native PyTgCalls play via VoiceClient
-      await this.voice.play(numChat, filePath, {
+      const playOpts = {
         isChannel: Boolean(isChannel),
         video: true,
         playbackId,
         durationSeconds: duration,
         bass: false,
         eq: 'off'
-      });
+      };
+
+      // Native PyTgCalls play via VoiceClient with auto-creation of voice chat
+      try {
+        await this.voice.play(numChat, resolvedSource, playOpts);
+      } catch (playErr) {
+        if (['NO_ACTIVE_CALL', 'CALL_FAILED'].includes(playErr?.code) && typeof this.voice?.setup === 'function') {
+          await this.voice.setup(numChat, 'start', { create: true }).catch(() => null);
+          await this.voice.play(numChat, resolvedSource, playOpts);
+        } else {
+          throw playErr;
+        }
+      }
 
       // Update state to PLAYING
       this.db.run(
         `UPDATE cinema_playback_sessions 
-         SET playback_state = 'PLAYING', position_seconds = ?, revision = revision + 1, updated_at = datetime('now')
+         SET playback_state = 'PLAYING', position_seconds = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
          WHERE session_id = ?`,
         offset, sessionId
       );
@@ -118,11 +182,11 @@ export class CinemaPlaybackAdapter {
         chatId: numChat,
         destinationId,
         mediaType,
-        mediaId: String(mediaId),
-        title,
+        mediaId: String(mediaId || '0'),
+        title: title || 'Untitled Stream',
         season,
         episode,
-        filePath,
+        source: resolvedSource,
         duration,
         position: offset,
         state: 'PLAYING',
@@ -131,11 +195,17 @@ export class CinemaPlaybackAdapter {
       };
 
       this.activeSessions.set(numChat, sessionObj);
+
+      // Post / Update Public Now-Playing Card in Channel
+      if (this.app?.cinemaCards?.postOrUpdateCard) {
+        this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
+      }
+
       return sessionObj;
     } catch (err) {
       this.db.run(
         `UPDATE cinema_playback_sessions 
-         SET playback_state = 'FAILED', updated_at = datetime('now')
+         SET playback_state = 'FAILED', updated_at = CURRENT_TIMESTAMP
          WHERE session_id = ?`,
         sessionId
       );
@@ -144,17 +214,84 @@ export class CinemaPlaybackAdapter {
     }
   }
 
+  async handleStreamEnded(chatId, playbackId) {
+    const numChat = Number(chatId);
+    const active = this.activeSessions.get(numChat);
+    if (!active || (playbackId && active.playbackId !== playbackId)) {
+      return;
+    }
+
+    this.log.info({ numChat, playbackId, title: active.title }, 'Cinema stream ended, checking queue and progression');
+
+    // Mark current session completed
+    this.db.run(
+      `UPDATE cinema_playback_sessions 
+       SET playback_state = 'COMPLETED', revision = revision + 1, updated_at = CURRENT_TIMESTAMP
+       WHERE session_id = ?`,
+      active.sessionId
+    );
+    this.activeSessions.delete(numChat);
+
+    // 1. Check if queue has a queued item
+    const nextQueueItem = this.app?.cinemaQueue ? await this.app.cinemaQueue.getNextItem(numChat) : null;
+    if (nextQueueItem) {
+      this.app.cinemaQueue.removeFromQueue(numChat, nextQueueItem.queue_item_id);
+      try {
+        await this.play(numChat, {
+          mediaType: nextQueueItem.media_type,
+          mediaId: nextQueueItem.media_id,
+          title: nextQueueItem.title,
+          season: nextQueueItem.season,
+          episode: nextQueueItem.episode,
+          isChannel: true
+        });
+        return;
+      } catch (err) {
+        this.log.warn({ err: err?.message, numChat }, 'Failed to play next queued cinema item');
+      }
+    }
+
+    // 2. If current media was TV and queue is empty, check TV progression:
+    if (active.mediaType === 'tv' && active.season != null && active.episode != null && this.app?.cinemaQueue) {
+      const nextEp = await this.app.cinemaQueue.resolveNextEpisode(active.mediaId, active.season, active.episode);
+      if (nextEp) {
+        try {
+          this.log.info({ numChat, nextEp }, 'Auto-progressing to next TV episode');
+          await this.play(numChat, {
+            mediaType: 'tv',
+            mediaId: nextEp.mediaId,
+            title: nextEp.title,
+            season: nextEp.season,
+            episode: nextEp.episode,
+            isChannel: true
+          });
+          return;
+        } catch (err) {
+          this.log.warn({ err: err?.message, numChat }, 'Failed auto TV episode progression');
+        }
+      }
+    }
+
+    // 3. Queue empty and no more episodes — stream concluded
+    if (this.app?.cinemaCards?.postOrUpdateCard) {
+      this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
+    }
+  }
+
   async pause(chatId) {
     const numChat = Number(chatId);
     await this.voice.pause(numChat);
     this.db.run(
       `UPDATE cinema_playback_sessions 
-       SET playback_state = 'PAUSED', revision = revision + 1, updated_at = datetime('now')
+       SET playback_state = 'PAUSED', revision = revision + 1, updated_at = CURRENT_TIMESTAMP
        WHERE destination_id = (SELECT id FROM cinema_destinations WHERE chat_id = ?) AND playback_state = 'PLAYING'`,
       numChat
     );
     const active = this.activeSessions.get(numChat);
     if (active) active.state = 'PAUSED';
+    if (this.app?.cinemaCards?.postOrUpdateCard) {
+      this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
+    }
     return { ok: true, state: 'PAUSED' };
   }
 
@@ -163,12 +300,15 @@ export class CinemaPlaybackAdapter {
     await this.voice.resume(numChat);
     this.db.run(
       `UPDATE cinema_playback_sessions 
-       SET playback_state = 'PLAYING', revision = revision + 1, updated_at = datetime('now')
+       SET playback_state = 'PLAYING', revision = revision + 1, updated_at = CURRENT_TIMESTAMP
        WHERE destination_id = (SELECT id FROM cinema_destinations WHERE chat_id = ?) AND playback_state = 'PAUSED'`,
       numChat
     );
     const active = this.activeSessions.get(numChat);
     if (active) active.state = 'PLAYING';
+    if (this.app?.cinemaCards?.postOrUpdateCard) {
+      this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
+    }
     return { ok: true, state: 'PLAYING' };
   }
 
@@ -179,7 +319,7 @@ export class CinemaPlaybackAdapter {
 
     this.db.run(
       `UPDATE cinema_playback_sessions 
-       SET position_seconds = ?, revision = revision + 1, updated_at = datetime('now')
+       SET position_seconds = ?, revision = revision + 1, updated_at = CURRENT_TIMESTAMP
        WHERE destination_id = (SELECT id FROM cinema_destinations WHERE chat_id = ?) AND playback_state IN ('PLAYING', 'PAUSED')`,
       targetSeconds, numChat
     );
@@ -188,6 +328,9 @@ export class CinemaPlaybackAdapter {
     if (active) {
       active.position = targetSeconds;
       active.lastUpdated = Date.now();
+    }
+    if (this.app?.cinemaCards?.postOrUpdateCard) {
+      this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
     }
     return { ok: true, position: targetSeconds };
   }
@@ -200,12 +343,15 @@ export class CinemaPlaybackAdapter {
 
     this.db.run(
       `UPDATE cinema_playback_sessions 
-       SET playback_state = 'STOPPED', revision = revision + 1, updated_at = datetime('now')
+       SET playback_state = 'STOPPED', revision = revision + 1, updated_at = CURRENT_TIMESTAMP
        WHERE destination_id = (SELECT id FROM cinema_destinations WHERE chat_id = ?) AND playback_state IN ('PLAYING', 'PAUSED')`,
       numChat
     );
 
     this.activeSessions.delete(numChat);
+    if (this.app?.cinemaCards?.postOrUpdateCard) {
+      this.app.cinemaCards.postOrUpdateCard(numChat).catch(() => {});
+    }
     return { ok: true, state: 'STOPPED' };
   }
 

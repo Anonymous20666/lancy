@@ -131,6 +131,42 @@ export class CinemaApiRouter {
         return sendJson(200, { ok: true, data });
       }
 
+      // Direct Stream Play
+      if (pathname === '/cinema/api/play' && req.method === 'POST') {
+        const body = await readBody();
+        const chatId = this.app.cinemaDestinations.verifyToken(body.dest);
+        if (!chatId) return sendJson(401, { ok: false, error: 'UNAUTHORIZED' });
+
+        const session = await this.app.cinemaPlayback.play(chatId, {
+          mediaType: body.mediaType || 'movie',
+          mediaId: body.mediaId,
+          title: body.title,
+          season: body.season,
+          episode: body.episode,
+          source: body.source || body.sourceUrl || null,
+          offset: parseFloat(body.offset || '0'),
+          duration: parseFloat(body.duration || '0'),
+          isChannel: true
+        });
+        return sendJson(200, { ok: true, session });
+      }
+
+      // Start Community Poll
+      if (pathname === '/cinema/api/poll/start' && req.method === 'POST') {
+        const body = await readBody();
+        const chatId = this.app.cinemaDestinations.verifyToken(body.dest);
+        if (!chatId) return sendJson(401, { ok: false, error: 'UNAUTHORIZED' });
+
+        const durationSeconds = parseInt(body.durationSeconds || '0', 10) || undefined;
+        const poll = await this.app.cinemaPoll.startPoll(chatId, { durationSeconds });
+        if (!poll) return sendJson(400, { ok: false, message: 'Queue is empty or poll could not start' });
+
+        if (this.app?.cinemaCards?.postOrUpdateCard) {
+          this.app.cinemaCards.postOrUpdateCard(chatId).catch(() => {});
+        }
+        return sendJson(200, { ok: true, poll });
+      }
+
       // 3. Status & Authoritative Playback Clock
       if (pathname === '/cinema/api/status') {
         const token = parsedUrl.searchParams.get('dest');

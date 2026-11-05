@@ -349,6 +349,66 @@ export function createCinemaScreen({ app }) {
           return ctx.editScreen(renderMainMenu(ctx));
         }
 
+        case 'card_refresh': {
+          const chatId = Number(args[0]);
+          if (app.cinemaCards?.postOrUpdateCard) {
+            await app.cinemaCards.postOrUpdateCard(chatId);
+            await ctx.answerCallback?.('Now Playing card refreshed!');
+          }
+          return;
+        }
+
+        case 'open_poll': {
+          const chatId = Number(args[0]);
+          const dest = app.cinemaDestinations.getDestinationByChatId(chatId);
+          if (!dest) return;
+          const pollRow = app.db.get(
+            `SELECT poll_session_id FROM cinema_poll_sessions 
+             WHERE destination_id = ? AND status = 'open' 
+             ORDER BY id DESC LIMIT 1`,
+            dest.id
+          );
+          if (!pollRow) {
+            await ctx.answerCallback?.('No active community poll in this destination right now.', { showAlert: true });
+            return;
+          }
+          const pollData = app.cinemaPoll.getPollResults(pollRow.poll_session_id);
+          const b = new RichMessageBuilder();
+          b.paragraph(rt.bold(banner([
+            '🗳 COMMUNITY CINEMA VOTE',
+            dest.title
+          ])));
+          b.divider();
+          b.quote(rt.concat(
+            rt.bold('Vote for the Next Movie / Episode to Stream!\n\n'),
+            rt.text(`Total Votes: ${pollData.totalVotes}\n\n`),
+            ...pollData.candidates.map((c, i) => rt.text(`${i + 1}. ${c.title} — ${c.votes} vote(s)\n`))
+          ));
+          b.divider();
+          for (const cand of pollData.candidates.slice(0, 5)) {
+            b.buttons([
+              richButton.callback(`Vote: ${cand.title.slice(0, 25)}`, encodeCallback(id, 'cast_vote', pollRow.poll_session_id, cand.queueItemId))
+            ]);
+          }
+          b.buttons([
+            richButton.callback('« Back', encodeCallback(id, 'select', dest.chatId))
+          ]);
+          b.validate();
+          return ctx.editScreen(b.toJSON());
+        }
+
+        case 'cast_vote': {
+          const pollSessionId = args[0];
+          const queueItemId = args[1];
+          const res = await app.cinemaPoll.vote(pollSessionId, ctx.tgId, queueItemId);
+          if (res.ok) {
+            await ctx.answerCallback?.('✅ Vote recorded! Result updated in queue.');
+          } else {
+            await ctx.answerCallback?.(res.message || 'Could not record vote.', { showAlert: true });
+          }
+          return;
+        }
+
         case 'connect_dest': {
           const rawTarget = args[0] ? decodeURIComponent(args[0]) : '';
           if (!rawTarget) return ctx.editScreen(renderMainMenu(ctx));

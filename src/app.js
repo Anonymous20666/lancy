@@ -47,6 +47,7 @@ import { CinemaDestinationManager } from './cinema/destinations.js';
 import { CinemaPlaybackAdapter } from './cinema/playbackAdapter.js';
 import { CinemaQueueManager } from './cinema/queueManager.js';
 import { SynchronizedPollManager } from './cinema/pollManager.js';
+import { CinemaCardManager } from './cinema/cardManager.js';
 import { MultiBotManager } from './telegram/multiBotManager.js';
 import { VoiceClient } from './music/voiceClient.js';
 import { QueueManager as MusicQueueManager } from './music/queueManager.js';
@@ -177,6 +178,7 @@ export class LancyApp {
     this.cinemaPlayback = new CinemaPlaybackAdapter({ app: this, db: this.db, voiceClient: this.voiceClient, log: this.log });
     this.cinemaQueue = new CinemaQueueManager({ app: this, db: this.db, api: this.movieApi, playbackAdapter: this.cinemaPlayback, log: this.log });
     this.cinemaPoll = new SynchronizedPollManager({ app: this, db: this.db, queueManager: this.cinemaQueue, playbackAdapter: this.cinemaPlayback, log: this.log });
+    this.cinemaCards = new CinemaCardManager({ app: this, db: this.db, log: this.log });
 
     // ── Screens ──
     this.screens = new Map();
@@ -295,6 +297,10 @@ export class LancyApp {
     // Video HTTP Streaming Server for Telegram Live Inline & Instant Playback
     await this.videoServer.start().catch((err) => this.log.error({ err }, 'failed to start video streaming server'));
 
+    // Start Cinema Card Manager Ticker & Event Listener
+    this.cinemaCards?.startTicker();
+    this.cinemaPlayback?.startEventListener();
+
     // Telegram polling.
     await this.telegram.controller.start();
     await this.multiBotManager.startAll();
@@ -370,6 +376,8 @@ export class LancyApp {
     clearInterval(this.cleanupTimer);
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
+    this.cinemaCards?.stopTicker();
+    this.cinemaPlayback?.stopEventListener();
     await this.musicQueueManager?.shutdown();
     await this.music?.previews?.shutdown();
     await this.screens.get('music')?.cleanup?.();
