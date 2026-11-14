@@ -22,6 +22,13 @@ export const ADMIN_MUSIC_COMMANDS = [
   { command: 'volume', description: 'Admin: adjust the shared call volume' },
   { command: 'loop', description: 'Admin: change repeat mode' },
   { command: 'shuffle', description: 'Admin: shuffle the queued recordings' },
+  { command: 'bass', description: 'Admin: toggle bass boost for the live call' },
+  { command: 'eq', description: 'Admin: cycle or choose audio studio EQ preset' },
+  { command: 'aidj', description: 'Admin: Spotify AI DJ mode (on/off/vibe/chat)' },
+  { command: 'dj', description: 'Admin: chat with AI DJ or manage DJ roles' },
+  { command: 'movie', description: 'Admin: search & stream movies and multi-season TV series' },
+  { command: 'movieai', description: 'Admin: unified AI Movie & Song conversational agent' },
+  { command: 'vcsudo', description: 'Owner/Sudo: authorize users who can control VC in group chats' },
   { command: 'playlist', description: 'Save lists; admins can load into live queues' }
 ];
 export const PRIVATE_CHANNEL_COMMANDS = [

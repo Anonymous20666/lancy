@@ -13,6 +13,7 @@ import { sleep, parseDurationToSeconds } from '../utils/time.js';
 import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
 import { getLyrics, getCachedLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
+import { getStreamPublicUrl } from '../media/streamingServer.js';
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
 import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from './permissions.js';
@@ -460,6 +461,7 @@ export class TelegramController extends EventEmitter {
     if (update.chat_member) return this.#handleChatMemberUpdated(update.chat_member);
     if (update.my_chat_member) return this.#handleMyChatMemberUpdated(update.my_chat_member);
     if (update.chat_join_request) return this.#handleChatJoinRequest(update.chat_join_request);
+    if (update.poll_answer) return this.app?.music?.handlePollAnswer?.(update.poll_answer);
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
@@ -637,6 +639,8 @@ export class TelegramController extends EventEmitter {
       try {
         const res = await execFileAsync('yt-dlp', [
           '--no-warnings',
+          '--flat-playlist',
+          '--skip-download',
           '--js-runtimes', 'node:/usr/bin/node',
           '--ignore-errors',
           '--print', '%(id)s ||| %(title)s ||| %(channel)s ||| %(duration_string)s ||| %(thumbnail)s',
@@ -894,8 +898,8 @@ export class TelegramController extends EventEmitter {
     if (resultId.startsWith('tt_')) {
       const cachedInfo = recentInlineSearchResults.get(resultId);
       const videoId = cachedInfo?.videoId || (resultId.split('_')[1] || '');
-      const videoTitle = cachedInfo?.title || chosen.query?.replace(/^(tt|tiktok)\s*/i, '') || 'TikTok HD Clip';
-      const videoDuration = cachedInfo?.duration || 'HD Clip';
+      let videoTitle = cachedInfo?.title || chosen.query?.replace(/^(tt|tiktok)\s*/i, '') || 'TikTok HD Clip';
+      let videoDuration = cachedInfo?.duration || 'HD Clip';
       const queryTopic = cachedInfo?.query || chosen.query?.replace(/^(tt|tiktok)\s*/i, '') || '';
       const botUser = this.botUsername || 'Lancy_easy_bot';
 
@@ -954,7 +958,7 @@ export class TelegramController extends EventEmitter {
         }
       }
 
-      const directVideoUrl = `https://pappysonghttps.duckdns.org/video/live/${encodeURIComponent(videoId || 'clip')}.mp4`;
+      const directVideoUrl = `${getStreamPublicUrl(this.settings)}/video/live/${encodeURIComponent(videoId || 'clip')}.mp4`;
       const videoMediaTarget = fileId || directVideoUrl;
       if (videoMediaTarget) {
         try {
@@ -1057,8 +1061,8 @@ export class TelegramController extends EventEmitter {
       if (!fileId) {
         try {
           // If VideoStreamingServer is already downloading this exact videoId for Telegram's inline fetch, await it instead of starting a duplicate yt-dlp process
-          if (videoId && this.app?.videoStreamer?.activeAudioDownloads?.has(videoId)) {
-            await this.app.videoStreamer.activeAudioDownloads.get(videoId).catch(() => null);
+          if (videoId && this.app?.videoServer?.activeAudioDownloads?.has(videoId)) {
+            await this.app.videoServer.activeAudioDownloads.get(videoId).catch(() => null);
           }
           const cachedAudioPath = videoId ? `/data/audio_cache/${videoId}.mp3` : null;
           let audioBuffer = null;
@@ -1110,7 +1114,7 @@ export class TelegramController extends EventEmitter {
 
       const safeArtChosen = trackArtist.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
       const safeTitChosen = trackTitle.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
-      const directStreamUrl = `https://pappysonghttps.duckdns.org/audio/live/${encodeURIComponent(videoId || 'track')}/${safeArtChosen}_-_${safeTitChosen}.mp3`;
+      const directStreamUrl = `${getStreamPublicUrl(this.settings)}/audio/live/${encodeURIComponent(videoId || 'track')}/${safeArtChosen}_-_${safeTitChosen}.mp3`;
       const audioMediaTarget = fileId || directStreamUrl;
       if (audioMediaTarget) {
         try {
@@ -1756,9 +1760,10 @@ export class TelegramController extends EventEmitter {
             recentInlineSearchResults.delete(firstKey);
           }
 
+          const streamBase = getStreamPublicUrl(this.settings);
           const streamUrl = existsSync(`/data/video_cache/${item.videoId}.mp4`)
-            ? `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`
-            : (item.videoUrl || `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`);
+            ? `${streamBase}/video/${item.videoId}.mp4`
+            : (item.videoUrl || `${streamBase}/video/${item.videoId}.mp4`);
 
           const durSec = parseDurationToSeconds(item.duration) || 30;
           results.push({
@@ -1995,8 +2000,10 @@ export class TelegramController extends EventEmitter {
           const ytItems = await searchYouTubeFast(cleanTopic, 'NG', { wide: true }).catch(() => []);
 
           if (Array.isArray(ytItems) && ytItems.length > 0) {
+            const streamBase = getStreamPublicUrl(this.settings);
             for (const yt of ytItems) {
               if (!yt?.videoId || !yt?.title) continue;
+              if (yt.isLive || yt.duration === 'LIVE' || /^short$/i.test(String(yt.duration || ''))) continue;
               const normTitle = (yt.title || '').toLowerCase().trim();
               const normAuthor = (yt.author || '').toLowerCase().trim();
               const normKey = `${normTitle} ${normAuthor}`.trim();
@@ -2027,8 +2034,8 @@ export class TelegramController extends EventEmitter {
                 const safeTit = (yt.title || 'Track').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
                 const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
                 const streamUrl = existsSync(`/data/audio_cache/${yt.videoId}.mp3`)
-                  ? `https://pappysonghttps.duckdns.org/audio/${yt.videoId}.mp3`
-                  : `https://pappysonghttps.duckdns.org/audio/live/${yt.videoId}/${cleanSlug}`;
+                  ? `${streamBase}/audio/${yt.videoId}.mp3`
+                  : `${streamBase}/audio/live/${yt.videoId}/${cleanSlug}`;
 
                 this.audioMetadataMap?.set(String(yt.videoId), {
                   id: yt.videoId,
@@ -2078,10 +2085,11 @@ export class TelegramController extends EventEmitter {
               const safeArt = String(t.artist || 'Music').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
               const safeTit = String(t.title || 'Track').replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
               const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
+              const streamBase = getStreamPublicUrl(this.settings);
               const streamUrl = videoId
                 ? (existsSync(`/data/audio_cache/${videoId}.mp3`)
-                  ? `https://pappysonghttps.duckdns.org/audio/${videoId}.mp3`
-                  : `https://pappysonghttps.duckdns.org/audio/live/${videoId}/${cleanSlug}`)
+                  ? `${streamBase}/audio/${videoId}.mp3`
+                  : `${streamBase}/audio/live/${videoId}/${cleanSlug}`)
                 : (t.streamUrl || null);
               if (!streamUrl) continue;
 
@@ -2100,6 +2108,10 @@ export class TelegramController extends EventEmitter {
         }
       }
 
+      if (inlineMusicCache.size > 200) {
+        const firstKey = inlineMusicCache.keys().next().value;
+        inlineMusicCache.delete(firstKey);
+      }
       inlineMusicCache.set(legacyKey, cached.items);
 
       if (cached.items.length === 0) return { results: [], nextOffset: '' };
@@ -2149,9 +2161,10 @@ export class TelegramController extends EventEmitter {
         ];
 
         if (item.source === 'youtube_video' && item.videoId) {
+          const streamBase = getStreamPublicUrl(this.settings);
           const streamUrl = existsSync(`/data/video_cache/${item.videoId}.mp4`)
-            ? `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`
-            : (item.videoUrl || `https://pappysonghttps.duckdns.org/video/${item.videoId}.mp4`);
+            ? `${streamBase}/video/${item.videoId}.mp4`
+            : (item.videoUrl || `${streamBase}/video/${item.videoId}.mp4`);
           results.push({
             type: 'video',
             id: `yt_vid_${item.videoId}_${offset}_${idx}`,
@@ -2181,9 +2194,10 @@ export class TelegramController extends EventEmitter {
           const safeArt = safeArtist.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Music';
           const safeTit = safeTitle.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_') || 'Track';
           const cleanSlug = `${safeArt}_-_${safeTit}.mp3`;
+          const streamBase = getStreamPublicUrl(this.settings);
           const streamUrl = item.audioUrl || (existsSync(`/data/audio_cache/${videoId}.mp3`)
-            ? `https://pappysonghttps.duckdns.org/audio/${videoId}.mp3`
-            : `https://pappysonghttps.duckdns.org/audio/live/${videoId}/${cleanSlug}`);
+            ? `${streamBase}/audio/${videoId}.mp3`
+            : `${streamBase}/audio/live/${videoId}/${cleanSlug}`);
           const resId = `yt_aud_${videoId}_${offset}_${idx}`;
 
           this.audioMetadataMap?.set(String(videoId), {
@@ -3596,6 +3610,7 @@ export class TelegramController extends EventEmitter {
 
   async #handleMessage(message, { edited = false } = {}) {
     if (!message) return;
+    if (message.is_automatic_forward || message.from?.id === 777000) return;
     const user = message.from ? this.#upsertUser(message.from) : null;
     const chatType = message.chat?.type;
     const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
@@ -3762,7 +3777,7 @@ export class TelegramController extends EventEmitter {
         const hasDownloader = this.screens.has('downloader');
         const isOneStepDownloadOrLyricsCmd =
           hasDownloader &&
-          (command === '/play' || command === '/song' || command === '/music' || (command === '/lyrics' && rest.length > 0));
+          (command === '/play' || command === '/song' || (command === '/music' && (!isChannel || rest.length > 0)) || (command === '/lyrics' && rest.length > 0));
         if (!isOneStepDownloadOrLyricsCmd) {
           if (await musicScreen?.handleCommand?.(this.#ctx(tgId, { message }, { forceNew: true }), command, rest)) return;
         }
@@ -4171,6 +4186,36 @@ export class TelegramController extends EventEmitter {
         }
         return;
       }
+      if (command === '/xvideos' || command === '/xv') {
+        const query = rest.join(' ').trim();
+        await this.sm.reset(tgId, { reason: 'command' });
+        const nsfw = this.screens.get('nsfw');
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        if (query && nsfw?.executeXvideosSearch) {
+          const sent = await nsfw.executeXvideosSearch(ctx, query);
+          updateScreenMsg(sent);
+        } else if (nsfw?.openXvideosHub) {
+          const sent = await nsfw.openXvideosHub(ctx);
+          updateScreenMsg(sent);
+        }
+        return;
+      }
+
+      if (command === '/adultmovies' || command === '/adultcinema' || command === '/amovies') {
+        const query = rest.join(' ').trim();
+        await this.sm.reset(tgId, { reason: 'command' });
+        const nsfw = this.screens.get('nsfw');
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        if (query && nsfw?.executeAdultMoviesSearch) {
+          const sent = await nsfw.executeAdultMoviesSearch(ctx, query);
+          updateScreenMsg(sent);
+        } else if (nsfw?.openAdultMovies) {
+          const sent = await nsfw.openAdultMovies(ctx);
+          updateScreenMsg(sent);
+        }
+        return;
+      }
+
       if (command === '/nsfw' || command === '/18+' || command === '/hentai' || command === '/adult' || command === '/ecchi' || command === '/r18' || command === '/porn') {
         const query = rest.join(' ').trim();
         await this.sm.reset(tgId, { reason: 'command' });
@@ -4210,6 +4255,9 @@ export class TelegramController extends EventEmitter {
         await this.sm.reset(tgId, { reason: 'command' });
         const downloaderScreen = this.screens.get('downloader');
         const isMusicCommand = command === '/play' || command === '/music' || command === '/song';
+        if (isChannel && isMusicCommand && message?.message_id) {
+          await this.api?.deleteMessage?.(chatId, message.message_id).catch(() => {});
+        }
         const targetUrl = rest.find((arg) => /^https?:\/\//i.test(arg));
         if (targetUrl) {
           await downloaderScreen?.executeDownload(this.#ctx(tgId, { message }, { forceNew: true }), targetUrl);
@@ -4331,15 +4379,27 @@ export class TelegramController extends EventEmitter {
       }
       if (command === '/ai') {
         await this.sm.reset(tgId, { reason: 'command' });
+        if (isChannel && rest.length > 0 && this.app?.assistant) {
+          const aiCtx = this.#ctx(tgId, { message }, { isGroup: false, isPrivate: false, isTag: true, forceNew: true });
+          await this.app.assistant.handleMessage({ ctx: aiCtx, message, text: rest.join(' ') });
+          return;
+        }
         const aiScreen = this.screens.get('ai');
         const sent = await aiScreen?.open(this.#ctx(tgId, { message }, { forceNew: true }));
         updateScreenMsg(sent);
         return;
       }
       if (command === '/cancel') {
-        const state = this.sm.state(tgId);
+        const stateOwnerId = this.sm.get?.(tgId)
+          ? tgId
+          : (isChannel && this.sm.get?.(String(chatId)) ? String(chatId) : tgId);
+        const state = this.sm.state(stateOwnerId);
         if (state !== States.IDLE) {
-          await this.sm.cancel(tgId);
+          await this.sm.cancel(stateOwnerId);
+        }
+        if (isChannel) {
+          if (message?.message_id) await this.api?.deleteMessage?.(chatId, message.message_id).catch(() => {});
+          return;
         }
         const dashboard = this.screens.get('dashboard');
         const sent = await dashboard?.open(this.#ctx(tgId, { message }, { forceNew: true }), { forceNew: true });
@@ -4442,7 +4502,8 @@ export class TelegramController extends EventEmitter {
     // Route to the state machine (flows handle text/photos/documents).
     try {
       const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
-      const isPrivate = !isGroup;
+      const isChannelMsg = Boolean(message.chat?.type === 'channel');
+      const isPrivate = Boolean(message.chat?.type === 'private');
 
       const botName = this.botName || this.botContext?.botName || 'Lancy';
       const cleanBotName = String(botName).replace(/[^\p{L}\p{N}_]/gu, ' ').trim();
@@ -4457,8 +4518,19 @@ export class TelegramController extends EventEmitter {
 
       const botUsername = (this.botUsername || this.botContext?.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
       const replyMsgFrom = message.reply_to_message?.from;
+      const musicScreen = this.screens.get('music');
+      const isChannelCardReply = Boolean(
+        isChannelMsg &&
+        message.reply_to_message?.message_id &&
+        (
+          this.app?.musicQueueManager?.getSession?.(Number(chatId))?.screenMessageId === message.reply_to_message.message_id ||
+          musicScreen?.isBotMessageId?.(chatId, message.reply_to_message.message_id) ||
+          this.getScreenMsg(chatId, tgId)?.messageId === message.reply_to_message.message_id
+        )
+      );
       const isReplyToThisBot = Boolean(
         message.reply_to_message && (
+          isChannelCardReply ||
           (this.api.me?.id && replyMsgFrom?.id === this.api.me.id) ||
           (botUsername && replyMsgFrom?.username && replyMsgFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
           (isPrivate && (replyMsgFrom?.is_bot || !replyMsgFrom || (replyMsgFrom?.id && replyMsgFrom.id !== Number(tgId))))
@@ -4485,15 +4557,19 @@ export class TelegramController extends EventEmitter {
         (botUsername && new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text))
       );
 
+      const stateOwnerId = this.sm.get?.(tgId)
+        ? tgId
+        : (isChannelMsg && this.sm.get?.(String(chatId)) ? String(chatId) : tgId);
+
       // Check if user uploaded/sent a video, audio file, or voice note for music recognition:
       const recMedia = extractMediaForMusicRecognition(message);
       if (recMedia && recMedia.obj?.file_id) {
-        const currentState = this.sm.state(tgId);
+        const currentState = this.sm.state(stateOwnerId);
         // Only recognize music if user is explicitly in the downloader or music input flow.
         // In group chats: interactive menu inputs REQUIRE replying to the bot or tagging the bot!
-        const canListen = isPrivate || isReplyToBot || isTag;
+        const canListen = isPrivate || isReplyToBot || isTag || isChannelMsg;
         if (canListen && (currentState === States.URL_DOWNLOADER_INPUT || currentState === States.MUSIC_SEARCH_INPUT)) {
-          const ctx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
+          const ctx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
           await this.handleAudioRecognition(ctx, recMedia.obj, message, recMedia);
           return;
         }
@@ -4502,10 +4578,10 @@ export class TelegramController extends EventEmitter {
       // In DM (private chat): state inputs work directly without needing to quote or tag!
       // In Group Chat: interactive prompt input requires replying to the bot or tagging @bot
       // to avoid chat conflicts when group members talk with each other.
-      const stateChat = this.sm.get?.(tgId)?.chatId;
-      const shouldHandleState = (stateChat == null || Number(stateChat) === Number(chatId)) && (isPrivate || isReplyToBot || isTag);
-      const ctx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
-      const handled = shouldHandleState ? await this.sm.handleMessage(tgId, { ...message, chatId }, ctx) : false;
+      const stateChat = this.sm.get?.(stateOwnerId)?.chatId;
+      const shouldHandleState = (stateChat == null || Number(stateChat) === Number(chatId)) && (isPrivate || isReplyToBot || isTag || (isChannelMsg && stateChat != null && Number(stateChat) === Number(chatId)));
+      const ctx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
+      const handled = shouldHandleState ? await this.sm.handleMessage(stateOwnerId, { ...message, chatId }, ctx) : false;
       if (!handled) {
         if (text) {
           // Check if message is a reply to the bot's prompt cards in group or private chat:
@@ -4537,11 +4613,12 @@ export class TelegramController extends EventEmitter {
             }
           }
 
-          // Direct media / social link detection in DM or group:
-          const urlMatch = text.match(/https?:\/\/[^\s]+/i);
+          // Direct media / social link or Spotify URI detection in DM or group (never passive channel posts):
+          const urlMatch = !isChannelMsg ? text.match(/https?:\/\/[^\s<>]+|spotify:(?:track|album|artist|playlist):[A-Za-z0-9]+/i) : null;
           if (urlMatch) {
-            const url = urlMatch[0];
-            const isKnownMedia = /tiktok\.com|instagram\.com|pinterest\.com|pin\.it|youtube\.com|youtu\.be|twitter\.com|x\.com|facebook\.com|fb\.watch|reddit\.com|threads\.net|spotify\.com|capcut\.com|\.(mp4|webm|mov|jpg|jpeg|png|webp|mp3|m4a|wav)(\?|$)/i.test(url);
+            const url = urlMatch[0].replace(/[),.;!?]+$/, '');
+            const isKnownMedia = /^(?:spotify:(?:track|album|artist|playlist):[A-Za-z0-9]+)$/i.test(url) ||
+              /(?:^|\/\/|\.)(?:tiktok\.com|instagram\.com|pinterest\.com|pin\.it|youtube\.com|youtu\.be|twitter\.com|x\.com|facebook\.com|fb\.watch|fb\.com|reddit\.com|redd\.it|threads\.net|threads\.com|spotify\.com|spotify\.link|spoti\.fi|music\.apple\.com|audiomack\.com|soundcloud\.com|on\.soundcloud\.com|xiaohongshu\.com|xhslink\.com|capcut\.com|dramabox|reelshort|goodshort|flextv|moboreels|dramafren|flickreels|shortmax|anydrama)|\.(mp4|webm|mov|jpg|jpeg|png|webp|mp3|m4a|wav)(\?|$)/i.test(url);
             if (isKnownMedia) {
               const downloaderScreen = this.screens.get('downloader');
               if (downloaderScreen?.executeDownload) {
@@ -4710,7 +4787,8 @@ export class TelegramController extends EventEmitter {
     const fromMedia = !isPagination && Boolean(opts.fromMedia || source?.fromMedia || forceNew);
 
     const chatType = queryMessage?.chat?.type ?? directMessage?.chat?.type ?? message?.chat?.type ?? 'private';
-    const isGroup = chatType === 'group' || chatType === 'supergroup' || Number(chatId) < 0;
+    const isChannel = chatType === 'channel';
+    const isGroup = !isChannel && (chatType === 'group' || chatType === 'supergroup' || Number(chatId) < 0);
 
     let userLang = 'en';
     try {
@@ -4726,7 +4804,9 @@ export class TelegramController extends EventEmitter {
       user: this.db.get('SELECT * FROM users WHERE tg_id = ?', Number(tgId)),
       chatId,
       chatType,
+      isChannel,
       isGroup,
+      replyTo: directMessage?.reply_to_message ?? queryMessage?.reply_to_message ?? null,
       bot: this.botContext,
       botName: this.botContext?.botName || 'Lancy',
       botUsername: this.botUsername || this.botContext?.botUsername || 'Lancy_easy_bot',

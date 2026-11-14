@@ -2,15 +2,44 @@ import { randomBytes } from 'node:crypto';
 import { CallSetup } from './setup.js';
 import { SavedChannels, channelReference } from './channels.js';
 import { InfiniteRadio, RADIO_CATEGORIES } from './radio.js';
+import { AiDjEngine } from './aiDj.js';
 import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { originalPlayDelivery } from './originalPlayCard.js';
 import { isMusicOwner } from './accounts.js';
 import { KeyedLock, MusicError } from './model.js';
 import { checkChatMediaPermissions } from '../telegram/permissions.js';
-export const EQ_PRESETS = ['off','bass','vocal','nightcore','vaporwave','8d'];
+export const EQ_PRESETS = ['off','studio','bass','vocal','nightcore','vaporwave','8d'];
+export const EQ_CYCLE_PRESETS = ['off','studio','bass','vocal','8d'];
 export class MusicService {
-  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.channelPanels=new ChannelPanels({service:this});this.setup=new CallSetup({service:this});this.channels=new SavedChannels({service:this});this.radio=new InfiniteRadio({app});this.listenCards=new Map();this.cardLocks=new KeyedLock();this.lyricJobs=new Map(); }
+  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.userDownloads=new Map(); this.maxDownloads=16; this.maxUserDownloads=2; this.channelPanels=new ChannelPanels({service:this});this.setup=new CallSetup({service:this});this.channels=new SavedChannels({service:this});this.radio=new InfiniteRadio({app});this.aiDj=new AiDjEngine({app});this.listenCards=new Map();this.cardLocks=new KeyedLock();this.lyricJobs=new Map();this.activePolls=new Map(); }
+  getSkipVoteThreshold(chatId){
+    const perChat=chatId!=null?this.app?.db?.getSetting?.(`music.skipVoteThreshold.${chatId}`,null):null;
+    const raw=perChat!==null&&perChat!==undefined?perChat:this.app?.settings?.get?.('music.skipVoteThreshold');
+    return Math.max(1,Math.min(25,Number(raw||2)));
+  }
+  getQueueVoteThreshold(chatId){
+    const perChat=chatId!=null?this.app?.db?.getSetting?.(`music.queueVoteThreshold.${chatId}`,null):null;
+    const raw=perChat!==null&&perChat!==undefined?perChat:this.app?.settings?.get?.('music.queueVoteThreshold');
+    return Math.max(1,Math.min(25,Number(raw||2)));
+  }
+  getQueueVoteAction(chatId){
+    const mode=chatId!=null?this.app?.db?.getSetting?.(`music.queueVoteAction.${chatId}`,'playnow'):'playnow';
+    return mode==='top'?'top':'playnow';
+  }
+  async syncSessionIdentity(s,ctx,chat=null){
+    if(!s)return s;
+    const botUser=ctx?.api?.botUsername||ctx?.api?.me?.username||this.app?.telegram?.botUsername||s.botUsername||'Lancy_easy_bot';
+    s.botUsername=String(botUser).replace(/^@/,'');
+    if(chat){
+      s.isChannel=chat.type==='channel';
+      s.destinationTitle=chat.title||(s.isChannel?'Channel':'Group');
+      s.destinationUsername=chat.username||null;
+      if(chat.username)s.vcUrl=`https://t.me/${chat.username}?voicechat`;
+      else if(chat.invite_link)s.vcUrl=chat.invite_link;
+    }
+    return s;
+  }
   async prepare(ctx,id=this.destination(ctx)) {
     // Older offline adapters remain supported. The real VoiceClient always has setup.
     if(typeof this.app.voiceClient?.setup==='function')return this.setup.prepare(ctx,id);
@@ -27,11 +56,14 @@ export class MusicService {
     const token=randomBytes(6).toString('base64url'),c={token,track,destination,user:String(ctx.tgId),bot:this.botKey(ctx),chat:Number(ctx.chatId),messageId:null,expires:Date.now()+3600000,consumed:false};this.listenCards.set(token,c);return c;
   }
   listenCard(ctx,token,{requireMessage=true}={}){const c=this.listenCards.get(token);if(!c||c.expires<Date.now()||c.user!==String(ctx.tgId)||c.bot!==this.botKey(ctx)||c.chat!==Number(ctx.chatId)||(requireMessage&&c.messageId!==ctx.messageId))throw new MusicError('LISTEN_CARD_EXPIRED','Use your own /play card in its original chat, or search again.');if(c.consumed)throw new MusicError('ALREADY_QUEUED','This recording was already added from this card.');return c;}
-  async queueListen(ctx,token,{destination=null,fromCatalog=false}={}){return this.cardLocks.run(token,async()=>{const c=this.listenCard(ctx,token,{requireMessage:!fromCatalog}),id=c.destination||destination;if(!id)throw new MusicError('DESTINATION_REQUIRED','Choose a saved channel, or use /play inside your group.');if(c.destination&&destination&&c.destination!==destination)throw new MusicError('DESTINATION_CHANGED','That recording belongs to its original destination.');const generation=this.queueGeneration(id);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);const session=this.app.musicQueueManager.getSession(id);const mediaType=ctx.mode==='video'?'video':'audio';await this.app.musicQueueManager.addMany(id,[{...c.track,mediaType,requester:ctx.user?.first_name||'Member'}]);c.consumed=true;return this.player(ctx,id);});}
+  hasYoutubeVideo(){return Boolean(this.app?.musicProviders?.get?.('youtube')?.enabled);}
+  syncEqSettings(s,id){const savedBass=this.app.db?.getSetting?.(`music.bass.${id}`,null);const savedEq=this.app.db?.getSetting?.(`music.eq.${id}`,null);s.bass=savedBass!==null&&savedBass!==undefined?Boolean(savedBass):true;s.eqPreset=savedEq||(s.bass?'bass':'off');this.aiDj?.syncSession?.(s);}
+  async queueListen(ctx,token,{destination=null,fromCatalog=false,playNow=false}={}){return this.cardLocks.run(token,async()=>{const c=this.listenCard(ctx,token,{requireMessage:!fromCatalog}),id=c.destination||destination;if(!id)throw new MusicError('DESTINATION_REQUIRED','Choose a saved channel, or use /play inside your group.');if(c.destination&&destination&&c.destination!==destination)throw new MusicError('DESTINATION_CHANGED','That recording belongs to its original destination.');const generation=this.queueGeneration(id);await this.authorize(ctx,true,id,{allowDj:true});this.assertQueueGeneration(id,generation);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);this.app.musicQueueManager.getSession(id);const mediaType=(ctx.mode==='video'||this.hasYoutubeVideo())?'video':'audio';const trackObj={...c.track,mediaType,requester:ctx.user?.first_name||'Member'};if(playNow&&typeof this.app.musicQueueManager.playImmediateAndContinue==='function'){await this.app.musicQueueManager.playImmediateAndContinue(id,trackObj);}else{await this.app.musicQueueManager.addMany(id,[trackObj]);}c.consumed=true;return this.player(ctx,id);});}
   async streamReply(ctx,message,{video=null}={}){
     this.rate(ctx);const id=this.destination(ctx),generation=this.queueGeneration(id);await this.authorize(ctx,true,id,{allowDj:true});this.assertQueueGeneration(id,generation);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);
+    const isChannelSession = Boolean(this.app.musicQueueManager?.getSession(id)?.isChannel);
     const wantsVideo=video!==null?Boolean(video):false;
-    const media=await this.app.musicLibrary.importTelegram(ctx.api,message,{video:wantsVideo});let transferred=false;
+    const media=await this.app.musicLibrary.importTelegram(ctx.api,message,{video:wantsVideo||isChannelSession});let transferred=false;
     try{this.assertQueueGeneration(id,generation);await this.app.musicQueueManager.addMany(id,[{...media.track,queuedMedia:media,requester:ctx.user?.first_name||'Member'}]);transferred=true;return await this.player(ctx,id);}finally{if(!transferred)media.release();}
   }
   requestCardLyrics(s, { force = false } = {}){
@@ -42,6 +74,20 @@ export class MusicService {
     const job=Promise.resolve(this.lyrics.get(track,{force})).then(result=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:result?.found?'ready':'unavailable',result};}).catch(()=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:'unavailable'};}).finally(()=>{this.lyricJobs.delete(root.chatId);if(!this.app.musicQueueManager.closed)void this.app.musicQueueManager.updatePlayerCard(root.chatId).catch(()=>{});});this.lyricJobs.set(root.chatId,job);
   }
   owner(ctx) { return isMusicOwner(this.app,ctx.tgId); }
+  #isTrackReady(session, entry) {
+    if (!entry) return false;
+    if (entry.queuedMedia) return true;
+    if (session?.prefetched?.entryId === entry.entryId && session.prefetched.media) return true;
+    if (typeof this.app?.musicLibrary?.hasReady === 'function' && ['youtube', 'audius', 'telegram', 'music'].includes(entry.provider)) {
+      return this.app.musicLibrary.hasReady(entry, {
+        video: entry.mediaType === 'video',
+        isChannel: Boolean(session?.isChannel),
+        eqPreset: session?.eqPreset || (session?.bass ? 'bass' : 'off'),
+        djNote: session?.aiDj?.introNote || ''
+      });
+    }
+    return false;
+  }
   botKey(ctx) { return String(ctx.api?.me?.id || ctx.botUsername || ''); }
   destination(ctx) {
     if(ctx.musicPanel)return ctx.musicPanel.chatId;
@@ -58,14 +104,147 @@ export class MusicService {
     const djs = this.app.db?.getSetting?.(`music.djs.${id}`, []) || [];
     return Array.isArray(djs) && djs.map(String).includes(String(ctx.tgId));
   }
+  getVcSudoList(id = null) {
+    const globalList = this.app?.db?.getSetting?.('music.vcsudo.global', []) || [];
+    const chatList = id !== null && id !== undefined ? (this.app?.db?.getSetting?.(`music.vcsudo.${id}`, []) || []) : [];
+    return {
+      global: Array.isArray(globalList) ? globalList.map(String) : [],
+      chat: Array.isArray(chatList) ? chatList.map(String) : []
+    };
+  }
+  isVcSudo(ctx, id = null) {
+    if (!ctx) return false;
+    if (this.owner(ctx)) return true;
+    const { global, chat } = this.getVcSudoList(id);
+    const combined = new Set([...global, ...chat].map(s => String(s).toLowerCase().replace(/^@/, '')));
+    if (ctx.tgId !== undefined && ctx.tgId !== null && combined.has(String(ctx.tgId).toLowerCase())) return true;
+    const uname = String(ctx.user?.username || ctx.from?.username || '').toLowerCase().replace(/^@/, '');
+    if (uname && combined.has(uname)) return true;
+    return false;
+  }
+  isVcSudoEnforced(id = null) {
+    if (id !== null && id !== undefined) {
+      const chatEnforced = this.app?.db?.getSetting?.(`music.vcsudo.enforced.${id}`, null);
+      if (typeof chatEnforced === 'boolean') return chatEnforced;
+    }
+    const globalEnforced = this.app?.db?.getSetting?.('music.vcsudo.enforced', null);
+    if (typeof globalEnforced === 'boolean') return globalEnforced;
+    const { global, chat } = this.getVcSudoList(id);
+    if (global.length > 0 || chat.length > 0) return true;
+    if (Boolean(this.app?.env?.BOT_TOKEN)) return true;
+    return false;
+  }
+  async vcsudoCommand(ctx, args = []) {
+    const chatId = Number(ctx.chatId);
+    const targetChatId = chatId < 0 ? chatId : null;
+    if (!this.owner(ctx) && !this.isVcSudo(ctx, targetChatId)) {
+      throw Object.assign(new MusicError('ADMIN_ONLY', 'Only the Bot Owner or authorized VC Sudo users can manage /vcsudo.'), { silent: true });
+    }
+    const rawArgs = (Array.isArray(args) ? args : String(args || '').split(/\s+/)).map(s => String(s || '').trim()).filter(Boolean);
+    const sub = String(rawArgs[0] || '').toLowerCase();
+    const isGlobal = rawArgs.includes('--global') || rawArgs.includes('-g') || !targetChatId;
+    const scopeKey = isGlobal ? 'music.vcsudo.global' : `music.vcsudo.${targetChatId}`;
+    const scopeLabel = isGlobal ? 'Global VC Sudo' : `Chat VC Sudo (${targetChatId})`;
+    const current = new Set((this.app?.db?.getSetting?.(scopeKey, []) || []).map(s => String(s).replace(/^@/, '')));
+
+    if (sub === 'list' || (!sub && !ctx.replyTo?.from?.id)) {
+      const { global, chat } = this.getVcSudoList(targetChatId);
+      const enforced = this.isVcSudoEnforced(targetChatId);
+      const lines = [
+        `🛡️ <b>VC Sudo Access Control</b> · <i>${enforced ? 'STRICT (Active)' : 'Standard'}</i>`,
+        `• <b>Global VC Sudo:</b> ${global.length ? global.map(u => `<code>${u}</code>`).join(', ') : '<i>Owner only</i>'}`
+      ];
+      if (targetChatId) {
+        lines.push(`• <b>This Group VC Sudo:</b> ${chat.length ? chat.map(u => `<code>${u}</code>`).join(', ') : '<i>None added yet</i>'}`);
+      }
+      lines.push(
+        '',
+        '<b>Usage:</b>',
+        '• Reply <code>/vcsudo</code> to a user\'s message to grant/revoke VC Sudo',
+        '• <code>/vcsudo add &lt;user_id|@username&gt;</code>',
+        '• <code>/vcsudo remove &lt;user_id|@username&gt;</code>',
+        '• <code>/vcsudo clear</code>'
+      );
+      return lines.join('\n');
+    }
+
+    if (sub === 'clear') {
+      this.app?.db?.setSetting?.(scopeKey, []);
+      return `🛡️ Cleared all entries in ${scopeLabel}. Only Bot Owner (and Global VC Sudo) can control VC now.`;
+    }
+
+    if (sub === 'strict' || sub === 'enforce') {
+      const mode = String(rawArgs[1] || 'on').toLowerCase();
+      const val = !['off', 'false', '0', 'disable'].includes(mode);
+      const enforceKey = targetChatId ? `music.vcsudo.enforced.${targetChatId}` : 'music.vcsudo.enforced';
+      this.app?.db?.setSetting?.(enforceKey, val);
+      return `🛡️ VC Sudo strict mode is now <b>${val ? 'ON (random group admins blocked & unauthorized users ignored silently)' : 'OFF'}</b>.`;
+    }
+
+    const argTarget = ['add', 'remove', 'del', 'rm'].includes(sub) ? rawArgs[1] : rawArgs[0];
+    const replyTarget = ctx.replyTo?.from?.id ? String(ctx.replyTo.from.id) : null;
+    const rawTarget = replyTarget || String(argTarget || '').replace(/^@/, '').trim();
+    if (!rawTarget || (!/^\d+$/.test(rawTarget) && !/^[a-zA-Z0-9_]{3,32}$/.test(rawTarget))) {
+      throw new MusicError('INVALID_VCSUDO', 'Reply /vcsudo to a user\'s message, or pass a user ID / @username: /vcsudo add <user-id>');
+    }
+
+    const keyNorm = rawTarget.toLowerCase();
+    const existingMatch = [...current].find(x => x.toLowerCase() === keyNorm);
+    if (['remove', 'del', 'rm'].includes(sub) || (!['add'].includes(sub) && existingMatch)) {
+      if (existingMatch) current.delete(existingMatch);
+      this.app?.db?.setSetting?.(scopeKey, [...current]);
+      if (targetChatId) this.app?.db?.setSetting?.(`music.vcsudo.enforced.${targetChatId}`, true);
+      return `🛡️ Removed <code>${rawTarget}</code> from ${scopeLabel}.`;
+    }
+
+    current.add(rawTarget);
+    this.app?.db?.setSetting?.(scopeKey, [...current]);
+    if (targetChatId) this.app?.db?.setSetting?.(`music.vcsudo.enforced.${targetChatId}`, true);
+    else this.app?.db?.setSetting?.('music.vcsudo.enforced', true);
+    return `🛡️ Added <code>${rawTarget}</code> to ${scopeLabel}. They are now authorized to control Voice Chat playback and queues.`;
+  }
+  async chatDjCommand(ctx, text) {
+    const id = await this.authorize(ctx, true, null, { allowDj: true });
+    const qm = this.app.musicQueueManager;
+    const s = qm.getSession(id);
+    if (ctx.message?.chat?.id === id) {
+      s.isChannel = ctx.message.chat.type === 'channel';
+      if (ctx.message.chat.title) s.destinationTitle = ctx.message.chat.title;
+    }
+    if (!s.destinationTitle || s.destinationTitle === String(id)) {
+      try {
+        const chat = await ctx.api?.getChat?.(id);
+        if (chat) {
+          s.isChannel = chat.type === 'channel';
+          s.destinationTitle = chat.title || (s.isChannel ? 'Channel' : 'Group');
+        }
+      } catch {}
+    }
+    this.syncEqSettings(s, id);
+    this.aiDj.toggle(id, true);
+    const res = await this.aiDj.chatWithDj(s, text, { ctx, apply: true });
+    s.lastNotice = `🎙️ DJ · ${String(res.reply || '').split('\n')[0].replace(/^🎙️\s*/, '').slice(0, 140)}`;
+    if (s.screenMessageId || !s.isChannel || Number(ctx.chatId) > 0 || res.added?.length || ['playing', 'paused', 'buffering'].includes(s.status)) {
+      await this.player(ctx, id).catch(() => {});
+    } else {
+      await qm.updatePlayerCard(id).catch(() => {});
+    }
+    return { ...res, chatId: id, session: s };
+  }
   async djCommand(ctx, args = []) {
+    const sub = String(args[0] || '').toLowerCase();
+    const isRoleSub = ['add', 'remove', 'list', 'clear'].includes(sub);
+    const looksLikeUserId = /^@?\d+$/.test(String(args[1] || args[0] || ''));
+    if (args.length > 0 && !isRoleSub && !ctx.replyTo?.from?.id && !looksLikeUserId && this.aiDj?.chatWithDj) {
+      const res = await this.chatDjCommand(ctx, args.join(' '));
+      return { kind: 'ai_chat', ...res };
+    }
     const id = await this.authorize(ctx, true);
     const key = `music.djs.${id}`;
     const current = new Set((this.app.db?.getSetting?.(key, []) || []).map(String));
-    const sub = String(args[0] || '').toLowerCase();
     if (sub === 'list' || (!sub && !ctx.replyTo?.from?.id)) {
       const list = [...current];
-      return list.length ? `🎧 Authorized DJs for this chat:\n${list.map(u => `• ${u}`).join('\n')}\n\nReply /dj to a member's message or use /dj add <user-id> / /dj remove <user-id>.` : '🎧 No custom DJs assigned yet. Reply /dj to a member\'s message or use /dj add <user-id> to let them queue & control tracks.';
+      return list.length ? `🎧 Authorized DJs for this chat:\n${list.map(u => `• ${u}`).join('\n')}\n\nReply /dj to a member's message, use /dj add <user-id>, or chat directly: /dj what's trending.` : '🎧 No custom DJs assigned yet. Reply /dj to a member\'s message, use /dj add <user-id>, or chat directly with Spotify AI DJ: /dj what\'s trending.';
     }
     if (sub === 'clear') {
       this.app.db?.setSetting?.(key, []);
@@ -95,28 +274,42 @@ export class MusicService {
         const bot=botId?await ctx.api.getChatMember(id,botId).catch(()=>null):null;
         if(!bot||!['creator','administrator'].includes(bot.status))throw new MusicError('BOT_ADMIN_REQUIRED','Make this bot a channel administrator before opening its private dashboard.');
       }
-    }else if(!destructive&&this.owner(ctx))return id;
+    }else if(this.owner(ctx) || this.isVcSudo(ctx, id))return id;
     if(!remote&&Number(ctx.chatId)<0&&(Number(ctx.tgId)===id||ctx.message?.sender_chat?.id===id))return id;
+    const isChannelChat = Boolean(ctx.isChannel || ctx.message?.chat?.type === 'channel' || this.app?.musicQueueManager?.getSession?.(id)?.isChannel);
+    const vcSudoEnforced = !remote && Number(id) < 0 && !isChannelChat && this.isVcSudoEnforced(id);
+    if (vcSudoEnforced && destructive) {
+      if (allowDj && this.isDj(ctx, id)) return id;
+      throw Object.assign(new MusicError('ADMIN_ONLY', 'Only authorized VC Sudo users can operate the player or change Voice Chat playback.'), { silent: true });
+    }
     const member=await ctx.api?.getChatMember?.(id,Number(ctx.tgId)).catch(()=>null);
-    if(!member || !['creator','administrator','member','restricted'].includes(member.status) || (member.status==='restricted'&&!member.is_member))throw new MusicError('PERMISSION_DENIED','Membership could not be verified.');
-    if((destructive||remote)&&!['creator','administrator'].includes(member.status)&&!(allowDj&&!remote&&this.isDj(ctx,id)))throw new MusicError('ADMIN_ONLY','Only verified chat administrators can operate the player or change playback, queue and settings.');
+    if(!member || !['creator','administrator','member','restricted'].includes(member.status) || (member.status==='restricted'&&!member.is_member)) {
+      throw Object.assign(new MusicError('PERMISSION_DENIED','Membership could not be verified.'), vcSudoEnforced ? { silent: true } : {});
+    }
+    if((destructive||remote)&&!['creator','administrator'].includes(member.status)&&!(allowDj&&!remote&&this.isDj(ctx,id))) {
+      throw Object.assign(new MusicError('ADMIN_ONLY','Only verified chat administrators can operate the player or change playback, queue and settings.'), vcSudoEnforced ? { silent: true } : {});
+    }
     return id;
   }
   async startSearch(ctx,query,mode='queue') {
     this.rate(ctx); const destination=['download','lyrics'].includes(mode) ? Number(ctx.chatId) : await this.authorize(ctx,true,null,{allowDj:true});
-    if (!['download','lyrics'].includes(mode)) { const chat=await ctx.api.getChat(destination);const state=this.app.musicQueueManager.getSession(destination);state.isChannel=chat.type==='channel';state.destinationTitle=chat.title||String(destination);state.bass=this.app.db?.getSetting?.(`music.bass.${destination}`,false)||false;state.eqPreset=this.app.db?.getSetting?.(`music.eq.${destination}`,state.bass?'bass':'off')||'off';await this.prepare(ctx,destination); }
-    const s=this.search.create({ userId:ctx.tgId,chatId:ctx.chatId,botId:this.botKey(ctx),destination,query,mode });
+    let sessionChannel = Boolean(ctx.isChannel || ctx.message?.chat?.type === 'channel');
+    if (!['download','lyrics'].includes(mode)) { const state=this.app.musicQueueManager.getSession(destination); if (ctx.message?.chat?.id === destination) { state.isChannel = ctx.message.chat.type === 'channel'; if (ctx.message.chat.title) state.destinationTitle = ctx.message.chat.title; } this.syncEqSettings(state,destination); await this.prepare(ctx,destination); if (!state.destinationTitle || state.destinationTitle === String(destination)) { const chat=await ctx.api?.getChat?.(destination).catch(()=>null); if (chat) { state.isChannel=chat.type==='channel'; state.destinationTitle=chat.title||String(destination); } } sessionChannel=Boolean(state.isChannel||sessionChannel); }
+    const s=this.search.create({ userId:ctx.tgId,chatId:ctx.chatId,botId:this.botKey(ctx),destination,query,mode,isChannel:sessionChannel && Number(ctx.chatId)===Number(destination) });
     s.queueDestination=ctx.musicPanel?.chatId||(Number(ctx.chatId)<0?Number(ctx.chatId):this.destinations.get(`${this.botKey(ctx)}:${ctx.tgId}`))||null;
     if(!['download','lyrics'].includes(mode))s.destinationTitle=this.app.musicQueueManager.getSession(destination).destinationTitle;
     await this.search.page(s,0); return s;
   }
-  async submit(ctx,s) {
+  async submit(ctx,s,{playNow=false}={}) {
     if (!s.selected.size) throw new MusicError('EMPTY_SELECTION','Select at least one track.');
     if(s.mode==='lyrics'){if(s.selected.size!==1)throw new MusicError('ONE_SELECTION','Select one recording for lyrics.');s.lyricsTrack=[...s.selected.values()][0];s.lyricsResult=await this.lyrics.get(s.lyricsTrack);s.consumed=true;return;}
     if (s.mode==='download') {
       if (s.selected.size!==1) throw new MusicError('ONE_DOWNLOAD','Choose one track to download.');
-      if(this.downloads>=2)throw new MusicError('DOWNLOAD_BUSY','Two full-song deliveries are already being prepared. Please try again shortly.');
+      const userKey = String(ctx.tgId || ctx.chatId || 'anon');
+      const activeUserDownloads = this.userDownloads.get(userKey) || 0;
+      if(activeUserDownloads>=this.maxUserDownloads || this.downloads>=this.maxDownloads)throw new MusicError('DOWNLOAD_BUSY','Two full-song deliveries are already being prepared. Please try again shortly.');
       this.downloads++;
+      this.userDownloads.set(userKey, activeUserDownloads + 1);
       try{
       const permission=await checkChatMediaPermissions(ctx.api,ctx.chatId,Number(ctx.tgId)).catch(()=>null);
       if(permission?.canSendAudios===false)throw new MusicError('MEDIA_RESTRICTED','Audio uploads are restricted in this chat.');
@@ -133,31 +326,135 @@ export class MusicService {
         this.previews.remember(ctx.api,media.track,audioFileId(sent));
         s.consumed=true; s.deliveryMessageId=sent?.message_id || s.messageId;listen.messageId=s.deliveryMessageId;
       } finally { media.release(); }
-      }finally{this.downloads--;}
+      }finally{
+        this.downloads--;
+        const left = (this.userDownloads.get(userKey) || 1) - 1;
+        if (left <= 0) this.userDownloads.delete(userKey);
+        else this.userDownloads.set(userKey, left);
+      }
       return;
     }
-    const generation=this.queueGeneration(s.destination);await this.authorize(ctx,true,s.destination,{allowDj:true});this.assertQueueGeneration(s.destination,generation);if(typeof this.app.voiceClient?.setup==='function')await this.prepare(ctx,s.destination);this.assertQueueGeneration(s.destination,generation); const mediaType=(s.mode==='video')?'video':'audio';const tracks=[...s.selected.values()].map(t=>({...t,mediaType,requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
-    await this.app.musicQueueManager.addMany(s.destination,tracks); s.consumed=true;
+    const generation=this.queueGeneration(s.destination);await this.authorize(ctx,true,s.destination,{allowDj:true});this.assertQueueGeneration(s.destination,generation);if(typeof this.app.voiceClient?.setup==='function')await this.prepare(ctx,s.destination);this.assertQueueGeneration(s.destination,generation); const mediaType=(s.mode==='video'||(s.mode==='queue'&&this.hasYoutubeVideo()))?'video':'audio';const tracks=[...s.selected.values()].map(t=>({...t,mediaType,requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
+    const qm = this.app.musicQueueManager;
+    const shouldPlayNow = Boolean(playNow || s.playNow);
+    if (shouldPlayNow && tracks.length > 0 && typeof qm.playImmediateAndContinue === 'function') {
+      await qm.playImmediateAndContinue(s.destination, tracks[0]);
+      if (tracks.length > 1) {
+        const sess = qm.getSession(s.destination);
+        const extra = tracks.slice(1).map((t) => qm.createQueueEntry ? qm.createQueueEntry(t) : { ...t, entryId: randomBytes(8).toString('hex') });
+        sess.upcoming.unshift(...extra);
+      }
+      const sess = qm.getSession(s.destination);
+      sess.lastNotice = `⚡ Playing "${tracks[0].title}" immediately — previous playlist will continue after.`;
+    } else {
+      await qm.addMany(s.destination,tracks);
+    }
+    s.consumed=true;
     await this.player(ctx,s.destination);
   }
   async player(ctx,id=this.destination(ctx)) { return this.panelLock.run(id,()=>this._player(ctx,id)); }
+  async aidjCommand(ctx, args = []) {
+    const id = await this.authorize(ctx, true, null, { allowDj: true });
+    const qm = this.app.musicQueueManager;
+    const s = qm.getSession(id);
+    this.aiDj.syncSession(s);
+    const sub = String(args[0] || '').toLowerCase();
+    if (sub === 'off' || sub === 'stop' || sub === 'disable') {
+      const cfg = this.aiDj.toggle(id, false);
+      s.lastNotice = '🤖 AI DJ turned off. Existing queue is retained.';
+      await qm.updatePlayerCard(id);
+      return cfg;
+    }
+    const rawArgs = args.join(' ').trim();
+    if (sub && !['on', 'start', 'enable', 'off', 'stop', 'disable', 'vibe', 'mood', 'skip', 'next', 'status'].includes(sub) && (/\b(what|who|which|why|how|trend|chart|bass|eq|play|put\s+on|drop|pause|resume)\b|\?/i.test(rawArgs)) && this.aiDj?.chatWithDj) {
+      const res = await this.chatDjCommand(ctx, rawArgs);
+      return { ...this.aiDj.getConfig(id), kind: 'ai_chat', reply: res.reply, actions: res.actions, added: res.added, intent: res.intent };
+    }
+    if (sub === 'vibe' || sub === 'mood' || (sub && !['on', 'start', 'enable', 'skip', 'next', 'status'].includes(sub))) {
+      const vibeText = ['vibe', 'mood'].includes(sub) ? args.slice(1).join(' ') : args.join(' ');
+      const cfg = this.aiDj.setVibe(id, vibeText);
+      const added = await this.aiDj.curateNextTracks(s, { count: 3 }).catch(() => []);
+      s.lastNotice = added.length
+        ? `🤖 AI DJ vibe "${cfg.vibe}" loaded ${added.length} tracks.`
+        : `🤖 AI DJ vibe locked to "${cfg.vibe}".`;
+      if (added.length && !['playing', 'paused', 'buffering'].includes(s.status)) {
+        await this.prepare(ctx, id);
+        await qm.ensurePlaying(id);
+      }
+      await this.player(ctx, id);
+      return cfg;
+    }
+    if (sub === 'skip' || sub === 'next') {
+      this.aiDj.toggle(id, true);
+      if (!s.upcoming.length) {
+        await this.aiDj.curateNextTracks(s, { count: 3 }).catch(() => []);
+      }
+      await this.prepare(ctx, id);
+      await qm.skip(id);
+      await this.player(ctx, id);
+      return this.aiDj.getConfig(id);
+    }
+    const cfg = sub === 'status' ? this.aiDj.getConfig(id) : this.aiDj.toggle(id, sub === 'on' || sub === 'start' || sub === 'enable' ? true : undefined);
+    if (cfg.enabled && s.upcoming.length < 2) {
+      const added = await this.aiDj.curateNextTracks(s, { count: 3 }).catch(() => []);
+      if (added.length && !['playing', 'paused', 'buffering'].includes(s.status)) {
+        await this.prepare(ctx, id);
+        await qm.ensurePlaying(id);
+      }
+    }
+    s.lastNotice = cfg.enabled
+      ? `🤖 AI DJ active · ${cfg.vibe}${s.aiDj?.introNote ? ` — ${s.aiDj.introNote}` : ''}`
+      : '🤖 AI DJ paused.';
+    await this.player(ctx, id);
+    return cfg;
+  }
   async _player(ctx,id) {
     await this.authorize(ctx,true,id,{allowDj:true});
-    const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); s.isChannel=chat.type==='channel'; s.destinationTitle=chat.title || (s.isChannel?'Channel':'Group'); s.bass=this.app.db?.getSetting?.(`music.bass.${id}`,false)||false; s.eqPreset=this.app.db?.getSetting?.(`music.eq.${id}`,s.bass?'bass':'off')||'off';
+    const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); await this.syncSessionIdentity(s,ctx,chat); this.syncEqSettings(s,id);
     if(s.status==='stopped'){s.status='idle';s.lastError=null;}
-    if(s.currentTrack)this.requestCardLyrics(s);
+    const isCinemaDeck = s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie';
+    if(s.currentTrack && !isCinemaDeck)this.requestCardLyrics(s);
     if(s.isChannel && Number(ctx.chatId) > 0)return this.channelPanels.open(ctx,s,{forceNew:Boolean(ctx.forceNew)});
     if(s.screenMessageId && !s.isChannel && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
-    s.view='player';
-    const created=!s.screenMessageId || (s.isChannel && s.playerChatId !== Number(ctx.chatId));
-    if(created){const rich=this.app.screens.get('music').renderPlayer(s);const sent=await ctx.api.sendRichMessage(ctx.chatId,rich);qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);s.lastRender=JSON.stringify(rich);}
-    else await qm.updatePlayerCard(id);
-    this.previews.schedule(s);
-    if(created&&s.fullPreview)await qm.updatePlayerCard(id);
+    s.view=isCinemaDeck?'cinema':'player';
+    s.overlayView=null;
+    s.overlayAt=0;
+    const sendFreshPlayerCard = async () => {
+      const oldMessageId = s.screenMessageId;
+      const oldPlayerChatId = s.playerChatId || Number(ctx.chatId);
+      const screen = this.app.screens.get('music');
+      const rich = isCinemaDeck && typeof screen.renderCinemaPlayer === 'function' ? screen.renderCinemaPlayer(s) : screen.renderPlayer(s);
+      let sent=null;
+      if(ctx.reuseMessageId && Number(ctx.chatId)===Number(id) && typeof ctx.api.editMessageRich==='function'){
+        try{
+          const edited=await ctx.api.editMessageRich(ctx.chatId,ctx.reuseMessageId,rich);
+          sent=edited?.message_id ? edited : {message_id:ctx.reuseMessageId};
+        }catch{}
+      }
+      if(!sent)sent=await ctx.api.sendRichMessage(ctx.chatId,rich);
+      qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);
+      s.lastRender=JSON.stringify(rich);
+      s.editAfter=0;
+      if(oldMessageId && oldMessageId !== sent.message_id && typeof ctx.api?.deleteMessage === 'function'){
+        await ctx.api.deleteMessage(oldPlayerChatId, oldMessageId).catch(()=>{});
+      }
+    };
+    let created=Boolean(!s.screenMessageId || ctx.forceNew || (s.isChannel && s.playerChatId !== Number(ctx.chatId)));
+    if(created){
+      await sendFreshPlayerCard();
+    } else {
+      const updated = await qm.updatePlayerCard(id, { forceEdit: true });
+      if(!updated && !s.screenMessageId){
+        created = true;
+        await sendFreshPlayerCard();
+      }
+    }
+    if (!isCinemaDeck) this.previews.schedule(s);
+    if(created&&s.fullPreview&&!isCinemaDeck)await qm.updatePlayerCard(id);
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','lyrics','lypage','accounts','volume','options','eq','voteskip','bass'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','submode','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','bass','aidj'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
@@ -166,10 +463,11 @@ export class MusicService {
     return this.controlLock.run(destination,()=>this._control(ctx,action,[...args]));
   }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','lyrics','lypage','bass','eq','voteskip','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
-    const isVoteSkip=action==='voteskip';
-    const allowDj=!['stop','leave','accounts','selectaccount','pin'].includes(action);
-    const id=await this.authorize(ctx,!isVoteSkip,null,{allowDj});
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','submode','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    const isViewerVote=['voteskip','votequeue'].includes(action);
+    const isDownloadAct=['downloadnow','downloadq'].includes(action);
+    const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh'].includes(action);
+    const id=await this.authorize(ctx,!(isViewerVote||isDownloadAct),null,{allowDj});
     const qm=this.app.musicQueueManager;
     const panel=ctx.musicPanel || ((qm.getSession(id).isChannel && Number(ctx.chatId) > 0) ? this.channelPanels.find(ctx,id) : null);
     const s=panel?.state ? this.channelPanels.state(panel) : panel || qm.getSession(id);
@@ -178,18 +476,26 @@ export class MusicService {
     if(ctx.query && args.pop() !== (s.panelToken?Number(s.controlRevision||0).toString(36):String(s.controlRevision||0)))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
     if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');
     if(['pause','resume','skip','previous'].includes(action)){
+      const rootSession=qm.getSession(id);
+      const deckQueue = rootSession.activeDeck === 'movie' ? (rootSession.movieUpcoming || []) : (rootSession.upcoming || []);
+      const deckHist = rootSession.activeDeck === 'movie' ? (rootSession.movieHistory || []) : (rootSession.history || []);
+      let ackPromise=null;
       if(action==='skip'){
-        s.lastNotice='⏭ Skipping to next track…';
-        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏭ Skipping to next track…'}).catch(()=>{});
-        if(s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
+        const isMovieDeck = rootSession.activeDeck === 'movie';
+        const ready=this.#isTrackReady(rootSession,deckQueue[0]);
+        if(!ready)s.lastNotice=isMovieDeck?'⏭ Skipping to next item…':'⏭ Skipping to next track…';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)ackPromise=ctx.api.answerCallbackQuery(ctx.query.id,{text:isMovieDeck?(ready?'⏭ Next':'⏭ Skipping…'):(ready?'⏭ Next track':'⏭ Skipping to next track…')}).catch(()=>{});
+        if(!ready&&s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
       }else if(action==='previous'){
-        s.lastNotice='⏮ Loading previous track…';
-        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏮ Loading previous track…'}).catch(()=>{});
-        if(s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
+        const isMovieDeck = rootSession.activeDeck === 'movie';
+        const ready=this.#isTrackReady(rootSession,deckHist.at?.(-1));
+        if(!ready)s.lastNotice=isMovieDeck?'⏮ Loading previous item…':'⏮ Loading previous track…';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)ackPromise=ctx.api.answerCallbackQuery(ctx.query.id,{text:isMovieDeck?(ready?'⏮ Previous':'⏮ Loading previous…'):(ready?'⏮ Previous track':'⏮ Loading previous track…')}).catch(()=>{});
+        if(!ready&&s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
       }else if(action==='pause'){
-        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏸ Paused'}).catch(()=>{});
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)ackPromise=ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏸ Paused'}).catch(()=>{});
       }else if(action==='resume'){
-        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Resuming playback…'}).catch(()=>{});
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)ackPromise=ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Resuming playback…'}).catch(()=>{});
         if(!s.connected){
           s.lastNotice='⏳ Reconnecting to call & starting playback…';
           if(s.screenMessageId)void qm.updatePlayerCard(id).catch(()=>{});
@@ -201,23 +507,172 @@ export class MusicService {
         this.assertQueueGeneration(id,generation);
       }
       await qm[action](id);
+      if(ackPromise)await ackPromise;
     }
     else if(action==='voteskip'){
       if(!s.currentTrack||!['playing','paused'].includes(s.status))throw new MusicError('NOTHING_PLAYING','There is no active track to vote-skip.');
-      const needed=Math.max(1,Number(this.app.settings?.get?.('music.skipVoteThreshold')||2));
+      const needed=this.getSkipVoteThreshold(id);
       const votes=new Set(Array.isArray(s.skipVotes)?s.skipVotes:[]);
-      votes.add(String(ctx.tgId));
+      const voterId=String(ctx.tgId);
+      if(votes.has(voterId))votes.delete(voterId);
+      else votes.add(voterId);
       s.skipVotes=[...votes];
       if(s.skipVotes.length>=needed){
         s.skipVotes=[];
-        s.lastNotice=`Vote skip passed (${needed}/${needed}) — advancing to next track.`;
+        s.lastNotice=`✅ Vote skip passed (${needed}/${needed}) — advancing to next.`;
         if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'Vote skip passed! Skipping…'}).catch(()=>{});
         await qm.skip(id);
       }else{
-        s.lastNotice=`Skip vote recorded (${s.skipVotes.length}/${needed} needed).`;
+        s.lastNotice=`⏭ Skip vote: ${s.skipVotes.length}/${needed} needed.`;
         if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Skip vote: ${s.skipVotes.length}/${needed}`}).catch(()=>{});
       }
-      s.view='player';
+      s.view=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')?'cinema':'player';
+    }
+    else if(action==='votequeue'){
+      const deckQueue=s.activeDeck==='movie'?(s.movieUpcoming||[]):(s.upcoming||[]);
+      let entryId=args[0];
+      if(s.panelToken){
+        const matches=deckQueue.filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entryId);
+        if(matches.length===1)entryId=matches[0].entryId;
+      }
+      const rootSession=qm.getSession(id);
+      const rootQ=s.activeDeck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
+      const targetEntry=rootQ.find(t=>t.entryId===entryId);
+      if(!targetEntry)throw new MusicError('STALE_PLAYER','That queued item is no longer available.');
+      const needed=this.getQueueVoteThreshold(id);
+      const voterId=String(ctx.tgId);
+      const votes=new Set(Array.isArray(targetEntry.votes)?targetEntry.votes.map(String):[]);
+      if(votes.has(voterId))votes.delete(voterId);
+      else votes.add(voterId);
+      targetEntry.votes=[...votes];
+      if(targetEntry.votes.length>=needed){
+        targetEntry.votes=[];
+        const mode=this.getQueueVoteAction(id);
+        s.lastNotice=`🗳 Viewer vote passed (${needed}/${needed}) for ${targetEntry.title}!`;
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`🗳 Vote passed! ${mode==='playnow'?'Playing now…':'Moved to #1!'}`}).catch(()=>{});
+        if(mode==='playnow'){
+          if(!s.connected&&typeof this.app.voiceClient?.setup==='function'){
+            const generation=this.queueGeneration(id);
+            await this.prepare(ctx,id);
+            this.assertQueueGeneration(id,generation);
+          }
+          if(s.activeDeck==='movie'||targetEntry.provider==='movie'){
+            await qm.playQueuedMovieNow(id,targetEntry.entryId);
+            s.view='cinema';
+          }else{
+            await qm.playNow(id,targetEntry.entryId);
+            s.view='player';
+          }
+        }else if(s.activeDeck==='movie'||targetEntry.provider==='movie'){
+          qm.promoteMovieTrack(id,targetEntry.entryId);
+          s.view='mqueue';
+        }
+      }else{
+        s.lastNotice=`🗳 Queue vote for ${targetEntry.title}: ${targetEntry.votes.length}/${needed}`;
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Queue vote: ${targetEntry.votes.length}/${needed}`}).catch(()=>{});
+      }
+    }
+    else if(action==='voteset'){
+      s.view='voteset';
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🗳 Viewer Vote Settings'}).catch(()=>{});
+    }
+    else if(action==='setvotethresh'){
+      const [kind,valRaw]=args;
+      if(kind==='mode'){
+        const nextMode=valRaw==='top'?'top':'playnow';
+        this.app.db?.setSetting?.(`music.queueVoteAction.${id}`,nextMode);
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Queue action: ${nextMode==='playnow'?'Play Immediately':'Boost to #1'}`}).catch(()=>{});
+      }else{
+        const count=Math.max(1,Math.min(25,Number(valRaw)||2));
+        const key=kind==='skip'?`music.skipVoteThreshold.${id}`:`music.queueVoteThreshold.${id}`;
+        this.app.db?.setSetting?.(key,count);
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`${kind==='skip'?'Skip':'Queue'} vote limit: ${count}`}).catch(()=>{});
+      }
+      s.view='voteset';
+    }
+    else if(action==='launchpoll'){
+      if(typeof ctx.api?.sendPoll!=='function')throw new MusicError('POLL_UNAVAILABLE','Telegram Poll API is unavailable.');
+      const deck=s.activeDeck==='movie'?'movie':'music';
+      const rootSession=qm.getSession(id);
+      const q=deck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
+      if(!q.length&&!s.currentTrack)throw new MusicError('NOTHING_QUEUED','Queue at least one movie or track before launching a poll.');
+      const optionTargets=[];
+      const optionLabels=[];
+      if(s.currentTrack){
+        optionTargets.push({kind:'skip',title:s.currentTrack.title});
+        optionLabels.push(`⏭ Skip: ${String(s.currentTrack.title||'Current').slice(0,80)}`);
+      }
+      for(const item of q.slice(0,9)){
+        optionTargets.push({kind:'play',entryId:item.entryId,title:item.title});
+        optionLabels.push(`🎬 ${String(item.title||'Queued Item').slice(0,90)}`);
+      }
+      if(optionLabels.length<2){
+        optionTargets.push({kind:'keep',title:'Keep playing'});
+        optionLabels.push('🔁 Keep Current Order');
+      }
+      const targetChatId=s.playerChatId||id;
+      const needed=deck==='movie'?this.getQueueVoteThreshold(id):this.getSkipVoteThreshold(id);
+      const sentPoll=await ctx.api.sendPoll(targetChatId,`🗳 Lancy Viewer Poll (${needed} votes wins!)`,optionLabels,{is_anonymous:false,allows_multiple_answers:false});
+      const pollId=sentPoll?.poll?.id;
+      if(pollId){
+        const pollRec={pollId:String(pollId),chatId:targetChatId,destination:id,messageId:sentPoll.message_id,deck,optionTargets,needed,votesByUser:new Map(),api:ctx.api};
+        this.activePolls.set(String(pollId),pollRec);
+        rootSession.activePoll={pollId:String(pollId),messageId:sentPoll.message_id,needed};
+      }
+      s.lastNotice=`📊 Live Viewer Poll posted! First option to hit ${needed} vote(s) wins automatically.`;
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'📊 Live Viewer Poll posted!'}).catch(()=>{});
+    }
+    else if(action==='downloadnow'||action==='downloadq'){
+      const downloader=this.app?.movieDownloader;
+      if(!downloader)throw new MusicError('UNAVAILABLE','Download service is currently unavailable.');
+      const deck=s.activeDeck==='movie'?'movie':'music';
+      const rootSession=qm.getSession(id);
+      let targetItem=null;
+      if(action==='downloadnow'){
+        targetItem=s.currentTrack;
+      }else{
+        let entryId=args[0];
+        const qList=deck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
+        if(s.panelToken){
+          const matches=qList.filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entryId);
+          if(matches.length===1)entryId=matches[0].entryId;
+        }
+        targetItem=qList.find(t=>t.entryId===entryId)||null;
+      }
+      if(!targetItem)throw new MusicError('NOTHING_PLAYING','Select an active movie or episode to download.');
+      const userKey=String(ctx.tgId||ctx.chatId||'anon');
+      const activeUserDownloads=this.userDownloads.get(userKey)||0;
+      if(activeUserDownloads>=this.maxUserDownloads||this.downloads>=this.maxDownloads)throw new MusicError('DOWNLOAD_BUSY','Download queue is busy right now. Wait a few seconds and retry.');
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`⬇️ Preparing download: ${String(targetItem.title||'').slice(0,36)}…`}).catch(()=>{});
+      this.downloads++;
+      this.userDownloads.set(userKey,activeUserDownloads+1);
+      void (async()=>{
+        const dlCtx={...ctx,chatId:ctx.chatId||s.playerChatId||id};
+        let statusMsg=null;
+        try{
+          statusMsg=await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⬇️ Preparing <b>${String(targetItem.title||'Movie').replace(/[<>&]/g,'')}</b> for Telegram…`,{parse_mode:'HTML'}).catch(()=>null);
+          const res=await downloader.sendSingleVideo(dlCtx,targetItem,{
+            spoiler:Boolean(targetItem.isAdult&&Number(dlCtx.chatId)<0),
+            onProgress:(line)=>{
+              if(statusMsg?.message_id&&dlCtx.api?.editMessageText){
+                void dlCtx.api.editMessageText(dlCtx.chatId,statusMsg.message_id,`⬇️ ${String(line).slice(0,200)}`).catch(()=>{});
+              }
+            }
+          });
+          if(!res?.ok){
+            await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⚠️ Download could not finish: ${res?.reason||'Stream unavailable'}`).catch(()=>{});
+          }
+        }catch(err){
+          await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⚠️ Download failed: ${err?.message||'Unknown error'}`).catch(()=>{});
+        }finally{
+          if(statusMsg?.message_id)await dlCtx.api?.deleteMessage?.(dlCtx.chatId,statusMsg.message_id).catch(()=>{});
+          this.downloads=Math.max(0,this.downloads-1);
+          const left=(this.userDownloads.get(userKey)||1)-1;
+          if(left<=0)this.userDownloads.delete(userKey);
+          else this.userDownloads.set(userKey,left);
+        }
+      })();
+      return s;
     }
     else if(action==='stop'||action==='leave'){
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏹ Stopping playback…'}).catch(()=>{});
@@ -226,8 +681,8 @@ export class MusicService {
     else if(action==='retry'){s.lastNotice='Preparing your queued recording…';await qm.updatePlayerCard(id);const generation=this.queueGeneration(id);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);await qm.ensurePlaying(id);s.view='player';}
     else if(action==='setvol'){
       const targetVol=Number(args[0]);
-      await qm.setVolume(id,targetVol);
-      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Volume: ${targetVol}%`}).catch(()=>{});
+      await qm.setVolume(id,targetVol,{skipCardUpdate:true});
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`🔊 Volume: ${targetVol}%`}).catch(()=>{});
     }
     else if(action==='seek')await qm.seek(id,Number(args[0]));
     else if(action==='seekby'){ if(s.positionSeconds==null)throw new MusicError('CLOCK_UNAVAILABLE','The playback clock is unavailable.'); await qm.seek(id,Math.max(0,s.positionSeconds+Number(args[0]))); }
@@ -250,14 +705,20 @@ export class MusicService {
         if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued recording is no longer available.');
         entry=matches[0].entryId;
       }
-      s.lastNotice='▶ Switching track…';
-      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Switching track…'}).catch(()=>{});
+      const rootSession=qm.getSession(id);
+      const targetEntry=rootSession.upcoming.find(t=>t.entryId===entry);
+      const ready=this.#isTrackReady(rootSession,targetEntry);
+      s.view='player';
+      if(rootSession)rootSession.view='player';
+      if(!ready)s.lastNotice=`▶ Switching to ${targetEntry?.title||'selected track'}…`;
+      const ackPromise=(ctx.query?.id&&ctx.api?.answerCallbackQuery)?ctx.api.answerCallbackQuery(ctx.query.id,{text:ready?'▶ Playing track now':'▶ Switching track…'}).catch(()=>{}):null;
       if(!s.connected&&typeof this.app.voiceClient?.setup==='function'){
         const generation=this.queueGeneration(id);
         await this.prepare(ctx,id);
         this.assertQueueGeneration(id,generation);
       }
       await qm.playNow(id,entry);
+      if(ackPromise)await ackPromise;
       s.view='player';
     }
     else if(['radio','rpage','rpick','rstart','roff','retry'].includes(action)){
@@ -280,9 +741,55 @@ export class MusicService {
     else if(action==='remove'){let entry=args[0];if(s.panelToken){const matches=s.upcoming.filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entry);if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued recording is no longer available.');entry=matches[0].entryId;}qm.removeTrack(id,entry);}
     else if(action==='options'){s.view='options';}
     else if(action==='preview'){if(this.previews.pending.has(id))throw new MusicError('PREVIEW_BUSY','The full preview is already being prepared.');s.fullPreview=null;s.view='player';}
-    else if(action==='volume'){s.view='volume';}
+    else if(action==='volume'){
+      s.view='volume';
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`🔊 Volume: ${s.volume ?? 100}%`}).catch(()=>{});
+    }
     else if(action==='accounts'){await this.accounts.sync();s.availableAccounts=(await this.app.voiceClient.accounts(id)).accounts;s.view='accounts';}
     else if(action==='queue'||action==='qpage'){s.view='queue';s.page=Math.max(0,Number(args[0])||0);}
+    else if(action==='mqueue'||action==='mqpage'){s.view='mqueue';s.page=Math.max(0,Number(args[0])||0);}
+    else if(action==='mclear'){
+      qm.clearMovieQueue(id);
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🗑 Cinema queue cleared'}).catch(()=>{});
+    }
+    else if(action==='mremove'){
+      let entry=args[0];
+      if(s.panelToken){
+        const matches=(s.movieUpcoming||[]).filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entry);
+        if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued movie/episode is no longer available.');
+        entry=matches[0].entryId;
+      }
+      qm.removeMovieTrack(id,entry);
+    }
+    else if(action==='mplaynow'){
+      let entry=args[0];
+      if(s.panelToken){
+        const matches=(s.movieUpcoming||[]).filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entry);
+        if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued movie/episode is no longer available.');
+        entry=matches[0].entryId;
+      }
+      const rootSession=qm.getSession(id);
+      const targetEntry=(rootSession.movieUpcoming||[]).find(t=>t.entryId===entry);
+      s.view='cinema';
+      if(rootSession)rootSession.view='cinema';
+      s.lastNotice=`▶ Starting ${targetEntry?.title||'selected movie'}…`;
+      const ackPromise=(ctx.query?.id&&ctx.api?.answerCallbackQuery)?ctx.api.answerCallbackQuery(ctx.query.id,{text:'▶ Playing now…'}).catch(()=>{}):null;
+      if(!s.connected&&typeof this.app.voiceClient?.setup==='function'){
+        const generation=this.queueGeneration(id);
+        await this.prepare(ctx,id);
+        this.assertQueueGeneration(id,generation);
+      }
+      await qm.playQueuedMovieNow(id,entry);
+      if(ackPromise)await ackPromise;
+      s.view='cinema';
+    }
+    else if(action==='switchdeck'){
+      const reqDeck=args[0]==='movie'?'movie':args[0]==='music'?'music':(s.activeDeck==='movie'?'music':'movie');
+      const switched=await qm.switchDeck(id,reqDeck);
+      s.activeDeck=switched.activeDeck;
+      s.view=switched.view;
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:reqDeck==='movie'?'🎬 Cinema VC':'🎵 Music Player'}).catch(()=>{});
+    }
     else if(action==='lyrics'){
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🎶 Fetching lyrics…'}).catch(()=>{});
       const result=s.currentTrack?await this.lyrics.get(s.currentTrack,{force:true}):{found:false,reason:'Choose a track first.'};
@@ -293,15 +800,42 @@ export class MusicService {
       }
     }
     else if(action==='lypage'){s.lyricsPage=Math.max(0,Number(args[0])||0);s.view='lyrics';}
-    else if(action==='bass'){s.bass=!s.bass;s.eqPreset=s.bass?'bass':'off';this.app.db?.setSetting?.(`music.bass.${id}`,s.bass);this.app.db?.setSetting?.(`music.eq.${id}`,s.eqPreset);}
+    else if(action==='bass'){s.bass=!s.bass;s.eqPreset=s.bass?'bass':'off';this.app.db?.setSetting?.(`music.bass.${id}`,s.bass);this.app.db?.setSetting?.(`music.eq.${id}`,s.eqPreset);if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:s.bass?'🎛 Clean Bass EQ: ON (applies on next track / seek)':'🎛 Clean Bass EQ: OFF'}).catch(()=>{});}
+    else if(action==='aidj'){
+      const cfg=this.aiDj.toggle(id);
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:cfg.enabled?`🤖 AI DJ ON · ${cfg.vibe}`:'🤖 AI DJ OFF'}).catch(()=>{});
+      if(cfg.enabled){
+        const root=qm.getSession(id);
+        this.aiDj.syncSession(root);
+        if(root.upcoming.length<2){
+          const added=await this.aiDj.curateNextTracks(root,{count:2}).catch(()=>[]);
+          if(added.length&&!['playing','paused','buffering'].includes(root.status)){
+            await this.prepare(ctx,id);
+            await qm.ensurePlaying(id);
+          }
+        }
+        s.lastNotice=`🤖 AI DJ active · ${cfg.vibe}`;
+      }else{
+        s.lastNotice='🤖 AI DJ paused. Existing queue is retained.';
+      }
+    }
     else if(action==='eq'){
       const requested=args[0]&&EQ_PRESETS.includes(String(args[0]).toLowerCase())?String(args[0]).toLowerCase():null;
-      const cur=EQ_PRESETS.includes(s.eqPreset)?s.eqPreset:(s.bass?'bass':'off');
-      s.eqPreset=requested || EQ_PRESETS[(EQ_PRESETS.indexOf(cur)+1)%EQ_PRESETS.length];
+      const cur=EQ_CYCLE_PRESETS.includes(s.eqPreset)?s.eqPreset:(s.bass?'bass':'off');
+      s.eqPreset=requested || EQ_CYCLE_PRESETS[(EQ_CYCLE_PRESETS.indexOf(cur)+1)%EQ_CYCLE_PRESETS.length];
       s.bass=s.eqPreset==='bass';
       this.app.db?.setSetting?.(`music.eq.${id}`,s.eqPreset);
       this.app.db?.setSetting?.(`music.bass.${id}`,s.bass);
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`EQ preset: ${s.eqPreset}`}).catch(()=>{});
+    }
+    else if(action==='submode'){
+      const modes=['screen','live','off'];
+      const cur=modes.includes(s.subtitleMode)?s.subtitleMode:'screen';
+      const req=args[0]&&modes.includes(String(args[0]).toLowerCase())?String(args[0]).toLowerCase():null;
+      const nextMode=req||modes[(modes.indexOf(cur)+1)%modes.length];
+      await qm.setSubtitleMode(id,nextMode);
+      const label=nextMode==='screen'?'Burned on VC Screen':nextMode==='live'?'Live Chat/Card Cues':'Off';
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`💬 Subtitles: ${label}`}).catch(()=>{});
     }
     else if(action==='selectaccount'){
       if(s.connected||s.prepared)throw new MusicError('ACCOUNT_BUSY','Leave the current prepared session/call before changing its account.');
@@ -315,9 +849,61 @@ export class MusicService {
       if(!['creator','administrator'].includes(member.status)||(member.status!=='creator'&&!member.can_pin_messages&&!(s.isChannel&&member.can_edit_messages)))throw new MusicError('PIN_PERMISSION','Grant only the pin permission if you want a pinned player. Playback does not require it.');
       if(!s.pinned){const result=await ctx.api.call('pinChatMessage',{chat_id:ctx.chatId,message_id:s.screenMessageId,disable_notification:true});if(!result)throw new MusicError('PIN_FAILED','Telegram did not confirm pinning.');s.pinned=true;}
     }
-    if(['player','pause','resume','skip','previous','stop','leave','seek','seekby','selectaccount'].includes(action))s.view='player';
+    s.overlayView=null;s.overlayAt=0;
+    const isCinema=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')&&s.view!=='queue';
+    if(['player','stop','leave','seek','seekby','selectaccount'].includes(action)||(s.view!=='queue'&&s.view!=='mqueue'&&['pause','resume','skip','previous'].includes(action)))s.view=isCinema?'cinema':'player';
     if(action==='player'&&s.status==='stopped'){s.status='idle';s.lastError=null;}
-    s.controlRevision=(s.controlRevision||0)+1; await qm.updatePlayerCard(id);return s;
+    s.controlRevision=(s.controlRevision||0)+1; await qm.updatePlayerCard(id,{forceEdit:Boolean(ctx.query)});return s;
+  }
+  async handlePollAnswer(pollAnswer){
+    const pollId=String(pollAnswer?.poll_id||'');
+    const poll=this.activePolls.get(pollId);
+    if(!poll)return false;
+    const voterId=String(pollAnswer?.user?.id||pollAnswer?.voter_chat?.id||'');
+    if(!voterId)return false;
+    const picks=Array.isArray(pollAnswer.option_ids)?pollAnswer.option_ids:[];
+    if(!picks.length)poll.votesByUser.delete(voterId);
+    else poll.votesByUser.set(voterId,picks);
+
+    const tallies=new Map();
+    for(const optIds of poll.votesByUser.values()){
+      for(const oi of optIds)tallies.set(oi,(tallies.get(oi)||0)+1);
+    }
+    let winnerIndex=null;
+    for(const [oi,cnt] of tallies.entries()){
+      if(cnt>=poll.needed&&poll.optionTargets[oi]&&poll.optionTargets[oi].kind!=='keep'){
+        winnerIndex=oi;
+        break;
+      }
+    }
+    if(winnerIndex===null)return true;
+
+    const winner=poll.optionTargets[winnerIndex];
+    this.activePolls.delete(pollId);
+    const qm=this.app?.musicQueueManager;
+    const s=qm?.getSession?.(poll.destination);
+    if(s)s.activePoll=null;
+    if(poll.messageId&&typeof poll.api?.stopPoll==='function'){
+      await poll.api.stopPoll(poll.chatId,poll.messageId).catch(()=>{});
+    }
+    if(qm&&s){
+      if(winner.kind==='skip'){
+        s.lastNotice=`📊 Viewer Poll passed (${tallies.get(winnerIndex)} votes): Skipping current item!`;
+        await qm.skip(poll.destination).catch(()=>{});
+      }else if(winner.kind==='play'&&winner.entryId){
+        const mode=this.getQueueVoteAction(poll.destination);
+        s.lastNotice=`📊 Viewer Poll winner (${tallies.get(winnerIndex)} votes): ${winner.title}!`;
+        const inMovie=(s.movieUpcoming||[]).some(t=>t.entryId===winner.entryId);
+        if(mode==='playnow'){
+          if(inMovie)await qm.playQueuedMovieNow(poll.destination,winner.entryId).catch(()=>{});
+          else await qm.playNow(poll.destination,winner.entryId).catch(()=>{});
+        }else if(inMovie){
+          qm.promoteMovieTrack(poll.destination,winner.entryId);
+        }
+      }
+      await qm.updatePlayerCard(poll.destination,{forceEdit:true}).catch(()=>{});
+    }
+    return true;
   }
   async accountCommand(ctx,args) {
     if(!this.owner(ctx)||Number(ctx.chatId)<0||ctx.isClone)throw new MusicError('OWNER_ONLY','Account-pool management is restricted to the main owner in private chat.');
@@ -341,7 +927,7 @@ export class MusicService {
     await this.authorize(ctx,true,chat.id);
     if(chat.type==='channel')await this.channels.save(ctx,chat.id);
     this.destinations.set(`${this.botKey(ctx)}:${ctx.tgId}`,chat.id);
-    const session=this.app.musicQueueManager.getSession(chat.id);session.isChannel=chat.type==='channel';session.destinationTitle=chat.title||'Channel';
+    const session=this.app.musicQueueManager.getSession(chat.id);await this.syncSessionIdentity(session,ctx,chat);
     return chat.id;
   }
 }

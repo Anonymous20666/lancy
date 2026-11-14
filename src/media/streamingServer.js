@@ -1,4 +1,6 @@
 import http from 'node:http';
+import { Readable } from 'node:stream';
+import { randomBytes } from 'node:crypto';
 import { existsSync, statSync, createReadStream, writeFileSync, unlinkSync, mkdirSync, renameSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -6,8 +8,22 @@ import { promisify } from 'node:util';
 import { parseDurationToSeconds } from '../utils/time.js';
 import { optimizeVideoForTelegram, getCookieArgs, getAudioDurationSeconds } from './downloader.js';
 import { resolveAndDownloadAudio } from './musicResolver.js';
+import { resolveFfmpegPath } from './convert.js';
 
 const execFileAsync = promisify(execFile);
+
+export const DEFAULT_STREAM_PUBLIC_URL = 'https://pappysonghttps.duckdns.org';
+
+/**
+ * Resolve the public HTTPS base URL for streamed audio/video assets.
+ * Honors `STREAM_PUBLIC_URL` env override first, then settings `media.streamPublicUrl`.
+ */
+export function getStreamPublicUrl(settings) {
+  const raw = process.env.STREAM_PUBLIC_URL
+    || settings?.get?.('media.streamPublicUrl')
+    || DEFAULT_STREAM_PUBLIC_URL;
+  return String(raw).trim().replace(/\/+$/, '');
+}
 
 /**
  * High-Performance Video & Audio Streaming Server for Telegram Bot API
@@ -24,6 +40,7 @@ export class VideoStreamingServer {
     this.server = null;
     this.activeDownloads = new Map();
     this.activeAudioDownloads = new Map();
+    this.remoteStreams = new Map();
 
     try {
       mkdirSync(this.cacheDir, { recursive: true });
@@ -51,6 +68,8 @@ export class VideoStreamingServer {
       });
 
       this.server.listen(this.port, '127.0.0.1', () => {
+        const addr = this.server.address();
+        if (addr && typeof addr === 'object' && addr.port) this.port = addr.port;
         this.log?.info?.({ port: this.port }, 'video streaming server listening on 127.0.0.1');
         resolve(this.server);
       });
@@ -74,8 +93,8 @@ export class VideoStreamingServer {
       return;
     }
 
-    // 1. Audio stream request (/audio/:id/:filename? or /audio/live/:id/:filename?)
-    const audioMatch = pathname.match(/^\/audio\/(?:live\/)?([a-zA-Z0-9_-]+)(?:\/([^\/]+))?$/i);
+    // 1. Audio stream request (/audio/:id(.mp3)?/:filename? or /audio/live/:id/:filename?)
+    const audioMatch = pathname.match(/^\/audio\/(?:live\/)?([a-zA-Z0-9_-]+?)(?:\.mp3)?(?:\/([^\/]+))?$/i);
     if (audioMatch) {
       const trackId = audioMatch[1];
       const filename = audioMatch[2] ? decodeURIComponent(audioMatch[2]) : `${trackId}.mp3`;
@@ -92,6 +111,13 @@ export class VideoStreamingServer {
       }
 
       this.#serveMediaFile(req, res, filePath, 'audio/mpeg', filename);
+      return;
+    }
+
+    // 1.5 Loopback progressive movie/episode relay (/movie-proxy/:token[.ext]) for PyTgCalls
+    const proxyMatch = pathname.match(/^\/movie-proxy\/([a-f0-9]{16,64})(?:\.(?:m3u8|ts|mp4|mkv|m4s|aac|key))?$/i);
+    if (proxyMatch) {
+      await this.#handleMovieProxy(req, res, proxyMatch[1]);
       return;
     }
 
@@ -226,10 +252,12 @@ export class VideoStreamingServer {
           : (filename ? filename.replace(/\.mp3$/i, '').replace(/_/g, ' ').trim() : trackId);
 
         const cookieArgs = getCookieArgs();
-        const tempPath = join(this.audioCacheDir, `temp_full_${trackId}_${Date.now()}.mp3`);
+        const ffmpegPath = resolveFfmpegPath(this.app?.settings?.get('media.ffmpegPath') ?? '') || 'ffmpeg';
+        const tempStem = join(this.audioCacheDir, `temp_full_${trackId}_${Date.now()}`);
+        const tempPath = `${tempStem}.mp3`;
 
-        // Multi-source full-track resolution (YouTube exact-id -> Audius full
-        // stream), duration-validated >= 45s so previews can never leak through.
+        // Multi-source full-track resolution (YouTube exact-id -> JioSaavn / Audius),
+        // duration-validated >= 45s so 30s previews can never leak through.
         let downloaded = false;
         try {
           const resolved = await resolveAndDownloadAudio({
@@ -237,6 +265,7 @@ export class VideoStreamingServer {
             trackId: isYouTubeId ? trackId : null,
             tempPath,
             minSeconds: 45,
+            ffmpegPath,
           });
           downloaded = resolved.ok;
           if (resolved.ok) {
@@ -253,15 +282,16 @@ export class VideoStreamingServer {
             await execFileAsync('yt-dlp', [
               '--no-warnings',
               '--no-playlist',
+              '--ffmpeg-location', ffmpegPath,
               ...cookieArgs,
               '-N', '4',
               '--max-filesize', '50M',
               '--js-runtimes', 'node:/usr/bin/node',
-              '-f', 'ba/b',
+              '-f', 'ba[ext=m4a]/ba/b',
               '-x',
               '--audio-format', 'mp3',
               '--audio-quality', '2',
-              '-o', tempPath,
+              '-o', `${tempStem}.%(ext)s`,
               isYouTubeId ? `https://www.youtube.com/watch?v=${trackId}` : `ytsearch1:${searchQuery}`
             ], { timeout: 45000 });
 
@@ -291,7 +321,7 @@ export class VideoStreamingServer {
           const titleStr = meta?.title || searchQuery;
           const artistStr = meta?.artist || 'Music';
           try {
-            await execFileAsync('ffmpeg', [
+            await execFileAsync(ffmpegPath, [
               '-y',
               '-i', tempPath,
               '-metadata', `title=${titleStr}`,
@@ -358,6 +388,214 @@ export class VideoStreamingServer {
     return downloadPromise;
   }
 
+  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, ttlMs = 8 * 3600 * 1000 } = {}) {
+    if (!url || !/^https?:\/\//i.test(String(url))) return null;
+    const now = Date.now();
+    for (const [k, v] of this.remoteStreams) {
+      if (now > v.expiresAt) this.remoteStreams.delete(k);
+    }
+    const token = randomBytes(16).toString('hex');
+    const urlStr = String(url);
+    const detectedHls = Boolean(isHls || /mpegurl/i.test(String(contentType || '')) || /\.m3u8(\?|$)/i.test(urlStr));
+    this.remoteStreams.set(token, {
+      url: urlStr,
+      headers: headers && typeof headers === 'object' ? { ...headers } : {},
+      contentType: detectedHls ? 'application/vnd.apple.mpegurl' : contentType,
+      isHls: detectedHls,
+      forceContentType: null,
+      childTokens: new Map(),
+      expiresAt: now + ttlMs
+    });
+    return `http://127.0.0.1:${this.port}/movie-proxy/${token}`;
+  }
+
+  #registerChildProxyStream(parentEntry, targetUrl, { isHls = false, contentType = 'video/mp2t', forceContentType = null } = {}) {
+    const absUrl = String(targetUrl);
+    const existing = parentEntry.childTokens?.get(absUrl);
+    const now = Date.now();
+    if (existing) {
+      const existingEntry = this.remoteStreams.get(existing);
+      if (existingEntry && now <= existingEntry.expiresAt) {
+        return existing;
+      }
+    }
+    if (this.remoteStreams.size > 6000) {
+      for (const [k, v] of this.remoteStreams) {
+        if (now > v.expiresAt) this.remoteStreams.delete(k);
+      }
+      if (this.remoteStreams.size > 6000) {
+        for (const [k, v] of this.remoteStreams) {
+          if (v.isChildSegment) {
+            this.remoteStreams.delete(k);
+            if (this.remoteStreams.size <= 4500) break;
+          }
+        }
+      }
+    }
+    const childToken = randomBytes(16).toString('hex');
+    this.remoteStreams.set(childToken, {
+      url: absUrl,
+      headers: parentEntry.headers ? { ...parentEntry.headers } : {},
+      contentType,
+      isHls: Boolean(isHls),
+      forceContentType,
+      isChildSegment: !isHls,
+      childTokens: new Map(),
+      expiresAt: parentEntry.expiresAt
+    });
+    parentEntry.childTokens?.set(absUrl, childToken);
+    return childToken;
+  }
+
+  #rewriteHlsPlaylist(text, baseUrl, parentEntry) {
+    const lines = String(text || '').split(/\r?\n/);
+    const hasInitMap = /^#EXT-X-MAP:/im.test(text);
+    const base = `http://127.0.0.1:${this.port}/movie-proxy`;
+    let expectVariantPlaylist = false;
+
+    const rewriteUri = (rawUri, opts) => {
+      try {
+        const abs = new URL(rawUri, baseUrl).toString();
+        const tok = this.#registerChildProxyStream(parentEntry, abs, opts);
+        return `${base}/${tok}.${opts.ext}`;
+      } catch {
+        return rawUri;
+      }
+    };
+
+    return lines.map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+
+      if (trimmed.startsWith('#')) {
+        expectVariantPlaylist = /^#EXT-X-STREAM-INF\b/i.test(trimmed);
+        if (/^#EXT-X-(?:KEY|MAP|MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed) && /\bURI="([^"]+)"/i.test(line)) {
+          const isSubPlaylist = /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed);
+          const isKey = /^#EXT-X-KEY\b/i.test(trimmed);
+          const isMap = /^#EXT-X-MAP\b/i.test(trimmed);
+          const opts = isSubPlaylist
+            ? { isHls: true, contentType: 'application/vnd.apple.mpegurl', forceContentType: 'application/vnd.apple.mpegurl', ext: 'm3u8' }
+            : isKey
+              ? { isHls: false, contentType: 'application/octet-stream', forceContentType: 'application/octet-stream', ext: 'key' }
+              : isMap
+                ? { isHls: false, contentType: 'video/mp4', forceContentType: 'video/mp4', ext: 'mp4' }
+                : { isHls: false, contentType: 'video/mp2t', forceContentType: 'video/mp2t', ext: 'ts' };
+          return line.replace(/\bURI="([^"]+)"/i, (_, u) => `URI="${rewriteUri(u, opts)}"`);
+        }
+        return line;
+      }
+
+      if (expectVariantPlaylist) {
+        expectVariantPlaylist = false;
+        return rewriteUri(trimmed, {
+          isHls: true,
+          contentType: 'application/vnd.apple.mpegurl',
+          forceContentType: 'application/vnd.apple.mpegurl',
+          ext: 'm3u8'
+        });
+      }
+
+      let isFmp4 = hasInitMap || /\.m4s(\?|$)/i.test(trimmed);
+      if (!isFmp4) {
+        try {
+          const nested = new URL(trimmed, baseUrl).searchParams.get('url') || '';
+          if (/\.m4s(\?|$)/i.test(nested)) isFmp4 = true;
+        } catch {}
+      }
+      return rewriteUri(trimmed, isFmp4
+        ? { isHls: false, contentType: 'video/mp4', forceContentType: 'video/mp4', ext: 'm4s' }
+        : { isHls: false, contentType: 'video/mp2t', forceContentType: 'video/mp2t', ext: 'ts' });
+    }).join('\n');
+  }
+
+  async #handleMovieProxy(req, res, token) {
+    const entry = this.remoteStreams.get(token);
+    if (!entry || Date.now() > entry.expiresAt) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Stream expired or not found');
+      return;
+    }
+    const upstreamHeaders = {
+      ...(entry.headers || {}),
+      'User-Agent': entry.headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+    };
+    if (req.headers.range && !entry.isHls) upstreamHeaders.Range = req.headers.range;
+    if (req.headers['if-range'] && !entry.isHls) upstreamHeaders['If-Range'] = req.headers['if-range'];
+
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+    let upstream;
+    try {
+      upstream = await fetch(entry.url, {
+        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+        headers: upstreamHeaders,
+        redirect: 'follow',
+        signal: controller.signal
+      });
+    } catch {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Upstream movie stream unreachable');
+      }
+      return;
+    }
+
+    const passHeaders = {};
+    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag', 'last-modified']) {
+      const val = upstream.headers.get(h);
+      if (val) passHeaders[h] = val;
+    }
+    const ctype = String(passHeaders['content-type'] || '').toLowerCase();
+    if (entry.forceContentType) {
+      passHeaders['content-type'] = entry.forceContentType;
+    } else if (!passHeaders['content-type'] || entry.isHls) {
+      passHeaders['content-type'] = entry.contentType || 'application/octet-stream';
+    }
+
+    if (req.method === 'HEAD' || !upstream.body) {
+      res.writeHead(upstream.status, passHeaders);
+      res.end();
+      return;
+    }
+
+    const maybePlaylist = upstream.ok
+      && !entry.isChildSegment
+      && (entry.isHls
+        || ctype.includes('mpegurl')
+        || ctype.includes('application/json')
+        || ctype.includes('text/plain')
+        || /\.m3u8(\?|$)/i.test(upstream.url || entry.url));
+
+    if (maybePlaylist) {
+      const lenHint = Number(upstream.headers.get('content-length') || 0);
+      if (!lenHint || lenHint <= 4 * 1024 * 1024) {
+        const rawBuf = Buffer.from(await upstream.arrayBuffer());
+        const headSample = rawBuf.subarray(0, 64).toString('utf8').trimStart();
+        if (headSample.startsWith('#EXTM3U')) {
+          const rewritten = this.#rewriteHlsPlaylist(rawBuf.toString('utf8'), upstream.url || entry.url, entry);
+          const outBuf = Buffer.from(rewritten, 'utf8');
+          res.writeHead(200, {
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Content-Length': outBuf.length,
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*'
+          });
+          res.end(outBuf);
+          return;
+        }
+        res.writeHead(upstream.status, passHeaders);
+        res.end(rawBuf);
+        return;
+      }
+    }
+
+    res.writeHead(upstream.status, passHeaders);
+    const nodeStream = Readable.fromWeb(upstream.body);
+    nodeStream.on('error', () => { try { res.end(); } catch {} });
+    res.on('close', () => { try { nodeStream.destroy(); } catch {} });
+    nodeStream.pipe(res);
+  }
+
   #serveMediaFile(req, res, filePath, contentType = 'video/mp4', downloadFilename = null) {
     const stat = statSync(filePath);
     const fileSize = stat.size;
@@ -376,11 +614,29 @@ export class VideoStreamingServer {
     }
 
     if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const match = /^bytes=(\d*)-(\d*)$/i.exec(String(range).trim());
+      if (!match || (!match[1] && !match[2])) {
+        res.writeHead(416, {
+          'Content-Range': `bytes */${fileSize}`,
+          'Access-Control-Allow-Origin': '*'
+        });
+        res.end();
+        return;
+      }
 
-      if (start >= fileSize || end >= fileSize || start > end) {
+      let start;
+      let end;
+      if (!match[1] && match[2]) {
+        // Suffix byte range: bytes=-N (last N bytes)
+        const suffixLen = parseInt(match[2], 10);
+        start = Math.max(0, fileSize - suffixLen);
+        end = fileSize - 1;
+      } else {
+        start = parseInt(match[1], 10);
+        end = match[2] ? Math.min(parseInt(match[2], 10), fileSize - 1) : fileSize - 1;
+      }
+
+      if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || start >= fileSize || start > end) {
         res.writeHead(416, {
           'Content-Range': `bytes */${fileSize}`,
           'Access-Control-Allow-Origin': '*'

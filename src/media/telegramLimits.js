@@ -67,20 +67,23 @@ export async function fitResultForTelegram(result, { limitBytes = uploadLimitByt
   const oversized = [];
   const kept = [];
   for (const item of result?.mediaItems || []) {
-    const size = item?.buffer?.length || 0;
+    const size = item?.buffer?.length || item?.sizeBytes || (item?.filePath && existsSync(item.filePath) ? statSync(item.filePath).size : 0);
     if (item.type === 'photo' && size > PHOTO_LIMIT_BYTES) {
       try {
         const sharp = sharpImpl || (await import('sharp')).default;
-        const buf = await sharp(item.buffer, { limitInputPixels: 100_000_000 }).rotate().resize({ width: 2560, height: 2560, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+        const src = item.buffer || item.filePath;
+        const buf = await sharp(src, { limitInputPixels: 100_000_000 }).rotate().resize({ width: 2560, height: 2560, fit: 'inside', withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
         if (buf.length <= PHOTO_LIMIT_BYTES) { kept.push({ ...item, buffer: buf, mimeType: 'image/jpeg' }); continue; }
       } catch {}
       oversized.push({ type: 'photo', sizeBytes: size, reason: 'photo_too_large' });
       continue;
     }
     if (item.type !== 'video' || size <= limitBytes) { kept.push(item); continue; }
-    const durationSeconds = await durationOf(item.buffer, runner);
+    const durationSeconds = item.filePath && existsSync(item.filePath)
+      ? await probeDuration(item.filePath, runner)
+      : await durationOf(item.buffer, runner);
     const plan = planVideoFit({ sizeBytes: size, durationSeconds, limitBytes });
-    if (plan.action === 'transcode') {
+    if (plan.action === 'transcode' && item.buffer) {
       onProgress?.(`Compressing ${Math.round(size / MB)} MB video to fit Telegram (${plan.height}p)…`);
       const out = await transcodeVideo(item.buffer, plan, runner).catch(() => null);
       if (out && out.length <= limitBytes) { kept.push({ ...item, buffer: out, mimeType: 'video/mp4', compressedFrom: size }); continue; }

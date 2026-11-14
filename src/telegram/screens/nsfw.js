@@ -2,7 +2,15 @@ import { RichMessageBuilder, rt, richButton, encodeCallback, block } from '../ri
 import { navButtons, kvTable, banner } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { ProgressTracker } from '../progress.js';
-import { searchNsfw, isBlockedNsfwQuery, NSFW_CATEGORIES, CATEGORY_SUGGESTIONS } from '../../wallpaper/nsfwSearch.js';
+import {
+  searchNsfw,
+  searchXvideos,
+  searchAdultMovies,
+  resolveXvideosStream,
+  isBlockedNsfwQuery,
+  NSFW_CATEGORIES,
+  CATEGORY_SUGGESTIONS
+} from '../../wallpaper/nsfwSearch.js';
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice } from '../permissions.js';
 import { optimizePreviewImage } from '../../media/convert.js';
@@ -129,6 +137,96 @@ async function fetchPreviewBuffers(items, max = 10) {
 export function createNsfwScreen({ app }) {
   const id = 'nsfw';
   const activeSearches = new Map(); // tgId -> AbortController
+  const adultCinemaSessions = new Map(); // sid -> { sid, mode, category, query, page, apiPage, sort, items, selectedIds, msgId, createdAt }
+
+  function rememberAdultSession(session) {
+    adultCinemaSessions.set(session.sid, session);
+    if (adultCinemaSessions.size > 200) {
+      const oldestKey = adultCinemaSessions.keys().next().value;
+      adultCinemaSessions.delete(oldestKey);
+    }
+    return session;
+  }
+
+  function getAdultSession(sid) {
+    return sid ? adultCinemaSessions.get(String(sid)) || null : null;
+  }
+
+  async function ensureAdultStreamResolved(item) {
+    if (!item) return null;
+    if (item._fullResolved && (item.videoUrl || item.hlsUrl)) return item;
+    if (item.pageUrl && /xvideos\./i.test(item.pageUrl)) {
+      const resolved = await resolveXvideosStream(item.pageUrl).catch(() => null);
+      if (resolved?.streamUrl) {
+        item.videoUrl = resolved.streamUrl;
+        item.hlsUrl = resolved.hlsUrl || item.hlsUrl || null;
+        item.fallbackUrls = [...new Set([...(resolved.fallbackUrls || []), ...(item.fallbackUrls || [])])];
+        item.headers = resolved.headers || item.headers;
+        item.streamHeaders = resolved.headers || item.streamHeaders;
+      }
+      item._fullResolved = true;
+    } else if (item.videoUrl || item.mediaUrl) {
+      item._fullResolved = true;
+    }
+    return item;
+  }
+
+  function buildAdultTrack(item, mode = 'adult_movies') {
+    const streamUrl = item.videoUrl || item.hlsUrl || item.fallbackUrls?.[0] || item.mediaUrl;
+    return {
+      id: String(item.id || `adult_${Date.now()}`),
+      title: item.title || (mode === 'xvideos' ? '18+ Stream' : '18+ Feature Film'),
+      artist: mode === 'xvideos' ? '18+ Stream' : '18+ Cinema',
+      durationSec: Number(item.durationSec) || 0,
+      durationLabel: item.duration || '',
+      provider: 'movie',
+      mediaType: 'video',
+      isAdult: true,
+      streamUrl,
+      videoUrl: streamUrl,
+      streamHeaders: item.streamHeaders || item.headers || {},
+      fallbackUrls: item.fallbackUrls || [],
+      thumbnailUrl: item.thumbUrl || null,
+      pageUrl: item.pageUrl || null,
+      resolution: item.quality || 'HD'
+    };
+  }
+
+  async function fetchThumbnailSlides(items = []) {
+    const previewBlocks = [];
+    const mediaFiles = {};
+    const fetched = await Promise.all(
+      items.slice(0, 5).map(async (it, i) => {
+        const url = it.thumbUrl;
+        if (!url || !url.startsWith('http')) return null;
+        try {
+          const res = await fetch(url, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+              ...(it.headers || {})
+            },
+            signal: AbortSignal.timeout(3000)
+          });
+          if (!res.ok) return null;
+          let buf = Buffer.from(await res.arrayBuffer());
+          if (!buf.length || buf.length < 400) return null;
+          try {
+            buf = await optimizePreviewImage(buf, { maxWidth: 960, quality: 75 });
+          } catch {}
+          return { i, buf };
+        } catch {
+          return null;
+        }
+      })
+    );
+    for (const r of fetched) {
+      if (!r) continue;
+      const key = `ac_th_${r.i}.jpg`;
+      mediaFiles[key] = { buffer: r.buf, filename: key, contentType: 'image/jpeg' };
+      previewBlocks.push(block.photo(`attach://${key}`));
+    }
+    return { previewBlocks, mediaFiles };
+  }
 
   function isGroupChat(ctx) {
     return Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || Number(ctx.chatId) < 0);
@@ -219,6 +317,12 @@ export function createNsfwScreen({ app }) {
     b.buttons([
       richButton.callback('📸 Adult Wallpapers (4K)', encodeCallback(id, 'sub', 'real_wallpapers'), { style: 'primary' }),
       richButton.callback('🎥 Adult Videos', encodeCallback(id, 'sub', 'real_videos'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎬 18+ Adult Movies (Full Features)', encodeCallback(id, 'sub', 'adult_movies'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🔥 XVideos Streaming & Download', encodeCallback(id, 'sub', 'xvideos'), { style: 'primary' })
     ]);
     b.buttons([
       richButton.callback('🎲 Random Spicy Pick', encodeCallback(id, 'random', 'all'), { style: 'primary' }),
@@ -366,6 +470,10 @@ export function createNsfwScreen({ app }) {
       richButton.callback('🎞 Full Adult Videos & Streams', encodeCallback(id, 'cat', NSFW_CATEGORIES.REAL_FULL_VIDEOS), { style: 'primary' })
     ]);
     b.buttons([
+      richButton.callback('🍿 18+ Adult Movies Studio', encodeCallback(id, 'sub', 'adult_movies'), { style: 'primary' }),
+      richButton.callback('🔥 XVideos Hub', encodeCallback(id, 'sub', 'xvideos'), { style: 'primary' })
+    ]);
+    b.buttons([
       richButton.callback('🎲 Random Spicy Video Pick', encodeCallback(id, 'random', NSFW_CATEGORIES.REAL_CLIPS), { style: 'primary' })
     ]);
     b.divider();
@@ -441,6 +549,8 @@ export function createNsfwScreen({ app }) {
       [NSFW_CATEGORIES.REAL_WALLPAPERS]: 'Real Adult 4K Wallpapers',
       [NSFW_CATEGORIES.REAL_CLIPS]: 'Real Adult Video Clips & Previews',
       [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: 'Full Adult Videos',
+      [NSFW_CATEGORIES.ADULT_MOVIES]: '18+ Adult Feature Movies',
+      [NSFW_CATEGORIES.XVIDEOS_VIDEO]: 'XVideos Streaming & Download',
       all: '18+ Adult & Hentai Studio'
     };
 
@@ -448,6 +558,8 @@ export function createNsfwScreen({ app }) {
       [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'boudoir', 'baddie'],
       [NSFW_CATEGORIES.REAL_CLIPS]: ['asian', 'latina', 'brunette', 'teaser', 'glamour'],
       [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['asian', 'latina', 'blonde', 'baddie', 'brunette'],
+      [NSFW_CATEGORIES.ADULT_MOVIES]: ['romantic', 'passionate', 'couples', 'full movie', 'brunette'],
+      [NSFW_CATEGORIES.XVIDEOS_VIDEO]: ['trending', 'asian', 'latina', 'brunette', 'blonde', 'amateur'],
       [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'genshin', 'makima', 'yor forger', '2b', 'marin'],
       [NSFW_CATEGORIES.HENTAI_CENSORED]: ['waifu', 'swimsuit', 'lingerie', 'genshin', 'honkai', 'anime girl'],
       [NSFW_CATEGORIES.HENTAI_CLIPS]: ['blowjob', 'fuck', 'anal', 'cum', 'dance'],
@@ -1082,6 +1194,453 @@ export function createNsfwScreen({ app }) {
     }
   }
 
+  function renderAdultMoviesMenu(ctx) {
+    const b = new RichMessageBuilder();
+    b.header('🎬 18+ ADULT MOVIES STUDIO', 1);
+    b.paragraph(rt.italic('full-length 18+ HD feature films — stream in VC, add to queue, or download directly (separate from SFW movies)'));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🔍 Search 18+ Adult Movies', encodeCallback(id, 'cat', NSFW_CATEGORIES.ADULT_MOVIES), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎲 Random Adult Feature', encodeCallback(id, 'random', NSFW_CATEGORIES.ADULT_MOVIES), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.paragraph(rt.bold('🍿 Popular 18+ Feature Tags:'));
+    b.buttons([
+      richButton.callback('❤️ Romantic 18+', encodeCallback(id, 'amRun', 'romantic'), { style: 'primary' }),
+      richButton.callback('🔥 Passionate', encodeCallback(id, 'amRun', 'passionate'), { style: 'primary' }),
+      richButton.callback('💑 Couples', encodeCallback(id, 'amRun', 'couples'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🎬 Full Storyline', encodeCallback(id, 'amRun', 'full movie'), { style: 'primary' }),
+      richButton.callback('💋 Brunette HD', encodeCallback(id, 'amRun', 'brunette'), { style: 'primary' }),
+      richButton.callback('💋 Asian HD', encodeCallback(id, 'amRun', 'asian'), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🔥 Switch to XVideos', encodeCallback(id, 'sub', 'xvideos'), { style: 'primary' }),
+      richButton.callback('« 18+ Menu', encodeCallback(id, 'menu')),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  function renderXvideosMenu(ctx) {
+    const b = new RichMessageBuilder();
+    b.header('🔥 XVIDEOS STREAM & DOWNLOAD', 1);
+    b.paragraph(rt.italic('dedicated XVideos hub — browse trending, sort by views/rating, stream in VC, or download HD MP4'));
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🔍 Search XVideos', encodeCallback(id, 'cat', NSFW_CATEGORIES.XVIDEOS_VIDEO), { style: 'primary' }),
+      richButton.callback('🔥 Trending Now', encodeCallback(id, 'xvRun', 'trending'), { style: 'success' })
+    ]);
+    b.buttons([
+      richButton.callback('🎲 Random XVideos Pick', encodeCallback(id, 'random', NSFW_CATEGORIES.XVIDEOS_VIDEO), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.paragraph(rt.bold('✨ Quick XVideos Categories:'));
+    b.buttons([
+      richButton.callback('🔥 Asian', encodeCallback(id, 'xvRun', 'asian'), { style: 'primary' }),
+      richButton.callback('🔥 Latina', encodeCallback(id, 'xvRun', 'latina'), { style: 'primary' }),
+      richButton.callback('🔥 Brunette', encodeCallback(id, 'xvRun', 'brunette'), { style: 'primary' })
+    ]);
+    b.buttons([
+      richButton.callback('🔥 Blonde', encodeCallback(id, 'xvRun', 'blonde'), { style: 'primary' }),
+      richButton.callback('🔥 Amateur', encodeCallback(id, 'xvRun', 'amateur'), { style: 'primary' }),
+      richButton.callback('🔥 Cosplay', encodeCallback(id, 'xvRun', 'cosplay'), { style: 'primary' })
+    ]);
+    b.divider();
+
+    b.buttons([
+      richButton.callback('🎬 18+ Adult Movies', encodeCallback(id, 'sub', 'adult_movies'), { style: 'primary' }),
+      richButton.callback('« 18+ Menu', encodeCallback(id, 'menu')),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+    ]);
+    b.validate();
+    return b.toJSON();
+  }
+
+  async function upsertAdultScreen(ctx, rich, files = null, session = null) {
+    const api = ctx.api || app.telegram.api;
+    const chatId = ctx.chatId ?? Number(ctx.tgId);
+    const targetMsgId = ctx.query?.message?.message_id || session?.msgId || ctx.messageId || ctx.screenMessageId || ctx.sm?.context?.(ctx.tgId)?.screenMessageId || null;
+    if (targetMsgId && !files && typeof api.editMessageRich === 'function') {
+      try {
+        await api.editMessageRich(chatId, targetMsgId, rich);
+        if (session) session.msgId = targetMsgId;
+        return { message_id: targetMsgId };
+      } catch (err) {
+        if (/not modified/i.test(String(err?.description ?? err?.message))) return { message_id: targetMsgId };
+      }
+    }
+    if (targetMsgId && files && typeof api.editMessageRich === 'function') {
+      try {
+        await api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+        if (session) session.msgId = targetMsgId;
+        return { message_id: targetMsgId };
+      } catch (err) {
+        if (/not modified/i.test(String(err?.description ?? err?.message))) return { message_id: targetMsgId };
+      }
+    }
+    const sent = await api.sendRichMessage(chatId, rich, {}, files);
+    if (sent?.message_id) {
+      if (targetMsgId && sent.message_id !== targetMsgId) {
+        await api.deleteMessage(chatId, targetMsgId).catch(() => {});
+      }
+      if (session) session.msgId = sent.message_id;
+      app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+      app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: sent.message_id });
+      ctx.sm?.update?.(ctx.tgId, { screenMessageId: sent.message_id });
+    }
+    return sent;
+  }
+
+  async function renderAndShowAdultCinemaPage(ctx, session, uiPage = 0) {
+    const isGroup = isGroupChat(ctx);
+    const PER_PAGE = 5;
+    let totalItems = session.items.length;
+    let totalPages = Math.max(1, Math.ceil(totalItems / PER_PAGE));
+    let safePage = Math.max(0, Number(uiPage) || 0);
+
+    // Lazy-fetch next backend page when user paginates beyond buffered items
+    if (safePage * PER_PAGE >= totalItems && totalItems >= 12) {
+      const nextApiPage = (session.apiPage || 0) + 1;
+      const more = session.mode === 'xvideos'
+        ? await searchXvideos({ query: session.query, page: nextApiPage, limit: 15, sort: session.sort || 'relevance' }).catch(() => ({ results: [] }))
+        : await searchAdultMovies({ query: session.query, page: nextApiPage, limit: 15 }).catch(() => ({ results: [] }));
+      const existingIds = new Set(session.items.map(it => it.id));
+      const added = (more?.results || []).filter(it => it?.id && !existingIds.has(it.id));
+      if (added.length) {
+        session.apiPage = nextApiPage;
+        session.items.push(...added);
+        totalItems = session.items.length;
+        totalPages = Math.max(1, Math.ceil(totalItems / PER_PAGE));
+      }
+    }
+
+    safePage = Math.min(safePage, Math.max(0, totalPages - 1));
+    session.page = safePage;
+    const start = safePage * PER_PAGE;
+    const slice = session.items.slice(start, start + PER_PAGE);
+
+    let previewBlocks = [];
+    let mediaFiles = null;
+    if (!isGroup && slice.length) {
+      const fetched = await fetchThumbnailSlides(slice);
+      if (fetched.previewBlocks.length) {
+        previewBlocks = fetched.previewBlocks;
+        mediaFiles = fetched.mediaFiles;
+      }
+    }
+
+    const titlePrefix = session.mode === 'xvideos' ? '🔥 XVIDEOS' : '🎬 18+ ADULT MOVIES';
+    const b = new RichMessageBuilder();
+    b.bannerHeader([
+      `${titlePrefix} · "${truncate(session.query || 'trending', 24)}"`,
+      `Page ${safePage + 1}/${totalPages} · ${totalItems} titles${session.mode === 'xvideos' ? ` · Sort: ${session.sort || 'relevance'}` : ''}`
+    ], { size: 2 });
+
+    if (previewBlocks.length > 1) {
+      b.slideshow(previewBlocks);
+      b.divider();
+    } else if (previewBlocks.length === 1) {
+      b.image(previewBlocks[0].url);
+      b.divider();
+    }
+
+    const rows = slice.map((item, i) => {
+      const absIdx = start + i;
+      const checked = session.selectedIds.has(absIdx) ? '☑' : '☐';
+      return [
+        `${checked} ${absIdx + 1}.`,
+        truncate(item.title || '18+ Video', 38),
+        String(item.duration || 'HD').slice(0, 14)
+      ];
+    });
+    if (rows.length) {
+      b.table(rows, { striped: true, bordered: true, compact: true });
+    }
+
+    const selectedCount = session.selectedIds.size;
+    if (isGroup) {
+      b.paragraph(rt.italic('ℹ️ Group safety active: downloads use Telegram spoiler blur.'));
+    } else {
+      b.paragraph(rt.italic(`Selected: ${selectedCount} · Tap ▶ VC, ➕ Q, ⬇ MP4 or multi-select for Slide Album`));
+    }
+
+    slice.forEach((item, i) => {
+      const absIdx = start + i;
+      const num = absIdx + 1;
+      const mark = session.selectedIds.has(absIdx) ? '☑' : '☐';
+      b.buttons([
+        richButton.callback(`${mark} #${num}`, encodeCallback(id, 'acTg', session.sid, String(absIdx))),
+        richButton.callback('▶ VC', encodeCallback(id, 'acPl', session.sid, String(absIdx)), { style: 'success' }),
+        richButton.callback('➕ Q', encodeCallback(id, 'acQu', session.sid, String(absIdx)), { style: 'primary' }),
+        richButton.callback('⬇ MP4', encodeCallback(id, 'acDl', session.sid, String(absIdx)))
+      ]);
+    });
+
+    b.buttons([
+      richButton.callback('☑ Page', encodeCallback(id, 'acAp', session.sid, String(safePage))),
+      richButton.callback('⬇ Slide Album', encodeCallback(id, 'acSl', session.sid, '0'), { style: 'primary' }),
+      richButton.callback('➕ Queue Sel', encodeCallback(id, 'acQa', session.sid))
+    ]);
+
+    const navRow = [];
+    if (safePage > 0) {
+      navRow.push(richButton.callback('◀ Prev', encodeCallback(id, 'acPg', session.sid, String(safePage - 1)), { style: 'primary' }));
+    }
+    navRow.push(richButton.callback(`${safePage + 1}/${totalPages}`, encodeCallback(id, 'noop')));
+    if (safePage < totalPages - 1 || totalItems >= 12) {
+      navRow.push(richButton.callback('Next ▶', encodeCallback(id, 'acPg', session.sid, String(safePage + 1)), { style: 'primary' }));
+    }
+    b.buttons(navRow);
+
+    if (session.mode === 'xvideos') {
+      b.buttons([
+        richButton.callback(session.sort === 'relevance' ? '• Rel' : '🔍 Rel', encodeCallback(id, 'xvSo', session.sid, 'relevance')),
+        richButton.callback(session.sort === 'views' ? '• Views' : '🔥 Views', encodeCallback(id, 'xvSo', session.sid, 'views')),
+        richButton.callback(session.sort === 'rating' ? '• Top' : '⭐ Top', encodeCallback(id, 'xvSo', session.sid, 'rating'))
+      ]);
+    }
+
+    b.buttons([
+      richButton.callback('🔍 Search', encodeCallback(id, 'cat', session.category)),
+      richButton.callback('« 18+ Menu', encodeCallback(id, 'menu')),
+      richButton.callback('✦ Home', encodeCallback('dashboard', 'open'))
+    ]);
+    b.validate();
+    return upsertAdultScreen(ctx, b.toJSON(), mediaFiles, session);
+  }
+
+  async function runAdultCinemaSearch(ctx, category, query = '', { page = 0, sort = 'relevance' } = {}) {
+    if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+    if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+
+    const cleanQ = String(query || '').trim();
+    if (isBlockedNsfwQuery(cleanQ)) {
+      const b = new RichMessageBuilder();
+      b.header('⚠️ QUERY BLOCKED BY SAFETY FILTER', 1);
+      b.paragraph('Your search query contains prohibited terms. Queries involving minors or non-consensual content are strictly blocked.');
+      b.buttons(navButtons(id, { back: true, home: true }));
+      b.validate();
+      return editOrSend(ctx, b.toJSON());
+    }
+
+    const mode = category === NSFW_CATEGORIES.XVIDEOS_VIDEO ? 'xvideos' : 'adult_movies';
+    const isGroup = isGroupChat(ctx);
+    const api = ctx.api || app.telegram.api;
+    const chatId = ctx.chatId ?? Number(ctx.tgId);
+
+    if (!isGroup && ctx.message?.message_id && app.settings?.get?.('telegram.messageCleanup')) {
+      await api.deleteMessage(chatId, ctx.message.message_id).catch(() => {});
+    }
+
+    const targetMsgId = ctx.screenMessageId || ctx.query?.message?.message_id || ctx.sm?.context?.(ctx.tgId)?.screenMessageId || null;
+    const tracker = new ProgressTracker({ api, chatId, messageId: targetMsgId, heartbeatMs: 2000 });
+    await tracker.live((state, { elapsedMs }) => progressRich({
+      ...state,
+      elapsedMs,
+      category,
+      query: cleanQ || 'trending',
+      goal: '15 HD titles'
+    }), { stage: 'searching', category, query: cleanQ || 'trending', goal: '15 HD titles' });
+
+    const res = mode === 'xvideos'
+      ? await searchXvideos({ query: cleanQ, page, limit: 15, sort })
+      : await searchAdultMovies({ query: cleanQ, page, limit: 15 });
+
+    const items = res?.results || [];
+    if (!items.length) {
+      const b = new RichMessageBuilder();
+      b.heading(mode === 'xvideos' ? '🔥 NO XVIDEOS RESULTS' : '🎬 NO 18+ MOVIES FOUND', 2);
+      b.paragraph(rt.italic(`nothing matched "${truncate(cleanQ || 'trending', 24)}" — try a different keyword.`));
+      b.buttons([
+        richButton.callback('🔍 Try Another Search', encodeCallback(id, 'cat', category), { style: 'primary' }),
+        richButton.callback('« 18+ Menu', encodeCallback(id, 'menu'))
+      ]);
+      b.validate();
+      await tracker.finish(b.toJSON());
+      return { message_id: tracker.messageId };
+    }
+
+    const sid = `${Date.now().toString(36).slice(-4)}${Math.random().toString(36).slice(2, 4)}`;
+    const session = rememberAdultSession({
+      sid,
+      mode,
+      category,
+      query: cleanQ || 'trending',
+      page: 0,
+      apiPage: page,
+      sort,
+      items,
+      selectedIds: new Set(),
+      msgId: tracker.messageId || targetMsgId || null,
+      chatId,
+      createdAt: Date.now()
+    });
+    if (tracker.messageId) ctx.screenMessageId = tracker.messageId;
+    return renderAndShowAdultCinemaPage(ctx, session, 0);
+  }
+
+  async function answerCb(ctx, text = '', alert = false) {
+    if (!ctx.query?.id) return;
+    const api = ctx.api || app.telegram?.api;
+    await api?.answerCallbackQuery?.(ctx.query.id, { text: String(text || '').slice(0, 190), show_alert: alert }).catch(() => {});
+  }
+
+  async function handleAdultPlayOrQueue(ctx, sid, idx, { playNow = true } = {}) {
+    if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+    if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+
+    const session = getAdultSession(sid);
+    const item = session?.items?.[idx];
+    if (!session || !item) return answerCb(ctx, 'Session expired — search again.', true);
+
+    const qm = app.musicQueueManager || app.music?.queue;
+    if (!app.music || !qm) return answerCb(ctx, '⚠️ VC cinema player is unavailable right now.', true);
+
+    await answerCb(ctx, playNow ? '⏳ Loading stream into VC…' : '⏳ Adding to VC queue…');
+    try {
+      const dest = app.music.destination(ctx);
+      await app.music.authorize(ctx, true, dest, { allowDj: true });
+      await app.music.prepare(ctx, dest);
+      await ensureAdultStreamResolved(item);
+      const track = buildAdultTrack(item, session.mode);
+      if (!track.streamUrl) throw new Error('Playable stream URL could not be resolved.');
+
+      await qm.addMovies(dest, [track], { playNow });
+      const updated = qm.getSession(dest);
+      if (playNow && updated.activeDeck === 'movie') {
+        const canMorph = Boolean(session.msgId && !updated.screenMessageId && Number(ctx.chatId) === Number(session.chatId));
+        await app.music.player({
+          ...ctx,
+          ...(canMorph ? { reuseMessageId: session.msgId } : {}),
+          forceNew: !canMorph && !updated.screenMessageId
+        }, dest).catch(() => null);
+      }
+      return { ok: true, track };
+    } catch (err) {
+      await (ctx.api || app.telegram?.api)?.sendMessage?.(ctx.chatId, `⚠️ ${err?.message || 'Failed to stream video to VC.'}`).catch(() => {});
+      return { ok: false };
+    }
+  }
+
+  async function handleAdultQueueSelected(ctx, sid) {
+    if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+    if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+
+    const session = getAdultSession(sid);
+    if (!session?.items?.length) return answerCb(ctx, 'Session expired — search again.', true);
+
+    const qm = app.musicQueueManager || app.music?.queue;
+    if (!app.music || !qm) return answerCb(ctx, '⚠️ VC queue is unavailable.', true);
+
+    const indices = session.selectedIds.size
+      ? [...session.selectedIds].sort((a, b) => a - b)
+      : session.items.slice(session.page * 5, session.page * 5 + 5).map((_, i) => session.page * 5 + i);
+
+    await answerCb(ctx, `⏳ Queueing ${indices.length} title(s) to VC…`);
+    try {
+      const dest = app.music.destination(ctx);
+      await app.music.authorize(ctx, true, dest, { allowDj: true });
+      await app.music.prepare(ctx, dest);
+      const tracks = [];
+      for (const idx of indices) {
+        const it = session.items[idx];
+        if (!it) continue;
+        await ensureAdultStreamResolved(it);
+        const tr = buildAdultTrack(it, session.mode);
+        if (tr.streamUrl) tracks.push(tr);
+      }
+      if (!tracks.length) throw new Error('No playable streams resolved.');
+      await qm.addMovies(dest, tracks, { playNow: false });
+      const s = qm.getSession(dest);
+      s.view = 'mqueue';
+      await app.music.player({ ...ctx, forceNew: !s.screenMessageId }, dest).catch(() => null);
+      return { ok: true, count: tracks.length };
+    } catch (err) {
+      await (ctx.api || app.telegram?.api)?.sendMessage?.(ctx.chatId, `⚠️ ${err?.message || 'Could not queue titles.'}`).catch(() => {});
+      return { ok: false };
+    }
+  }
+
+  async function handleAdultDownloadSingle(ctx, sid, idx) {
+    if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+    if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+
+    const session = getAdultSession(sid);
+    const item = session?.items?.[idx];
+    if (!session || !item) return answerCb(ctx, 'Session expired — search again.', true);
+    if (!app.movieDownloader) return answerCb(ctx, '⚠️ Downloader module unavailable.', true);
+
+    await answerCb(ctx, '⬇️ Preparing MP4 upload…');
+    try {
+      await ensureAdultStreamResolved(item);
+      const track = buildAdultTrack(item, session.mode);
+      const res = await app.movieDownloader.sendSingleVideo(ctx, track, {
+        spoiler: isGroupChat(ctx)
+      });
+      if (!res?.ok) {
+        await (ctx.api || app.telegram?.api)?.sendMessage?.(ctx.chatId, `⚠️ Download failed: ${res?.reason || 'stream unavailable'}`).catch(() => {});
+      }
+      return res;
+    } catch (err) {
+      await (ctx.api || app.telegram?.api)?.sendMessage?.(ctx.chatId, `⚠️ ${err?.message || 'Download failed.'}`).catch(() => {});
+      return { ok: false };
+    }
+  }
+
+  async function handleAdultDownloadSlides(ctx, sid, slidePage = 0) {
+    if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+    if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+
+    const session = getAdultSession(sid);
+    if (!session?.items?.length) return answerCb(ctx, 'Session expired — search again.', true);
+    if (!app.movieDownloader) return answerCb(ctx, '⚠️ Downloader module unavailable.', true);
+
+    await answerCb(ctx, '🎞 Preparing paginated video slide album…');
+    try {
+      if (!session.dlManifest || slidePage === 0) {
+        const indices = session.selectedIds.size
+          ? [...session.selectedIds].sort((a, b) => a - b)
+          : session.items.slice(session.page * 5, session.page * 5 + 5).map((_, i) => session.page * 5 + i);
+        const tracks = [];
+        for (const idx of indices) {
+          const it = session.items[idx];
+          if (!it) continue;
+          await ensureAdultStreamResolved(it);
+          const tr = buildAdultTrack(it, session.mode);
+          if (tr.streamUrl) tracks.push(tr);
+        }
+        session.dlManifest = {
+          title: `${session.mode === 'xvideos' ? 'XVideos' : '18+ Cinema'} · ${session.query}`,
+          pageSize: 4,
+          items: tracks
+        };
+      }
+      const res = await app.movieDownloader.deliverAlbumSlidePage(ctx, session, slidePage, {
+        buildNavCallback: (p) => encodeCallback(id, 'acSl', session.sid, String(p)),
+        backCallback: () => encodeCallback(id, 'acPg', session.sid, String(session.page || 0)),
+        spoiler: isGroupChat(ctx)
+      });
+      if (!res?.ok) {
+        await (ctx.api || app.telegram?.api)?.sendMessage?.(ctx.chatId, `⚠️ Slide upload failed: ${res?.reason || 'stream unavailable'}`).catch(() => {});
+      }
+      return res;
+    } catch (err) {
+      await (ctx.api || app.telegram?.api)?.sendMessage?.(ctx.chatId, `⚠️ ${err?.message || 'Slide album failed.'}`).catch(() => {});
+      return { ok: false };
+    }
+  }
+
   function registerStateHandlers(sm) {
     sm.register(States.NSFW_SEARCH_INPUT, {
       onMessage: async (sctx, message) => {
@@ -1119,14 +1678,25 @@ export function createNsfwScreen({ app }) {
           if (botPromptMsgId) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, botPromptMsgId).catch(() => {});
           }
+          const activeCat = sctx.context?.category || 'all';
+          if (activeCat === NSFW_CATEGORIES.XVIDEOS_VIDEO || activeCat === NSFW_CATEGORIES.ADULT_MOVIES) {
+            await runAdultCinemaSearch(sctx, activeCat, text);
+            return true;
+          }
           // Do NOT delete the user's message; quote it for the amount selection card
-          await askCount(sctx, text, sctx.context?.category || 'all', { replyToMessageId: message.message_id });
+          await askCount(sctx, text, activeCat, { replyToMessageId: message.message_id });
         } else {
           // In private chat: delete user's message to maintain clean in-place screen
           if (message.message_id) {
             await (sctx.api || app.telegram.api).deleteMessage(sctx.chatId, message.message_id).catch(() => {});
           }
-          await askCount(sctx, text, sctx.context?.category || 'all');
+          const activeCat = sctx.context?.category || 'all';
+          if (activeCat === NSFW_CATEGORIES.XVIDEOS_VIDEO || activeCat === NSFW_CATEGORIES.ADULT_MOVIES) {
+            sctx.screenMessageId = sctx.context?.screenMessageId || sctx.screenMessageId;
+            await runAdultCinemaSearch(sctx, activeCat, text);
+            return true;
+          }
+          await askCount(sctx, text, activeCat);
         }
         return true;
       },
@@ -1148,7 +1718,28 @@ export function createNsfwScreen({ app }) {
       const q = String(query || '').trim().toLowerCase();
       if (q === 'off' || q === 'lock' || q === 'disable') return toggleGroupNsfw(ctx, false);
       if (q === 'on' || q === 'unlock' || q === 'enable') return toggleGroupNsfw(ctx, true);
+      if (category === NSFW_CATEGORIES.XVIDEOS_VIDEO || category === NSFW_CATEGORIES.ADULT_MOVIES) {
+        return runAdultCinemaSearch(ctx, category, query, { page });
+      }
       return runSearch(ctx, query, category, 10);
+    },
+    async executeAdultMoviesSearch(ctx, query = '') {
+      return runAdultCinemaSearch(ctx, NSFW_CATEGORIES.ADULT_MOVIES, query);
+    },
+    async executeXvideosSearch(ctx, query = '') {
+      return runAdultCinemaSearch(ctx, NSFW_CATEGORIES.XVIDEOS_VIDEO, query);
+    },
+    async openAdultMovies(ctx) {
+      await ctx.sm?.reset?.(ctx.tgId, { reason: 'navigate' });
+      if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+      if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+      await editOrSend(ctx, renderAdultMoviesMenu(ctx));
+    },
+    async openXvideosHub(ctx) {
+      await ctx.sm?.reset?.(ctx.tgId, { reason: 'navigate' });
+      if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+      if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+      await editOrSend(ctx, renderXvideosMenu(ctx));
     },
     async open(ctx) {
       await ctx.sm?.reset?.(ctx.tgId, { reason: 'navigate' });
@@ -1167,6 +1758,8 @@ export function createNsfwScreen({ app }) {
           return openMenu(ctx);
         case 'sub': {
           const subCategory = args[0] || '';
+          if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+          if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
           if (subCategory === 'hentai_wallpapers') {
             return editOrSend(ctx, renderHentaiWallpapersMenu(ctx));
           } else if (subCategory === 'hentai_videos') {
@@ -1175,13 +1768,20 @@ export function createNsfwScreen({ app }) {
             return editOrSend(ctx, renderRealWallpapersMenu(ctx));
           } else if (subCategory === 'real_videos') {
             return editOrSend(ctx, renderRealVideosMenu(ctx));
+          } else if (subCategory === 'adult_movies') {
+            return editOrSend(ctx, renderAdultMoviesMenu(ctx));
+          } else if (subCategory === 'xvideos') {
+            return editOrSend(ctx, renderXvideosMenu(ctx));
           }
           return openMenu(ctx);
         }
         case 'cat':
-          return askQuery(ctx, args[0] || 'all');
-        case 'searchPrompt':
-          return askQuery(ctx, args[0] || 'all');
+        case 'searchPrompt': {
+          const category = args[0] || 'all';
+          if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+          if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+          return askQuery(ctx, category);
+        }
         case 'customCount': {
           const category = args[0] || 'all';
           const query = args[1] || ctx.sm?.context?.(ctx.tgId)?.query || '';
@@ -1191,8 +1791,74 @@ export function createNsfwScreen({ app }) {
           const query = args[0] || '';
           const category = args[1] || 'all';
           ctx.screenMessageId = ctx.query?.message?.message_id || ctx.messageId;
+          if (category === NSFW_CATEGORIES.XVIDEOS_VIDEO || category === NSFW_CATEGORIES.ADULT_MOVIES) {
+            return runAdultCinemaSearch(ctx, category, query);
+          }
           return askCount(ctx, query, category);
         }
+        case 'xvRun': {
+          const q = args[0] || 'trending';
+          ctx.screenMessageId = ctx.query?.message?.message_id || ctx.messageId;
+          return runAdultCinemaSearch(ctx, NSFW_CATEGORIES.XVIDEOS_VIDEO, q);
+        }
+        case 'amRun': {
+          const q = args[0] || 'full movie';
+          ctx.screenMessageId = ctx.query?.message?.message_id || ctx.messageId;
+          return runAdultCinemaSearch(ctx, NSFW_CATEGORIES.ADULT_MOVIES, q);
+        }
+        case 'xvSo': {
+          const [sid, sort] = args;
+          const session = getAdultSession(sid);
+          if (!session) return answerCb(ctx, 'Session expired — search again.', true);
+          ctx.screenMessageId = ctx.query?.message?.message_id || session.msgId || ctx.messageId;
+          return runAdultCinemaSearch(ctx, NSFW_CATEGORIES.XVIDEOS_VIDEO, session.query, { sort: sort || 'relevance' });
+        }
+        case 'acPg': {
+          if (isGroupChat(ctx) && !isGroupNsfwAllowed(ctx)) return editOrSend(ctx, renderGroupLocked());
+          if (isAgeGateRequired(ctx)) return editOrSend(ctx, renderAgeGate());
+          const [sid, pg] = args;
+          const session = getAdultSession(sid);
+          if (!session) return answerCb(ctx, 'Session expired — search again.', true);
+          await answerCb(ctx);
+          return renderAndShowAdultCinemaPage(ctx, session, Number(pg) || 0);
+        }
+        case 'acTg': {
+          const [sid, idxStr] = args;
+          const session = getAdultSession(sid);
+          if (!session) return answerCb(ctx, 'Session expired — search again.', true);
+          const idx = Number(idxStr);
+          if (session.selectedIds.has(idx)) session.selectedIds.delete(idx);
+          else session.selectedIds.add(idx);
+          await answerCb(ctx);
+          return renderAndShowAdultCinemaPage(ctx, session, session.page);
+        }
+        case 'acAp': {
+          const [sid, pg] = args;
+          const session = getAdultSession(sid);
+          if (!session) return answerCb(ctx, 'Session expired — search again.', true);
+          const page = Number(pg) ?? session.page ?? 0;
+          const start = page * 5;
+          const end = Math.min(session.items.length, start + 5);
+          const allSelected = end > start && Array.from({ length: end - start }, (_, k) => start + k).every(i => session.selectedIds.has(i));
+          for (let i = start; i < end; i++) {
+            if (allSelected) session.selectedIds.delete(i);
+            else session.selectedIds.add(i);
+          }
+          await answerCb(ctx);
+          return renderAndShowAdultCinemaPage(ctx, session, page);
+        }
+        case 'acPl':
+          return handleAdultPlayOrQueue(ctx, args[0], Number(args[1]), { playNow: true });
+        case 'acQu':
+          return handleAdultPlayOrQueue(ctx, args[0], Number(args[1]), { playNow: false });
+        case 'acQa':
+          return handleAdultQueueSelected(ctx, args[0]);
+        case 'acDl':
+          return handleAdultDownloadSingle(ctx, args[0], Number(args[1]));
+        case 'acSl':
+          return handleAdultDownloadSlides(ctx, args[0], Number(args[1]) || 0);
+        case 'noop':
+          return answerCb(ctx);
         case 'runCount': {
           const goal = args[0] || '10';
           const category = args[1] || 'all';
@@ -1214,6 +1880,14 @@ export function createNsfwScreen({ app }) {
         }
         case 'random': {
           const cat = args[0] || 'all';
+          if (cat === NSFW_CATEGORIES.ADULT_MOVIES) {
+            const pool = CATEGORY_SUGGESTIONS[NSFW_CATEGORIES.ADULT_MOVIES];
+            return runAdultCinemaSearch(ctx, cat, pool[Math.floor(Math.random() * pool.length)]);
+          }
+          if (cat === NSFW_CATEGORIES.XVIDEOS_VIDEO) {
+            const pool = CATEGORY_SUGGESTIONS[NSFW_CATEGORIES.XVIDEOS_VIDEO];
+            return runAdultCinemaSearch(ctx, cat, pool[Math.floor(Math.random() * pool.length)]);
+          }
           const randomPools = {
             [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'boudoir', 'baddie', 'fitness model'],
             [NSFW_CATEGORIES.REAL_CLIPS]: ['asian clip', 'latina clip', 'teaser', 'glamour preview'],

@@ -244,6 +244,7 @@ export const richButton = {
     style: normalizeButtonStyle(style)
   }),
   url: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), url, style: normalizeButtonStyle(style) }),
+  webApp: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), web_app: { url }, style: normalizeButtonStyle(style) }),
   copy: (text, copyText, { style = 'primary' } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, style: normalizeButtonStyle(style) }),
   switchInline: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query: query, style: normalizeButtonStyle(style) }),
   switchInlineCurrent: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query_current_chat: query, style: normalizeButtonStyle(style) }),
@@ -529,6 +530,9 @@ export function inlineKeyboard(rows) {
         if (btn.url !== undefined) out.url = btn.url;
         if (btn.copy_text !== undefined) out.copy_text = btn.copy_text;
         out.style = normalizeButtonStyle(btn.style); // danger | success | primary
+        if (btn.icon_custom_emoji_id || btn.emojiId) {
+          out.icon_custom_emoji_id = String(btn.icon_custom_emoji_id || btn.emojiId);
+        }
         if (btn.disabled) out.disabled = btn.disabled;
         if (btn.switch_inline_query !== undefined) out.switch_inline_query = btn.switch_inline_query;
         if (btn.switch_inline_query_current_chat !== undefined) out.switch_inline_query_current_chat = btn.switch_inline_query_current_chat;

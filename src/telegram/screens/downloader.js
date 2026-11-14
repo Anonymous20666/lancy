@@ -1,7 +1,7 @@
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { writeFileSync, readFileSync, existsSync } from 'node:fs';
+import { writeFileSync, readFileSync, existsSync, mkdirSync, readdirSync, unlinkSync, statSync } from 'node:fs';
 import sharp from 'sharp';
 import { RichMessageBuilder, rt, block, richButton, encodeCallback } from '../rich.js';
 import { banner, kvTable, statusDot } from '../ui.js';
@@ -16,6 +16,7 @@ import { toTelegramStaticSticker, optimizePreviewImage, splitMatchingCollage } f
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 import { PinterestWebProvider } from '../../pinterest/web.js';
 import { fitResultForTelegram, describeOversized } from '../../media/telegramLimits.js';
+import { getStreamPublicUrl } from '../../media/streamingServer.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -25,6 +26,84 @@ const trackAudioCache = new Map();
 const audioMetaCache = new Map();
 const imageStickerCache = new Map();
 const albumCache = new Map();
+const spotifyCollectionCache = new Map();
+
+function saveSpotifyCollection(key, data, db = null) {
+  if (spotifyCollectionCache.size > 30) {
+    const oldestKey = spotifyCollectionCache.keys().next().value;
+    spotifyCollectionCache.delete(oldestKey);
+  }
+  spotifyCollectionCache.set(key, data);
+  try {
+    const serializable = {
+      url: data.url || null,
+      platform: data.platform || 'spotify',
+      spotifyType: data.spotifyType || 'album',
+      title: data.title || 'Spotify Collection',
+      artist: data.artist || null,
+      author: data.author || null,
+      album: data.album || null,
+      year: data.year || null,
+      totalTracks: data.totalTracks || (data.tracks?.length || 0),
+      tracks: Array.isArray(data.tracks) ? data.tracks.slice(0, 100) : [],
+      description: data.description || null,
+      requestedBy: data.requestedBy || null
+    };
+    writeFileSync(join(tmpdir(), `lancy_sp_col_${key}.json`), JSON.stringify(serializable));
+    if (data.coverBuf) {
+      writeFileSync(join(tmpdir(), `lancy_sp_cover_${key}.jpg`), data.coverBuf);
+    }
+    db?.run?.(
+      'INSERT OR REPLACE INTO bot_settings (key, value_json) VALUES (?, ?)',
+      `sp_col_${key}`,
+      JSON.stringify(serializable)
+    );
+  } catch {}
+}
+
+function getSpotifyCollection(key, db = null) {
+  let col = spotifyCollectionCache.get(key);
+  if (!col && key) {
+    try {
+      const jsonPath = join(tmpdir(), `lancy_sp_col_${key}.json`);
+      if (existsSync(jsonPath)) {
+        col = JSON.parse(readFileSync(jsonPath, 'utf8'));
+      }
+    } catch {}
+    if (!col && db) {
+      try {
+        const row = db.get?.('SELECT value_json FROM bot_settings WHERE key = ?', `sp_col_${key}`);
+        if (row?.value_json) {
+          col = JSON.parse(row.value_json);
+        }
+      } catch {}
+    }
+    if (col) {
+      try {
+        const coverPath = join(tmpdir(), `lancy_sp_cover_${key}.jpg`);
+        if (existsSync(coverPath)) {
+          col.coverBuf = readFileSync(coverPath);
+        }
+      } catch {}
+      spotifyCollectionCache.set(key, col);
+    }
+  }
+  return col;
+}
+
+function formatMusicPlatformLabel(platform) {
+  const p = String(platform || '').toLowerCase();
+  if (p === 'applemusic') return 'APPLE MUSIC ♡';
+  if (p === 'audiomack') return 'AUDIOMACK HQ ♡';
+  if (p === 'soundcloud') return 'SOUNDCLOUD ♡';
+  if (p === 'music-search') return 'MUSIC SEARCH ♡';
+  if (p === 'spotify') return 'SPOTIFY ♡';
+  return `${(p || 'MUSIC').toUpperCase()} ♡`;
+}
+
+function isSafeHttpUrl(url) {
+  return /^https?:\/\/[^\s]+$/i.test(String(url || '').trim());
+}
 
 // Global cache for matching PFP deep search sessions: sessionId -> { query, candidates, currentIndex }
 const pfpSearchSessions = new Map();
@@ -218,55 +297,139 @@ function getTrackMeta(key, db = null) {
   return meta;
 }
 
+const vcStreamCache = new Map();
+
+function resolveVcStreamDir() {
+  const candidates = ['/data/vc_stream_cache', join(tmpdir(), 'lancy_vc_stream_cache')];
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true });
+      return dir;
+    } catch {}
+  }
+  return tmpdir();
+}
+
+function saveVcStreamItem(key, data, db = null) {
+  if (!key || (!data?.buffer && !(data?.filePath && existsSync(data.filePath)))) return null;
+  const dir = resolveVcStreamDir();
+  const ext = data.mediaType === 'video' ? 'mp4' : 'mp3';
+  let filePath = data?.filePath && existsSync(data.filePath) ? data.filePath : join(dir, `vc_${key}.${ext}`);
+  try {
+    if (data?.buffer) {
+      filePath = join(dir, `vc_${key}.${ext}`);
+      writeFileSync(filePath, data.buffer);
+    }
+    const files = readdirSync(dir).filter((f) => f.startsWith('vc_') && !f.startsWith(`vc_${key}.`));
+    if (files.length > 80) {
+      files.sort((a, b) => {
+        try { return statSync(join(dir, a)).mtimeMs - statSync(join(dir, b)).mtimeMs; } catch { return 0; }
+      });
+      for (const old of files.slice(0, files.length - 80)) {
+        try { unlinkSync(join(dir, old)); } catch {}
+      }
+    }
+  } catch {
+    return null;
+  }
+  const meta = {
+    key,
+    filePath,
+    mediaType: data.mediaType === 'video' ? 'video' : 'audio',
+    title: data.title || 'Downloaded Track',
+    artist: data.artist || 'Creator',
+    durationSeconds: Number(data.durationSeconds) > 0 ? Math.round(Number(data.durationSeconds)) : 180,
+    platform: data.platform || 'media',
+    sourceUrl: data.sourceUrl || null,
+    createdAt: Date.now()
+  };
+  if (vcStreamCache.size > 80) {
+    vcStreamCache.delete(vcStreamCache.keys().next().value);
+  }
+  vcStreamCache.set(key, meta);
+  try {
+    writeFileSync(join(dir, `vc_${key}.json`), JSON.stringify(meta));
+  } catch {}
+  try {
+    db?.run?.('INSERT OR REPLACE INTO bot_settings (key, value_json) VALUES (?, ?)', `vc_stream_${key}`, JSON.stringify(meta));
+  } catch {}
+  return meta;
+}
+
+function getVcStreamItem(key, db = null) {
+  if (!key) return null;
+  let meta = vcStreamCache.get(key) || null;
+  const dir = resolveVcStreamDir();
+  if (!meta) {
+    try {
+      const jsonPath = join(dir, `vc_${key}.json`);
+      if (existsSync(jsonPath)) {
+        meta = JSON.parse(readFileSync(jsonPath, 'utf8'));
+      }
+    } catch {}
+  }
+  if (!meta && db) {
+    try {
+      const row = db.get?.('SELECT value_json FROM bot_settings WHERE key = ?', `vc_stream_${key}`);
+      if (row?.value_json) {
+        meta = JSON.parse(row.value_json);
+      }
+    } catch {}
+  }
+  if (meta) {
+    vcStreamCache.set(key, meta);
+  }
+  return meta;
+}
+
 export function createDownloaderScreen({ app }) {
   const id = 'downloader';
   const log = logger().child({ module: 'screen:downloader' });
 
   function renderMainMenu(ctx) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 URL DOWNLOADER STUDIO 𓆩♡𓆪',
-      'download media from any link with audio extraction ♡'
-    ])));
-    b.divider();
+      'universal media & Hi-Fi music extraction ♡'
+    ]);
 
-    b.heading('୨୧ supported platforms', 3);
-    b.paragraph(rt.text(
-      '• 🎵 TikTok — HD videos without watermark & photo carousels\n' +
-      '• 📌 Pinterest — Full carousel albums, HD videos & original pins\n' +
-      '• 📸 Instagram — Reels, posts, carousels/albums & stories\n' +
-      '• 🎬 YouTube & Shorts — HD videos + clean MP3 audio track\n' +
-      '• 🐦 Twitter / X — HD videos & multi-image tweet posts\n' +
-      '• 💙 Facebook & CapCut — Reels, videos & template downloads\n' +
-      '• 🎧 Spotify — Track info & audio track extraction\n' +
-      '• 🌐 Direct Web — Direct MP4 / WebM / JPG / PNG files'
-    ));
-    b.divider();
+    b.table([
+      [{ text: 'Category', is_header: true }, { text: 'Supported Platforms & Formats', is_header: true }],
+      ['🎵 Social Video', 'TikTok (HD no-watermark), Instagram Reels, YouTube Shorts, Twitter / X, Facebook, Reddit & CapCut'],
+      ['📺 Video & Cinema', 'Bilibili (HD BV/av & b23.tv), TheNkiri (Movies & TV Series), JustWatch, Twitch, Vimeo & Bluesky'],
+      ['🧵 Micro & Visual', 'Threads, RedNote (Xiaohongshu), Pinterest albums & multi-slide photo posts'],
+      ['🎧 Hi-Fi Music', 'Spotify (Tracks, Albums & Playlists), Apple Music, Audiomack & SoundCloud'],
+      ['🎬 Short Dramas', 'DramaBox, ReelShort, GoodShort, FlexTV, MoboReels, DramaFren & FlickReels'],
+      ['🎀 Output Mode', `${statusDot('online')} HD Media Groups + CBR 192k ID3 MP3 + Group VC Streaming`]
+    ], { striped: true, compact: true });
 
-    b.table(kvTable([
-      ['🎧 Audio Extraction', `${statusDot('online')} Auto-extracts MP3 if sound is present`],
-      ['📦 Multi-Content', `${statusDot('online')} Full carousel & album extraction`],
-      ['🎀 Delivery Mode', `${statusDot('online')} HD Media Group & Audio`]
-    ]), { compact: true });
+    b.details('📋 All Supported Link Types & Quick Tips', [
+      block.list([
+        'Paste any https:// URL or Spotify URI (spotify:track:... / spotify.link / spoti.fi)',
+        'Spotify albums, playlists & artists open an interactive tracklist selector with one-tap downloads',
+        'Audio tracks include embedded ID3 cover artwork, lyrics (when available), and one-tap MP3 export',
+        'Direct MP4 / WebM / JPG / PNG links are automatically detected in DM and groups'
+      ])
+    ], false);
     b.divider();
 
     b.buttons([
-      richButton.callback('✦ Paste / Send Link', encodeCallback(id, 'input'), { style: 'primary' }),
+      richButton.callback('✦ Paste / Send Link', encodeCallback(id, 'input'), { style: 'success' }),
       richButton.callback('👥 Matching PFP', encodeCallback(id, 'pfp_menu'), { style: 'primary' })
     ]);
     b.buttons([
       richButton.callback('🎬 TikTok Search', encodeCallback(id, 'tiktokSearch'), { style: 'primary' }),
-      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' })
+      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'success' })
     ]);
     b.buttons([
       richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' }),
       richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' })
     ]);
     b.buttons([
-      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+      richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'), { style: 'primary' })
     ]);
 
-    b.footer(rt.italic('Tip: You can also simply paste any social link directly in chat ♡'));
+    b.footer(rt.italic('Tip: You can also simply paste any social or music link directly in chat ♡'));
     b.validate();
     return b.toJSON();
   }
@@ -301,29 +464,31 @@ export function createDownloaderScreen({ app }) {
 
   function renderInputPrompt() {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 PASTE YOUR MEDIA LINK 𓆩♡𓆪',
       'ready to download & extract ♡'
-    ])));
-    b.divider();
-    b.heading('୨୧ supported platforms & capabilities', 3);
-    b.paragraph(rt.text(
-      '🌸 🎵 TikTok — HD videos (no watermark) & photo slides/carousels + sound track\n' +
-      '🌸 📌 Pinterest — Full carousel albums, high-res photos & video pins\n' +
-      '🌸 📸 Instagram — Reels, video posts, multi-photo carousels & stories\n' +
-      '🌸 🎬 YouTube — Shorts, standard videos & clean MP3 audio tracks\n' +
-      '🌸 🐦 Twitter / X — HD videos, GIFs & multi-image tweet posts\n' +
-      '🌸 💙 Facebook & CapCut — Reels, videos & template downloads\n' +
-      '🌸 🎧 Spotify & Music Search — Spotify links OR type song name & artist directly\n' +
-      '🌸 🌐 Direct Web — Direct MP4 / WebM videos and JPG / PNG images'
-    ));
-    b.divider();
+    ]);
+
+    b.table([
+      [{ text: 'Platform', is_header: true }, { text: 'What Lancy Extracts', is_header: true }],
+      ['🎵 TikTok', 'HD videos (no watermark) & photo carousels + sound track'],
+      ['📌 Pinterest', 'Full carousel albums, high-res photos & video pins'],
+      ['📸 Instagram', 'Reels, video posts, multi-photo carousels & stories'],
+      ['🎬 YouTube', 'Shorts, standard videos & clean MP3 audio tracks'],
+      ['🐦 Twitter / X', 'HD videos, GIFs & multi-image tweet posts'],
+      ['💙 Facebook & CapCut', 'Reels, videos & CapCut template downloads'],
+      ['📺 Bilibili & Cinema', 'Bilibili HD videos, TheNkiri movies/series, JustWatch & Reddit'],
+      ['🎧 Spotify & Music', 'Spotify tracks/albums/playlists, Apple Music, Audiomack & SoundCloud'],
+      ['🧵 Social & Dramas', 'Threads, RedNote (Xiaohongshu), Bluesky, DramaBox, ReelShort & direct media']
+    ], { striped: true, compact: true });
+
     b.quote(rt.text(
-      '✨ Send any media link, type /grab <link>, or type any song title/artist to search music!\n' +
-      '🎧 If background music or sound is present, Lancy extracts and delivers the MP3 audio track automatically ♡'
+      '✨ Send any media URL, Spotify URI (spotify:track:...), /grab <link>, or type any song title/artist!\n' +
+      '🎧 Audio tracks & background sounds are extracted as 192k ID3 MP3s with artwork automatically ♡'
     ));
     b.divider();
     b.buttons([
+      richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'success' }),
       richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
     ]);
     b.validate();
@@ -372,7 +537,13 @@ export function createDownloaderScreen({ app }) {
     b.header('𓆩♡𓆪 PLAY & DOWNLOAD MUSIC 𓆩♡𓆪', 1);
     b.divider();
     b.heading('୨୧ how to play & download', 3);
-    if (isGroup) {
+    if (ctx?.isChannel) {
+      b.paragraph(rt.text(
+        '• 🎵 Post the song title & artist right here in this channel\n' +
+        '• 🎧 Or paste a Spotify / YouTube / SoundCloud link\n' +
+        '• 🎬 Use /vidc <song> or tap below for HD music videos in VC!'
+      ));
+    } else if (isGroup) {
       b.paragraph(rt.text(
         '• 🎵 Type /play <song title> directly in this chat\n' +
         '• 🔍 Tap "Search Music Live" below to search right from your chat box!\n' +
@@ -392,17 +563,27 @@ export function createDownloaderScreen({ app }) {
       '🎙️ Forwarded audio will be automatically recognized and downloaded!'
     ));
     b.divider();
-    b.buttons([
-      richButton.switchInlineCurrent('🔍 Search Music Live', ''),
-      richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
-    ]);
-    b.buttons([
-      richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
-      richButton.callback('« Downloader', encodeCallback(id, 'open'))
-    ]);
-    b.buttons([
-      richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
-    ]);
+    if (ctx?.isChannel) {
+      b.buttons([
+        richButton.callback('🎬 Browse VC Videos', encodeCallback('music', 'catmenu', 'video'), { style: 'success' }),
+        richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
+      ]);
+      b.buttons([
+        richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+      ]);
+    } else {
+      b.buttons([
+        richButton.switchInlineCurrent('🔍 Search Music Live', ''),
+        richButton.callback('📜 Search Lyrics', encodeCallback(id, 'searchLyrics'), { style: 'primary' })
+      ]);
+      b.buttons([
+        richButton.callback('🎙️ Audio Recognition', encodeCallback(id, 'recognize'), { style: 'primary' }),
+        richButton.callback('« Downloader', encodeCallback(id, 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
+      ]);
+    }
     b.validate();
     return b.toJSON();
   }
@@ -560,11 +741,12 @@ export function createDownloaderScreen({ app }) {
   }
 
   function renderDownloadProgress({ stage, platform, url, elapsedMs = 0, current = 0, total = 0, requester = null }) {
-    const isUrl = /^https?:\/\//i.test(String(url || ''));
+    const isUrl = /^(?:https?:\/\/|spotify:)/i.test(String(url || ''));
     const b = new RichMessageBuilder();
-    b.header(isUrl ? '𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪' : '𓆩♡𓆪 MUSIC DOWNLOADER 𓆩♡𓆪', 1);
-    b.paragraph(rt.italic(isUrl ? '₊˚⊹♡  processing your media  ˙ᵕ˙' : '₊˚⊹♡  searching & preparing your track  ˙ᵕ˙'));
-    b.divider();
+    b.bannerHeader([
+      isUrl ? '𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪' : '𓆩♡𓆪 MUSIC DOWNLOADER 𓆩♡𓆪',
+      isUrl ? 'processing your media' : 'searching & preparing your track'
+    ]);
 
     const s = String(stage || '');
     let stageTrail = 'Searching source → Resolving media → Downloading → Processing audio → Delivering file';
@@ -583,19 +765,126 @@ export function createDownloaderScreen({ app }) {
     }
 
     const elapsedSec = Math.max(1, Math.round(elapsedMs / 1000));
-    b.quote(rt.text(
-      `⏳ Stage: ${stage}\n` +
-      `🔄 Flow: ${stageTrail}\n` +
-      `${isUrl ? '🔗 Link' : '🎵 Track'}: ${truncate(url, 48)}\n` +
-      (platform ? `📱 Platform: ${platform.toUpperCase()}\n` : '') +
-      (total > 0 ? `📦 Items: ${current}/${total}\n` : '') +
-      (requester ? `👤 Requested by: ${requester}\n` : '') +
-      `⏱ Elapsed: ${elapsedSec}s ♡`
-    ));
-    b.divider();
-    b.paragraph(rt.italic(isUrl ? 'Fetching full quality files & extracting audio track… ♡' : 'Resolving best legitimate match & preparing full audio track… ♡'));
+    const progressRows = [
+      ['⏳ Stage', truncate(stage || 'Preparing…', 44)],
+      ['🔄 Pipeline', stageTrail],
+      [isUrl ? '🔗 Target' : '🎵 Query', truncate(url, 48)]
+    ];
+    if (platform) progressRows.push(['📱 Platform', platform.toUpperCase()]);
+    if (total > 0) progressRows.push(['📦 Items', `${current}/${total}`]);
+    if (requester) progressRows.push(['👤 Requested By', requester]);
+    progressRows.push(['⏱ Elapsed', `${elapsedSec}s ♡`]);
+
+    b.table(kvTable(progressRows), { striped: true, compact: true });
+    b.footer(rt.italic(isUrl ? 'Fetching full quality files & extracting audio track… ♡' : 'Resolving best legitimate match & preparing full audio track… ♡'));
     b.validate();
     return b.toJSON();
+  }
+
+  function buildSpotifyCollectionRichMessage(col, { page = 0, spKey, attachCover = true, botName = 'Lancy Bot' } = {}) {
+    const files = {};
+    const b = new RichMessageBuilder();
+    const tracks = Array.isArray(col?.tracks) ? col.tracks : [];
+    const PAGE_SIZE = 6;
+    const totalTracks = col?.totalTracks || tracks.length;
+    const totalPages = Math.max(1, Math.ceil(tracks.length / PAGE_SIZE));
+    const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+    const startIdx = safePage * PAGE_SIZE;
+    const slice = tracks.slice(startIdx, startIdx + PAGE_SIZE);
+
+    if (attachCover && col?.coverBuf) {
+      files.sp_cover = {
+        buffer: col.coverBuf,
+        filename: 'spotify_cover.jpg',
+        contentType: 'image/jpeg'
+      };
+      b.photo('attach://sp_cover');
+    }
+
+    const spKind = String(col?.spotifyType || 'album').toUpperCase();
+    b.bannerHeader([
+      `𓆩♡𓆪 SPOTIFY ${spKind} 𓆩♡𓆪`,
+      truncate(col?.title || 'Spotify Collection', 44)
+    ]);
+
+    const rows = [
+      ['📱 Platform', 'SPOTIFY ♡'],
+      ['📀 Title', truncate(col?.title || 'Spotify Collection', 40)],
+      ['🎧 Artist / Curator', truncate(col?.artist || col?.author || 'Various Artists', 36)],
+      ['🎶 Tracks', `${totalTracks} track(s) • Page ${safePage + 1}/${totalPages}`]
+    ];
+    if (col?.year) rows.push(['📅 Release', String(col.year)]);
+    if (col?.requestedBy) rows.push(['👤 Requested By', col.requestedBy]);
+    b.table(kvTable(rows), { striped: true, compact: true });
+
+    const previewLines = tracks.slice(0, 40).map((t, i) => {
+      const artistPart = t.artist ? ` — ${truncate(t.artist, 24)}` : '';
+      const durPart = t.duration ? ` (${t.duration})` : '';
+      return `${i + 1}. ${truncate(t.title || 'Track', 32)}${artistPart}${durPart}`;
+    });
+    if (tracks.length > 40) {
+      previewLines.push(`…and ${tracks.length - 40} more track(s)`);
+    }
+    if (previewLines.length > 0) {
+      b.expandableBlockquote(truncate(`🎼 Tracklist • ${truncate(col?.title || 'Spotify', 32)}\n\n${previewLines.join('\n')}`, 2500));
+    }
+
+    b.divider();
+    for (let i = 0; i < slice.length; i += 2) {
+      const pair = slice.slice(i, i + 2);
+      const rowBtns = pair.map((t, j) => {
+        const globalIdx = startIdx + i + j;
+        return richButton.callback(
+          `🎵 ${globalIdx + 1}. ${truncate(t.title || 'Track', 18)}`,
+          encodeCallback(id, 'sp_trk', spKey, String(globalIdx)),
+          { style: 'primary' }
+        );
+      });
+      b.buttons(rowBtns);
+    }
+
+    const actionRow = [];
+    if (slice.length > 0) {
+      actionRow.push(
+        richButton.callback(
+          `⏬ Download Page (${slice.length})`,
+          encodeCallback(id, 'sp_batch', spKey, String(safePage)),
+          { style: 'success' }
+        )
+      );
+    }
+    const copySeed = truncate(
+      `${col?.title || 'Spotify'}\n` + slice.map((t, i) => `${startIdx + i + 1}. ${t.artist ? `${t.artist} - ` : ''}${t.title}`).join('\n'),
+      240
+    );
+    if (copySeed) {
+      actionRow.push(richButton.copy('📋 Copy Page Tracks', copySeed, { style: 'primary' }));
+    }
+    if (actionRow.length > 0) b.buttons(actionRow);
+
+    if (totalPages > 1) {
+      const navRow = [];
+      if (safePage > 0) {
+        navRow.push(richButton.callback('← Prev', encodeCallback(id, 'sp_page', spKey, String(safePage - 1)), { style: 'primary' }));
+      }
+      navRow.push(richButton.disabled(`• Page ${safePage + 1}/${totalPages} •`));
+      if (safePage + 1 < totalPages) {
+        navRow.push(richButton.callback('Next →', encodeCallback(id, 'sp_page', spKey, String(safePage + 1)), { style: 'primary' }));
+      }
+      b.buttons(navRow);
+    }
+
+    const bottomRow = [];
+    if (isSafeHttpUrl(col?.url)) {
+      bottomRow.push(richButton.url('🔗 Open Spotify', col.url, { style: 'primary' }));
+    }
+    bottomRow.push(richButton.callback('📥 Another Link', encodeCallback(id, 'input', 'from_media'), { style: 'primary' }));
+    bottomRow.push(richButton.callback('« Dashboard', encodeCallback('dashboard', 'open', 'from_media'), { style: 'primary' }));
+    b.buttons(bottomRow);
+
+    b.footer(rt.italic(`Tap any track to extract 192k ID3 MP3 + Artwork • ${botName} ♡`));
+    b.validate();
+    return { rich: b.toJSON(), files };
   }
 
   const SLIDESHOW_PAGE_SIZE = 10;
@@ -617,29 +906,36 @@ export function createDownloaderScreen({ app }) {
     pfpTotalCount = 0,
     targetGoal = null,
     extraCount = 0,
-    canonicalMusic = null
+    canonicalMusic = null,
+    vcStreamKey = null
   }) {
     const files = {};
     const b = new RichMessageBuilder();
 
-    const isMusic = Boolean(canonicalMusic) || platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result?.artist);
+    const pLower = String(platform || '').toLowerCase();
+    const isMusic = Boolean(canonicalMusic) ||
+      ['spotify', 'applemusic', 'audiomack', 'soundcloud', 'music-search'].includes(pLower) ||
+      Boolean(result?.artist);
     const videoCount = mediaItems.filter((m) => m.type === 'video').length;
     const photoCount = mediaItems.filter((m) => m.type === 'photo').length;
     const isMatchingPfp = !canonicalMusic && Boolean(
       result?.isMatchingPfp ||
       /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(title || '') ||
       /matching\s*(?:pfp|icons?|avatars?|profile|couple|duo|pair)|couple\s*(?:pfp|icons?|avatar)|bestie\s*(?:pfp|icons?)|pfp\s*matching|trio\s*pfp/i.test(result?.sourceUrl || '') ||
-      (platform.toLowerCase() === 'pinterest' && photoCount >= 2 && videoCount === 0 && (ctx?.isPfp || /pfp|icon|avatar|couple|pair|her|him/i.test(title || '')))
+      (pLower === 'pinterest' && photoCount >= 2 && videoCount === 0 && (ctx?.isPfp || /pfp|icon|avatar|couple|pair|her|him/i.test(title || '')))
     );
 
     if (isMatchingPfp) {
-      b.header('𓆩♡𓆪 MATCHING PFP ALBUM 𓆩♡𓆪', 1);
-      b.paragraph(rt.italic('₊˚⊹♡ duo & matching avatar set ˙ᵕ˙'));
+      b.bannerHeader([
+        '𓆩♡𓆪 MATCHING PFP ALBUM 𓆩♡𓆪',
+        'duo & matching avatar set'
+      ]);
     } else {
-      b.header(`𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`, 1);
-      b.paragraph(rt.italic('₊˚⊹♡ aesthetic media delivery ♡ ˙ᵕ˙'));
+      b.bannerHeader([
+        `𓆩♡𓆪 ${platform.toUpperCase()} DOWNLOAD 𓆩♡𓆪`,
+        isMusic ? 'Hi-Fi music & artwork delivery' : 'aesthetic media delivery'
+      ]);
     }
-    b.divider();
 
     // 1. Embed Downloaded Media (Video / Photo / Single Slideshow block) inside Rich Message
     if (mediaItems.length === 1) {
@@ -647,6 +943,7 @@ export function createDownloaderScreen({ app }) {
       const field = `${item.type}_0`;
       files[field] = {
         buffer: item.buffer,
+        filePath: item.filePath,
         filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
         contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
       };
@@ -673,6 +970,7 @@ export function createDownloaderScreen({ app }) {
         const field = `${item.type}_${offset}`;
         files[field] = {
           buffer: item.buffer,
+          filePath: item.filePath,
           filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
           contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
         };
@@ -684,6 +982,7 @@ export function createDownloaderScreen({ app }) {
           const field = `${item.type}_${globalIdx}`;
           files[field] = {
             buffer: item.buffer,
+            filePath: item.filePath,
             filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
             contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
           };
@@ -777,12 +1076,12 @@ export function createDownloaderScreen({ app }) {
       if (ctx?.isGroup) {
         pfpRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
       }
-      b.table(kvTable(pfpRows), { compact: true });
+      b.table(kvTable(pfpRows), { striped: true, compact: true });
     } else if (isMusic) {
       const musicRows = [
-        ['📱 Platform', canonicalMusic?.platform || 'SPOTIFY / MUSIC ♡'],
+        ['📱 Platform', canonicalMusic?.platform || formatMusicPlatformLabel(platform)],
         ['🎵 Title', truncate(result?.title || title, 40)],
-        ['🎧 Artist', truncate(result?.artist || result?.author || 'Spotify', 36)]
+        ['🎧 Artist', truncate(result?.artist || result?.author || 'Music Artist', 36)]
       ];
       if (result?.album) musicRows.push(['💿 Album', truncate(result.album, 36)]);
       if (result?.year) musicRows.push(['📅 Release', String(result.year)]);
@@ -791,7 +1090,7 @@ export function createDownloaderScreen({ app }) {
       if (ctx?.isGroup) {
         musicRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
       }
-      b.table(kvTable(musicRows), { compact: true });
+      b.table(kvTable(musicRows), { striped: true, compact: true });
       if (lyrics) {
         b.expandableBlockquote(`📜 Lyrics • ${truncate(result?.title || title, 36)}\n\n${lyrics}`);
       }
@@ -807,15 +1106,36 @@ export function createDownloaderScreen({ app }) {
       if (ctx?.isGroup) {
         metaRows.push(['👤 Requested By', ctx.user?.first_name ? `${ctx.user.first_name}` : 'Member']);
       }
-      b.table(kvTable(metaRows), { compact: true });
+      b.table(kvTable(metaRows), { striped: true, compact: true });
+      if (result?.description) {
+        b.expandableBlockquote(truncate(`📖 Synopsis • ${truncate(title, 36)}\n\n${result.description}`, 1200));
+      }
+      if (result?.oversizeNotice) {
+        b.quote(rt.text(result.oversizeNotice));
+      }
     }
     b.divider();
+
+    if (result?.directUrl || (Array.isArray(result?.sourceLinks) && result.sourceLinks.length > 0)) {
+      const linkButtons = [];
+      if (result.directUrl && /^https?:\/\//i.test(result.directUrl)) {
+        linkButtons.push(richButton.url('🔗 Direct Download / Stream', result.directUrl, { style: 'success' }));
+      }
+      for (const sLink of (result.sourceLinks || []).slice(0, 3)) {
+        if (sLink?.url && /^https?:\/\//i.test(sLink.url) && sLink.url !== result.directUrl) {
+          linkButtons.push(richButton.url(truncate(sLink.label || 'Source Mirror', 26), sLink.url, { style: 'primary' }));
+        }
+      }
+      for (let i = 0; i < linkButtons.length; i += 2) {
+        b.buttons(linkButtons.slice(i, i + 2));
+      }
+    }
 
     // 4. Audio Action Row (send audio / recognize)
     const audioActionRow = [];
     if (audioKey) {
       audioActionRow.push(
-        richButton.callback('🎵 Send Audio File', encodeCallback(id, 'send_audio', audioKey), { style: 'primary' })
+        richButton.callback('🎵 Send Audio File', encodeCallback(id, 'send_audio', audioKey), { style: 'success' })
       );
     }
     if (isMusic) {
@@ -923,6 +1243,19 @@ export function createDownloaderScreen({ app }) {
 
     // Optional VC action is additive: never replace the original non-VC controls.
     if (canonicalMusic?.queueButton) b.buttons([canonicalMusic.queueButton]);
+    if (ctx?.isGroup && vcStreamKey) {
+      const vcRunning = Boolean(app?.musicQueueManager?.hasActiveSession?.(ctx.chatId));
+      if (vcRunning) {
+        b.buttons([
+          richButton.callback('⚡ Play Now in VC', encodeCallback(id, 'vc_now', vcStreamKey), { style: 'success' }),
+          richButton.callback('➕ Queue in VC', encodeCallback(id, 'vc_q', vcStreamKey), { style: 'primary' })
+        ]);
+      } else {
+        b.buttons([
+          richButton.callback('📻 Stream in VC', encodeCallback(id, 'vc_stream', vcStreamKey), { style: 'success' })
+        ]);
+      }
+    }
 
     // 7. General Action Buttons
     const mediaRow = [
@@ -1057,8 +1390,49 @@ export function createDownloaderScreen({ app }) {
       // Telegram refuses bot uploads above its size limit. Compress watchable
       // oversize videos; otherwise say exactly why instead of a silent failure.
       const result = await fitResultForTelegram(rawResult, { onProgress: (status) => tracker.set({ stage: status }) });
+
+      if (result.spotifyType && Array.isArray(result.tracks) && result.tracks.length > 0) {
+        const spKey = randomBytes(4).toString('hex');
+        const coverItem = (result.mediaItems || []).find((m) => m.type === 'photo' && m.buffer);
+        let coverBuf = coverItem?.buffer || null;
+        if (coverBuf) {
+          coverBuf = await optimizePreviewImage(coverBuf).catch(() => coverBuf);
+        }
+        const colData = {
+          url: result.sourceUrl || url,
+          platform: 'spotify',
+          spotifyType: result.spotifyType,
+          title: result.title || 'Spotify Collection',
+          artist: result.artist || result.author || null,
+          author: result.author || result.artist || null,
+          album: result.album || null,
+          year: result.year || null,
+          totalTracks: result.totalTracks || result.tracks.length,
+          tracks: result.tracks,
+          description: result.description || null,
+          requestedBy: ctx.isGroup && ctx.user?.first_name ? ctx.user.first_name : null,
+          coverBuf
+        };
+        saveSpotifyCollection(spKey, colData, app.db || ctx.db);
+        const { rich: colRich, files: colFiles } = buildSpotifyCollectionRichMessage(colData, {
+          page: 0,
+          spKey,
+          attachCover: Boolean(coverBuf),
+          botName: ctx?.botName || 'Lancy Bot'
+        });
+        tracker.setAction('upload_photo');
+        const sentCol = await tracker.finish(colRich, colFiles);
+        if (tracker.messageId && sentCol && !sentCol.permissionError) {
+          (ctx.controller || app.telegram?.controller)?.markMediaDeliveryMessage?.(tracker.messageId);
+          app.telegram?.markMediaDeliveryMessage?.(tracker.messageId);
+          (ctx.controller || app.telegram?.controller)?.userScreenMessage?.set?.(ctx.tgId, { chatId: ctx.chatId, messageId: tracker.messageId });
+        }
+        await ctx.sm?.reset(ctx.tgId, { reason: 'download_complete' });
+        return;
+      }
+
       const oversizeNote = describeOversized(result.oversized);
-      if (!result.mediaItems?.length && !result.audioTrack?.buffer && oversizeNote) {
+      if (!result.mediaItems?.length && !result.audioTrack?.buffer && !result.infoOnly && oversizeNote) {
         throw new Error(oversizeNote);
       }
 
@@ -1068,7 +1442,8 @@ export function createDownloaderScreen({ app }) {
       const hasVideo = mediaItems.some((m) => m.type === 'video');
       tracker.setAction(hasVideo ? 'upload_video' : 'upload_photo');
 
-      const isMusic = platform.toLowerCase() === 'spotify' || platform.toLowerCase() === 'music-search' || Boolean(result.artist);
+      const pLower = String(platform || '').toLowerCase();
+      const isMusic = ['spotify', 'applemusic', 'audiomack', 'soundcloud', 'music-search'].includes(pLower) || Boolean(result.artist);
       const photoItem = mediaItems.find((m) => m.type === 'photo');
       const photoItems = mediaItems.filter((m) => m.type === 'photo');
       const thumbBuf = photoItem?.buffer || null;
@@ -1080,17 +1455,18 @@ export function createDownloaderScreen({ app }) {
       }
 
       let audioKey = null;
+      let parsedAudioDuration = 0;
       if (audioTrack && audioTrack.buffer) {
         audioKey = Math.random().toString(36).slice(2, 8);
-        const parsedDuration = parseDurationToSeconds(audioTrack.duration || result.duration);
+        parsedAudioDuration = parseDurationToSeconds(audioTrack.duration || result.duration || result.durationSeconds);
         const audioMeta = {
           title: audioTrack.title || result.title || title || 'Audio Track',
-          performer: audioTrack.performer || result.artist || result.author || (isMusic ? 'Spotify' : 'Soundtrack'),
-          duration: parsedDuration > 0 ? parsedDuration : undefined,
+          performer: audioTrack.performer || result.artist || result.author || (isMusic ? 'Music Artist' : 'Soundtrack'),
+          duration: parsedAudioDuration > 0 ? parsedAudioDuration : undefined,
           filename: audioTrack.filename || `${(title || 'soundtrack').replace(/[^\w\s-]/g, '') || 'soundtrack'}.mp3`,
           album: result.album || null,
           year: result.year || null,
-          platform: isMusic ? 'SPOTIFY / MUSIC ♡' : platform.toUpperCase(),
+          platform: isMusic ? formatMusicPlatformLabel(platform) : platform.toUpperCase(),
           requestedBy: ctx.isGroup && ctx.user?.first_name ? ctx.user.first_name : null
         };
         saveTrackAudio(audioKey, audioTrack.buffer, audioMeta, thumbBuf);
@@ -1102,6 +1478,30 @@ export function createDownloaderScreen({ app }) {
             JSON.stringify(audioMeta)
           );
         } catch {}
+      }
+
+      let vcStreamKey = null;
+      if (isGroup) {
+        const videoMedia = mediaItems.find((m) => m.type === 'video' && (m.buffer || m.filePath));
+        const streamBuffer = videoMedia?.buffer || audioTrack?.buffer || null;
+        const streamFilePath = videoMedia?.filePath || null;
+        if (streamBuffer || streamFilePath) {
+          vcStreamKey = audioKey || Math.random().toString(36).slice(2, 8);
+          const streamDur = Number(result.durationSeconds) || parsedAudioDuration || parseDurationToSeconds(result.duration) || 180;
+          if (streamFilePath && videoMedia) {
+            videoMedia.preserveForVc = true;
+          }
+          saveVcStreamItem(vcStreamKey, {
+            buffer: streamBuffer,
+            filePath: streamFilePath,
+            mediaType: videoMedia ? 'video' : 'audio',
+            title: audioTrack?.title || result.title || title || 'Downloaded Media',
+            artist: audioTrack?.performer || result.artist || result.author || platform,
+            durationSeconds: streamDur,
+            platform,
+            sourceUrl: url
+          }, app.db || ctx.db);
+        }
       }
 
       const albumKey = mediaItems.length > 1 ? Math.random().toString(36).slice(2, 8) : null;
@@ -1136,7 +1536,8 @@ export function createDownloaderScreen({ app }) {
         albumKey,
         imageKey,
         audioKey,
-        lyrics: lyricsText
+        lyrics: lyricsText,
+        vcStreamKey
       });
 
       // Deliver Media
@@ -1179,7 +1580,16 @@ export function createDownloaderScreen({ app }) {
             performer: songArtist,
             caption,
             parse_mode: 'HTML',
-            filename: cleanFilename
+            filename: cleanFilename,
+            ...(vcStreamKey ? {
+              reply_markup: {
+                inline_keyboard: [[{
+                  text: '📻 Stream in VC',
+                  callback_data: encodeCallback(id, 'vc_stream', vcStreamKey),
+                  style: 'success'
+                }]]
+              }
+            } : {})
           }).catch(() => null);
 
           if (sent && sendFollowupLyrics && lyricsText) {
@@ -1193,7 +1603,37 @@ export function createDownloaderScreen({ app }) {
       }
 
       if (!sent) {
-        sent = await tracker.finish(rich, files);
+        try {
+          sent = await tracker.finish(rich, files);
+        } catch (finishErr) {
+          const largeFileItem = mediaItems.find((m) => m.type === 'video' && m.filePath && existsSync(m.filePath));
+          if (largeFileItem) {
+            await tracker.cleanup();
+            const cap = `🎬 <b>${escapeHtml(title || 'Movie Download')}</b>\n<blockquote>📦 Direct High-Capacity Delivery (${Math.round((largeFileItem.sizeBytes || 0) / (1024 * 1024))} MB)</blockquote>`;
+            sent = await (ctx.api || app.telegram?.api).sendVideo(ctx.chatId, { filePath: largeFileItem.filePath }, {
+              caption: cap,
+              parse_mode: 'HTML',
+              filename: largeFileItem.filename || 'video.mp4',
+              supports_streaming: true,
+              ...(vcStreamKey ? {
+                reply_markup: {
+                  inline_keyboard: [[{
+                    text: '📻 Stream in VC',
+                    callback_data: encodeCallback(id, 'vc_stream', vcStreamKey),
+                    style: 'success'
+                  }]]
+                }
+              } : {})
+            });
+          } else {
+            throw finishErr;
+          }
+        }
+      }
+      for (const item of mediaItems) {
+        if (item?.cleanupOnDeliver && item?.filePath && !item?.preserveForVc) {
+          try { unlinkSync(item.filePath); } catch {}
+        }
       }
       if (oversizeNote && sent && !sent.permissionError) {
         await (ctx.api || app.telegram?.api).sendMessage(ctx.chatId, `Some items were skipped:\n${oversizeNote}`, {
@@ -1268,10 +1708,10 @@ export function createDownloaderScreen({ app }) {
         return;
       }
       const b = new RichMessageBuilder();
-      b.paragraph(rt.bold(banner([
+      b.bannerHeader([
         '𓆩♡𓆪 DOWNLOAD FAILED 𓆩♡𓆪',
         'could not retrieve media ♡'
-      ])));
+      ]);
       const rawMsg = err.message || 'Unknown download error';
       let cleanErr = rawMsg;
 
@@ -1296,8 +1736,9 @@ export function createDownloaderScreen({ app }) {
       b.quote(rt.text(`✕ ${cleanErr}\n\nPlease check the link and try again ♡`));
       b.divider();
       b.buttons([
-        richButton.callback('🔄 Try Again', encodeCallback(id, 'input'), { style: 'primary' }),
-        richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'))
+        richButton.callback('🔄 Try Again', encodeCallback(id, 'input'), { style: 'success' }),
+        richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
+        richButton.callback('« Dashboard', encodeCallback('dashboard', 'open'), { style: 'primary' })
       ]);
       b.validate();
       await tracker.finish(b.toJSON());
@@ -1920,7 +2361,6 @@ export function createDownloaderScreen({ app }) {
         ['🎧 Artist', truncate(trackArtist, 36)]
       ];
       if (albumTitle) metaRows.push(['💿 Album', truncate(albumTitle, 36)]);
-      metaRows.push(['📜 Source', lyricsRes.source?.toUpperCase() || 'LRCLIB']);
       b.table(kvTable(metaRows), { compact: true });
       b.divider();
 
@@ -2019,8 +2459,9 @@ export function createDownloaderScreen({ app }) {
             }
           }
           return ctx.editScreen(renderTikTokSearchPrompt(ctx));
-        case 'play':
-          await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
+        case 'play': {
+          const stateKey = (ctx.isChannel && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId;
+          await ctx.sm?.transition(stateKey, States.MUSIC_SEARCH_INPUT, { chatId: ctx.chatId, context: { mode: 'music' } });
           if (fromMedia) {
             try {
               return await ctx.replyRich(renderMusicSearchPrompt(ctx));
@@ -2029,8 +2470,10 @@ export function createDownloaderScreen({ app }) {
             }
           }
           return ctx.editScreen(renderMusicSearchPrompt(ctx));
-        case 'searchLyrics':
-          await ctx.sm?.transition(ctx.tgId, States.URL_DOWNLOADER_INPUT, { context: { mode: 'lyrics' } });
+        }
+        case 'searchLyrics': {
+          const stateKey = (ctx.isChannel && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId;
+          await ctx.sm?.transition(stateKey, States.URL_DOWNLOADER_INPUT, { chatId: ctx.chatId, context: { mode: 'lyrics' } });
           if (fromMedia) {
             try {
               return await ctx.replyRich(renderLyricsSearchPrompt(ctx));
@@ -2039,8 +2482,10 @@ export function createDownloaderScreen({ app }) {
             }
           }
           return ctx.editScreen(renderLyricsSearchPrompt(ctx));
-        case 'recognize':
-          await ctx.sm?.transition(ctx.tgId, States.MUSIC_SEARCH_INPUT, { context: { mode: 'music' } });
+        }
+        case 'recognize': {
+          const stateKey = (ctx.isChannel && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId;
+          await ctx.sm?.transition(stateKey, States.MUSIC_SEARCH_INPUT, { chatId: ctx.chatId, context: { mode: 'music' } });
           if (fromMedia) {
             try {
               return await ctx.replyRich(renderAudioRecognitionPrompt());
@@ -2049,6 +2494,7 @@ export function createDownloaderScreen({ app }) {
             }
           }
           return ctx.editScreen(renderAudioRecognitionPrompt());
+        }
         case 'more_slide':
         case 'moreSlide':
         case 'prev_slide':
@@ -2368,7 +2814,7 @@ export function createDownloaderScreen({ app }) {
               }
             }
 
-            const directStreamUrl = `https://pappysonghttps.duckdns.org/audio/live/${encodeURIComponent(videoId || 'track')}/${encodeURIComponent(songArtist)}_-_${encodeURIComponent(songTitle)}.mp3`;
+            const directStreamUrl = `${getStreamPublicUrl(ctx?.settings)}/audio/live/${encodeURIComponent(videoId || 'track')}/${encodeURIComponent(songArtist)}_-_${encodeURIComponent(songTitle)}.mp3`;
             try {
               await ctx.api.call('editMessageMedia', {
                 inline_message_id: inlineMsgId,
@@ -2448,6 +2894,177 @@ export function createDownloaderScreen({ app }) {
                 }
               } catch {}
             }
+          }
+          return;
+        }
+        case 'vc_stream':
+        case 'vc_q':
+        case 'vc_now':
+        case 'vc_cancel': {
+          const vcKey = args[0];
+          const db = app.db || ctx.db;
+          if (app.music) {
+            try {
+              await app.music.authorize(ctx, true, ctx.chatId, { allowDj: true });
+            } catch (authErr) {
+              if (ctx.query?.id) {
+                if (authErr?.silent || (ctx.isGroup && app.music?.isVcSudoEnforced?.(ctx.chatId))) {
+                  await ctx.api?.answerCallbackQuery?.(ctx.query.id).catch(() => {});
+                } else {
+                  await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                    text: `🔒 ${authErr?.message || 'Only authorized VC Sudo / DJs can control Voice Chat playback.'}`,
+                    show_alert: true
+                  }).catch(() => {});
+                }
+              }
+              return;
+            }
+          }
+
+          if (action === 'vc_cancel') {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: '✕ Cancelled' }).catch(() => {});
+            }
+            if (ctx.messageId) {
+              await ctx.api?.deleteMessage?.(ctx.chatId, ctx.messageId).catch(async () => {
+                await ctx.api?.editMessageText?.(ctx.chatId, ctx.messageId, '✕ Voice Chat stream request cancelled.').catch(() => {});
+              });
+            }
+            return;
+          }
+
+          const item = getVcStreamItem(vcKey, db);
+          if (!item || !item.filePath || !existsSync(item.filePath)) {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: '⚠️ Stream cache expired. Please download the link again ♡',
+                show_alert: true
+              }).catch(() => {});
+            }
+            return;
+          }
+
+          if (!app.music || !app.musicQueueManager) {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: '⚠️ Voice Chat music engine is not enabled on this instance.',
+                show_alert: true
+              }).catch(() => {});
+            }
+            return;
+          }
+
+          const qm = app.musicQueueManager;
+          const s = qm.getSession(ctx.chatId);
+          const vcActive = Boolean(['playing', 'paused', 'buffering'].includes(s.status) && s.currentTrack);
+          const trackObj = {
+            id: `local:${item.key}`,
+            provider: 'local',
+            providerId: item.key,
+            title: item.title || 'Downloaded Track',
+            artist: item.artist || 'Creator',
+            durationSeconds: Number(item.durationSeconds) > 0 ? Number(item.durationSeconds) : 180,
+            filePath: item.filePath,
+            sourceUrl: item.sourceUrl || null,
+            mediaType: item.mediaType === 'video' ? 'video' : 'audio',
+            availability: 'resolved',
+            requester: ctx.user?.first_name || 'Member',
+            capabilities: {
+              stream: true,
+              download: true,
+              seek: true,
+              video: item.mediaType === 'video'
+            }
+          };
+
+          if (action === 'vc_stream') {
+            if (vcActive) {
+              if (ctx.query?.id) {
+                await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                  text: '🎙️ VC is active — choose Queue or Play Immediately!'
+                }).catch(() => {});
+              }
+              const promptBuilder = new RichMessageBuilder();
+              promptBuilder.header('🎙️ VOICE CHAT IS ALREADY PLAYING', 2);
+              promptBuilder.quote([
+                rt.bold('Now Playing: '),
+                rt.text(`${truncate(s.currentTrack.title || 'Current Track', 42)}\n`),
+                rt.bold('Selected Media: '),
+                rt.text(`${truncate(trackObj.title, 42)} (${trackObj.mediaType === 'video' ? '🎬 Video' : '🎵 Audio'})\n\n`),
+                rt.italic('Choose how to stream this download. If you Play Immediately, the current song & playlist playing before will continue right after! ♡')
+              ]);
+              promptBuilder.buttons([
+                richButton.callback('➕ Add to Queue', encodeCallback(id, 'vc_q', item.key), { style: 'primary' }),
+                richButton.callback('⚡ Play Immediately', encodeCallback(id, 'vc_now', item.key), { style: 'success' })
+              ]);
+              promptBuilder.buttons([
+                richButton.callback('✕ Cancel', encodeCallback(id, 'vc_cancel', item.key), { style: 'danger' })
+              ]);
+              promptBuilder.validate();
+              await (ctx.api || app.telegram?.api).sendRichMessage(ctx.chatId, promptBuilder.toJSON(), {
+                ...(ctx.messageId ? { reply_to_message_id: ctx.messageId } : {})
+              });
+              return;
+            }
+
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: '📻 Starting stream in Voice Chat… ♡'
+              }).catch(() => {});
+            }
+            await app.music.prepare(ctx, ctx.chatId);
+            await qm.addMany(ctx.chatId, [trackObj]);
+            await app.music.player(ctx, ctx.chatId);
+            return;
+          }
+
+          if (action === 'vc_q') {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: `➕ Added "${truncate(trackObj.title, 28)}" to VC Queue!`
+              }).catch(() => {});
+            }
+            if (!s.connected && typeof app.voiceClient?.setup === 'function') {
+              await app.music.prepare(ctx, ctx.chatId);
+            }
+            const queued = qm.enqueue(ctx.chatId, trackObj);
+            if (!qm.hasActiveSession(ctx.chatId)) {
+              await qm.ensurePlaying(ctx.chatId);
+            }
+            await qm.updatePlayerCard(ctx.chatId);
+            if (ctx.messageId) {
+              const confirmB = new RichMessageBuilder();
+              confirmB.header('✅ ADDED TO VOICE CHAT QUEUE', 2);
+              confirmB.quote(rt.text(`➕ "${truncate(trackObj.title, 45)}" queued at #${queued.position}.\nYour current playlist will continue uninterrupted! ♡`));
+              confirmB.validate();
+              await ctx.api?.editMessageRich?.(ctx.chatId, ctx.messageId, confirmB.toJSON()).catch(() => {});
+            }
+            return;
+          }
+
+          if (action === 'vc_now') {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: `⚡ Playing "${truncate(trackObj.title, 28)}" immediately!`
+              }).catch(() => {});
+            }
+            if (!s.connected && typeof app.voiceClient?.setup === 'function') {
+              await app.music.prepare(ctx, ctx.chatId);
+            }
+            const { interrupted } = await qm.playImmediateAndContinue(ctx.chatId, trackObj);
+            await app.music.player(ctx, ctx.chatId);
+            if (ctx.messageId) {
+              const confirmB = new RichMessageBuilder();
+              confirmB.header('⚡ PLAYING IMMEDIATELY IN VC', 2);
+              confirmB.quote(rt.text(
+                interrupted
+                  ? `▶ Now streaming "${truncate(trackObj.title, 42)}"!\n⏭ "${truncate(interrupted.title, 38)}" & your previous playlist will continue right after ♡`
+                  : `▶ Now streaming "${truncate(trackObj.title, 42)}" in Voice Chat! ♡`
+              ));
+              confirmB.validate();
+              await ctx.api?.editMessageRich?.(ctx.chatId, ctx.messageId, confirmB.toJSON()).catch(() => {});
+            }
+            return;
           }
           return;
         }
@@ -3207,6 +3824,114 @@ export function createDownloaderScreen({ app }) {
           }
           return;
         }
+        case 'sp_page': {
+          const spKey = args[0];
+          const page = Math.max(0, Number.parseInt(args[1] || '0', 10) || 0);
+          const col = getSpotifyCollection(spKey, app.db || ctx.db);
+          if (!col || !col.tracks?.length) {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: '♡ Spotify playlist cache expired — please send the link again! ♡',
+                showAlert: true
+              }).catch(() => {});
+            }
+            return;
+          }
+          if (ctx.query?.id) {
+            await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `🎧 Page ${page + 1} ♡` }).catch(() => {});
+          }
+          const hasPhotoMsg = Boolean(ctx.query?.message?.photo?.length);
+          const { rich, files } = buildSpotifyCollectionRichMessage(col, {
+            page,
+            spKey,
+            attachCover: !hasPhotoMsg && Boolean(col.coverBuf),
+            botName: ctx?.botName || 'Lancy Bot'
+          });
+          const chatId = ctx.chatId;
+          const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
+          if (targetMsgId && ctx.api?.editMessageRich) {
+            try {
+              await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+              return { message_id: targetMsgId };
+            } catch (err) {
+              const errMsg = String(err?.description ?? err?.message);
+              if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
+              if (ctx.api?.sendRichMessage) {
+                const { rich: freshRich, files: freshFiles } = buildSpotifyCollectionRichMessage(col, {
+                  page,
+                  spKey,
+                  attachCover: Boolean(col.coverBuf),
+                  botName: ctx?.botName || 'Lancy Bot'
+                });
+                const sent = await ctx.api.sendRichMessage(chatId, freshRich, {}, freshFiles).catch(() => null);
+                if (sent?.message_id) {
+                  if (sent.message_id !== targetMsgId) {
+                    await ctx.api.deleteMessage?.(chatId, targetMsgId).catch(() => {});
+                  }
+                  ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
+                  app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
+                  ctx.controller?.userScreenMessage?.set?.(ctx.tgId, { chatId, messageId: sent.message_id });
+                  ctx.sm?.update?.(ctx.tgId, { screenMessageId: sent.message_id });
+                  return sent;
+                }
+              }
+            }
+          }
+          if (ctx.editScreen) {
+            return ctx.editScreen(rich);
+          }
+          return ctx.api?.sendRichMessage?.(chatId, rich, {}, files);
+        }
+        case 'sp_trk': {
+          const spKey = args[0];
+          const trkIdx = Math.max(0, Number.parseInt(args[1] || '0', 10) || 0);
+          const col = getSpotifyCollection(spKey, app.db || ctx.db);
+          const track = col?.tracks?.[trkIdx];
+          if (!col || !track) {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: '♡ Spotify tracklist cache expired — please send the link again! ♡',
+                showAlert: true
+              }).catch(() => {});
+            }
+            return;
+          }
+          if (ctx.query?.id) {
+            await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+              text: `🎵 Extracting ${truncate(track.title || 'Track', 28)}… ♡`
+            }).catch(() => {});
+          }
+          const target = track.url || `${track.artist ? `${track.artist} - ` : ''}${track.title || col.title}`;
+          return executeDownload({ ...ctx, forceNew: true }, target);
+        }
+        case 'sp_batch': {
+          const spKey = args[0];
+          const page = Math.max(0, Number.parseInt(args[1] || '0', 10) || 0);
+          const col = getSpotifyCollection(spKey, app.db || ctx.db);
+          if (!col || !col.tracks?.length) {
+            if (ctx.query?.id) {
+              await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+                text: '♡ Spotify playlist cache expired — please send the link again! ♡',
+                showAlert: true
+              }).catch(() => {});
+            }
+            return;
+          }
+          const slice = col.tracks.slice(page * 6, page * 6 + 6);
+          if (ctx.query?.id) {
+            await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+              text: `⏬ Queuing ${slice.length} tracks from Page ${page + 1}… ♡`
+            }).catch(() => {});
+          }
+          for (const track of slice) {
+            const target = track.url || `${track.artist ? `${track.artist} - ` : ''}${track.title || col.title}`;
+            await executeDownload({ ...ctx, forceNew: true }, target).catch((err) => {
+              log.warn({ err, target }, 'spotify batch track failed');
+            });
+            await sleep(400);
+          }
+          return;
+        }
         case 'cancel':
           await ctx.sm?.reset(ctx.tgId, { reason: 'cancelled' });
           return this.open(ctx);
@@ -3225,6 +3950,7 @@ export function createDownloaderScreen({ app }) {
       }
     },
     executeDownload,
+    buildSpotifyCollectionRichMessage,
     executeTikTokSearch,
     executeLyricsSearch,
     executePfpSearch,
@@ -3276,20 +4002,19 @@ export function createDownloaderScreen({ app }) {
             return true;
           }
 
-          const match = text.match(/https?:\/\/[^\s]+/i);
+          const match = text.match(/https?:\/\/[^\s<>]+|spotify:(?:track|album|artist|playlist):[A-Za-z0-9]+/i);
           if (sctx.context?.mode === 'url' && !match) {
             const b = new RichMessageBuilder();
-            b.paragraph(rt.bold(banner([
+            b.bannerHeader([
               '𓆩♡𓆪 URL DOWNLOADER 𓆩♡𓆪',
               'valid link required ♡'
-            ])));
-            b.divider();
-            b.paragraph(rt.text('୨୧ Please provide a valid media link starting with http:// or https:// ♡'));
+            ]);
+            b.paragraph(rt.text('୨୧ Please provide a valid media link starting with http://, https://, or spotify: ♡'));
             b.quote(rt.italic('Tip: To search and download music by song name or lyrics, tap 🎵 Play Music below or type /play <song>!'));
             b.divider();
             b.buttons([
-              richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'primary' }),
-              richButton.callback('« Downloader', encodeCallback(id, 'open'))
+              richButton.callback('🎵 Play Music', encodeCallback(id, 'play'), { style: 'success' }),
+              richButton.callback('« Downloader', encodeCallback(id, 'open'), { style: 'primary' })
             ]);
             b.buttons([
               richButton.callback('✕ Cancel', encodeCallback(id, 'cancel'), { style: 'danger' })
@@ -3306,7 +4031,7 @@ export function createDownloaderScreen({ app }) {
             return true;
           }
 
-          const target = match ? match[0] : text;
+          const target = match ? match[0].replace(/[),.;!?]+$/, '') : text;
           await executeDownload(dlCtx, target);
           return true;
         },
@@ -3341,8 +4066,8 @@ export function createDownloaderScreen({ app }) {
 
           const text = String(message.text || message.caption || '').trim();
           if (!text) return true;
-          const match = text.match(/https?:\/\/[^\s]+/i);
-          const target = match ? match[0] : text;
+          const match = text.match(/https?:\/\/[^\s<>]+|spotify:(?:track|album|artist|playlist):[A-Za-z0-9]+/i);
+          const target = match ? match[0].replace(/[),.;!?]+$/, '') : text;
           const dlCtx = {
             ...sctx,
             controller: sctx.controller || app.telegram?.controller,

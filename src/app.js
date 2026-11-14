@@ -27,6 +27,7 @@ import { LancyAssistant } from './ai/assistant.js';
 import { AutonomousScheduler } from './ai/scheduler.js';
 
 import { MediaDownloader } from './media/downloader.js';
+import { getSharedMediaWorkerPool } from './core/mediaWorkerPool.js';
 import { VideoStreamingServer } from './media/streamingServer.js';
 import { createDashboardScreen } from './telegram/screens/dashboard.js';
 import { createPinterestScreen } from './telegram/screens/pinterest.js';
@@ -50,6 +51,12 @@ import { SearchSessions } from './music/search.js';
 import { MatchedLyrics } from './music/lyrics.js';
 import { AccountStore } from './music/accounts.js';
 import { MusicService } from './music/service.js';
+import { MovieApiClient } from './media/movieApi.js';
+import { SubtitleService } from './media/subtitles.js';
+import { MovieStreamResolver } from './media/movieResolver.js';
+import { MovieSessions } from './media/movieSessions.js';
+import { MovieDownloader } from './media/movieDownloader.js';
+import { MediaAiAgent } from './ai/mediaAgent.js';
 
 /**
  * LancyApp — the composition root. Every service is constructed here and
@@ -147,11 +154,21 @@ export class LancyApp {
     this.inboundHandler = new InboundHandler({ app: this, log: this.log });
 
     // ── AI ──
+    if (!this.env.AI_MODEL && this.settings.get('ai.model') === 'qwen2.5:0.5b') {
+      this.db?.setSetting?.('ai.model', 'qwen2.5:3b');
+      this.settings.load?.();
+    }
     this.ai = new AIService({ settings: this.settings });
     this.assistant = new LancyAssistant({ app: this });
+    this.mediaAgent = new MediaAiAgent({ app: this, log: this.log });
     this.scheduler = new AutonomousScheduler({ app: this });
 
-    this.mediaDownloader = new MediaDownloader({ log: this.log });
+    this.mediaWorkerPool = getSharedMediaWorkerPool({
+      maxWorkers: this.settings.get('performance.workerConcurrency') ?? 8,
+      maxConcurrentJobs: Math.max(8, (this.settings.get('performance.workerConcurrency') ?? 8) * 2),
+      perUserMaxConcurrent: 3
+    });
+    this.mediaDownloader = new MediaDownloader({ log: this.log, workerPool: this.mediaWorkerPool });
     this.videoServer = new VideoStreamingServer({ app: this, port: 3055, log: this.log });
 
     // ── Voice Chat & Music Streaming ──
@@ -162,6 +179,11 @@ export class LancyApp {
     this.musicProviders.get('youtube').enabled = this.settings.get('music.allowYtDlp');
     this.musicQueueManager.idleTimeoutMs = this.settings.get('music.idleLeaveSeconds') * 1000;
     this.musicLibrary = new MediaLibrary({ root: join(this.root, 'cache', 'music'), providers: this.musicProviders, maxBytes: this.settings.get('music.maxFileMiB') * 1024 * 1024, videoMaxBytes: (this.settings.get('music.maxVideoMiB') || this.settings.get('music.maxFileMiB')) * 1024 * 1024, quotaBytes: this.settings.get('music.maxCacheMiB') * 1024 * 1024, ttlMs: this.settings.get('music.cacheTtlMinutes') * 60000 });
+    this.movieApi = new MovieApiClient({ log: this.log });
+    this.subtitles = new SubtitleService({ cacheDir: join(this.root, 'cache', 'music', 'subs'), log: this.log });
+    this.movieResolver = new MovieStreamResolver({ movieApi: this.movieApi, subtitles: this.subtitles, log: this.log });
+    this.movieSessions = new MovieSessions({ db: this.db });
+    this.movieDownloader = new MovieDownloader({ app: this, log: this.log });
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
 
@@ -368,6 +390,7 @@ export class LancyApp {
     await this.whatsapp.stopAll();
     await this.ai.stop();
     await this.queues.shutdown();
+    await this.mediaWorkerPool?.shutdown?.().catch(() => {});
     this.db.close();
   }
 }

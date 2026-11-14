@@ -45,7 +45,7 @@ export class VoiceClient {
   }
   waitEvent(signal) { return this.request('/events',{timeoutMs:25000,signal}); }
   checkHealth() { return this.request('/health', { timeoutMs: 1500 }); }
-  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')) }, timeoutMs:110000 }); }
+  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, remote_proxy:Boolean(opts.remoteProxy), subtitle_path:opts.subtitlePath || null, is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), video_quality:String(opts.videoQuality || process.env.VOICE_VIDEO_QUALITY || 'HD_720p'), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')) }, timeoutMs:110000 }); }
   control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 65000 : op === 'resume' ? 35000 : 20000 }); }
   pause(id) { return this.control('pause', id); }
   resume(id) { return this.control('resume', id); }
@@ -54,6 +54,7 @@ export class VoiceClient {
   async setup(id, stage, options = {}) { await this.ensureDaemon();return this.request('/destination/setup',{method:'POST',body:{chat_id:Number(id),stage,...options},timeoutMs:65000}); }
   idle(id) { return this.control('idle', id); }
   setVolume(id, volume) { return this.control('volume', id, { volume:Number(volume) }); }
+  setSubtitle(id, subtitlePath) { return this.control('subtitle', id, { subtitle_path: subtitlePath || null }); }
   seek(id, seconds) { return this.control('seek', id, { seconds:Number(seconds) }); }
   getStatus(id) { return this.request(`/call/status?chat_id=${Number(id)}`); }
   accounts(id = null, refresh = false) { const params = new URLSearchParams();if(id!=null)params.set('chat_id',String(Number(id)));if(refresh)params.set('refresh','1');return this.request(`/accounts?${params}`, {timeoutMs:75000}); }

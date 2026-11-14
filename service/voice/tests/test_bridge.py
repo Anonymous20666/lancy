@@ -286,3 +286,73 @@ class ConcurrentDestinationSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.bridge.prepared[-1]={'alias':'one'}
         with self.assertRaises(VoiceFailure) as caught:await self.bridge.configure({'alias':'one','remove':True})
         self.assertEqual(caught.exception.code,'ACCOUNT_IN_USE')
+
+class StreamSyncAndGeometryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_video_sync_locks_nightcore_tempo_and_computes_exact_geometry(self):
+        self.assertEqual(MODULE.compute_target_video_size(1920, 1080, 1280, 720, True), (1280, 720))
+        self.assertEqual(MODULE.compute_target_video_size(972, 720, 1280, 720, True), (972, 720))
+        self.assertEqual(MODULE.compute_target_video_size(1920, 800, 1280, 720, True), (1280, 532))
+        self.assertEqual(MODULE.compute_target_video_size(1080, 1920, 1280, 720, True), (404, 720))
+
+        class Flags: REQUIRED='required'; IGNORE='ignore'
+        class Stream:
+            def __init__(self, path, **kw): self.path=path; self.kw=kw
+        Stream.Flags = Flags
+        class Config:
+            def __init__(self, **kw): self.kw=kw
+        fake_types = types.ModuleType('pytgcalls.types'); fake_types.MediaStream=Stream; fake_types.AudioQuality=types.SimpleNamespace(HIGH='48k-stereo'); fake_types.VideoQuality=types.SimpleNamespace(HD_720p='720p', SD_360p='360p'); fake_types.GroupCallConfig=Config
+        bridge=Bridge('/tmp'); engine=FakeEngine(); bridge.ensure_publisher=AsyncMock()
+        with patch.dict(sys.modules, {'pytgcalls':types.ModuleType('pytgcalls'),'pytgcalls.types':fake_types}):
+            await bridge.stream({'engine':engine}, -1, {'path':'clip.mp4','offset':0.0,'bass':False,'eq':'nightcore','video':True})
+            ff_video = engine.streams[-1][1].kw['ffmpeg_parameters']
+            self.assertNotIn('asetrate', ff_video)
+            self.assertNotIn('atempo', ff_video)
+            self.assertNotIn('pad=1280:720', ff_video)
+            self.assertIn('-sws_flags lanczos', ff_video)
+
+            await bridge.stream({'engine':engine}, -1, {'path':'song.mp3','offset':0.0,'bass':False,'eq':'nightcore','video':False})
+            ff_audio = engine.streams[-1][1].kw['ffmpeg_parameters']
+            self.assertIn('aresample=48000,asetrate=48000*1.12,aresample=48000', ff_audio)
+
+    async def test_rewrite_video_ffmpeg_command_consolidates_vf_and_maps_primary_stream(self):
+        orig = "ffmpeg -reconnect 1 -i http://127.0.0.1:3055/movie-proxy/tok -sws_flags lanczos -v quiet -f rawvideo -r 30 -pix_fmt yuv420p -vf scale=906:528 pipe:1"
+        rewritten = MODULE.rewrite_video_ffmpeg_command(
+            orig,
+            924,
+            520,
+            subtitle_path='/tmp/sub:test.srt',
+            stream_index=0,
+            video_count=2,
+            is_image=False,
+        )
+        import shlex as _shlex
+        parts = _shlex.split(rewritten)
+        self.assertEqual(sum(1 for p in parts if p == '-vf'), 1)
+        vf_val = parts[parts.index('-vf') + 1]
+        self.assertIn('scale=924:520:flags=lanczos,setsar=1,', vf_val)
+        self.assertIn('format=yuv420p', vf_val)
+        self.assertIn('-map', parts)
+        self.assertEqual(parts[parts.index('-map') + 1], '0:0')
+
+    async def test_probe_video_stream_info_skips_attached_pic_cover(self):
+        import json as _json
+        payload = {
+            'streams': [
+                {'index': 0, 'codec_name': 'hevc', 'width': 924, 'height': 520, 'disposition': {'attached_pic': 0}},
+                {'index': 4, 'codec_name': 'png', 'width': 906, 'height': 528, 'disposition': {'attached_pic': 1}},
+            ]
+        }
+        fake_proc = types.SimpleNamespace(returncode=0, communicate=AsyncMock(return_value=(_json.dumps(payload).encode('utf-8'), b'')), kill=lambda: None)
+        with patch.object(MODULE.asyncio, 'create_subprocess_exec', AsyncMock(return_value=fake_proc)):
+            info = await MODULE.probe_video_stream_info('http://127.0.0.1:3055/movie-proxy/tok')
+        self.assertEqual(info, {'width': 924, 'height': 520, 'stream_index': 0, 'video_count': 2, 'is_image': False})
+
+    async def test_strip_reconnect_at_eof_preserves_midstream_reconnect_for_hls_proxy(self):
+        audio_cmd = 'ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 -i http://127.0.0.1:3055/movie-proxy/abcdef0123456789 -f s16le pipe:1'
+        video_cmd = 'ffmpeg -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2 -i http://127.0.0.1:3055/movie-proxy/abcdef0123456789 -f rawvideo -r 30 -pix_fmt yuv420p pipe:1'
+        stripped_audio = MODULE.strip_reconnect_at_eof(audio_cmd)
+        rewritten_video = MODULE.rewrite_video_ffmpeg_command(video_cmd, 1280, 686)
+        self.assertNotIn('-reconnect_at_eof', stripped_audio)
+        self.assertIn('-reconnect_streamed 1', stripped_audio)
+        self.assertNotIn('-reconnect_at_eof', rewritten_video)
+        self.assertIn('scale=1280:686:flags=lanczos,setsar=1,format=yuv420p', rewritten_video)

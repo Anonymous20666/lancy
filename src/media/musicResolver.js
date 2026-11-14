@@ -8,11 +8,13 @@
  */
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createWriteStream, existsSync, statSync, unlinkSync, renameSync } from 'node:fs';
+import { createWriteStream, existsSync, statSync, unlinkSync, renameSync, copyFileSync } from 'node:fs';
 import { createDecipheriv } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { createConnection } from 'node:net';
+import { join } from 'node:path';
+import { resolveFfmpegPath } from './convert.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -68,27 +70,58 @@ export async function isProxyReachable(proxyUrl, timeoutMs = 150) {
 }
 
 /** ── metadata (title/artist/explicit/duration) ─────────────────────── */
+function metadataTokenScore(query, title, artist) {
+    const q = String(query || '').toLowerCase();
+    const tokens = [...new Set(q.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((t) => t.length >= 2))];
+    if (!tokens.length) return 0;
+    const text = `${title || ''} ${artist || ''}`.toLowerCase();
+    let score = 0;
+    for (const tok of tokens) {
+        if (text.includes(tok)) score += 25;
+    }
+    const extraRe = /\b(beat|type\s*beat|tribute|lofi|lo-fi|acoustic|remix|slowed|reverb|karaoke|instrumental|cover|sped\s*up|nightcore)\b/i;
+    if (!extraRe.test(q) && extraRe.test(text)) {
+        score -= 45;
+    }
+    return score;
+}
+
 async function deezerMatch(query) {
     try {
-        const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=5`, { signal: AbortSignal.timeout(4500) });
+        const res = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(query)}&limit=10`, { signal: AbortSignal.timeout(4500) });
         if (!res.ok) return null;
         const rows = (await res.json()).data ?? [];
         if (!rows.length) return null;
         const wantX = wantsExplicit(query);
-        rows.sort((a, b) => (Number(b.rank ?? 0) * (wantX && b.explicit_lyrics ? 1.25 : 1)) - (Number(a.rank ?? 0) * (wantX && a.explicit_lyrics ? 1.25 : 1)));
-        const t = rows[0];
-        return { title: t.title, artist: t.artist?.name, duration: t.duration ?? 0, explicit: Boolean(t.explicit_lyrics), cover: t.album?.cover_big || t.album?.cover_medium || null, source: 'deezer' };
+        const scored = rows.map((r) => {
+            const rel = metadataTokenScore(query, r.title, r.artist?.name);
+            const popBoost = Math.log10(Math.max(10, Number(r.rank ?? 10))) * 4;
+            const bonus = (wantX && r.explicit_lyrics ? 6 : 0) + ((r.duration ?? 0) >= 45 ? 10 : -50) + popBoost;
+            return { r, rel: rel + bonus, rank: Number(r.rank ?? 0) };
+        });
+        scored.sort((a, b) => (b.rel - a.rel) || (b.rank - a.rank));
+        const t = scored[0].r;
+        return { title: t.title, artist: t.artist?.name, duration: t.duration ?? 0, explicit: Boolean(t.explicit_lyrics), cover: t.album?.cover_big || t.album?.cover_medium || null, source: 'deezer', _rel: scored[0].rel };
     } catch { return null; }
 }
 
 async function itunesMatch(query) {
     try {
-        const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=5`, { signal: AbortSignal.timeout(4500) });
+        const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(query)}&entity=song&limit=10`, { signal: AbortSignal.timeout(4500) });
         if (!res.ok) return null;
         const rows = (await res.json()).results ?? [];
         if (!rows.length) return null;
-        const t = rows[0];
-        return { title: t.trackName, artist: t.artistName, duration: Math.round((t.trackTimeMillis ?? 0) / 1000), explicit: t.trackExplicitness === 'explicit', cover: t.artworkUrl100?.replace('100x100', '600x600') || null, source: 'itunes' };
+        const wantX = wantsExplicit(query);
+        const scored = rows.map((r) => {
+            const dur = Math.round((r.trackTimeMillis ?? 0) / 1000);
+            const rel = metadataTokenScore(query, r.trackName, r.artistName);
+            const bonus = (wantX && r.trackExplicitness === 'explicit' ? 8 : 0) + (dur >= 45 ? 10 : -50);
+            return { r, rel: rel + bonus, dur };
+        });
+        scored.sort((a, b) => b.rel - a.rel);
+        const best = scored[0];
+        const t = best.r;
+        return { title: t.trackName, artist: t.artistName, duration: best.dur, explicit: t.trackExplicitness === 'explicit', cover: t.artworkUrl100?.replace('100x100', '600x600') || null, source: 'itunes', _rel: best.rel };
     } catch { return null; }
 }
 
@@ -101,7 +134,17 @@ export async function resolveMetadata(query) {
         return cached.value;
     }
     const [dz, it] = await Promise.all([deezerMatch(query), itunesMatch(query)]);
-    const value = ((dz?.duration ?? 0) >= 45 ? dz : (it ?? dz)) ?? null;
+    let picked = null;
+    if (dz && it) {
+        const dzOk = (dz.duration ?? 0) >= 45;
+        const itOk = (it.duration ?? 0) >= 45;
+        if (dzOk && !itOk) picked = dz;
+        else if (itOk && !dzOk) picked = it;
+        else picked = (it._rel ?? 0) > (dz._rel ?? 0) ? it : dz;
+    } else {
+        picked = dz || it || null;
+    }
+    const value = picked ? (({ _rel, ...rest }) => rest)(picked) : null;
     if (value) {
         metadataCache.set(cacheKey, { value, at: now });
         if (metadataCache.size > 300) {
@@ -112,16 +155,20 @@ export async function resolveMetadata(query) {
     return value;
 }
 
-/** ── source 1: YouTube via residential proxy ───────────────────────── */
-async function ytDlpMp3(url, tempPath, { minSeconds = 45, timeoutMs = 90000 } = {}) {
+/** ── source 1: YouTube (direct / optional residential proxy) ──────── */
+async function ytDlpMp3(url, tempPath, { minSeconds = 45, timeoutMs = 90000, ffmpegPath = 'ffmpeg' } = {}) {
+    const outStem = tempPath.replace(/\.mp3$/i, '');
+    const outTemplate = `${outStem}.%(ext)s`;
+    const resolvedFfmpeg = resolveFfmpegPath(ffmpegPath !== 'ffmpeg' ? ffmpegPath : '') || ffmpegPath;
     const run = (proxy) => execFileAsync('yt-dlp', [
         '--no-warnings', '--no-playlist',
         ...(proxy ? ['--proxy', proxy] : []),
+        ...(resolvedFfmpeg ? ['--ffmpeg-location', resolvedFfmpeg] : []),
         '-N', '4', '--max-filesize', '80M',
         '--js-runtimes', 'node:/usr/bin/node',
         '--match-filter', `duration>=${minSeconds}`,
-        '-f', 'ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '2',
-        '-o', tempPath, url,
+        '-f', 'ba[ext=m4a]/ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '2',
+        '-o', outTemplate, url,
     ], { timeout: timeoutMs });
     if (await isProxyReachable(RESIDENTIAL_PROXY)) {
         try {
@@ -133,26 +180,64 @@ async function ytDlpMp3(url, tempPath, { minSeconds = 45, timeoutMs = 90000 } = 
     } else {
         await run(null);
     }
+    if (!existsSync(tempPath) && existsSync(`${outStem}.mp3`)) {
+        try { renameSync(`${outStem}.mp3`, tempPath); } catch {}
+    }
     return existsSync(tempPath) && statSync(tempPath).size > 20000;
+}
+
+const UNDESIRED_EDIT_RE = /\b(slowed|reverb|nightcore|sped\s*up|8d\s*audio|karaoke|instrumental|reaction|teaser|shorts|cover|bass\s*boosted|tiktok\s*version)\b/i;
+
+function scoreTrackCandidate(query, title, author = '', durationSec = 0) {
+    const q = String(query || '').toLowerCase();
+    const text = `${title || ''} ${author || ''}`.toLowerCase();
+    const tokens = q.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter((t) => t.length >= 2);
+    let score = 0;
+    let hits = 0;
+    for (const tok of tokens) {
+        if (text.includes(tok)) {
+            hits++;
+            score += 20;
+        }
+    }
+    if (tokens.length > 0 && hits === 0) return -100;
+    if (/\b(official audio|topic|audio)\b/i.test(text)) score += 18;
+    else if (/\b(official lyric|lyrics)\b/i.test(text)) score += 10;
+    else if (/\b(official video|official music video)\b/i.test(text)) score += 5;
+
+    if (!UNDESIRED_EDIT_RE.test(q) && UNDESIRED_EDIT_RE.test(text)) score -= 45;
+    if (durationSec > 0 && durationSec < 45) score -= 80;
+    if (durationSec >= 90 && durationSec <= 480) score += 8;
+    if (durationSec > 900) score -= 40;
+    return score;
 }
 
 async function ytSearchId(query, minSeconds) {
     try {
         const { searchYouTubeFast } = await import('./youtubeSearch.js');
+        const settled = await Promise.allSettled([
+            searchYouTubeFast(query, 'NG'),
+            searchYouTubeFast(query, 'US'),
+        ]);
         const seen = new Set();
-        // regional catalog first (NG), then global US — merged
-        for (const gl of ['NG', 'US']) {
-            let results = [];
-            try { results = await searchYouTubeFast(query, gl); } catch {}
-            for (const v of results) {
+        const candidates = [];
+        for (const r of settled) {
+            if (r.status !== 'fulfilled' || !Array.isArray(r.value)) continue;
+            for (const v of r.value) {
                 const id = v.videoId ?? v.id ?? null;
                 if (!id || seen.has(id)) continue;
                 seen.add(id);
                 const secs = Number(v.durationSeconds ?? v.duration ?? 0);
-                if (secs === 0 || secs >= minSeconds) return id;
+                if (secs > 0 && secs < minSeconds) continue;
+                candidates.push({
+                    id,
+                    score: scoreTrackCandidate(query, v.title, v.author, secs),
+                });
             }
         }
-        return null;
+        if (!candidates.length) return null;
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates[0].id;
     } catch { return null; }
 }
 
@@ -176,8 +261,11 @@ async function jiosaavnPick(query) {
         const data = await res.json();
         const rows = (data.results ?? [])
             .map((r) => ({ title: String(r.title ?? '').replace(/&quot;/g, '"').replace(/&amp;/g, '&'), artist: r.primaryArtists ?? 'Music', duration: Number(r.duration ?? 0), enc: r.encrypted_media_url }))
-            .filter((r) => r.enc);
-        const best = rows.find((r) => r.duration >= 45) ?? rows[0];
+            .filter((r) => r.enc && r.duration >= 45)
+            .map((r) => ({ ...r, score: scoreTrackCandidate(query, r.title, r.artist, r.duration) }))
+            .filter((r) => r.score >= 0)
+            .sort((a, b) => b.score - a.score);
+        const best = rows[0];
         if (!best) return null;
         const url = decryptJioUrl(best.enc);
         if (!url) return null;
@@ -185,15 +273,16 @@ async function jiosaavnPick(query) {
     } catch { return null; }
 }
 
-async function jiosaavnDownload(track, tempPath) {
+async function jiosaavnDownload(track, tempPath, ffmpegPath = 'ffmpeg') {
     try {
         const res = await fetch(track.url, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(90000) });
         if (!res.ok || !res.body) return false;
         await pipeline(Readable.fromWeb(res.body), createWriteStream(tempPath));
         if (!existsSync(tempPath) || statSync(tempPath).size < 200000) return false;
         // jiosaavn serves m4a/mp4 — normalize to mp3
+        const resolvedFfmpeg = resolveFfmpegPath(ffmpegPath !== 'ffmpeg' ? ffmpegPath : '') || ffmpegPath || 'ffmpeg';
         try {
-            await execFileAsync('ffmpeg', ['-y', '-i', tempPath, '-c:a', 'libmp3lame', '-q:a', '2', `${tempPath}.mp3`], { timeout: 60000 });
+            await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-c:a', 'libmp3lame', '-q:a', '2', `${tempPath}.mp3`], { timeout: 60000 });
             unlinkSync(tempPath);
             renameSync(`${tempPath}.mp3`, tempPath);
         } catch {}
@@ -215,10 +304,12 @@ async function audiusApi(path) {
 
 async function audiusPick(query) {
     const data = await audiusApi(`/v1/tracks/search?query=${encodeURIComponent(query)}`);
-    const tracks = (data?.data ?? []).filter((t) => t?.is_streamable !== false && (t?.duration ?? 0) >= 60);
-    if (!tracks.length) return null;
-    tracks.sort((a, b) => Number(b.play_count ?? 0) - Number(a.play_count ?? 0));
-    return tracks[0] ?? null;
+    const tracks = (data?.data ?? [])
+        .filter((t) => t?.is_streamable !== false && (t?.duration ?? 0) >= 60)
+        .map((t) => ({ t, score: scoreTrackCandidate(query, t.title, t.user?.name, Number(t.duration ?? 0)) }))
+        .filter((x) => x.score >= 0)
+        .sort((a, b) => (b.score - a.score) || (Number(b.t.play_count ?? 0) - Number(a.t.play_count ?? 0)));
+    return tracks[0]?.t ?? null;
 }
 
 export async function audiusTrending(genre) {
@@ -265,32 +356,67 @@ export async function resolveAndDownloadAudio({
     skipYouTube = false,
     onProgress = null
 }) {
-    onProgress?.('Searching source & resolving metadata… ♡');
-    const meta = preResolvedMeta !== undefined ? preResolvedMeta : await resolveMetadata(query);
+    const resolvedFfmpeg = resolveFfmpegPath(ffmpegPath !== 'ffmpeg' ? ffmpegPath : '') || ffmpegPath || 'ffmpeg';
     const rawQuery = String(query ?? '').replace(/\.mp3$/i, '').replace(/_/g, ' ').trim();
+    const hasValidYtId = Boolean(trackId && /^[a-zA-Z0-9_-]{11}$/.test(trackId));
+
+    // Instant disk cache reuse when resolved by exact YouTube ID
+    if (hasValidYtId) {
+        const cachedTrackPath = join('/data/audio_cache', `${trackId}.mp3`);
+        if (existsSync(cachedTrackPath) && statSync(cachedTrackPath).size > 50000) {
+            try {
+                copyFileSync(cachedTrackPath, tempPath);
+                const cachedDur = await durationOf(tempPath, resolvedFfmpeg);
+                if (cachedDur === null || cachedDur >= minSeconds) {
+                    const metaFast = preResolvedMeta !== undefined ? preResolvedMeta : null;
+                    return { ok: true, source: 'disk-cache', meta: { ...(metaFast ?? {}), title: metaFast?.title ?? rawQuery, artist: metaFast?.artist ?? 'Music' } };
+                }
+                try { unlinkSync(tempPath); } catch {}
+            } catch {}
+        }
+    }
+
+    onProgress?.('Searching source & resolving metadata… ♡');
+    const [metaSettled, rawYtIdSettled, proxyUpSettled] = await Promise.allSettled([
+        preResolvedMeta !== undefined ? Promise.resolve(preResolvedMeta) : resolveMetadata(query),
+        (!hasValidYtId && !skipYouTube && rawQuery) ? ytSearchId(rawQuery, minSeconds) : Promise.resolve(null),
+        isProxyReachable(RESIDENTIAL_PROXY),
+    ]);
+    const meta = metaSettled.status === 'fulfilled' ? metaSettled.value : null;
+    const rawYtId = rawYtIdSettled.status === 'fulfilled' ? rawYtIdSettled.value : null;
+    const proxyUp = proxyUpSettled.status === 'fulfilled' ? proxyUpSettled.value : false;
+
     const searchQuery = meta ? `${meta.artist} ${meta.title}`.trim() : rawQuery;
     const attempts = [];
+    const triedYtIds = new Set();
 
-    const proxyUp = await isProxyReachable(RESIDENTIAL_PROXY);
     if (!skipYouTube || proxyUp) {
-        if (trackId && /^[a-zA-Z0-9_-]{11}$/.test(trackId)) {
-            attempts.push({ name: 'youtube-id', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${trackId}`, tempPath, { minSeconds }) });
+        if (hasValidYtId) {
+            triedYtIds.add(trackId);
+            attempts.push({ name: 'youtube-id', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${trackId}`, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg }) });
         } else {
-            if (meta) {
+            if (meta && searchQuery.toLowerCase() !== rawQuery.toLowerCase()) {
                 const ytIdMeta = await ytSearchId(searchQuery, minSeconds);
-                if (ytIdMeta) attempts.push({ name: 'youtube-search', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdMeta}`, tempPath, { minSeconds }) });
+                if (ytIdMeta && !triedYtIds.has(ytIdMeta)) {
+                    triedYtIds.add(ytIdMeta);
+                    attempts.push({ name: 'youtube-search', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdMeta}`, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg }) });
+                }
             }
-            const ytIdRaw = await ytSearchId(rawQuery, minSeconds);
-            if (ytIdRaw) attempts.push({ name: 'youtube-search-raw', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${ytIdRaw}`, tempPath, { minSeconds }) });
+            if (rawYtId && !triedYtIds.has(rawYtId)) {
+                triedYtIds.add(rawYtId);
+                attempts.push({ name: 'youtube-search-raw', run: () => ytDlpMp3(`https://www.youtube.com/watch?v=${rawYtId}`, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg }) });
+            }
         }
 
-        attempts.push({
-            name: 'youtube-direct',
-            run: async () => {
-                if (meta && (await ytDlpMp3(`ytsearch3:${searchQuery}`, tempPath, { minSeconds }))) return true;
-                return ytDlpMp3(`ytsearch3:${rawQuery || searchQuery}`, tempPath, { minSeconds });
-            },
-        });
+        if (triedYtIds.size === 0) {
+            attempts.push({
+                name: 'youtube-direct',
+                run: async () => {
+                    if (meta && (await ytDlpMp3(`ytsearch1:${searchQuery}`, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg }))) return true;
+                    return ytDlpMp3(`ytsearch1:${rawQuery || searchQuery}`, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg });
+                },
+            });
+        }
     }
 
     attempts.push({
@@ -300,10 +426,10 @@ export async function resolveAndDownloadAudio({
             const t = await jiosaavnPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await jiosaavnPick(rawQuery) : null);
             if (!t) return false;
             onProgress?.(`Downloading full track "${t.title}"… ♡`);
-            const ok = await jiosaavnDownload(t, tempPath);
+            const ok = await jiosaavnDownload(t, tempPath, resolvedFfmpeg);
             if (ok) {
                 try {
-                    await execFileAsync(ffmpegPath, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.artist}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
+                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.artist}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
                     unlinkSync(tempPath);
                     renameSync(`${tempPath}.tag.mp3`, tempPath);
                 } catch {}
@@ -311,13 +437,6 @@ export async function resolveAndDownloadAudio({
             return ok;
         },
     });
-
-    if (!skipYouTube) {
-        attempts.push({
-            name: 'soundcloud',
-            run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 75000 }),
-        });
-    }
 
     attempts.push({
         name: 'audius',
@@ -329,7 +448,7 @@ export async function resolveAndDownloadAudio({
             const ok = await audiusDownload(t, tempPath);
             if (ok) {
                 try {
-                    await execFileAsync(ffmpegPath, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.user?.name || 'Unknown'}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
+                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.user?.name || 'Unknown'}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
                     unlinkSync(tempPath);
                     renameSync(`${tempPath}.tag.mp3`, tempPath);
                 } catch {}
@@ -338,11 +457,16 @@ export async function resolveAndDownloadAudio({
         },
     });
 
+    attempts.push({
+        name: 'soundcloud',
+        run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg }),
+    });
+
     for (const attempt of attempts) {
         try {
             if (!(await attempt.run())) continue;
             onProgress?.('Processing audio & verifying track duration… ♡');
-            const dur = await durationOf(tempPath, ffmpegPath);
+            const dur = await durationOf(tempPath, resolvedFfmpeg);
             if (dur !== null && dur < minSeconds) {
                 try { unlinkSync(tempPath); } catch {}
                 continue;

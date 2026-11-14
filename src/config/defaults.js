@@ -103,7 +103,7 @@ export const DEFAULT_SETTINGS = {
     assistantEnabled: true,      // toggleable AI assistant
     provider: 'ollama',         // builtin | ollama | openai-compatible
     endpoint: 'http://127.0.0.1:11434',
-    model: 'qwen2.5:1.5b',
+    model: 'qwen2.5:3b',
     apiKey: '',                  // env-overridable, never shown in UI
     personality: 'lancy',
     style: 'girly',
@@ -119,9 +119,9 @@ export const DEFAULT_SETTINGS = {
     idleLeaveSeconds: 600,
     allowYtDlp: true,
     allowExistingGroupMembers: true,
-    maxCacheMiB: 8192,
+    maxCacheMiB: 12288,
     maxFileMiB: 48,
-    maxVideoMiB: 700,            // VC movie night: one video stream (≈2 h at 360p)
+    maxVideoMiB: 1500,           // Long VC video streams & movie nights (up to 4h / 1.5 GB)
     cacheTtlMinutes: 1440
   },
 

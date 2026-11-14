@@ -3,8 +3,10 @@ No bot-token call fallback, no interactive credentials over HTTP, no persistent 
 """
 import asyncio
 import hmac
+import json
 import logging
 import os
+import shlex
 import signal
 import secrets
 import re
@@ -55,6 +57,127 @@ def clear_engine_cache(engine, chat):
         if bind and hasattr(bind, '_cache'): bind._cache.drop_cache(chat)
     except Exception: pass
 
+IMAGE_CODECS = {'png', 'jpeg', 'jpg', 'mjpeg', 'webp', 'bmp', 'gif'}
+
+
+def compute_target_video_size(orig_w, orig_h, max_w, max_h, adjust_by_height=True):
+    """Match pytgcalls.ffmpeg.check_stream aspect-ratio rounding so rawvideo matches NTgCalls byte-for-byte."""
+    orig_w, orig_h = int(orig_w or 0), int(orig_h or 0)
+    if orig_w <= 0 or orig_h <= 0:
+        return None
+    ratio = float(orig_w) / float(orig_h)
+    new_w = min(orig_w, int(max_w))
+    new_h = int(new_w / ratio)
+    if adjust_by_height and new_h > int(max_h):
+        new_h = int(max_h)
+        new_w = int(new_h * ratio)
+    new_w = new_w - 1 if new_w % 2 else new_w
+    new_h = new_h - 1 if new_h % 2 else new_h
+    if new_w <= 0 or new_h <= 0:
+        return None
+    return new_w, new_h
+
+
+def strip_reconnect_at_eof(cmd_str):
+    """Remove -reconnect_at_eof flags from ffmpeg commands so proxied HLS playlists do not loop at EOF."""
+    args = shlex.split(str(cmd_str))
+    out = []
+    skip_next = False
+    for tok in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == '-reconnect_at_eof':
+            skip_next = True
+            continue
+        out.append(tok)
+    return shlex.join(out)
+
+
+def rewrite_video_ffmpeg_command(cmd_str, width, height, *, subtitle_path=None, stream_index=None, video_count=1, is_image=False):
+    """Ensure a single consolidated -vf pipeline outputting exact width:height yuv420p frames matching VideoParameters."""
+    w = max(2, int(width) - (int(width) % 2))
+    h = max(2, int(height) - (int(height) % 2))
+    vf_parts = [f'scale={w}:{h}:flags=lanczos', 'setsar=1']
+    if subtitle_path:
+        esc_sub = str(subtitle_path).replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'").replace('[', '\\[').replace(']', '\\]')
+        vf_parts.append(f"subtitles='{esc_sub}':force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H60000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=22'")
+    vf_parts.append('format=yuv420p')
+    vf_expr = ','.join(vf_parts)
+
+    args = shlex.split(str(cmd_str))
+    cleaned = []
+    skip_next = False
+    has_map = False
+    for tok in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok in {'-vf', '-filter:v', '-reconnect_at_eof'}:
+            skip_next = True
+            continue
+        if tok == '-map':
+            has_map = True
+        cleaned.append(tok)
+
+    out_args = []
+    inserted_map = False
+    inserted_vf = False
+    for tok in cleaned:
+        if not inserted_map and not has_map and stream_index is not None and video_count > 1 and not is_image and tok == '-f':
+            out_args.extend(['-map', f'0:{int(stream_index)}'])
+            inserted_map = True
+        if not inserted_vf and tok.startswith('pipe:'):
+            out_args.extend(['-vf', vf_expr])
+            inserted_vf = True
+        out_args.append(tok)
+    if not inserted_vf:
+        out_args.extend(['-vf', vf_expr])
+    return shlex.join(out_args)
+
+
+async def probe_video_stream_info(path):
+    """Probe primary non-attached-pic video stream dimensions asynchronously with a bounded timeout."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error', '-select_streams', 'v',
+            '-show_entries', 'stream=index,codec_name,width,height',
+            '-show_entries', 'stream_disposition=attached_pic', '-of', 'json', str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        info = json.loads((stdout or b'{}').decode('utf-8'))
+        streams = [s for s in (info.get('streams') or []) if int(s.get('width') or 0) > 0 and int(s.get('height') or 0) > 0]
+        if not streams:
+            return None
+        primary = next(
+            (s for s in streams if not (s.get('disposition') or {}).get('attached_pic') and str(s.get('codec_name') or '').lower() not in IMAGE_CODECS),
+            None,
+        )
+        is_image = primary is None
+        chosen = primary or streams[0]
+        idx = chosen.get('index')
+        return {
+            'width': int(chosen['width']),
+            'height': int(chosen['height']),
+            'stream_index': int(idx) if idx is not None else None,
+            'video_count': len(streams),
+            'is_image': is_image,
+        }
+    except Exception:
+        if proc and proc.returncode is None:
+            try: proc.kill()
+            except Exception: pass
+    return None
+
+
+async def probe_video_dimensions(path):
+    """Probe raw source video dimensions asynchronously with a short bounded timeout."""
+    info = await probe_video_stream_info(path)
+    return (info['width'], info['height']) if info else None
+
+
 class Bridge:
     def __init__(self, root, factory=None):
         self.root = Path(root).resolve()
@@ -88,7 +211,7 @@ class Bridge:
                 from pytgcalls.types import StreamEnded, Device
                 client = Client(f'lancy_{alias}', api_id=int(os.environ['TELEGRAM_API_ID']), api_hash=os.environ['TELEGRAM_API_HASH'], session_string=data['session'], in_memory=True)
                 await asyncio.wait_for(client.start(), 30)
-                me = await client.get_me()
+                me = getattr(client, 'me', None) or await asyncio.wait_for(client.get_me(), 10)
                 if me.is_bot:
                     await client.stop()
                     raise VoiceFailure('SESSION_NOT_READY')
@@ -115,7 +238,7 @@ class Bridge:
             if any(a.get('uid') == uid for a in self.accounts.values() if a is not account):
                 await client.stop()
                 raise VoiceFailure('ACCOUNT_UNAVAILABLE')
-            account.update(client=client, engine=engine, uid=uid, status='available')
+            account.update(client=client, engine=engine, uid=uid, status='available', me_checked_at=(0 if self.factory else time.monotonic()))
         except Exception as error:
             if 'client' in locals() and client:
                 try: await client.stop()
@@ -128,10 +251,19 @@ class Bridge:
     async def refresh_health(self):
         for account in list(self.accounts.values()):
             if not account['enabled'] or bool(account['leases']) or not account['client']: continue
+            if not self.factory and account.get('uid') and account.get('status') == 'available' and time.monotonic() - account.get('me_checked_at', 0) < 30:
+                continue
             try:
                 me = await asyncio.wait_for(account['client'].get_me(), 8)
-                account['status'] = 'authentication_required' if me.is_bot else 'available'
-            except Exception:
+                if me.is_bot:
+                    account['status'] = 'authentication_required'
+                else:
+                    account['status'] = 'available'
+                    if not self.factory:
+                        account['me_checked_at'] = time.monotonic()
+            except Exception as error:
+                if not self.factory and account.get('uid') and (isinstance(error, TimeoutError) or classify(error) in {'RATE_LIMITED', 'NO_ACTIVE_CALL'}):
+                    continue
                 account['status'] = 'authentication_required'
 
     def public_accounts(self, chat=None):
@@ -253,15 +385,17 @@ class Bridge:
             self.prepared.setdefault(chat, {'alias': a['alias']})
             if stage == 'identity':
                 try:
-                    if not self.factory and a.get('uid') and time.monotonic() - a.get('me_checked_at', 0) < 60:
+                    if not self.factory and a.get('uid') and time.monotonic() - a.get('me_checked_at', 0) < 300:
                         return {'ok': True, 'account_alias': a['alias'], 'user_id': a['uid']}
                     me = await asyncio.wait_for(a['client'].get_me(), 10)
                     if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
                     a['me_checked_at'] = time.monotonic()
-                except Exception:
+                except Exception as error:
                     if not was_prepared:
                         self.prepared.pop(chat, None)
                         self.release_destination(a, chat)
+                    if not self.factory and isinstance(error, TimeoutError):
+                        raise VoiceFailure('CALL_FAILED') from None
                     raise
                 return {'ok': True, 'account_alias': a['alias'], 'user_id': me.id}
             if stage == 'manage':
@@ -337,6 +471,64 @@ class Bridge:
             return str(path)
         except (ValueError, TypeError, OSError): raise VoiceFailure('MEDIA_INVALID') from None
 
+    def resolve_media_input(self, data):
+        val = str(data.get('stream_url') or '')
+        if data.get('remote_proxy') is True and re.fullmatch(r'http://127\.0\.0\.1:\d{2,5}/movie-proxy/[a-f0-9]{16,64}', val):
+            return val
+        return self.source(val)
+
+    def source_subtitle(self, value):
+        if not value: return None
+        try:
+            path = Path(value).resolve(strict=True)
+            if not path.is_file() or not path.is_relative_to(self.root) or path.suffix.lower() not in {'.srt', '.ass', '.vtt'}:
+                return None
+            return str(path)
+        except (ValueError, TypeError, OSError):
+            return None
+
+    def shift_subtitle(self, sub_path, offset_sec, playback_id):
+        if not sub_path or not offset_sec or offset_sec <= 0.25:
+            return sub_path
+        try:
+            text = Path(sub_path).read_text(encoding='utf-8', errors='replace')
+            shift_ms = int(offset_sec * 1000)
+            out_blocks = []
+            idx = 1
+            def to_ms(ts):
+                m = re.match(r'^(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})$', ts.strip())
+                if not m: return None
+                return (((int(m[1]) * 60) + int(m[2])) * 60 + int(m[3])) * 1000 + int(m[4].ljust(3, '0')[:3])
+            def fmt_ms(ms):
+                ms = max(0, int(ms))
+                rem, msec = divmod(ms, 1000)
+                rem, sec = divmod(rem, 60)
+                hr, mn = divmod(rem, 60)
+                return f'{hr:02d}:{mn:02d}:{sec:02d},{msec:03d}'
+            for block in re.split(r'\r?\n\r?\n+', text.replace('\r\n', '\n')):
+                lines = [l for l in block.split('\n') if l.strip()]
+                ti = next((i for i, l in enumerate(lines) if '-->' in l), -1)
+                if ti < 0: continue
+                parts = [p.strip().split()[0] for p in lines[ti].split('-->')]
+                if len(parts) < 2: continue
+                st, en = to_ms(parts[0]), to_ms(parts[1])
+                if st is None or en is None or en <= shift_ms: continue
+                nst = max(0, st - shift_ms)
+                nen = max(nst + 250, en - shift_ms)
+                body = '\n'.join(lines[ti + 1:])
+                if body:
+                    out_blocks.append(f'{idx}\n{fmt_ms(nst)} --> {fmt_ms(nen)}\n{body}')
+                    idx += 1
+            if not out_blocks: return None
+            out_dir = self.root / 'subs'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_id = re.sub(r'[^A-Za-z0-9_-]', '', str(playback_id or 'sub'))[:24] or 'sub'
+            out_path = out_dir / f'shifted_{safe_id}.srt'
+            out_path.write_text('\n\n'.join(out_blocks) + '\n', encoding='utf-8')
+            return str(out_path)
+        except Exception:
+            return sub_path
+
     async def publisher_step(self, operation, stage, timeout=8):
         try: return await asyncio.wait_for(operation, timeout)
         except VoiceFailure: raise
@@ -399,26 +591,85 @@ class Bridge:
 
     async def stream(self, a, chat, call):
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, GroupCallConfig
+        try:
+            from pytgcalls.types.raw import Stream, VideoParameters
+        except ImportError:
+            Stream = None
+            VideoParameters = None
+
         ff = f'-ss {call["offset"]:.3f}' if call['offset'] else ''
-        # Preserve 6 dB of headroom before PCM16/Opus conversion; no default EQ
-        # or loudness maximization. The limiter is a safety ceiling, not a cure
-        # for network loss, codec damage, or an already distorted recording.
-        eq_preset = str(call.get('eq') or ('bass' if call.get('bass') else 'off')).lower()
-        eq_map = {
-            'bass': 'bass=g=4:f=100:w=0.5,',
-            'vocal': 'highpass=f=160,equalizer=f=3000:width_type=q:w=1.2:g=3,',
-            'nightcore': 'asetrate=48000*1.18,aresample=48000,atempo=1.04,',
-            'vaporwave': 'asetrate=48000*0.85,aresample=48000,',
-            '8d': 'apulsator=hz=0.125,',
-        }
-        eq_filter = eq_map.get(eq_preset, 'bass=g=3:f=100:w=0.5,' if call.get('bass') else '')
-        filters = 'volume=0.5011872336,' + eq_filter + 'alimiter=limit=0.95:level=0,aresample=48000'
-        ff += ' --audio ---mid -af ' + filters
         is_channel = bool(call.get('is_channel'))
         has_video = bool(call.get('video'))
-        video_flags = MediaStream.Flags.REQUIRED if has_video else MediaStream.Flags.IGNORE
-        stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=VideoQuality.SD_360p, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
-        await asyncio.wait_for(a['engine'].play(chat, stream, config=GroupCallConfig(auto_start=False)), 25)
+        video_active = has_video or is_channel
+
+        # Preserve 6 dB of headroom before PCM16/Opus conversion; no default EQ
+        # or loudness maximization. Video-active streams lock playback tempo to 1.0x
+        # so audio never races ahead of video (e.g. nightcore/vaporwave on 44.1kHz files).
+        eq_preset = str(call.get('eq') or ('bass' if call.get('bass') else 'off')).lower()
+        eq_map = {
+            'studio': 'equalizer=f=55:width_type=q:w=1.1:g=2.2,equalizer=f=105:width_type=q:w=1.2:g=1.4,equalizer=f=240:width_type=q:w=1.4:g=-1.5,equalizer=f=3600:width_type=h:width=1400:g=1.6,equalizer=f=11000:width_type=h:width=3000:g=1.2,acompressor=threshold=-18dB:ratio=1.5:attack=20:release=180:makeup=1,',
+            'bass': 'equalizer=f=55:width_type=q:w=1.1:g=2.8,equalizer=f=105:width_type=q:w=1.2:g=1.8,equalizer=f=240:width_type=q:w=1.4:g=-1.8,equalizer=f=3800:width_type=q:w=1.5:g=1.2,acompressor=threshold=-18dB:ratio=1.5:attack=20:release=180:makeup=1,',
+            'clean_bass': 'equalizer=f=55:width_type=q:w=1.1:g=2.8,equalizer=f=105:width_type=q:w=1.2:g=1.8,equalizer=f=240:width_type=q:w=1.4:g=-1.8,equalizer=f=3800:width_type=q:w=1.5:g=1.2,acompressor=threshold=-18dB:ratio=1.5:attack=20:release=180:makeup=1,',
+            'vocal': 'highpass=f=140,equalizer=f=3000:width_type=q:w=1.2:g=2.5,',
+            'nightcore': 'treble=g=2.5:f=4000,' if video_active else 'aresample=48000,asetrate=48000*1.12,aresample=48000,',
+            'vaporwave': 'equalizer=f=120:width_type=q:w=1.2:g=2.0,lowpass=f=9000,' if video_active else 'aresample=48000,asetrate=48000*0.88,aresample=48000,',
+            '8d': 'apulsator=hz=0.125,',
+        }
+        clean_bass_fallback = 'equalizer=f=55:width_type=q:w=1.1:g=2.8,equalizer=f=105:width_type=q:w=1.2:g=1.8,equalizer=f=240:width_type=q:w=1.4:g=-1.8,acompressor=threshold=-18dB:ratio=1.5:attack=20:release=180:makeup=1,'
+        eq_filter = eq_map.get(eq_preset, clean_bass_fallback if call.get('bass') else '')
+        fade_in = 'afade=t=in:st=0:d=0.25,' if not call['offset'] else ''
+        vol_pct = call.get('volume')
+        vol_gain = f'volume={max(0, min(200, int(vol_pct))) / 100.0:.4f},' if vol_pct is not None and int(vol_pct) != 100 else ''
+        filters = 'volume=0.5011872336,' + eq_filter + vol_gain + fade_in + 'alimiter=limit=0.89:attack=7:release=80:level=0,aresample=48000:async=1:first_pts=0'
+        ff += ' --audio ---mid -af ' + filters
+
+        requested_quality = str(call.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p')
+        video_quality = getattr(VideoQuality, requested_quality, getattr(VideoQuality, 'HD_720p', VideoQuality.SD_360p))
+        vq_val = getattr(video_quality, 'value', None)
+        if VideoParameters is not None and isinstance(vq_val, tuple) and len(vq_val) >= 3:
+            video_params = VideoParameters(vq_val[0], vq_val[1], vq_val[2], adjust_by_height=True)
+            max_w, max_h = int(video_params.width), int(video_params.height)
+        else:
+            video_params = video_quality
+            max_w, max_h = 1280, 720
+
+        video_flags = MediaStream.Flags.REQUIRED if video_active else MediaStream.Flags.IGNORE
+        if video_active:
+            ff += ' --video ---mid -sws_flags lanczos'
+
+        stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=video_params, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
+        play_stream = stream
+        if Stream is not None and callable(getattr(stream, 'check_stream', None)):
+            await stream.check_stream()
+            if getattr(stream, 'microphone', None) is not None and getattr(stream.microphone, 'path', None):
+                if call.get('remote_proxy') or '-reconnect_at_eof' in str(stream.microphone.path):
+                    stream.microphone.path = strip_reconnect_at_eof(stream.microphone.path)
+            if video_active and getattr(stream, 'camera', None) is not None:
+                info = await probe_video_stream_info(call['path'])
+                scaled = compute_target_video_size(info['width'], info['height'], max_w, max_h, adjust_by_height=True) if info else None
+                cam_w = int(getattr(stream.camera.parameters, 'width', max_w) or max_w)
+                cam_h = int(getattr(stream.camera.parameters, 'height', max_h) or max_h)
+                final_w, final_h = scaled if scaled else (max(2, cam_w - (cam_w % 2)), max(2, cam_h - (cam_h % 2)))
+                stream.camera.parameters.width = final_w
+                stream.camera.parameters.height = final_h
+                sub_raw = call.get('subtitle_path')
+                active_sub = self.shift_subtitle(sub_raw, call.get('offset') or 0.0, call.get('playback_id')) if (sub_raw and Path(sub_raw).is_file()) else None
+                stream.camera.path = rewrite_video_ffmpeg_command(
+                    stream.camera.path,
+                    final_w,
+                    final_h,
+                    subtitle_path=active_sub,
+                    stream_index=info.get('stream_index') if info else None,
+                    video_count=info.get('video_count', 1) if info else 1,
+                    is_image=info.get('is_image', False) if info else False,
+                )
+            play_stream = Stream(
+                microphone=getattr(stream, 'microphone', None),
+                speaker=getattr(stream, 'speaker', None),
+                camera=getattr(stream, 'camera', None),
+                screen=getattr(stream, 'screen', None),
+            )
+        await asyncio.wait_for(a['engine'].play(chat, play_stream, config=GroupCallConfig(auto_start=False)), 25)
         if call.get('status') != 'paused':
             try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 15)
             except VoiceFailure: raise
@@ -427,7 +678,7 @@ class Bridge:
     async def resolve_destination(self, client, chat):
         # String sessions do not contain a peer/access-hash cache. Resolve only
         # existing dialog membership; never join/promote an account automatically.
-        if not self.factory:
+        if not self.factory and hasattr(client, 'resolve_peer'):
             try:
                 await asyncio.wait_for(client.resolve_peer(chat), 5)
                 return
@@ -438,7 +689,7 @@ class Bridge:
             await asyncio.wait_for(client.get_chat(chat), 10)
             return
         except Exception as error:
-            if not self.factory and type(error).__name__ == 'AttributeError':
+            if not self.factory and type(error).__name__ == 'AttributeError' and hasattr(client, 'resolve_peer'):
                 try:
                     await asyncio.wait_for(client.resolve_peer(chat), 5)
                     return
@@ -446,7 +697,7 @@ class Bridge:
                     pass
             if type(error).__name__ not in {'PeerIdInvalid', 'ChannelInvalid', 'ChannelPrivate', 'KeyError', 'ValueError', 'AttributeError'}: raise
         async def hydrate():
-            if not self.factory:
+            if not self.factory and hasattr(client, 'invoke') and hasattr(client, 'resolve_peer'):
                 from pyrogram import raw
                 offset_date = 0
                 offset_id = 0
@@ -493,58 +744,75 @@ class Bridge:
         chat = int(data['chat_id'])
         if chat >= 0 or self.closing: raise VoiceFailure('INVALID_REQUEST')
         async with self.chat_lock(chat):
-            path = self.source(data['stream_url'])
+            path = self.resolve_media_input(data)
+            sub_path = self.source_subtitle(data.get('subtitle_path'))
             a = await self.lease(chat, data.get('account_alias'))
             previous = self.calls.get(chat)
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
-            call = {'alias': a['alias'], 'path': path, 'video': bool(data.get('video')), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
+            call = {'alias': a['alias'], 'path': path, 'subtitle_path': sub_path, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'duration': float(data.get('duration_seconds') or 0), 'offset': 0.0, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': None, 'last_known_position': 0.0, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic()}
+            if data.get('volume') is not None:
+                call['volume'] = int(data['volume'])
+            elif previous and 'volume' in previous:
+                call['volume'] = int(previous['volume'])
             try:
                 # get_me confirms runtime authorization; preflight never promotes or joins the group.
-                if self.factory or not a.get('uid') or time.monotonic() - a.get('me_checked_at', 0) >= 60:
+                if self.factory or not a.get('uid') or time.monotonic() - a.get('me_checked_at', 0) >= 300:
                     me = await asyncio.wait_for(a['client'].get_me(), 10)
                     if me.is_bot: raise VoiceFailure('SESSION_NOT_READY')
                     a['me_checked_at'] = time.monotonic()
+                can_reuse_call = (
+                    not getattr(self, 'auto_create_call_in_tests', False)
+                    and previous is not None
+                    and previous.get('alias') == a['alias']
+                    and previous.get('status') in {'playing', 'paused', 'buffering'}
+                    and previous.get('native_call') is not None
+                )
                 if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
-                    await self.resolve_destination(a['client'], chat)
-                    try: peer, native = await self.native_call(a['client'], chat)
-                    except Exception: peer, native = None, None
-                    prev_id = getattr(previous.get('native_call'), 'id', None) if previous else None
-                    curr_id = getattr(native, 'id', None) if native else None
-                    need_reset = (not self.factory and previous is None) or native is None or (prev_id is not None and curr_id != prev_id)
-                    if need_reset:
-                        clear_engine_cache(a['engine'], chat)
-                        try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
-                        except Exception: pass
-                    if peer is not None and native is None:
-                        from pyrogram import raw
-                        try:
-                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=10), 15)
-                            for _ in range(6):
-                                await asyncio.sleep(0.3)
-                                _, native = await self.native_call(a['client'], chat)
-                                if native is not None: break
-                        except Exception as create_err:
-                            if type(create_err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
-                                raise VoiceFailure('PERMISSION_DENIED') from None
-                            if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 10:
-                                await asyncio.sleep(getattr(create_err, 'value', 1))
-                                _, native = await self.native_call(a['client'], chat)
-                    if native is not None:
-                        call['native_call'] = native
-                        bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
-                        if bind and hasattr(bind, '_cache'):
-                            try:
-                                bind._cache.drop_cache(chat)
-                                bind._cache.set_cache(chat, native)
+                    if can_reuse_call:
+                        call['native_call'] = previous['native_call']
+                    else:
+                        await self.resolve_destination(a['client'], chat)
+                        try: peer, native = await self.native_call(a['client'], chat)
+                        except Exception: peer, native = None, None
+                        prev_id = getattr(previous.get('native_call'), 'id', None) if previous else None
+                        curr_id = getattr(native, 'id', None) if native else None
+                        need_reset = (not self.factory and previous is None) or native is None or (prev_id is not None and curr_id != prev_id)
+                        if need_reset:
+                            clear_engine_cache(a['engine'], chat)
+                            try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                             except Exception: pass
-                    elif not call.get('native_call'):
-                        raise VoiceFailure('NO_ACTIVE_CALL')
+                        if peer is not None and native is None:
+                            from pyrogram import raw
+                            try:
+                                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title='Lancy music'), sleep_threshold=10), 15)
+                                for _ in range(6):
+                                    await asyncio.sleep(0.3)
+                                    _, native = await self.native_call(a['client'], chat)
+                                    if native is not None: break
+                            except Exception as create_err:
+                                if type(create_err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
+                                    raise VoiceFailure('PERMISSION_DENIED') from None
+                                if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 10:
+                                    await asyncio.sleep(getattr(create_err, 'value', 1))
+                                    _, native = await self.native_call(a['client'], chat)
+                        if native is not None:
+                            call['native_call'] = native
+                            bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
+                            if bind and hasattr(bind, '_cache'):
+                                try:
+                                    bind._cache.drop_cache(chat)
+                                    bind._cache.set_cache(chat, native)
+                                except Exception: pass
+                        elif not call.get('native_call'):
+                            raise VoiceFailure('NO_ACTIVE_CALL')
                 try:
                     await self.stream(a, chat, call)
                 except Exception as stream_err:
                     if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) in {'NO_ACTIVE_CALL', 'CALL_FAILED', 'PUBLISHER_UNVERIFIED'}:
                         clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                        except Exception: pass
+                        try: await self.resolve_destination(a['client'], chat)
                         except Exception: pass
                         peer, native = await self.native_call(a['client'], chat)
                         if native is None:
@@ -625,7 +893,92 @@ class Bridge:
             elif op == 'volume':
                 volume = int(data['volume'])
                 if not 0 <= volume <= 200: raise VoiceFailure('INVALID_REQUEST')
-                await asyncio.wait_for(engine.change_volume_call(chat, volume), 10); call['volume'] = volume
+                if self.factory:
+                    await asyncio.wait_for(engine.change_volume_call(chat, volume), 10)
+                    call['volume'] = volume
+                else:
+                    from pyrogram import raw
+                    prev_vol = call.get('volume', 100)
+                    call['volume'] = volume
+                    mtproto_ok = False
+                    try:
+                        user_peer_cache = getattr(engine, '_cache_user_peer', None)
+                        if user_peer_cache is not None and hasattr(user_peer_cache, 'put') and hasattr(user_peer_cache, 'get'):
+                            if user_peer_cache.get(chat) is None:
+                                user_peer_cache.put(chat, raw.types.InputPeerSelf())
+                        bind = getattr(getattr(engine, '_app', None), '_bind_client', None)
+                        if bind and hasattr(bind, '_cache') and call.get('native_call') is not None:
+                            try: bind._cache.set_cache(chat, call['native_call'])
+                            except Exception: pass
+                        if volume > 0:
+                            await asyncio.wait_for(engine.change_volume_call(chat, volume), 8)
+                            mtproto_ok = True
+                    except Exception:
+                        pass
+                    if not mtproto_ok:
+                        try:
+                            input_call = call.get('native_call')
+                            if input_call is None:
+                                _, input_call = await self.native_call(a['client'], chat)
+                                if input_call is not None: call['native_call'] = input_call
+                            if input_call is not None:
+                                await asyncio.wait_for(
+                                    a['client'].invoke(
+                                        raw.functions.phone.EditGroupCallParticipant(
+                                            call=input_call,
+                                            participant=raw.types.InputPeerSelf(),
+                                            muted=(volume == 0),
+                                            volume=max(100, volume * 100),
+                                        ),
+                                        sleep_threshold=10,
+                                    ),
+                                    8,
+                                )
+                                mtproto_ok = True
+                        except Exception:
+                            pass
+                    if not mtproto_ok and call.get('status') in {'playing', 'paused'} and prev_vol != volume:
+                        try:
+                            elapsed = float(await asyncio.wait_for(engine.time(chat), 3))
+                        except Exception:
+                            elapsed = 0.0
+                        new_offset = min(max(0.0, call.get('offset', 0.0) + elapsed), max(0.0, (call.get('duration') or 0.0) - 1.0)) if call.get('duration') else max(0.0, call.get('offset', 0.0) + elapsed)
+                        old_offset = call.get('offset', 0.0)
+                        was_paused = call.get('status') == 'paused'
+                        call['offset'] = new_offset
+                        try:
+                            await self.stream(a, chat, call)
+                            if was_paused:
+                                await asyncio.wait_for(engine.pause(chat), 8)
+                            call['position_seconds'] = new_offset
+                            call['last_progress'] = time.monotonic()
+                        except Exception:
+                            call['offset'] = old_offset
+            elif op == 'subtitle':
+                sub_path = self.source_subtitle(data.get('subtitle_path'))
+                old_sub = call.get('subtitle_path')
+                if sub_path != old_sub and call.get('status') in {'playing', 'paused'}:
+                    try:
+                        elapsed = float(await asyncio.wait_for(engine.time(chat), 3))
+                    except Exception:
+                        elapsed = 0.0
+                    new_offset = max(0.0, call.get('offset', 0.0) + elapsed)
+                    old_offset = call.get('offset', 0.0)
+                    was_paused = call.get('status') == 'paused'
+                    call['subtitle_path'] = sub_path
+                    call['offset'] = new_offset
+                    try:
+                        await self.stream(a, chat, call)
+                        if was_paused:
+                            await asyncio.wait_for(engine.pause(chat), 8)
+                        call['position_seconds'] = new_offset
+                        call['last_progress'] = time.monotonic()
+                    except Exception:
+                        call['subtitle_path'] = old_sub
+                        call['offset'] = old_offset
+                        raise
+                else:
+                    call['subtitle_path'] = sub_path
             elif op == 'seek':
                 position = float(data['seconds'])
                 if not 0 <= position < call['duration']: raise VoiceFailure('INVALID_REQUEST')
@@ -650,8 +1003,12 @@ class Bridge:
                     position = call['offset'] + elapsed
                     if position != call['position_seconds']: call['last_progress'] = time.monotonic()
                     call['position_seconds'] = position; call['last_known_position'] = position; call['clock_errors'] = 0
-                    if call['duration'] and position >= call['duration'] - 0.5: call['status'] = 'ended'
-                    elif call['status'] == 'playing' and time.monotonic() - call['last_progress'] > 60: call['status'] = 'error'
+                    stall_sec = time.monotonic() - call['last_progress']
+                    near_end = bool(call['duration'] and position >= max(0, min(call['duration'] - 3.0, call['duration'] * 0.88)))
+                    if (call['duration'] and position >= call['duration'] - 0.5) or (near_end and stall_sec > 6):
+                        call['status'] = 'ended'
+                    elif call['status'] == 'playing' and stall_sec > 25:
+                        call['status'] = 'error'
                 except Exception as error:
                     if classify(error) == 'NO_ACTIVE_CALL':
                         # Definitive native absence is not a live call merely because

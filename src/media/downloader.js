@@ -1,10 +1,13 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readdirSync, readFileSync, statSync, writeFileSync, unlinkSync, openSync, readSync, closeSync, createWriteStream, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import sharp from 'sharp';
 import { logger } from '../core/logger.js';
+import { uploadLimitBytes } from './telegramLimits.js';
+import { getSharedMediaWorkerPool } from '../core/mediaWorkerPool.js';
 import {
   tiktokDl,
   instagramDl,
@@ -13,14 +16,52 @@ import {
   facebookDl,
   capcutDl,
   spotifyDl,
+  spotifyMetadata,
+  selectSpotifyCandidate,
   pinterestDl,
-  universalDl
+  applemusicMetadata,
+  applemusicDl,
+  audiomackDl,
+  threadsDl,
+  rednoteDl,
+  thenkiriDl,
+  thenkiriGetLink,
+  isThenkiriUrl,
+  bilibiliDl,
+  bilibiliSave,
+  isBilibiliUrl,
+  justwatchDetails,
+  justwatchWatch,
+  isJustWatchUrl,
+  universalDl,
+  universalSave,
+  detectPlatform as socialDetectPlatform
 } from 'social-dl';
 
 import { searchSongByLyrics, cleanSongMetadata } from './lyrics.js';
 import { searchYouTubeFast } from './youtubeSearch.js';
 import { parseDurationToSeconds } from '../utils/time.js';
-import { splitMatchingCollage } from './convert.js';
+import { splitMatchingCollage, resolveFfmpegPath } from './convert.js';
+
+const SHORT_DRAMA_PLATFORMS = new Set([
+  'dramabox', 'anydrama', 'dramafren', 'goodshort',
+  'flextv', 'moboreels', 'reelshort', 'shortmax', 'flickreels'
+]);
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let tikwmLastRequestAt = 0;
+let tikwmQueue = Promise.resolve();
+
+function scheduleTikwmRequest(taskFn, minIntervalMs = 1250) {
+  const run = tikwmQueue.then(async () => {
+    const waitMs = Math.max(0, minIntervalMs - (Date.now() - tikwmLastRequestAt));
+    if (waitMs > 0) await sleep(waitMs);
+    tikwmLastRequestAt = Date.now();
+    return taskFn();
+  });
+  tikwmQueue = run.catch(() => {});
+  return run;
+}
 
 const execFileAsync = promisify(execFile);
 
@@ -56,9 +97,38 @@ export async function getAudioDurationSeconds(filePath) {
  * - Prioritizes standard commercial song length (1:30 - 7:00)
  * - Penalizes long 1-3 hour mixes, continuous loops, and sub-45s snippets unless explicitly requested
  */
+const UNWANTED_VARIANT_RE = /\b(slowed|reverb|nightcore|sped\s*up|8d\s*audio|karaoke|instrumental|reaction|teaser|shorts|cover|tiktok\s*version)\b/i;
+
+function isMp3HeaderBuffer(buf) {
+  return Boolean(
+    buf &&
+    buf.length >= 3 &&
+    ((buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) ||
+     (buf[0] === 0xFF && (buf[1] & 0xE0) === 0xE0))
+  );
+}
+
+function isMp3FileByMagic(filePath) {
+  let fd = null;
+  try {
+    fd = openSync(filePath, 'r');
+    const hdr = Buffer.alloc(4);
+    const bytesRead = readSync(fd, hdr, 0, 4, 0);
+    return bytesRead >= 3 && isMp3HeaderBuffer(hdr);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+  }
+}
+
 export function rankYouTubeAudioCandidates(items, queryTerms, { clean = '', wantsLongMix = false } = {}) {
   if (!Array.isArray(items) || items.length === 0) return null;
   const cleanLower = clean.toLowerCase();
+  const queryContext = `${cleanLower} ${(queryTerms || []).join(' ').toLowerCase()}`;
+  const queryWantsVariant = UNWANTED_VARIANT_RE.test(queryContext);
   const scored = items.map((item) => {
     const combined = `${item.title} ${item.author}`.toLowerCase();
     let score = 0;
@@ -87,8 +157,13 @@ export function rankYouTubeAudioCandidates(items, queryTerms, { clean = '', want
       if (durSec >= 600) score += 25;
     }
 
-    if (/\b(official\s*(?:audio|music\s*video|video)|topic)\b/i.test(combined)) {
-      score += 15;
+    if (/\b(official\s*audio|topic|provided\s+to\s+youtube)\b/i.test(combined)) {
+      score += 20;
+    } else if (/\b(official\s*(?:music\s*video|video|lyric)|lyrics)\b/i.test(combined)) {
+      score += 12;
+    }
+    if (!queryWantsVariant && UNWANTED_VARIANT_RE.test(combined)) {
+      score -= 45;
     }
 
     return { item, score, durSec };
@@ -118,17 +193,56 @@ export class MediaDownloader {
     const trimmed = String(url || '').trim();
     if (!trimmed) return 'generic';
     const u = trimmed.toLowerCase();
-    if (/tiktok\.com|vt\.tiktok\.com|vm\.tiktok\.com/.test(u)) return 'tiktok';
-    if (/instagram\.com/.test(u)) return 'instagram';
-    if (/pinterest\.com|pin\.it/.test(u)) return 'pinterest';
-    if (/youtube\.com|youtu\.be/.test(u)) return 'youtube';
-    if (/twitter\.com|x\.com/.test(u)) return 'twitter';
-    if (/facebook\.com|fb\.watch|fb\.com/.test(u)) return 'facebook';
-    if (/capcut\.com/.test(u)) return 'capcut';
-    if (/spotify\.com/.test(u)) return 'spotify';
-    if (/reddit\.com|redd\.it/.test(u)) return 'reddit';
-    if (/threads\.net/.test(u)) return 'threads';
-    if (/spankbang\.com/.test(u)) return 'spankbang';
+    if (/^spotify:(track|album|artist|playlist):/i.test(u)) return 'spotify';
+    let host = '';
+    try {
+      if (/^https?:\/\//i.test(trimmed)) {
+        host = new URL(trimmed).hostname.replace(/^www\./i, '').toLowerCase();
+      }
+    } catch {}
+    const matchesDomain = (...domains) => {
+      if (host) {
+        return domains.some((d) => host === d || host.endsWith(`.${d}`));
+      }
+      return domains.some((d) => new RegExp(`(?:^|//|\\.)${d.replace(/\./g, '\\.')}(?:[/:?#]|$)`, 'i').test(u));
+    };
+
+    if (matchesDomain('tiktok.com', 'vt.tiktok.com', 'vm.tiktok.com')) return 'tiktok';
+    if (matchesDomain('instagram.com')) return 'instagram';
+    if (matchesDomain('pinterest.com', 'pin.it')) return 'pinterest';
+    if (matchesDomain('youtube.com', 'youtu.be')) return 'youtube';
+    if (matchesDomain('twitter.com', 'x.com')) return 'twitter';
+    if (matchesDomain('facebook.com', 'fb.watch', 'fb.com')) return 'facebook';
+    if (matchesDomain('capcut.com')) return 'capcut';
+    if (matchesDomain('spotify.com', 'open.spotify.com', 'spotify.link', 'spoti.fi')) return 'spotify';
+    if (matchesDomain('music.apple.com')) return 'applemusic';
+    if (matchesDomain('audiomack.com')) return 'audiomack';
+    if (matchesDomain('soundcloud.com', 'on.soundcloud.com')) return 'soundcloud';
+    if (matchesDomain('threads.net', 'threads.com')) return 'threads';
+    if (matchesDomain('xiaohongshu.com', 'xhslink.com')) return 'rednote';
+    if (matchesDomain('reddit.com', 'redd.it')) return 'reddit';
+    if (matchesDomain('spankbang.com')) return 'spankbang';
+    if (matchesDomain('thenkiri.com', 'nkiri.com', 'nkiri.ink') || isThenkiriUrl(trimmed)) return 'thenkiri';
+    if (matchesDomain('bilibili.com', 'b23.tv') || isBilibiliUrl(trimmed)) return 'bilibili';
+    if (matchesDomain('justwatch.com') || isJustWatchUrl(trimmed)) return 'justwatch';
+    if (matchesDomain('bsky.app')) return 'bluesky';
+    if (matchesDomain('snapchat.com')) return 'snapchat';
+    if (matchesDomain('twitch.tv', 'clips.twitch.tv')) return 'twitch';
+    if (matchesDomain('kick.com')) return 'kick';
+    if (matchesDomain('vimeo.com')) return 'vimeo';
+    if (matchesDomain('dailymotion.com', 'dai.ly')) return 'dailymotion';
+    if (matchesDomain('rumble.com')) return 'rumble';
+    if (matchesDomain('bandcamp.com')) return 'bandcamp';
+    if (matchesDomain('ok.ru')) return 'odnoklassniki';
+    if (matchesDomain('vk.com', 'vk.ru')) return 'vk';
+    if (matchesDomain('ted.com')) return 'ted';
+    for (const p of SHORT_DRAMA_PLATFORMS) {
+      if (host && host.includes(p)) return p;
+    }
+    try {
+      const detected = socialDetectPlatform(trimmed);
+      if (detected) return detected;
+    } catch {}
     if (/\.(mp4|webm|mov|mkv)(\?|$)/i.test(u)) return 'direct-video';
     if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(u)) return 'direct-photo';
     if (/\.(mp3|m4a|wav|ogg|opus)(\?|$)/i.test(u)) return 'direct-audio';
@@ -142,9 +256,14 @@ export class MediaDownloader {
    * @param {object} opts - { onProgress?: (status: string) => void }
    */
   async download(url, { onProgress } = {}) {
-    const rawUrl = String(url || '').trim();
+    let rawUrl = String(url || '').trim();
     if (!rawUrl) {
       throw new Error('Please provide a media link or song title to search ♡');
+    }
+
+    const uriMatch = rawUrl.match(/^spotify:(track|album|artist|playlist):([A-Za-z0-9]+)$/i);
+    if (uriMatch) {
+      rawUrl = `https://open.spotify.com/${uriMatch[1].toLowerCase()}/${uriMatch[2]}`;
     }
 
     const platform = this.detectPlatform(rawUrl);
@@ -154,6 +273,10 @@ export class MediaDownloader {
 
     this.log.info({ url: rawUrl, platform }, 'download started');
     onProgress?.(`Detecting platform: ${platform.toUpperCase()} ♡`);
+
+    if (SHORT_DRAMA_PLATFORMS.has(platform)) {
+      return this.#downloadSocialDrama(rawUrl, { onProgress, platform });
+    }
 
     switch (platform) {
       case 'tiktok':
@@ -172,6 +295,24 @@ export class MediaDownloader {
         return this.#downloadCapcut(rawUrl, { onProgress });
       case 'spotify':
         return this.#downloadSpotify(rawUrl, { onProgress });
+      case 'applemusic':
+        return this.#downloadAppleMusic(rawUrl, { onProgress });
+      case 'audiomack':
+        return this.#downloadAudiomack(rawUrl, { onProgress });
+      case 'soundcloud':
+        return this.#downloadSoundCloud(rawUrl, { onProgress });
+      case 'threads':
+        return this.#downloadThreads(rawUrl, { onProgress });
+      case 'rednote':
+        return this.#downloadRedNote(rawUrl, { onProgress });
+      case 'thenkiri':
+        return this.#downloadThenkiri(rawUrl, { onProgress });
+      case 'bilibili':
+        return this.#downloadBilibili(rawUrl, { onProgress });
+      case 'justwatch':
+        return this.#downloadJustWatch(rawUrl, { onProgress });
+      case 'reddit':
+        return this.#downloadReddit(rawUrl, { onProgress });
       case 'music-search':
         return this.#downloadMusicSearch(rawUrl, { onProgress });
       case 'spankbang':
@@ -190,7 +331,7 @@ export class MediaDownloader {
    */
   async #downloadTikTok(url, { onProgress }) {
     onProgress?.('Fetching TikTok media from TikWM… ♡');
-    try {
+    const fetchTikwm = () => scheduleTikwmRequest(async () => {
       const res = await fetch('https://www.tikwm.com/api/', {
         method: 'POST',
         headers: {
@@ -201,12 +342,20 @@ export class MediaDownloader {
         body: new URLSearchParams({ url, hd: '1' }),
         signal: AbortSignal.timeout(15000)
       });
-      const json = await res.json().catch(() => null);
+      return res.json().catch(() => null);
+    });
+    try {
+      let json = await fetchTikwm();
+      if (json?.code === -1 && /1 request\/second|rate.?limit|too many/i.test(json?.msg || '')) {
+        await sleep(1350);
+        json = await fetchTikwm();
+      }
 
       if (json?.code === 0 && json.data) {
         const d = json.data;
         const title = d.title || 'TikTok Media';
         const author = d.author?.nickname || d.author?.unique_id || 'TikTok';
+        const durationSeconds = Number(d.duration || d.music_info?.duration || 0) || null;
         const mediaItems = [];
         let audioTrack = null;
 
@@ -288,6 +437,7 @@ export class MediaDownloader {
             platform: 'tiktok',
             title,
             author,
+            durationSeconds,
             mediaItems,
             audioTrack
           };
@@ -301,6 +451,47 @@ export class MediaDownloader {
     try {
       onProgress?.('Trying TikTok direct extractor… ♡');
       const info = await tiktokDl(url);
+      if (Array.isArray(info?.images) && info.images.length > 0) {
+        const mediaItems = [];
+        for (let i = 0; i < info.images.length; i++) {
+          try {
+            const imgRes = await fetch(info.images[i], { signal: AbortSignal.timeout(10000) });
+            if (imgRes.ok) {
+              mediaItems.push({
+                type: 'photo',
+                buffer: Buffer.from(await imgRes.arrayBuffer()),
+                filename: `tiktok_${i + 1}.jpg`,
+                mimeType: 'image/jpeg'
+              });
+            }
+          } catch {}
+        }
+        let audioTrack = null;
+        if (info.music) {
+          const musRes = await fetch(info.music, { signal: AbortSignal.timeout(15000) }).catch(() => null);
+          if (musRes?.ok) {
+            const musBuf = Buffer.from(await musRes.arrayBuffer());
+            if (musBuf.length > 1024) {
+              audioTrack = {
+                buffer: musBuf,
+                filename: 'tiktok_sound.mp3',
+                title: info.title || 'Original Sound',
+                performer: info.author || 'TikTok'
+              };
+            }
+          }
+        }
+        if (mediaItems.length > 0) {
+          return {
+            sourceUrl: url,
+            platform: 'tiktok',
+            title: info.title || 'TikTok Photo Slideshow',
+            author: info.author || 'TikTok',
+            mediaItems,
+            audioTrack
+          };
+        }
+      }
       if (info?.video) {
         const vidRes = await fetch(info.video, { signal: AbortSignal.timeout(30000) });
         if (vidRes.ok) {
@@ -373,6 +564,9 @@ export class MediaDownloader {
         signal: AbortSignal.timeout(15000)
       });
       let resolvedUrl = headRes.url;
+      if (/show_error=true/i.test(resolvedUrl)) {
+        throw new Error('Pinterest pin not found or removed by creator.');
+      }
       const pinIdMatch = resolvedUrl.match(/pin\/(\d+)/);
       const pinId = pinIdMatch ? pinIdMatch[1] : null;
 
@@ -638,6 +832,32 @@ export class MediaDownloader {
     try {
       onProgress?.('Trying Pinterest direct downloader… ♡');
       const pRes = await pinterestDl(url);
+      if (Array.isArray(pRes?.images) && pRes.images.length > 0) {
+        const mediaItems = [];
+        for (let i = 0; i < pRes.images.length; i++) {
+          try {
+            const imgRes = await fetch(pRes.images[i], { signal: AbortSignal.timeout(15000) });
+            if (imgRes.ok) {
+              mediaItems.push({
+                type: 'photo',
+                buffer: Buffer.from(await imgRes.arrayBuffer()),
+                filename: `pinterest_${i + 1}.jpg`,
+                mimeType: 'image/jpeg'
+              });
+            }
+          } catch {}
+        }
+        if (mediaItems.length > 0) {
+          return {
+            sourceUrl: url,
+            platform: 'pinterest',
+            title: pRes.title || 'Pinterest Pin',
+            author: 'Pinterest',
+            mediaItems,
+            audioTrack: null
+          };
+        }
+      }
       if (pRes?.formats?.length) {
         const best = pRes.formats[0];
         const res = await fetch(best.url, { signal: AbortSignal.timeout(30000) });
@@ -777,7 +997,63 @@ export class MediaDownloader {
       this.log.debug({ err: err.message }, 'btch igdl failed');
     }
 
-    // Layer 2: yt-dlp fallback
+    // Layer 2: social-dl instagramDl (reels, posts & multi-photo carousels)
+    try {
+      onProgress?.('Trying Instagram direct extractor… ♡');
+      const igInfo = await instagramDl(url);
+      if (igInfo) {
+        const mediaItems = [];
+        let audioTrack = null;
+        if (Array.isArray(igInfo.images) && igInfo.images.length > 0) {
+          for (let i = 0; i < igInfo.images.length; i++) {
+            try {
+              const imgRes = await fetch(igInfo.images[i], { signal: AbortSignal.timeout(15000) });
+              if (imgRes.ok) {
+                mediaItems.push({
+                  type: 'photo',
+                  buffer: Buffer.from(await imgRes.arrayBuffer()),
+                  filename: `instagram_${i + 1}.jpg`,
+                  mimeType: 'image/jpeg'
+                });
+              }
+            } catch {}
+          }
+        } else if (Array.isArray(igInfo.formats) && igInfo.formats.length > 0) {
+          const vidUrl = igInfo.formats[0]?.url;
+          if (vidUrl) {
+            const vidRes = await fetch(vidUrl, { signal: AbortSignal.timeout(30000) });
+            if (vidRes.ok) {
+              let buf = Buffer.from(await vidRes.arrayBuffer());
+              try { buf = await optimizeVideoForTelegram(buf) || buf; } catch {}
+              mediaItems.push({ type: 'video', buffer: buf, filename: 'instagram_video.mp4', mimeType: 'video/mp4' });
+              const extAudio = await this.extractAudioFromBuffer(buf);
+              if (extAudio) {
+                audioTrack = {
+                  buffer: extAudio,
+                  filename: 'instagram_audio.mp3',
+                  title: igInfo.title || 'Instagram Sound',
+                  performer: igInfo.author || 'Instagram'
+                };
+              }
+            }
+          }
+        }
+        if (mediaItems.length > 0) {
+          return {
+            sourceUrl: url,
+            platform: 'instagram',
+            title: igInfo.title || 'Instagram Post',
+            author: igInfo.author || 'Instagram',
+            mediaItems,
+            audioTrack
+          };
+        }
+      }
+    } catch (err) {
+      this.log.debug({ err: err.message }, 'social-dl instagramDl failed');
+    }
+
+    // Layer 3: yt-dlp fallback
     return this.#downloadUniversal(url, { onProgress, platform: 'instagram' });
   }
 
@@ -952,20 +1228,17 @@ export class MediaDownloader {
     let isAlreadyMp3 = false;
     if (typeof input === 'string') {
       inPath = input;
-      isAlreadyMp3 = inPath.toLowerCase().endsWith('.mp3');
+      // Verify magic bytes so non-MP3 streams (e.g. M4A/AAC saved as .mp3) are transcoded rather than stream-copied
+      isAlreadyMp3 = isMp3FileByMagic(inPath);
     } else if (Buffer.isBuffer(input)) {
       inPath = join(tempDir, 'input_raw');
       writeFileSync(inPath, input);
-      if (input.length >= 3 && (
-        (input[0] === 0x49 && input[1] === 0x44 && input[2] === 0x33) ||
-        (input[0] === 0xFF && (input[1] & 0xE0) === 0xE0)
-      )) {
-        isAlreadyMp3 = true;
-      }
+      isAlreadyMp3 = isMp3HeaderBuffer(input);
     } else {
       return input;
     }
 
+    const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
     const outPath = join(tempDir, 'optimized.mp3');
     try {
       const cleaned = cleanSongMetadata(title, artist);
@@ -979,7 +1252,7 @@ export class MediaDownloader {
         ? ['-c:a', 'copy']
         : ['-c:a', 'libmp3lame', '-b:a', '192k', '-compression_level', '7', '-ar', '44100'];
 
-      await execFileAsync('ffmpeg', [
+      const ffArgs = [
         '-y',
         '-i', inPath,
         '-map_metadata', '-1',
@@ -990,7 +1263,12 @@ export class MediaDownloader {
         ...(album ? ['-metadata', `album=${album}`] : []),
         ...(year ? ['-metadata', `date=${year}`] : []),
         outPath
-      ], { timeout: 30000 });
+      ];
+      try {
+        await getSharedMediaWorkerPool().execInWorker(ffmpegBin, ffArgs, { timeout: 30000 });
+      } catch {
+        await execFileAsync(ffmpegBin, ffArgs, { timeout: 30000 });
+      }
 
       if (existsSync(outPath) && statSync(outPath).size > 1000) {
         return readFileSync(outPath);
@@ -1005,134 +1283,23 @@ export class MediaDownloader {
   }
 
   /**
-   * Spotify Downloader: Metadata, Cover Art & Audio
+   * Shared helper: resolve full audio track matching metadata (title/artist/duration)
+   * and normalize to CBR 192k MP3 with ID3v2 tags + artwork.
    */
-  async #downloadSpotify(url, { onProgress }) {
-    onProgress?.('Fetching Spotify track metadata… ♡');
-    let title = 'Spotify Track';
-    let artist = '';
-    let album = '';
-    let year = '';
-    let duration = '';
-    let coverBuf = null;
-
-    // 1. Fetch metadata & cover art via Spotify oembed API
-    try {
-      const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(10000) });
-      if (oembedRes.ok) {
-        const oembedData = await oembedRes.json();
-        if (oembedData.title) title = oembedData.title;
-        if (oembedData.thumbnail_url) {
-          const imgRes = await fetch(oembedData.thumbnail_url, { signal: AbortSignal.timeout(10000) });
-          if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
-        }
-      }
-    } catch {}
-
-    // 2. Extract song title, artist, album, year & high-res artwork from Spotify HTML meta tags
-    try {
-      const pageRes = await fetch(url, {
-        headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-        signal: AbortSignal.timeout(10000)
-      });
-      if (pageRes.ok) {
-        const html = await pageRes.text();
-        const ogTitle = html.match(/<meta property="og:title" content="(.*?)"/i)?.[1];
-        const ogDesc = html.match(/<meta property="og:description" content="(.*?)"/i)?.[1];
-        const ogImage = html.match(/<meta property="og:image" content="(.*?)"/i)?.[1];
-
-        if (ogTitle) {
-          const clean = ogTitle.replace(/\s*\|\s*Spotify.*/i, '').trim();
-          if (clean) title = clean;
-        }
-
-        if (ogDesc) {
-          // Spotify og:description format: "Artist · Album · Song · Year"
-          const parts = ogDesc.split(/\s*[·•]\s*/).map((p) => p.trim()).filter(Boolean);
-          if (parts.length >= 1 && !artist) artist = parts[0];
-          if (parts.length >= 2 && !album) album = parts[1];
-          const yearMatch = ogDesc.match(/\b(19\d\d|20\d\d)\b/);
-          if (yearMatch && !year) year = yearMatch[1];
-        }
-
-        const mTitle = html.match(/<title>(.*?)\s*-\s*song and lyrics by (.*?)\s*\|\s*Spotify<\/title>/i);
-        if (mTitle) {
-          if (!title || title === 'Spotify Track') title = mTitle[1].trim();
-          if (!artist) artist = mTitle[2].trim();
-        }
-
-        // Schema.org JSON-LD
-        const ldMatch = html.match(/<script type="application\/ld\+json">(.*?)<\/script>/s);
-        if (ldMatch) {
-          try {
-            const ld = JSON.parse(ldMatch[1]);
-            if (ld.name && (!title || title === 'Spotify Track')) title = ld.name;
-            if (ld.datePublished && !year) year = ld.datePublished.slice(0, 4);
-          } catch {}
-        }
-
-        // High-res album artwork
-        if (ogImage && !coverBuf) {
-          try {
-            const imgRes = await fetch(ogImage, { signal: AbortSignal.timeout(10000) });
-            if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
-          } catch {}
-        }
-      }
-    } catch {}
-
-    // 3. Try social-dl format only if it is a genuine full track (>= 50 seconds)
-    try {
-      const res = await spotifyDl(url);
-      if (res?.title) title = res.title;
-      if (res?.artist && !artist) artist = res.artist;
-      if (res?.formats?.length) {
-        const best = res.formats[0];
-        const musRes = await fetch(best.url, { signal: AbortSignal.timeout(30000) });
-        if (musRes.ok) {
-          let buf = Buffer.from(await musRes.arrayBuffer());
-          const tempCheckPath = join(tmpdir(), `lancy_sp_chk_${Date.now()}.mp3`);
-          writeFileSync(tempCheckPath, buf);
-          const dur = await getAudioDurationSeconds(tempCheckPath);
-          try { unlinkSync(tempCheckPath); } catch {}
-          if (dur && dur >= 50) {
-            buf = await this.#optimizeAudioToCbrMp3(buf, { title, artist, album, year });
-            const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
-            const min = Math.floor(dur / 60);
-            const sec = String(Math.floor(dur % 60)).padStart(2, '0');
-            return {
-              sourceUrl: url,
-              platform: 'spotify',
-              title,
-              artist,
-              author: artist || 'Spotify',
-              album,
-              year,
-              duration: `${min}:${sec}`,
-              mediaItems,
-              audioTrack: {
-                buffer: buf,
-                filename: `${title.replace(/[^\w\s-]/g, '') || 'track'}.mp3`,
-                title,
-                performer: artist || 'Spotify',
-                album,
-                year,
-                duration: dur
-              }
-            };
-          }
-        }
-      }
-    } catch (err) {
-      this.log.debug({ err: err.message }, 'spotifyDl threw');
-      const match = err.message?.match(/“([^”]+)”\s*by\s*([^.]+)/);
-      if (match) {
-        if (!title || title === 'Spotify Track') title = match[1].trim();
-        if (!artist) artist = match[2].trim();
-      }
-    }
-
-    // 4. Download genuine full audio match via YouTube & SoundCloud
+  async #resolveAndOptimizeTrack({
+    sourceUrl,
+    platform = 'spotify',
+    title = 'Audio Track',
+    artist = '',
+    album = '',
+    year = '',
+    duration = '',
+    expectedDurationSec = 0,
+    coverBuf = null,
+    onProgress
+  }) {
+    const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
+    const cookieArgs = getCookieArgs();
     const primaryArtist = (artist || '').split(/[,&]/)[0].trim();
     const cleanTitle = (title || '').replace(/\(.*?\)/g, '').replace(/\[.*?\]/g, '').trim();
 
@@ -1140,64 +1307,100 @@ export class MediaDownloader {
       `${primaryArtist} ${cleanTitle}`,
       `${artist} ${cleanTitle}`,
       `${title} ${artist}`,
-      `${cleanTitle} audio`
-    ].map((q) => q.replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ').trim()).filter(Boolean);
+      `${cleanTitle} official audio`
+    ]
+      .map((q) => q.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim())
+      .filter((q, i, arr) => q && arr.indexOf(q) === i);
 
     onProgress?.(`Finding full audio match for "${title}"… ♡`);
-    const cookieArgs = getCookieArgs();
 
     for (const query of candidateQueries) {
-      const tempDir = join(tmpdir(), `lancy_sp_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+      const tempDir = join(tmpdir(), `lancy_trk_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
       mkdirSync(tempDir, { recursive: true });
       try {
         let downloaded = false;
 
-        // Try fast search for exact YouTube video
+        // 1. Multi-source resolver (InnerTube scored NG/US -> JioSaavn 320k -> Audius)
         try {
-          const fastVids = await searchYouTubeFast(query);
-          const bestCandidate = rankYouTubeAudioCandidates(fastVids, query.toLowerCase().split(/\s+/).filter(Boolean), { clean: query });
-          if (bestCandidate && bestCandidate.videoId) {
-            await execFileAsync('yt-dlp', [
-              '--no-warnings',
-              '--no-playlist',
-              ...cookieArgs,
-              '-N', '4',
-              '--max-filesize', '48M',
-              '--js-runtimes', 'node:/usr/bin/node',
-              '-f', 'ba/b',
-              '-x',
-              '--audio-format', 'mp3',
-              '--audio-quality', '2',
-              '-o', join(tempDir, '%(title).60s.%(ext)s'),
-              `https://www.youtube.com/watch?v=${bestCandidate.videoId}`
-            ], { timeout: 45000 });
-            const files = readdirSync(tempDir);
-            const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
-            if (foundAudio) {
-              const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
-              if (dur && dur >= 45) downloaded = true;
-            }
+          const { resolveAndDownloadAudio } = await import('./musicResolver.js');
+          const resolvedPath = join(tempDir, 'resolved.mp3');
+          const resolved = await resolveAndDownloadAudio({
+            query,
+            trackId: null,
+            tempPath: resolvedPath,
+            ffmpegPath: ffmpegBin,
+            minSeconds: 45,
+            meta: { title, artist: artist || 'Music' },
+            skipYouTube: false,
+            onProgress
+          });
+          if (resolved.ok && existsSync(resolvedPath) && statSync(resolvedPath).size > 20000) {
+            downloaded = true;
           }
-        } catch {}
+        } catch (rErr) {
+          this.log?.debug?.({ err: rErr.message, query }, 'track resolver attempt failed');
+        }
 
+        // 2. Duration-aware InnerTube candidate fallback
+        if (!downloaded) {
+          try {
+            const fastVids = await searchYouTubeFast(query, 'NG', { wide: true });
+            const filtered = expectedDurationSec > 45
+              ? fastVids.filter((v) => {
+                  const d = parseDurationToSeconds(v.duration);
+                  return !d || Math.abs(d - expectedDurationSec) <= Math.max(25, expectedDurationSec * 0.25);
+                })
+              : fastVids;
+            const pool = filtered.length ? filtered : fastVids;
+            const bestCandidate = rankYouTubeAudioCandidates(
+              pool,
+              query.toLowerCase().split(/\s+/).filter(Boolean),
+              { clean: query }
+            );
+            if (bestCandidate?.videoId) {
+              await execFileAsync('yt-dlp', [
+                '--no-warnings',
+                '--no-playlist',
+                '--ffmpeg-location', ffmpegBin,
+                ...cookieArgs,
+                '-N', '4',
+                '--max-filesize', '48M',
+                '--js-runtimes', 'node:/usr/bin/node',
+                '-f', 'ba[ext=m4a]/ba/b',
+                '-x',
+                '--audio-format', 'mp3',
+                '--audio-quality', '2',
+                '-o', join(tempDir, '%(title).60s.%(ext)s'),
+                `https://www.youtube.com/watch?v=${bestCandidate.videoId}`
+              ], { timeout: 45000 });
+              const foundAudio = readdirSync(tempDir).find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+              if (foundAudio) {
+                const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
+                if (dur && dur >= 45) downloaded = true;
+              }
+            }
+          } catch {}
+        }
+
+        // 3. Direct yt-dlp search fallback
         if (!downloaded) {
           try {
             await execFileAsync('yt-dlp', [
               '--no-warnings',
               '--no-playlist',
+              '--ffmpeg-location', ffmpegBin,
               ...cookieArgs,
               '-N', '4',
               '--max-filesize', '48M',
               '--js-runtimes', 'node:/usr/bin/node',
-              '-f', 'ba/b',
+              '-f', 'ba[ext=m4a]/ba/b',
               '-x',
               '--audio-format', 'mp3',
               '--audio-quality', '2',
               '-o', join(tempDir, '%(title).60s.%(ext)s'),
               `ytsearch1:${query}`
             ], { timeout: 45000 });
-            const files = readdirSync(tempDir);
-            const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+            const foundAudio = readdirSync(tempDir).find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
             if (foundAudio) {
               const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
               if (dur && dur >= 45) downloaded = true;
@@ -1205,61 +1408,20 @@ export class MediaDownloader {
           } catch {}
         }
 
-        if (!downloaded) {
-          try {
-            await execFileAsync('yt-dlp', [
-              '--no-warnings',
-              '--no-playlist',
-              '-N', '4',
-              '--max-filesize', '48M',
-              '-x',
-              '--audio-format', 'mp3',
-              '--audio-quality', '2',
-              '-o', join(tempDir, '%(title).60s.%(ext)s'),
-              `scsearch1:${query}`
-            ], { timeout: 45000 });
-            const files = readdirSync(tempDir);
-            const foundAudio = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
-            if (foundAudio) {
-              const dur = await getAudioDurationSeconds(join(tempDir, foundAudio));
-              if (dur && dur >= 45) downloaded = true;
-            }
-          } catch {}
-        }
-
-        if (!downloaded) {
-          try {
-            const { resolveAndDownloadAudio } = await import('./musicResolver.js');
-            const resolvedPath = join(tempDir, 'resolved.mp3');
-            const resolved = await resolveAndDownloadAudio({ query: `${title} ${artist ?? ''}`.trim() || query, trackId: null, tempPath: resolvedPath, minSeconds: 45 });
-            if (resolved.ok) this.log?.info?.({ title, source: resolved.source }, 'resolver rescued url-track');
-          } catch (rErr) {
-            this.log?.debug?.({ err: rErr.message }, 'resolver layer (url path) failed');
-          }
-        }
-
-        const files = readdirSync(tempDir);
-        const audioFile = files.find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
+        const audioFile = readdirSync(tempDir).find((f) => /\.(mp3|m4a|webm|opus|ogg|wav)$/i.test(f));
         if (audioFile) {
           const fullAudioPath = join(tempDir, audioFile);
           const durSec = await getAudioDurationSeconds(fullAudioPath);
-          if (durSec && durSec < 45) {
-            continue; // Skip preview clip and continue searching
-          }
-          const audioBuf = await this.#optimizeAudioToCbrMp3(fullAudioPath, {
-            title,
-            artist,
-            album,
-            year
-          });
+          if (durSec && durSec < 45) continue;
+          const audioBuf = await this.#optimizeAudioToCbrMp3(fullAudioPath, { title, artist, album, year });
           const mediaItems = coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [];
           const durString = durSec ? `${Math.floor(durSec / 60)}:${String(Math.floor(durSec % 60)).padStart(2, '0')}` : duration;
           return {
-            sourceUrl: url,
-            platform: 'spotify',
+            sourceUrl,
+            platform,
             title,
             artist,
-            author: artist || 'Spotify',
+            author: artist || platform.toUpperCase(),
             album,
             year,
             duration: durString,
@@ -1268,10 +1430,10 @@ export class MediaDownloader {
               buffer: audioBuf,
               filename: `${title.replace(/[^\w\s-]/g, '') || 'track'}.mp3`,
               title,
-              performer: artist || 'Spotify',
+              performer: artist || platform.toUpperCase(),
               album,
               year,
-              duration: durSec
+              duration: durSec || expectedDurationSec || undefined
             }
           };
         }
@@ -1282,7 +1444,801 @@ export class MediaDownloader {
       }
     }
 
-    throw new Error(`Could not download full audio track for "${title}". Please verify the title or try another song ♡`);
+    throw new Error(`Could not download full audio track for "${title}". Please verify the link/title or try another song ♡`);
+  }
+
+  /**
+   * Fetch image gallery or video URLs with headers + optional audio extraction.
+   */
+  async #collectMediaFromUrls({
+    sourceUrl,
+    platform,
+    title,
+    author,
+    images = [],
+    videoUrl = null,
+    headers = {},
+    optimizeVideo = false
+  }) {
+    const mediaItems = [];
+    let audioTrack = null;
+
+    if (videoUrl) {
+      const vidRes = await fetch(videoUrl, { headers, signal: AbortSignal.timeout(45000) });
+      if (vidRes.ok) {
+        let buf = Buffer.from(await vidRes.arrayBuffer());
+        if (optimizeVideo) {
+          try { buf = await optimizeVideoForTelegram(buf) || buf; } catch {}
+        }
+        if (buf.length > 4096) {
+          mediaItems.push({ type: 'video', buffer: buf, filename: `${platform}_video.mp4`, mimeType: 'video/mp4' });
+          const extAudio = await this.extractAudioFromBuffer(buf);
+          if (extAudio) {
+            audioTrack = {
+              buffer: extAudio,
+              filename: `${platform}_audio.mp3`,
+              title: title || `${platform} Audio`,
+              performer: author || platform
+            };
+          }
+        }
+      }
+    }
+
+    if (mediaItems.length === 0 && Array.isArray(images) && images.length > 0) {
+      for (let i = 0; i < Math.min(images.length, 30); i++) {
+        try {
+          const r = await fetch(images[i], { headers, signal: AbortSignal.timeout(15000) });
+          if (r.ok) {
+            const buf = Buffer.from(await r.arrayBuffer());
+            if (buf.length > 1024) {
+              mediaItems.push({
+                type: 'photo',
+                buffer: buf,
+                filename: `${platform}_${i + 1}.jpg`,
+                mimeType: 'image/jpeg'
+              });
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (mediaItems.length === 0) return null;
+    return { sourceUrl, platform, title, author, mediaItems, audioTrack };
+  }
+
+  /**
+   * Spotify Downloader: Supports Tracks, Albums, Playlists & Artists (via social-dl@1.4.3 spotifyMetadata + fallbacks)
+   */
+  async #downloadSpotify(url, { onProgress }) {
+    onProgress?.('Fetching Spotify metadata… ♡');
+    let title = 'Spotify Track';
+    let artist = '';
+    let album = '';
+    let year = '';
+    let duration = '';
+    let expectedDurationSec = 0;
+    let coverBuf = null;
+    let spMeta = null;
+
+    // 1. Structured Spotify metadata from social-dl (handles spotify.link, spoti.fi, track/album/playlist/artist)
+    try {
+      spMeta = await spotifyMetadata(url);
+      if (spMeta) {
+        if (spMeta.title) title = spMeta.title;
+        if (spMeta.artist || spMeta.author) artist = spMeta.artist || spMeta.author;
+        if (spMeta.album) album = spMeta.album;
+        if (spMeta.releaseDate) year = String(spMeta.releaseDate).slice(0, 4);
+        if (spMeta.duration) duration = spMeta.duration;
+        if (spMeta.durationMs) expectedDurationSec = Math.round(spMeta.durationMs / 1000);
+        if (spMeta.thumbnail) {
+          try {
+            const imgRes = await fetch(spMeta.thumbnail, { signal: AbortSignal.timeout(10000) });
+            if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+          } catch {}
+        }
+      }
+    } catch (err) {
+      this.log?.debug?.({ err: err.message }, 'spotifyMetadata embed lookup failed, falling back to oEmbed/HTML');
+    }
+
+    // Return rich collection object for Spotify Albums, Playlists, and Artists so UI renders track selector
+    if (spMeta && ['album', 'playlist', 'artist'].includes(spMeta.type)) {
+      return {
+        sourceUrl: spMeta.originalUrl || url,
+        platform: 'spotify',
+        spotifyType: spMeta.type,
+        title: spMeta.title || title,
+        artist: artist || spMeta.author || 'Spotify',
+        author: spMeta.author || artist || 'Spotify',
+        album: spMeta.type === 'album' ? (spMeta.title || album) : album,
+        year,
+        totalTracks: spMeta.totalTracks || spMeta.tracks?.length || 0,
+        tracks: Array.isArray(spMeta.tracks) ? spMeta.tracks : [],
+        description: spMeta.description || '',
+        mediaItems: coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [],
+        audioTrack: null
+      };
+    }
+
+    // 2. Fallback metadata via Spotify oEmbed + HTML OG tags when embed fails
+    if (!artist || title === 'Spotify Track' || !coverBuf) {
+      try {
+        const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(url)}`, { signal: AbortSignal.timeout(10000) });
+        if (oembedRes.ok) {
+          const oembedData = await oembedRes.json();
+          if (oembedData.title && title === 'Spotify Track') title = oembedData.title;
+          if (oembedData.thumbnail_url && !coverBuf) {
+            const imgRes = await fetch(oembedData.thumbnail_url, { signal: AbortSignal.timeout(10000) });
+            if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+          }
+        }
+      } catch {}
+
+      if (!artist || title === 'Spotify Track') {
+        try {
+          const pageRes = await fetch(url, {
+            headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+            signal: AbortSignal.timeout(10000)
+          });
+          if (pageRes.ok) {
+            const html = await pageRes.text();
+            const ogTitle = html.match(/<meta property="og:title" content="(.*?)"/i)?.[1];
+            const ogDesc = html.match(/<meta property="og:description" content="(.*?)"/i)?.[1];
+            const ogImage = html.match(/<meta property="og:image" content="(.*?)"/i)?.[1];
+
+            if (ogTitle && title === 'Spotify Track') {
+              const clean = ogTitle.replace(/\s*\|\s*Spotify.*/i, '').trim();
+              if (clean) title = clean;
+            }
+            if (ogDesc) {
+              const parts = ogDesc.split(/\s*[·•]\s*/).map((p) => p.trim()).filter(Boolean);
+              if (parts.length >= 1 && !artist) artist = parts[0];
+              if (parts.length >= 2 && !album) album = parts[1];
+              const yearMatch = ogDesc.match(/\b(19\d\d|20\d\d)\b/);
+              if (yearMatch && !year) year = yearMatch[1];
+            }
+            const mTitle = html.match(/<title>(.*?)\s*-\s*song and lyrics by (.*?)\s*\|\s*Spotify<\/title>/i);
+            if (mTitle) {
+              if (!title || title === 'Spotify Track') title = mTitle[1].trim();
+              if (!artist) artist = mTitle[2].trim();
+            }
+            if (ogImage && !coverBuf) {
+              try {
+                const imgRes = await fetch(ogImage, { signal: AbortSignal.timeout(10000) });
+                if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+              } catch {}
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // 3. Resolve full-length audio + optimize CBR 192k MP3 with ID3v2 tags
+    return this.#resolveAndOptimizeTrack({
+      sourceUrl: spMeta?.originalUrl || url,
+      platform: 'spotify',
+      title,
+      artist,
+      album,
+      year,
+      duration,
+      expectedDurationSec,
+      coverBuf,
+      onProgress
+    });
+  }
+
+  /**
+   * Apple Music Downloader: Catalog metadata + full studio match (fallback to preview only if needed)
+   */
+  async #downloadAppleMusic(url, { onProgress }) {
+    onProgress?.('Fetching Apple Music catalog metadata… ♡');
+    let meta = null;
+    try {
+      meta = await applemusicMetadata(url);
+    } catch {
+      const dlInfo = await applemusicDl(url).catch(() => null);
+      if (dlInfo) meta = dlInfo;
+    }
+    if (!meta?.title) {
+      throw new Error('Could not read Apple Music track metadata from this link ♡');
+    }
+
+    const coverUrl = meta.thumbnail ? String(meta.thumbnail).replace('100x100bb', '600x600bb') : null;
+    let coverBuf = null;
+    if (coverUrl) {
+      try {
+        const imgRes = await fetch(coverUrl, { signal: AbortSignal.timeout(10000) });
+        if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+      } catch {}
+    }
+
+    const expectedDurationSec = meta.durationMs ? Math.round(meta.durationMs / 1000) : 0;
+    const durStr = expectedDurationSec ? `${Math.floor(expectedDurationSec / 60)}:${String(expectedDurationSec % 60).padStart(2, '0')}` : '';
+    const year = meta.releaseDate ? String(meta.releaseDate).slice(0, 4) : '';
+
+    return this.#resolveAndOptimizeTrack({
+      sourceUrl: url,
+      platform: 'applemusic',
+      title: meta.title,
+      artist: meta.artist || meta.author || '',
+      album: meta.album || '',
+      year,
+      duration: durStr,
+      expectedDurationSec,
+      coverBuf,
+      onProgress
+    });
+  }
+
+  /**
+   * Audiomack Downloader: Direct HQ stream + ID3v2 MP3 optimization (with resolver fallback)
+   */
+  async #downloadAudiomack(url, { onProgress }) {
+    onProgress?.('Fetching Audiomack track stream… ♡');
+    let info = null;
+    try {
+      info = await audiomackDl(url);
+    } catch (err) {
+      this.log?.debug?.({ err: err.message }, 'audiomackDl failed, falling back');
+    }
+
+    let coverBuf = null;
+    if (info?.thumbnail) {
+      try {
+        const imgRes = await fetch(info.thumbnail, { signal: AbortSignal.timeout(10000) });
+        if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+      } catch {}
+    }
+
+    const streamUrl = info?.formats?.[0]?.url;
+    if (streamUrl) {
+      try {
+        onProgress?.(`Downloading Audiomack HQ audio for "${info.title}"… ♡`);
+        const res = await fetch(streamUrl, {
+          headers: { Referer: 'https://audiomack.com/' },
+          signal: AbortSignal.timeout(45000)
+        });
+        if (res.ok) {
+          const rawBuf = Buffer.from(await res.arrayBuffer());
+          if (rawBuf.length > 20000) {
+            const optBuf = await this.#optimizeAudioToCbrMp3(rawBuf, {
+              title: info.title,
+              artist: info.artist || info.author || 'Audiomack',
+              album: info.album || ''
+            });
+            const durSec = Number(info.duration || 0);
+            const durStr = durSec > 0 ? `${Math.floor(durSec / 60)}:${String(Math.floor(durSec % 60)).padStart(2, '0')}` : '';
+            return {
+              sourceUrl: url,
+              platform: 'audiomack',
+              title: info.title || 'Audiomack Track',
+              artist: info.artist || info.author || 'Audiomack',
+              author: info.author || info.artist || 'Audiomack',
+              album: info.album || '',
+              duration: durStr,
+              mediaItems: coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [],
+              audioTrack: {
+                buffer: optBuf,
+                filename: `${(info.title || 'audiomack_track').replace(/[^\w\s-]/g, '') || 'track'}.mp3`,
+                title: info.title || 'Audiomack Track',
+                performer: info.artist || info.author || 'Audiomack',
+                album: info.album || '',
+                duration: durSec || undefined
+              }
+            };
+          }
+        }
+      } catch (err) {
+        this.log?.debug?.({ err: err.message }, 'audiomack direct stream fetch failed');
+      }
+    }
+
+    if (info?.title) {
+      return this.#resolveAndOptimizeTrack({
+        sourceUrl: url,
+        platform: 'audiomack',
+        title: info.title,
+        artist: info.artist || info.author || '',
+        album: info.album || '',
+        expectedDurationSec: Number(info.duration || 0),
+        coverBuf,
+        onProgress
+      });
+    }
+
+    return this.#downloadUniversal(url, { onProgress, platform: 'audiomack' });
+  }
+
+  /**
+   * SoundCloud Downloader: Audio track + artwork extraction
+   */
+  async #downloadSoundCloud(url, { onProgress }) {
+    onProgress?.('Fetching SoundCloud track… ♡');
+    const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
+    const tempDir = join(tmpdir(), `lancy_sc_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+    mkdirSync(tempDir, { recursive: true });
+    try {
+      const { stdout } = await execFileAsync('yt-dlp', [
+        '--no-warnings',
+        '--no-playlist',
+        '--ffmpeg-location', ffmpegBin,
+        '--write-thumbnail',
+        '--print-json',
+        '-x',
+        '--audio-format', 'mp3',
+        '--audio-quality', '2',
+        '-P', tempDir,
+        '-o', '%(title).60s.%(ext)s',
+        url
+      ], { timeout: 60000, maxBuffer: 6 * 1024 * 1024 });
+
+      let meta = null;
+      const lastJsonLine = String(stdout || '').trim().split('\n').reverse().find((l) => l.trim().startsWith('{'));
+      if (lastJsonLine) {
+        try { meta = JSON.parse(lastJsonLine); } catch {}
+      }
+
+      const files = readdirSync(tempDir);
+      const audioFile = files.find((f) => /\.(mp3|m4a|opus|ogg|wav)$/i.test(f));
+      if (audioFile) {
+        const title = meta?.track || meta?.title || 'SoundCloud Track';
+        const artist = meta?.artist || meta?.uploader || 'SoundCloud';
+        const durSec = Number(meta?.duration || 0) || (await getAudioDurationSeconds(join(tempDir, audioFile))) || 0;
+        const durStr = durSec > 0 ? `${Math.floor(durSec / 60)}:${String(Math.floor(durSec % 60)).padStart(2, '0')}` : '';
+
+        const thumbFile = files.find((f) => /\.(jpg|jpeg|png|webp)$/i.test(f));
+        let coverBuf = null;
+        if (thumbFile) {
+          try {
+            coverBuf = await sharp(readFileSync(join(tempDir, thumbFile))).jpeg({ quality: 92 }).toBuffer();
+          } catch {}
+        }
+
+        const audioBuf = await this.#optimizeAudioToCbrMp3(join(tempDir, audioFile), { title, artist });
+        return {
+          sourceUrl: url,
+          platform: 'soundcloud',
+          title,
+          artist,
+          author: artist,
+          duration: durStr,
+          mediaItems: coverBuf ? [{ type: 'photo', buffer: coverBuf, filename: 'cover.jpg', mimeType: 'image/jpeg' }] : [],
+          audioTrack: {
+            buffer: audioBuf,
+            filename: `${title.replace(/[^\w\s-]/g, '') || 'track'}.mp3`,
+            title,
+            performer: artist,
+            duration: durSec || undefined
+          }
+        };
+      }
+    } catch (err) {
+      this.log?.debug?.({ err: err.message }, 'soundcloud yt-dlp extraction failed');
+    } finally {
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+
+    return this.#downloadUniversal(url, { onProgress, platform: 'soundcloud' });
+  }
+
+  /**
+   * Threads Downloader: Handles video & multi-image posts (using social-dl@1.4.3 login-shell bypass)
+   */
+  async #downloadThreads(url, { onProgress }) {
+    onProgress?.('Fetching Threads post media… ♡');
+    try {
+      const info = await threadsDl(url);
+      if (info) {
+        const collected = await this.#collectMediaFromUrls({
+          sourceUrl: url,
+          platform: 'threads',
+          title: info.title || 'Threads Post',
+          author: info.author || 'Threads',
+          images: info.images || [],
+          videoUrl: info.formats?.[0]?.url || null,
+          headers: { Referer: 'https://www.threads.net/', 'User-Agent': 'Mozilla/5.0' },
+          optimizeVideo: true
+        });
+        if (collected) return collected;
+      }
+    } catch (err) {
+      this.log?.debug?.({ err: err.message }, 'threadsDl failed, falling back to universal');
+    }
+    return this.#downloadUniversal(url, { onProgress, platform: 'threads' });
+  }
+
+  /**
+   * RedNote / Xiaohongshu Downloader: Videos & multi-photo notes
+   */
+  async #downloadRedNote(url, { onProgress }) {
+    onProgress?.('Fetching RedNote / Xiaohongshu media… ♡');
+    try {
+      const info = await rednoteDl(url);
+      if (info) {
+        const collected = await this.#collectMediaFromUrls({
+          sourceUrl: url,
+          platform: 'rednote',
+          title: info.title || 'RedNote Post',
+          author: info.author || 'RedNote',
+          images: info.images || [],
+          videoUrl: info.formats?.[0]?.url || null,
+          headers: { Referer: url },
+          optimizeVideo: false
+        });
+        if (collected) return collected;
+      }
+    } catch (err) {
+      this.log?.debug?.({ err: err.message }, 'rednoteDl failed, falling back to universal');
+    }
+    return this.#downloadUniversal(url, { onProgress, platform: 'rednote' });
+  }
+
+  /**
+   * Short-Drama Platforms Downloader (DramaBox, ReelShort, GoodShort, FlexTV, MoboReels, AnyDrama, ShortMax, FlickReels)
+   */
+  async #downloadSocialDrama(url, { onProgress, platform }) {
+    onProgress?.(`Extracting ${platform.toUpperCase()} episode stream… ♡`);
+    const tempDir = join(tmpdir(), `lancy_drama_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`);
+    mkdirSync(tempDir, { recursive: true });
+    try {
+      const info = await universalDl(url).catch(() => null);
+      const destPath = join(tempDir, `${platform}.mp4`);
+      await universalSave(url, destPath, { quality: 'best' });
+      if (existsSync(destPath) && statSync(destPath).size > 8192) {
+        const buf = readFileSync(destPath);
+        const extAudio = await this.extractAudioFromBuffer(buf);
+        const title = info?.title || `${platform.toUpperCase()} Video`;
+        const author = info?.author || platform.toUpperCase();
+        return {
+          sourceUrl: url,
+          platform,
+          title,
+          author,
+          mediaItems: [{ type: 'video', buffer: buf, filename: `${platform}.mp4`, mimeType: 'video/mp4' }],
+          audioTrack: extAudio ? { buffer: extAudio, filename: `${platform}_audio.mp3`, title, performer: author } : null
+        };
+      }
+    } catch (err) {
+      this.log?.debug?.({ err: err.message, platform }, 'short-drama direct extraction failed, falling back to universal');
+    } finally {
+      try { rmSync(tempDir, { recursive: true, force: true }); } catch {}
+    }
+    return this.#downloadUniversal(url, { onProgress, platform });
+  }
+
+  /**
+   * Read bounded response body into Buffer while aborting early if payload exceeds maxBytes.
+   */
+  async #fetchBoundedBuffer(targetUrl, { headers = {}, maxBytes = 46 * 1024 * 1024, timeoutMs = 45000 } = {}) {
+    const res = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        ...headers
+      },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) throw new Error(`HTTP_${res.status}`);
+    const cl = Number(res.headers.get('content-length') || 0);
+    if (cl > 0 && cl > maxBytes) {
+      await res.body?.cancel?.().catch(() => {});
+      return { oversized: true, contentLength: cl, contentType: res.headers.get('content-type') || '', buffer: null };
+    }
+    if (!res.body) {
+      const arr = Buffer.from(await res.arrayBuffer());
+      if (arr.length > maxBytes) return { oversized: true, contentLength: arr.length, contentType: res.headers.get('content-type') || '', buffer: null };
+      return { oversized: false, contentLength: arr.length, contentType: res.headers.get('content-type') || '', buffer: arr };
+    }
+    const reader = res.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value?.byteLength) {
+          total += value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel().catch(() => {});
+            return { oversized: true, contentLength: total, contentType: res.headers.get('content-type') || '', buffer: null };
+          }
+          chunks.push(Buffer.from(value));
+        }
+      }
+      return { oversized: false, contentLength: total, contentType: res.headers.get('content-type') || '', buffer: Buffer.concat(chunks) };
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+  }
+
+  /**
+   * Stream a large file (up to 2 GB) directly to disk without holding it in RAM.
+   */
+  async #fetchBoundedStreamToFile(targetUrl, destPath, { headers = {}, maxBytes = 2000 * 1024 * 1024, timeoutMs = 600000, onProgress } = {}) {
+    const res = await fetch(targetUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        ...headers
+      },
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) throw new Error(`HTTP_${res.status}`);
+    const cl = Number(res.headers.get('content-length') || 0);
+    if (cl > 0 && cl > maxBytes) {
+      await res.body?.cancel?.().catch(() => {});
+      return { oversized: true, contentLength: cl, contentType: res.headers.get('content-type') || '', filePath: null };
+    }
+    if (!res.body) {
+      const arr = Buffer.from(await res.arrayBuffer());
+      if (arr.length > maxBytes) return { oversized: true, contentLength: arr.length, contentType: res.headers.get('content-type') || '', filePath: null };
+      writeFileSync(destPath, arr);
+      return { oversized: false, contentLength: arr.length, contentType: res.headers.get('content-type') || '', filePath: destPath };
+    }
+    const reader = res.body.getReader();
+    const out = createWriteStream(destPath, { mode: 0o600 });
+    let total = 0;
+    let lastReportAt = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value?.byteLength) {
+          total += value.byteLength;
+          if (total > maxBytes) {
+            await reader.cancel().catch(() => {});
+            out.destroy();
+            try { unlinkSync(destPath); } catch {}
+            return { oversized: true, contentLength: total, contentType: res.headers.get('content-type') || '', filePath: null };
+          }
+          if (!out.write(Buffer.from(value))) {
+            await new Promise((resolve) => out.once('drain', resolve));
+          }
+          if (onProgress && Date.now() - lastReportAt > 3500) {
+            lastReportAt = Date.now();
+            const mbDone = Math.round(total / (1024 * 1024));
+            const mbTotal = cl > 0 ? ` / ${Math.round(cl / (1024 * 1024))} MB` : ' MB';
+            onProgress(`Downloading movie stream: ${mbDone}${mbTotal}… ♡`);
+          }
+        }
+      }
+      await new Promise((resolve, reject) => {
+        out.end((err) => (err ? reject(err) : resolve()));
+      });
+      return { oversized: false, contentLength: total, contentType: res.headers.get('content-type') || '', filePath: destPath };
+    } catch (err) {
+      out.destroy();
+      try { unlinkSync(destPath); } catch {}
+      throw err;
+    } finally {
+      try { reader.releaseLock(); } catch {}
+    }
+  }
+
+  /**
+   * TheNkiri / Nkiri Movies & TV Series Downloader (supports trailers, direct clips & 2 GB+ full movies via Local Bot API)
+   */
+  async #downloadThenkiri(url, { onProgress }) {
+    const sdl = this.socialDl || { thenkiriDl, thenkiriGetLink };
+    onProgress?.('Fetching TheNkiri release metadata… ♡');
+    const details = await sdl.thenkiriDl(url);
+    const title = details?.title || 'TheNkiri Release';
+    const description = details?.description || '';
+    const mediaItems = [];
+
+    if (details?.poster) {
+      try {
+        const posterRes = await this.#fetchBoundedBuffer(details.poster, { maxBytes: 8 * 1024 * 1024, timeoutMs: 12000 });
+        if (!posterRes.oversized && posterRes.buffer?.length > 1024) {
+          mediaItems.push({
+            type: 'photo',
+            buffer: posterRes.buffer,
+            filename: 'thenkiri_poster.jpg',
+            mimeType: 'image/jpeg'
+          });
+        }
+      } catch {}
+    }
+
+    onProgress?.('Resolving direct TheNkiri download link… ♡');
+    const resolved = await sdl.thenkiriGetLink(url).catch(() => null);
+    const maxTgBytes = Math.max(46 * 1024 * 1024, uploadLimitBytes());
+    const sources = (details?.sources || []).filter((s) => !s.locked && s.available !== false);
+
+    if (resolved?.url) {
+      const cl = Number(resolved.contentLength || 0);
+      const canTryVideo = !cl || cl <= maxTgBytes;
+      if (canTryVideo && details?.contentType !== 'series') {
+        try {
+          if (cl > 60 * 1024 * 1024 && maxTgBytes > 100 * 1024 * 1024) {
+            onProgress?.(`Downloading full TheNkiri movie (${Math.round(cl / (1024 * 1024))} MB)… ♡`);
+            const largeDir = existsSync('/data/tmp') ? '/data/tmp' : tmpdir();
+            mkdirSync(largeDir, { recursive: true });
+            const moviePath = join(largeDir, `lancy_thenkiri_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.${resolved.format || 'mp4'}`);
+            const streamed = await this.#fetchBoundedStreamToFile(resolved.url, moviePath, {
+              headers: resolved.headers || { Referer: url },
+              maxBytes: maxTgBytes,
+              timeoutMs: 600000,
+              onProgress
+            });
+            if (!streamed.oversized && streamed.filePath && existsSync(streamed.filePath) && streamed.contentLength > 4096) {
+              return {
+                sourceUrl: url,
+                platform: 'thenkiri',
+                title,
+                author: 'TheNkiri',
+                description,
+                directUrl: resolved.url,
+                mediaItems: [{
+                  type: 'video',
+                  filePath: streamed.filePath,
+                  sizeBytes: streamed.contentLength,
+                  filename: `${title.replace(/[^\w\s.-]/g, '').slice(0, 48) || 'thenkiri'}.${resolved.format || 'mp4'}`,
+                  mimeType: 'video/mp4',
+                  cleanupOnDeliver: true
+                }],
+                audioTrack: null
+              };
+            }
+          } else {
+            onProgress?.('Downloading TheNkiri video clip… ♡');
+            const fetched = await this.#fetchBoundedBuffer(resolved.url, {
+              headers: resolved.headers || { Referer: url },
+              maxBytes: Math.min(maxTgBytes, 60 * 1024 * 1024),
+              timeoutMs: 60000
+            });
+            if (!fetched.oversized && fetched.buffer?.length > 4096) {
+              let vidBuf = fetched.buffer;
+              try {
+                vidBuf = await optimizeVideoForTelegram(vidBuf) || vidBuf;
+              } catch {}
+              const extAudio = await this.extractAudioFromBuffer(vidBuf).catch(() => null);
+              return {
+                sourceUrl: url,
+                platform: 'thenkiri',
+                title,
+                author: 'TheNkiri',
+                description,
+                mediaItems: [{
+                  type: 'video',
+                  buffer: vidBuf,
+                  filename: `${title.replace(/[^\w\s.-]/g, '').slice(0, 48) || 'thenkiri'}.${resolved.format || 'mp4'}`,
+                  mimeType: 'video/mp4'
+                }],
+                audioTrack: extAudio ? { buffer: extAudio, filename: 'thenkiri_audio.mp3', title, performer: 'TheNkiri' } : null
+              };
+            }
+          }
+        } catch (err) {
+          this.log?.debug?.({ err: err.message }, 'thenkiri direct media download fell back to link card');
+        }
+      }
+    }
+
+    const directUrl = resolved?.url || sources[0]?.url || url;
+    const epCount = Array.isArray(details?.episodes) ? details.episodes.length : 0;
+    const sizeLabel = resolved?.contentLength ? `~${Math.round(Number(resolved.contentLength) / (1024 * 1024))} MB` : 'Full HD file (>50 MB Telegram upload limit)';
+    return {
+      sourceUrl: url,
+      platform: 'thenkiri',
+      title,
+      author: 'TheNkiri',
+      description,
+      directUrl,
+      sourceLinks: sources.slice(0, 6).map((s) => ({
+        label: s.label || (s.episodeNumber ? `S${s.seasonNumber || 1}E${s.episodeNumber}` : 'Download Mirror'),
+        url: s.url
+      })),
+      oversizeNotice: epCount
+        ? `Found ${epCount} episode(s) on TheNkiri (${sizeLabel}). Tap the direct download link below to save or stream in full quality! ♡`
+        : `Direct stream ready (${sizeLabel}). Telegram bots cap uploads at 50 MB, so use the direct high-speed link below! ♡`,
+      mediaItems,
+      infoOnly: true
+    };
+  }
+
+  /**
+   * Bilibili Video Downloader (bilibili.com/video/BV...|av... & b23.tv)
+   */
+  async #downloadBilibili(url, { onProgress }) {
+    const sdl = this.socialDl || { bilibiliDl, bilibiliSave, isBilibiliUrl };
+    onProgress?.('Fetching Bilibili video details… ♡');
+    let meta = null;
+    if (sdl.isBilibiliUrl?.(url)) {
+      try {
+        meta = await sdl.bilibiliDl(url);
+        const tempDir = mkdtempSync(join(tmpdir(), 'lancy_bili_'));
+        try {
+          const outPath = join(tempDir, 'bilibili.mp4');
+          onProgress?.('Downloading Bilibili video stream… ♡');
+          await sdl.bilibiliSave(url, outPath, 'best');
+          if (existsSync(outPath)) {
+            const st = statSync(outPath);
+            if (st.size > 4096 && st.size <= 48 * 1024 * 1024) {
+              let vidBuf = readFileSync(outPath);
+              try {
+                vidBuf = await optimizeVideoForTelegram(vidBuf) || vidBuf;
+              } catch {}
+              const extAudio = await this.extractAudioFromBuffer(vidBuf).catch(() => null);
+              const title = meta?.title || 'Bilibili Video';
+              const author = meta?.author || 'Bilibili';
+              return {
+                sourceUrl: url,
+                platform: 'bilibili',
+                title,
+                author,
+                durationSeconds: Number(meta?.duration || 0) || null,
+                mediaItems: [{ type: 'video', buffer: vidBuf, filename: 'bilibili.mp4', mimeType: 'video/mp4' }],
+                audioTrack: extAudio ? { buffer: extAudio, filename: 'bilibili_audio.mp3', title, performer: author } : null
+              };
+            }
+          }
+        } finally {
+          try { rmSync(tempDir, { recursive: true, force: true }); } catch {}
+        }
+      } catch (err) {
+        this.log?.debug?.({ err: err.message }, 'social-dl bilibili failed, falling back to universal');
+      }
+    }
+    return this.#downloadUniversal(url, {
+      onProgress,
+      platform: 'bilibili',
+      extraArgs: ['--add-headers', 'Referer:https://www.bilibili.com/'],
+      metadataHint: meta ? { title: meta.title, author: meta.author, durationSeconds: meta.duration } : null
+    });
+  }
+
+  /**
+   * JustWatch Catalog & Official Streaming Providers Lookup
+   */
+  async #downloadJustWatch(url, { onProgress }) {
+    const sdl = this.socialDl || { justwatchDetails, justwatchWatch };
+    onProgress?.('Fetching JustWatch catalog & watch providers… ♡');
+    const details = await sdl.justwatchDetails(url);
+    const watch = await sdl.justwatchWatch(url).catch(() => null);
+    const mediaItems = [];
+    const posterUrl = details?.poster || details?.thumbnail;
+    if (posterUrl) {
+      try {
+        const p = await this.#fetchBoundedBuffer(posterUrl, { maxBytes: 8 * 1024 * 1024, timeoutMs: 12000 });
+        if (!p.oversized && p.buffer?.length > 1024) {
+          mediaItems.push({ type: 'photo', buffer: p.buffer, filename: 'justwatch_poster.jpg', mimeType: 'image/jpeg' });
+        }
+      } catch {}
+    }
+    const offers = (details?.offers || []).slice(0, 6);
+    const offerSummary = offers.map((o) => `${o.provider}${o.accessLabel ? ` (${o.accessLabel})` : ''}`).join(', ');
+    return {
+      sourceUrl: url,
+      platform: 'justwatch',
+      title: details?.title || 'JustWatch Title',
+      author: details?.releaseYear ? `JustWatch (${details.releaseYear})` : 'JustWatch',
+      year: details?.releaseYear || null,
+      description: [details?.description, offerSummary ? `Where to watch: ${offerSummary}` : ''].filter(Boolean).join('\n\n'),
+      directUrl: watch?.watchUrl || details?.canonicalUrl || url,
+      sourceLinks: offers.filter((o) => o.providerUrl || o.watchUrl).map((o) => ({
+        label: `▶ ${o.provider}${o.accessLabel ? ` (${o.accessLabel})` : ''}`,
+        url: o.providerUrl || o.watchUrl
+      })),
+      oversizeNotice: offerSummary
+        ? `Available on: ${offerSummary}. Tap any official provider link below to watch! ♡`
+        : 'Catalog metadata retrieved from JustWatch. Open the official link below for provider availability! ♡',
+      mediaItems,
+      infoOnly: true
+    };
+  }
+
+  /**
+   * Reddit Video + DASH Audio Muxed Downloader (reddit.com & redd.it)
+   */
+  async #downloadReddit(url, { onProgress }) {
+    onProgress?.('Extracting Reddit video & audio… ♡');
+    return this.#downloadUniversal(url, {
+      onProgress,
+      platform: 'reddit',
+      extraArgs: ['-f', 'bv*[filesize<45M]+ba/b[filesize<48M]/b/best']
+    });
   }
 
   /**
@@ -1347,26 +2303,34 @@ export class MediaDownloader {
       ]);
 
       const fastItems = fastItemsResult.status === 'fulfilled' && Array.isArray(fastItemsResult.value) ? fastItemsResult.value : [];
-      let bestSp = null;
+      const metaCandidates = [];
       if (deezerResult.status === 'fulfilled' && deezerResult.value?.data?.length > 0) {
-        const spCandidates = deezerResult.value.data.map((item) => {
-          const combined = `${item.title} ${item.artist?.name || ''}`.toLowerCase();
+        for (const item of deezerResult.value.data) {
+          const combined = `${item.title || ''} ${item.artist?.name || ''}`.toLowerCase();
           const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
-          return { item, score };
-        });
-        spCandidates.sort((a, b) => b.score - a.score);
-        bestSp = spCandidates[0].item;
-      } else if (itunesResult.status === 'fulfilled' && itunesResult.value?.results?.length > 0) {
-        const it = itunesResult.value.results[0];
-        bestSp = {
-          title: it.trackName,
-          artist: { name: it.artistName },
-          duration: it.trackTimeMillis ? Math.round(it.trackTimeMillis / 1000) : 0,
-          album: {
-            cover_big: it.artworkUrl100?.replace('100x100bb', '600x600bb') || it.artworkUrl100
-          }
-        };
+          metaCandidates.push({ item, score, sourceScore: 1 });
+        }
       }
+      if (itunesResult.status === 'fulfilled' && itunesResult.value?.results?.length > 0) {
+        for (const it of itunesResult.value.results) {
+          const combined = `${it.trackName || ''} ${it.artistName || ''}`.toLowerCase();
+          const score = queryTerms.reduce((acc, term) => acc + (combined.includes(term) ? 1 : 0), 0);
+          metaCandidates.push({
+            item: {
+              title: it.trackName,
+              artist: { name: it.artistName },
+              duration: it.trackTimeMillis ? Math.round(it.trackTimeMillis / 1000) : 0,
+              album: {
+                cover_big: it.artworkUrl100?.replace('100x100bb', '600x600bb') || it.artworkUrl100
+              }
+            },
+            score,
+            sourceScore: 0
+          });
+        }
+      }
+      metaCandidates.sort((a, b) => (b.score - a.score) || (b.sourceScore - a.sourceScore));
+      const bestSp = metaCandidates[0]?.item || null;
 
       let bestYt = rankYouTubeAudioCandidates(fastItems, queryTerms, { clean, wantsLongMix });
 
@@ -1455,14 +2419,48 @@ export class MediaDownloader {
         }
       };
 
-      // Layer 0: Instant 0ms Disk Cache Hit (/data/audio_cache/<videoId>.mp3)
-      if (videoId) {
-        const diskCachePath = `/data/audio_cache/${videoId}.mp3`;
+      // Layer 0: Instant 0ms Disk Cache Hit (/data/audio_cache/<videoId|queryHash>.mp3)
+      const queryCacheHash = createHash('sha1').update(clean.toLowerCase()).digest('hex').slice(0, 16);
+      const cacheCandidates = [
+        videoId ? `/data/audio_cache/${videoId}.mp3` : null,
+        `/data/audio_cache/q_${queryCacheHash}.mp3`
+      ].filter(Boolean);
+      for (const diskCachePath of cacheCandidates) {
         try {
           if (existsSync(diskCachePath) && statSync(diskCachePath).size > 40000) {
-            const targetCopy = join(tempDir, `${videoId}.mp3`);
+            const targetCopy = join(tempDir, `${videoId || queryCacheHash}.mp3`);
             writeFileSync(targetCopy, readFileSync(diskCachePath));
-            if (await getValidAudioFile()) downloaded = true;
+            if (await getValidAudioFile()) {
+              downloaded = true;
+              break;
+            }
+          }
+        } catch {}
+      }
+
+      const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
+
+      // Layer 0.5: Ultra-fast direct HTTP CDN resolver (JioSaavn 320k / Audius — ~0.6s, no yt-dlp process overhead!)
+      if (!downloaded && !wantsLongMix && !isLyricQuery) {
+        try {
+          const { resolveAndDownloadAudio } = await import('./musicResolver.js');
+          const resolvedPath = join(tempDir, 'fast_resolved.mp3');
+          const preMeta = bestSp ? { title: trackTitle, artist: trackAuthor } : { title: trackTitle, artist: trackAuthor };
+          const fastRes = await Promise.race([
+            resolveAndDownloadAudio({
+              query: clean,
+              trackId: videoId || null,
+              tempPath: resolvedPath,
+              ffmpegPath: ffmpegBin,
+              minSeconds: 45,
+              meta: preMeta,
+              skipYouTube: true,
+              onProgress
+            }),
+            new Promise((resolve) => setTimeout(() => resolve({ ok: false }), 4500))
+          ]);
+          if (fastRes?.ok && (await getValidAudioFile())) {
+            downloaded = true;
           }
         } catch {}
       }
@@ -1473,14 +2471,12 @@ export class MediaDownloader {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
             '--no-playlist',
+            '--ffmpeg-location', ffmpegBin,
             ...cookieArgs,
             '-N', '8',
             '--max-filesize', '48M',
             '--js-runtimes', 'node:/usr/bin/node',
-            '-f', 'ba/b',
-            '-x',
-            '--audio-format', 'mp3',
-            '--audio-quality', '2',
+            '-f', 'ba[ext=m4a]/ba[ext=mp3]/ba/b',
             '-P', tempDir,
             '-o', '%(title).60s.%(ext)s',
             `https://www.youtube.com/watch?v=${videoId}`
@@ -1497,11 +2493,12 @@ export class MediaDownloader {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
             '--no-playlist',
+            '--ffmpeg-location', ffmpegBin,
             ...cookieArgs,
             '-N', '8',
             '--max-filesize', '48M',
             '--js-runtimes', 'node:/usr/bin/node',
-            '-f', 'ba/b',
+            '-f', 'ba[ext=m4a]/ba/b',
             '-x',
             '--audio-format', 'mp3',
             '--audio-quality', '2',
@@ -1523,12 +2520,13 @@ export class MediaDownloader {
             await execFileAsync('yt-dlp', [
               '--no-warnings',
               '--no-playlist',
+              '--ffmpeg-location', ffmpegBin,
               '--proxy', 'socks5h://127.0.0.1:9000',
               ...cookieArgs,
               '-N', '8',
               '--max-filesize', '48M',
               '--js-runtimes', 'node:/usr/bin/node',
-              '-f', 'ba/b',
+              '-f', 'ba[ext=m4a]/ba/b',
               '-x',
               '--audio-format', 'mp3',
               '--audio-quality', '2',
@@ -1539,17 +2537,44 @@ export class MediaDownloader {
             if (await getValidAudioFile()) downloaded = true;
           }
         } catch (proxyErr) {
-          this.log.warn({ err: proxyErr.message }, 'YouTube proxy download failed, trying SoundCloud fallback');
+          this.log.warn({ err: proxyErr.message }, 'YouTube proxy download failed, trying multi-source resolver');
         }
       }
 
-      // Layer 4: SoundCloud Search fallback (zero 403 blocks, downloads full non-DRM track)
+      // Layer 4: Fast multi-source HTTP resolver (JioSaavn 320k, Audius full stream)
+      if (!downloaded) {
+        try {
+          const { resolveAndDownloadAudio } = await import('./musicResolver.js');
+          const resolvedPath = join(tempDir, 'resolved.mp3');
+          const preMeta = bestSp ? { title: trackTitle, artist: trackAuthor } : null;
+          const resolved = await resolveAndDownloadAudio({
+            query: clean,
+            trackId: videoId || null,
+            tempPath: resolvedPath,
+            ffmpegPath: ffmpegBin,
+            minSeconds: 45,
+            meta: preMeta,
+            skipYouTube: true,
+            onProgress
+          });
+          if (resolved.ok) {
+            downloaded = true;
+            onProgress?.(`Got full track via ${resolved.source} ♡`);
+            this.log?.info?.({ query: clean, source: resolved.source }, 'multi-source resolver delivered full track');
+          }
+        } catch (rErr) {
+          this.log?.debug?.({ err: rErr.message }, 'resolver layer failed');
+        }
+      }
+
+      // Layer 5: SoundCloud Search fallback (non-DRM tracks)
       if (!downloaded) {
         onProgress?.(`Trying SoundCloud for "${clean}"… ♡`);
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
             '--no-playlist',
+            '--ffmpeg-location', ffmpegBin,
             '-N', '8',
             '--max-filesize', '48M',
             '-x',
@@ -1562,31 +2587,6 @@ export class MediaDownloader {
           if (await getValidAudioFile()) downloaded = true;
         } catch (scErr) {
           this.log.warn({ err: scErr.message }, 'SoundCloud search download also failed');
-        }
-      }
-
-      // Layer 5: multi-source resolver — YouTube via residential proxy (if reachable),
-      // JioSaavn (320k), Audius. Duration-validated, previews can't pass.
-      if (!downloaded) {
-        try {
-          const { resolveAndDownloadAudio } = await import('./musicResolver.js');
-          const resolvedPath = join(tempDir, 'resolved.mp3');
-          const preMeta = bestSp ? { title: trackTitle, artist: trackAuthor } : null;
-          const resolved = await resolveAndDownloadAudio({
-            query: clean,
-            trackId: videoId || null,
-            tempPath: resolvedPath,
-            minSeconds: 45,
-            meta: preMeta,
-            skipYouTube: true,
-            onProgress
-          });
-          if (resolved.ok) {
-            onProgress?.(`Got full track via ${resolved.source} ♡`);
-            this.log?.info?.({ query: clean, source: resolved.source }, 'multi-source resolver delivered full track');
-          }
-        } catch (rErr) {
-          this.log?.debug?.({ err: rErr.message }, 'resolver layer failed');
         }
       }
 
@@ -1629,11 +2629,12 @@ export class MediaDownloader {
         })
       ]);
 
-      // Save to /data/audio_cache/<videoId>.mp3 so future group requests or inline streams are 0ms!
-      if (videoId && audioBuf && audioBuf.length > 40000) {
+      // Save to /data/audio_cache/<videoId>.mp3 and query hash so future group requests or inline streams are 0ms!
+      if (audioBuf && audioBuf.length > 40000) {
         try {
           mkdirSync('/data/audio_cache', { recursive: true });
-          writeFileSync(`/data/audio_cache/${videoId}.mp3`, audioBuf);
+          if (videoId) writeFileSync(`/data/audio_cache/${videoId}.mp3`, audioBuf);
+          writeFileSync(`/data/audio_cache/q_${queryCacheHash}.mp3`, audioBuf);
         } catch {}
       }
 
@@ -1758,22 +2759,31 @@ export class MediaDownloader {
    * Universal Downloader using yt-dlp + FFmpeg:
    * Handles 1000+ websites, carousels, playlists, and extracts clean MP3 audio tracks!
    */
-  async #downloadUniversal(url, { onProgress, platform = 'generic', isYouTube = false }) {
+  async #downloadUniversal(url, { onProgress, platform = 'generic', isYouTube = false, extraArgs = [], metadataHint = null }) {
     const tempDir = mkdtempSync(join(tmpdir(), 'lancy_dl_'));
     onProgress?.('Running engine & extracting files… ♡');
 
     try {
       const cookieArgs = getCookieArgs();
-      const maxSourceMb = Math.max(60, Number(process.env.MEDIA_MAX_SOURCE_MB) || 1024);
+      const tgLimitMb = Math.round(uploadLimitBytes() / (1024 * 1024));
+      const maxSourceMb = Math.max(60, Number(process.env.MEDIA_MAX_SOURCE_MB) || tgLimitMb || 2000);
+      const isHighLimit = tgLimitMb > 100;
+      const needsDesktopUa = ['tiktok', 'bilibili', 'reddit', 'vimeo', 'dailymotion', 'twitch'].includes(platform) || /tiktok\.com|bilibili\.com|b23\.tv|reddit\.com/i.test(url);
+      const userAgent = needsDesktopUa
+        ? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        : 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36';
       const args = [
         '--no-warnings',
         '--no-playlist',
         '--write-thumbnail',
+        '--write-info-json',
+        '--concurrent-fragments', '8',
         '--max-filesize', `${maxSourceMb}M`,
-        // Prefer a rendition that already fits Telegram; fall back to the best one.
-        '-S', 'filesize~45M',
+        // When local 2GB Bot API is active, allow full HD streams; otherwise prefer ~45M rendition.
+        '-S', isHighLimit ? 'res:720,ext:mp4:m4a' : 'filesize~45M',
         '--js-runtimes', 'node:/usr/bin/node',
-        '--ffmpeg-location', '/usr/bin/ffmpeg',
+        '--ffmpeg-location', resolveFfmpegPath() || '/usr/bin/ffmpeg',
+        '--user-agent', userAgent,
         '-P', tempDir,
         '-o', '%(autonumber)02d_%(title).50s.%(ext)s',
         url
@@ -1783,13 +2793,12 @@ export class MediaDownloader {
         args.splice(1, 0, ...cookieArgs);
       } else {
         args.splice(1, 0,
-          '--extractor-args', 'youtube:player_client=android,web',
-          '--user-agent', 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36'
+          '--extractor-args', 'youtube:player_client=android,web'
         );
       }
 
-      if (platform === 'tiktok' || /tiktok\.com/i.test(url)) {
-        args.splice(1, 0, '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+      if (Array.isArray(extraArgs) && extraArgs.length > 0) {
+        args.splice(1, 0, ...extraArgs);
       }
 
       if (isYouTube) {
@@ -1797,7 +2806,7 @@ export class MediaDownloader {
         args.splice(1, 0, '-f', 'bv*[ext=mp4][height<=1080]+ba[ext=m4a]/b[ext=mp4]/ba/b/best');
       }
 
-      await execFileAsync('yt-dlp', args, { timeout: 90000 });
+      await execFileAsync('yt-dlp', args, { timeout: isHighLimit ? 360000 : 90000 });
 
       const files = readdirSync(tempDir);
       if (files.length === 0) {
@@ -1806,45 +2815,74 @@ export class MediaDownloader {
 
       const mediaItems = [];
       let audioTrack = null;
-      let title = 'Downloaded Media';
+      let title = metadataHint?.title || 'Downloaded Media';
+      let author = metadataHint?.author || 'Social Media';
+      let durationSeconds = Number(metadataHint?.durationSeconds || 0) || null;
 
-      // Sort files to preserve order
+      // Sort files to preserve order; read .info.json first for accurate title/author/duration
       files.sort();
+      for (const f of files) {
+        if (!f.endsWith('.info.json')) continue;
+        try {
+          const info = JSON.parse(readFileSync(join(tempDir, f), 'utf8'));
+          if (info?.title && !metadataHint?.title) title = String(info.title).trim();
+          const detectedAuthor = info?.uploader || info?.channel || info?.artist || info?.creator;
+          if (detectedAuthor && !metadataHint?.author) author = String(detectedAuthor).trim();
+          if (Number(info?.duration) > 0 && !durationSeconds) durationSeconds = Math.round(Number(info.duration));
+        } catch {}
+      }
 
       for (const f of files) {
+        if (f.endsWith('.info.json') || f.endsWith('.part') || f.endsWith('.ytdl')) continue;
         const fullPath = join(tempDir, f);
         const stat = statSync(fullPath);
         if (stat.isDirectory() || stat.size === 0) continue;
 
         const ext = f.split('.').pop().toLowerCase();
-        const buf = readFileSync(fullPath);
 
         if (['mp4', 'webm', 'mov', 'mkv'].includes(ext)) {
-          let vidBuf = buf;
-          try {
-            vidBuf = await optimizeVideoForTelegram(buf) || buf;
-          } catch {}
-          mediaItems.push({
-            type: 'video',
-            buffer: vidBuf,
-            filename: `${f.replace(/\.[^.]+$/, '')}.mp4`,
-            mimeType: 'video/mp4'
-          });
+          if (stat.size > 80 * 1024 * 1024) {
+            const largeDir = existsSync('/data/tmp') ? '/data/tmp' : tmpdir();
+            mkdirSync(largeDir, { recursive: true });
+            const movedPath = join(largeDir, `lancy_large_${Date.now()}_${Math.random().toString(36).slice(2, 7)}.mp4`);
+            renameSync(fullPath, movedPath);
+            mediaItems.push({
+              type: 'video',
+              filePath: movedPath,
+              sizeBytes: stat.size,
+              filename: `${f.replace(/\.[^.]+$/, '')}.mp4`,
+              mimeType: 'video/mp4',
+              cleanupOnDeliver: true
+            });
+          } else {
+            const buf = readFileSync(fullPath);
+            let vidBuf = buf;
+            try {
+              vidBuf = await optimizeVideoForTelegram(buf) || buf;
+            } catch {}
+            mediaItems.push({
+              type: 'video',
+              buffer: vidBuf,
+              filename: `${f.replace(/\.[^.]+$/, '')}.mp4`,
+              mimeType: 'video/mp4'
+            });
 
-          // Extract audio from first video with sound
-          if (!audioTrack) {
-            onProgress?.('Checking video sound track… ♡');
-            const extAudio = await this.extractAudioFromFile(fullPath);
-            if (extAudio) {
-              audioTrack = {
-                buffer: extAudio,
-                filename: `${f.replace(/\.[^.]+$/, '')}.mp3`,
-                title: f.replace(/\.[^.]+$/, ''),
-                performer: 'Audio Track'
-              };
+            // Extract audio from first video with sound
+            if (!audioTrack) {
+              onProgress?.('Checking video sound track… ♡');
+              const extAudio = await this.extractAudioFromFile(fullPath);
+              if (extAudio) {
+                audioTrack = {
+                  buffer: extAudio,
+                  filename: `${f.replace(/\.[^.]+$/, '')}.mp3`,
+                  title: title !== 'Downloaded Media' ? title : f.replace(/\.[^.]+$/, ''),
+                  performer: author !== 'Social Media' ? author : 'Audio Track'
+                };
+              }
             }
           }
         } else if (['jpg', 'jpeg', 'png', 'webp'].includes(ext)) {
+          const buf = readFileSync(fullPath);
           mediaItems.push({
             type: 'photo',
             buffer: buf,
@@ -1852,12 +2890,13 @@ export class MediaDownloader {
             mimeType: 'image/jpeg'
           });
         } else if (['mp3', 'm4a', 'wav', 'opus'].includes(ext)) {
-          if (!audioTrack) {
+          if (!audioTrack && stat.size <= 80 * 1024 * 1024) {
+            const buf = readFileSync(fullPath);
             audioTrack = {
               buffer: buf,
               filename: `${f.replace(/\.[^.]+$/, '')}.mp3`,
-              title: f.replace(/\.[^.]+$/, ''),
-              performer: 'Audio Track'
+              title: title !== 'Downloaded Media' ? title : f.replace(/\.[^.]+$/, ''),
+              performer: author !== 'Social Media' ? author : 'Audio Track'
             };
           }
         }
@@ -1871,7 +2910,8 @@ export class MediaDownloader {
         sourceUrl: url,
         platform,
         title,
-        author: 'Social Media',
+        author,
+        durationSeconds,
         mediaItems,
         audioTrack
       };

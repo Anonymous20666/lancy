@@ -1,7 +1,9 @@
 import { audioUpload, audioFileId } from './preview.js';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { logger } from '../core/logger.js';
+import { getCueAt } from '../media/subtitles.js';
 import { KeyedLock, MusicError, queueEntry } from './model.js';
 
 /** Sole owner of ephemeral destination queues. The bridge exclusively owns account leases. */
@@ -10,7 +12,7 @@ export class QueueManager extends EventEmitter {
     super(); this.app = app; this.voice = voiceClient; this.db = db;
     this.log = log || logger().child({ module: 'music-queue' }); this.sessions = new Map(); this.locks = new KeyedLock(); this.cardLocks = new KeyedLock(); this.closed = false;
     if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) throw new MusicError('INVALID_CONFIGURATION', 'Music idle timeout must be a positive duration.');
-    this.idleTimeoutMs = idleTimeoutMs;this.prefetchJobs=0;this.prefetchWork=new Set();this.eventJobs=new Set();this.eventAbort=new AbortController();
+    this.idleTimeoutMs = idleTimeoutMs;this.prefetchJobs=0;this.prefetchWork=new Set();this.radioRefillInFlight=new Set();this.eventJobs=new Set();this.eventAbort=new AbortController();
     for(const [id,m] of Object.entries(db?.getSetting?.('music.managedMemberships',{})||{})){const state=this.getSession(Number(id));state.prepared=true;state.isChannel=Boolean(m.isChannel);state.accountAlias=m.alias;this.#idle(state);}
     if(pollMs>0&&typeof this.voice?.waitEvent==='function')void this.watchEvents();
     if (pollMs > 0) { this.poller = setInterval(() => this.reconcile().catch(() => this.log.warn('Music reconciliation failed')), pollMs); this.poller.unref?.(); }
@@ -24,126 +26,269 @@ export class QueueManager extends EventEmitter {
   getSession(chatId) {
     const id = Number(chatId);
     if (!Number.isSafeInteger(id) || !id) throw new MusicError('INVALID_DESTINATION', 'Invalid playback destination.');
-    if(!this.sessions.has(id)&&this.sessions.size>=1000){const old=[...this.sessions].find(([,s])=>!s.connected&&!s.currentTrack&&!s.upcoming.length&&!s.idleTimeout&&!this.app?.music?.channelPanels?.hasDestination(s.chatId));if(old)this.sessions.delete(old[0]);else throw new MusicError('SESSION_LIMIT','The music destination limit has been reached.');}
-    if (!this.sessions.has(id)) this.sessions.set(id, { chatId: id, status: 'idle', currentTrack: null, upcoming: [], history: [], loopMode: 'off', volume: 100, isChannel: false, screenMessageId: null, playerChatId: id, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null, connected: false, accountAlias: null, preferredAccount: null, lastError: null, view: 'player', page: 0, bass: false, eqPreset: 'off', skipVotes: [] });
+    if(!this.sessions.has(id)&&this.sessions.size>=1000){const old=[...this.sessions].find(([,s])=>!s.connected&&!s.currentTrack&&!s.upcoming.length&&!(s.movieUpcoming?.length)&&!s.idleTimeout&&!this.app?.music?.channelPanels?.hasDestination(s.chatId));if(old)this.sessions.delete(old[0]);else throw new MusicError('SESSION_LIMIT','The music destination limit has been reached.');}
+    if (!this.sessions.has(id)) {
+      const savedAiDj = this.db?.getSetting?.(`music.aidj.${id}`, null);
+      const savedBass = this.db?.getSetting?.(`music.bass.${id}`, null);
+      const savedEq = this.db?.getSetting?.(`music.eq.${id}`, null);
+      const savedSubMode = this.db?.getSetting?.(`music.submode.${id}`, null);
+      const defaultBass = savedBass !== null && savedBass !== undefined ? Boolean(savedBass) : true;
+      const defaultEq = savedEq || (defaultBass ? 'bass' : 'off');
+      this.sessions.set(id, {
+        chatId: id, status: 'idle', currentTrack: null, upcoming: [], history: [], movieUpcoming: [], movieHistory: [], activeDeck: 'music', loopMode: 'off', volume: 100, isChannel: false,
+        screenMessageId: null, playerChatId: id, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null,
+        connected: false, accountAlias: null, preferredAccount: null, lastError: null, view: 'player', page: 0, bass: defaultBass, eqPreset: defaultEq,
+        subtitleMode: ['screen', 'live', 'off'].includes(savedSubMode) ? savedSubMode : 'screen',
+        liveSubCue: '',
+        skipVotes: [],
+        vcUrl: null,
+        destinationUsername: null,
+        botUsername: null,
+        activePoll: null,
+        aiDj: savedAiDj && typeof savedAiDj === 'object'
+          ? { enabled: Boolean(savedAiDj.enabled), vibe: savedAiDj.vibe || 'Late Night Studio Mix', introNote: '', seenIds: [], cursor: 0, chatHistory: [] }
+          : { enabled: false, vibe: 'Late Night Studio Mix', introNote: '', seenIds: [], cursor: 0, chatHistory: [] }
+      });
+    }
     return this.sessions.get(id);
   }
   hasActiveSession(id) { const s = this.sessions.get(Number(id)); return Boolean(s && ['playing','paused','buffering'].includes(s.status)); }
+  #deckForTrack(track) { return track?.provider === 'movie' ? 'movie' : 'music'; }
+  #deckQueue(s, deck) { return deck === 'movie' ? s.movieUpcoming : s.upcoming; }
+  #deckHistory(s, deck) { return deck === 'movie' ? s.movieHistory : s.history; }
   enqueue(id, track, { top = false } = {}) {
+    if (track?.provider === 'movie') return this.enqueueMovie(id, track, { top });
     if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
     const s = this.getSession(id); if (s.upcoming.length >= 100) throw new MusicError('QUEUE_FULL', 'This destination has reached its 100-track queue limit.');
     this.#cancelIdle(s); const entry = queueEntry(track); top ? s.upcoming.unshift(entry) : s.upcoming.push(entry);
-    if(s.status==='playing')this.prefetch(s);this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.upcoming.length, total: s.upcoming.length, track: entry };
+    if (s.status === 'playing' && s.activeDeck !== 'movie') this.prefetch(s);
+    else for (const u of s.upcoming.slice(0, 3)) this.#warmTrack(s, u);
+    this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.upcoming.length, total: s.upcoming.length, track: entry };
+  }
+  enqueueMovie(id, track, { top = false } = {}) {
+    if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
+    const s = this.getSession(id); if (s.movieUpcoming.length >= 100) throw new MusicError('QUEUE_FULL', 'Cinema queue has reached its 100-item limit.');
+    this.#cancelIdle(s); const entry = queueEntry({ ...track, provider: 'movie', mediaType: 'video' });
+    top ? s.movieUpcoming.unshift(entry) : s.movieUpcoming.push(entry);
+    this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.movieUpcoming.length, total: s.movieUpcoming.length, track: entry };
+  }
+  #trackAcquireOptions(s, entry) {
+    return {
+      video: entry?.mediaType === 'video',
+      isChannel: Boolean(s?.isChannel),
+      eqPreset: s?.eqPreset || (s?.bass ? 'bass' : 'off'),
+      djNote: s?.aiDj?.introNote || ''
+    };
+  }
+  #warmTrack(s, entry) {
+    if (this.closed || !entry?.entryId) return null;
+    if (entry.filePath && existsSync(entry.filePath)) return null;
+    if (!['youtube', 'audius', 'telegram', 'music'].includes(entry.provider)) return null;
+    if (typeof this.app?.musicLibrary?.warm !== 'function') return null;
+    if (!s.warmedPromises) s.warmedPromises = new Map();
+    const existing = s.warmedPromises.get(entry.entryId);
+    if (existing) return existing;
+    if (!s.warmedIds) s.warmedIds = new Set();
+    if (s.warmedIds.has(entry.entryId)) return null;
+    s.warmedIds.add(entry.entryId);
+    if (s.warmedIds.size > 80) s.warmedIds.delete(s.warmedIds.values().next().value);
+    const job = Promise.resolve(this.app.musicLibrary.warm(entry, this.#trackAcquireOptions(s, entry)))
+      .catch(() => null)
+      .finally(() => { if (s.warmedPromises?.get(entry.entryId) === job) s.warmedPromises.delete(entry.entryId); });
+    s.warmedPromises.set(entry.entryId, job);
+    return job;
   }
   async addMany(id, tracks) {
+    if (Array.isArray(tracks) && tracks.length && tracks.every(t => t?.provider === 'movie')) {
+      return this.addMovies(id, tracks);
+    }
     const generation=this.getSession(id).stopGeneration||0;
     return this.locks.run(Number(id), async () => {
       const s = this.getSession(id);if((s.stopGeneration||0)!==generation)throw new MusicError('ACTION_CANCELLED','This queue request was cancelled by Stop.');if(s.stopPending)throw new MusicError('DEPARTURE_PENDING','Wait for call/group departure to be confirmed, then run /vc to start again.'); if (s.upcoming.length + tracks.length > 100) throw new MusicError('QUEUE_FULL', 'There is not enough room in the queue for this selection.');
       const result = tracks.map(t => this.enqueue(id, t));
-      if (!['playing','paused','buffering'].includes(s.status)) await this.#next(s, { manual: true });
+      if (!['playing','paused','buffering'].includes(s.status)) {
+        s.activeDeck = 'music';
+        if (s.view === 'cinema' || s.view === 'mqueue') s.view = 'player';
+        await this.#next(s, { manual: true, deck: 'music' });
+      }
       await this.updatePlayerCard(id); return result;
+    });
+  }
+  async addMovies(id, tracks, { playNow = false } = {}) {
+    const list = (Array.isArray(tracks) ? tracks : [tracks]).filter(Boolean);
+    if (!list.length) return [];
+    if (playNow) this.sessions.get(Number(id))?.prepareAbort?.abort();
+    const generation = this.getSession(id).stopGeneration || 0;
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      if ((s.stopGeneration || 0) !== generation) throw new MusicError('ACTION_CANCELLED', 'This Cinema request was cancelled by Stop.');
+      if (s.stopPending) throw new MusicError('DEPARTURE_PENDING', 'Wait for call/group departure to be confirmed, then run /vc to start again.');
+      if (s.movieUpcoming.length + list.length > 100) throw new MusicError('QUEUE_FULL', 'Cinema queue has reached its 100-item limit.');
+      let result;
+      if (playNow) {
+        result = [];
+        for (let i = list.length - 1; i >= 0; i--) {
+          result.unshift(this.enqueueMovie(id, list[i], { top: true }));
+        }
+      } else {
+        result = list.map(t => this.enqueueMovie(id, t));
+      }
+      const hadActive = ['playing', 'paused', 'buffering'].includes(s.status) && Boolean(s.currentTrack);
+      if (playNow || !hadActive) {
+        s.activeDeck = 'movie';
+        s.view = 'cinema';
+        this.dropPrefetch(s);
+        await this.#next(s, {
+          manual: true,
+          targetEntryId: result[0]?.track?.entryId || null,
+          preservePreviousToEnd: Boolean(playNow && hadActive),
+          deck: 'movie'
+        });
+      } else {
+        await this.updatePlayerCard(id);
+      }
+      return result;
     });
   }
   async playNext(id) { return this.locks.run(Number(id), () => this.#next(this.getSession(id))); }
   async ensurePlaying(id) { return this.locks.run(Number(id), () => this.hasActiveSession(id) ? this.getSession(id).currentTrack : this.#next(this.getSession(id), { manual: true })); }
   #release(s) { s.media?.release?.(); s.media = null; }
-  armPreparedIdle(id) { const s=this.getSession(id);if(!s.currentTrack&&!s.upcoming.length&&s.status==='idle')this.#idle(s); }
+  armPreparedIdle(id) { const s=this.getSession(id);if(!s.currentTrack&&!s.upcoming.length&&!(s.movieUpcoming?.length)&&s.status==='idle')this.#idle(s); }
   dropPrefetch(s) { const p=s.prefetched;s.prefetched=null;p?.media?.release?.();if(p)p.media=null; }
+  async ensureInfinityLookahead(s) {
+    if (this.closed || !this.app?.musicProviders || this.radioRefillInFlight.has(s.chatId)) return;
+    const aiDj = this.app?.music?.aiDj;
+    const radioActive = Boolean(s.radio?.enabled);
+    const aiDjActive = Boolean(aiDj?.isEnabled?.(s));
+    if ((!radioActive && !aiDjActive) || s.upcoming.length >= 3) return;
+    this.radioRefillInFlight.add(s.chatId);
+    try {
+      if (radioActive) {
+        await this.app?.music?.radio?.refill(s).catch(() => {});
+      }
+      if (aiDjActive && s.upcoming.length < 3) {
+        await aiDj.curateNextTracks(s, { count: 3 }).catch(() => {});
+      }
+      if (s.upcoming.length && s.status === 'playing') {
+        this.prefetch(s);
+      }
+    } finally {
+      this.radioRefillInFlight.delete(s.chatId);
+    }
+  }
   prefetch(s) {
     if(this.closed||s.status!=='playing')return;
-    if(s.radio?.enabled&&!s.upcoming.length&&this.app?.musicLibrary&&s.lastRadioPrefetchId!==s.playbackId){
-      s.lastRadioPrefetchId=s.playbackId;
-      void this.app?.music?.radio?.refill(s).catch(()=>{});
-      return;
+    const activeDeck=s.activeDeck==='movie'||s.currentTrack?.provider==='movie'?'movie':'music';
+    if(activeDeck==='movie')return;
+    const aiDjActive=Boolean(this.app?.music?.aiDj?.isEnabled?.(s));
+    if((s.radio?.enabled||aiDjActive)&&s.upcoming.length<3&&this.app?.musicLibrary&&!this.radioRefillInFlight.has(s.chatId)){
+      void this.ensureInfinityLookahead(s);
     }
     const next=s.upcoming[0];
-    if(!next||!['youtube','audius','telegram','music'].includes(next.provider)||!this.app?.musicLibrary||s.status!=='playing')return;
-    if(typeof this.app.musicLibrary.warm==='function'){
-      if(!s.warmedIds)s.warmedIds=new Set();
-      for(const u of s.upcoming.slice(1,3)){
-        if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram','music'].includes(u.provider)){
-          s.warmedIds.add(u.entryId);
-          if(s.warmedIds.size>50)s.warmedIds.delete(s.warmedIds.values().next().value);
-          const uVid=u.mediaType==='video';
-          void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
-        }
-      }
-    }
+    if(!next||s.status!=='playing')return;
+    for(const u of s.upcoming.slice(1,4))this.#warmTrack(s,u);
+    if(next.filePath&&existsSync(next.filePath))return;
+    if(!['youtube','audius','telegram','music'].includes(next.provider)||!this.app?.musicLibrary)return;
+    const acquireOpts=this.#trackAcquireOptions(s,next);
     if(s.prefetched?.entryId===next.entryId)return;
     this.dropPrefetch(s);if(this.prefetchJobs>=5)return;
     const p={entryId:next.entryId,media:null,claimed:false};s.prefetched=p;this.prefetchJobs++;
-    const wantsVideo=next.mediaType==='video';
-    p.promise=this.app.musicLibrary.acquire(next,{video:wantsVideo}).then(media=>{
+    p.promise=this.app.musicLibrary.acquire(next,acquireOpts).then(media=>{
       if(this.closed||s.prefetched!==p||(!p.claimed&&s.upcoming[0]?.entryId!==p.entryId)){media.release();return null;}
       p.media=media;
       void this.updatePlayerCard(s.chatId).catch(()=>{});
       return media;
     }).catch(()=>null).finally(()=>{this.prefetchJobs=Math.max(0,this.prefetchJobs-1);this.prefetchWork.delete(p.promise);});this.prefetchWork.add(p.promise);
   }
-  async #next(s, { manual = false } = {}) {
+  async #next(s, { manual = false, targetEntryId = null, preservePreviousToEnd = false, deck = null } = {}) {
     if(this.closed)return null;
     if(s.stopPending)throw new MusicError('DEPARTURE_PENDING','Wait for call/group departure to be confirmed, then run /vc to start again.');
     this.#cancelIdle(s);s.controlRevision=(s.controlRevision||0)+1;s.lastNotice=null;
     const previous=s.currentTrack,cancel=s.stopGeneration||0;
-    if(previous){
-      if(!manual&&s.loopMode==='track')s.upcoming.unshift(previous);
-      else if(s.loopMode==='queue'&&!s.upcoming.some(t=>t.entryId===previous.entryId))s.upcoming.push(previous);
+    const targetDeck=deck||(s.activeDeck==='movie'||previous?.provider==='movie'?'movie':'music');
+    s.activeDeck=targetDeck;
+    const q=this.#deckQueue(s,targetDeck);
+    const hist=this.#deckHistory(s,targetDeck);
+    const prevDeck=previous?this.#deckForTrack(previous):targetDeck;
+    const sameDeckPrevious=Boolean(previous&&prevDeck===targetDeck);
+    const allowAutoRefill=targetDeck==='music';
+    const aiDj=allowAutoRefill?this.app?.music?.aiDj:null;
+    const aiDjActive=Boolean(allowAutoRefill&&aiDj?.isEnabled?.(s));
+    if(previous&&!sameDeckPrevious){
+      const prevQ=this.#deckQueue(s,prevDeck);
+      if(!prevQ.some(t=>t.entryId===previous.entryId)){
+        prevQ.unshift({...previous,resumePositionSeconds:Number.isFinite(s.positionSeconds)?s.positionSeconds:(previous.resumePositionSeconds||0)});
+      }
+    }else if(previous && !targetEntryId){
+      if(!manual&&s.loopMode==='track')q.unshift(previous);
+      else if(s.loopMode==='queue'&&!q.some(t=>t.entryId===previous.entryId))q.push(previous);
     }
-    if(s.radio?.enabled&&!s.upcoming.length)await this.app?.music?.radio?.refill(s);
+    if(allowAutoRefill&&(s.radio?.enabled||aiDjActive)&&q.length<3){
+      if(q.length<2){
+        if(s.radio?.enabled)await this.app?.music?.radio?.refill(s).catch(()=>{});
+        if(aiDjActive&&q.length<2)await aiDj.curateNextTracks(s,{count:3}).catch(()=>{});
+      }else{
+        void this.ensureInfinityLookahead(s);
+      }
+    }
     if(this.closed||(s.stopGeneration||0)!==cancel)return null;
     let refillTries=0;
-    while(s.upcoming.length||(s.radio?.enabled&&refillTries<2)){
-      if(!s.upcoming.length&&s.radio?.enabled&&refillTries<2){
+    while(q.length||(allowAutoRefill&&(s.radio?.enabled||aiDjActive)&&refillTries<2)){
+      if(!q.length&&allowAutoRefill&&(s.radio?.enabled||aiDjActive)&&refillTries<2){
         refillTries++;
-        await this.app?.music?.radio?.refill(s).catch(()=>{});
-        if(!s.upcoming.length)break;
+        if(s.radio?.enabled)await this.app?.music?.radio?.refill(s).catch(()=>{});
+        if(aiDjActive&&!q.length)await aiDj.curateNextTracks(s,{count:3}).catch(()=>{});
+        if(!q.length)break;
       }
-      const entry=s.upcoming.shift();let media=null,calledNative=false;
+      const entry=q.shift();let media=null,calledNative=false;
       const warm=s.prefetched?.entryId===entry.entryId?s.prefetched:null;if(warm)warm.claimed=true;
-      if(typeof this.app?.musicLibrary?.warm==='function'){
-        if(!s.warmedIds)s.warmedIds=new Set();
-        for(const u of s.upcoming.slice(0,2)){
-          if(u?.entryId&&!s.warmedIds.has(u.entryId)&&['youtube','audius','telegram','music'].includes(u.provider)){
-            s.warmedIds.add(u.entryId);
-            const uVid=u.mediaType==='video';
-            void this.app.musicLibrary.warm(u,{video:uVid}).catch(()=>{});
-          }
-        }
-      }
-      // Keep the old recording/title truthful during preparation. There is no
-      // intentional empty-stream gap before an already prepared replacement.
-      if(!previous)s.status='buffering';s.lastNotice=`⏳ Preparing ${entry.title}…`;await this.updatePlayerCard(s.chatId);
+      for(const u of q.slice(0,3))this.#warmTrack(s,u);
+      const wantsVideo=entry.mediaType==='video';
+      const acquireOpts=this.#trackAcquireOptions(s,entry);
+      const warmedJob=s.warmedPromises?.get(entry.entryId)||null;
+      const readyNow=Boolean(
+        entry.queuedMedia||
+        warm?.media||
+        (entry.filePath&&existsSync(entry.filePath))||
+        (typeof this.app?.musicLibrary?.hasReady==='function'&&['youtube','audius','telegram','music'].includes(entry.provider)&&this.app.musicLibrary.hasReady(entry,acquireOpts))
+      );
+      // Keep the old recording/title truthful during preparation. Skip the extra
+      // "Preparing..." card edit when media is already prefetched/warmed locally.
+      if(!previous)s.status='buffering';
+      if(!readyNow){s.lastNotice=`⏳ Preparing ${entry.title}…`;await this.updatePlayerCard(s.chatId);}
       try{
         if(entry.queuedMedia){media=entry.queuedMedia;entry.queuedMedia=null;}
         else if(warm){media=warm.media||await this.#awaitMedia(s,()=>warm.promise);if(s.prefetched===warm)s.prefetched=null;warm.media=null;}
+        if(!media&&warmedJob){await this.#awaitMedia(s,()=>warmedJob).catch(()=>null);}
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
-        const wantsVideo=entry.mediaType==='video';
         if(!media&&this.app?.musicLibrary&&['youtube','audius','telegram','music'].includes(entry.provider)){
           try {
-            media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,{video:wantsVideo}));
+            media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(entry,acquireOpts));
           } catch(acquireErr) {
             if(this.app?.musicProviders&&entry.provider!=='telegram'){
               const query=`${entry.title} ${entry.artist||''}`.trim();
               try {
                 const sameProvider=this.app.musicProviders.get(entry.provider);
-                if(sameProvider&&(!sameProvider. assertEnabled||sameProvider.enabled!==false)){
-                  const sameRes=await sameProvider.search(query,{limit:3}).catch(()=>null);
+                if(sameProvider&&(!sameProvider.assertEnabled||sameProvider.enabled!==false)){
+                  const sameRes=await sameProvider.search(query,{limit:3,video:wantsVideo}).catch(()=>null);
                   for(const cand of (sameRes?.items||[]).filter(x=>x.providerId!==entry.providerId).slice(0,2)){
                     if(this.closed||(s.stopGeneration||0)!==cancel)break;
-                    const candTrack={...cand,entryId:entry.entryId,requester:entry.requester};
-                    media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(candTrack,{video:wantsVideo})).catch(()=>null);
+                    const candTrack={...cand,mediaType:wantsVideo?'video':(cand.mediaType||entry.mediaType),entryId:entry.entryId,requester:entry.requester};
+                    media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(candTrack,acquireOpts)).catch(()=>null);
                     if(media)break;
                   }
                 }
               } catch {}
               if(!media){
-                const altProvider=entry.provider==='youtube'?'audius':(this.app.musicProviders.get('youtube')?.enabled?'youtube':null);
+                const hasMusicAdapter=Boolean(this.app.musicProviders.adapters?.has?.('music'));
+                const ytEnabled=Boolean(this.app.musicProviders.get?.('youtube')?.enabled);
+                const altProvider=entry.provider==='youtube'?(hasMusicAdapter?'music':(wantsVideo?null:'audius')):(ytEnabled?'youtube':(hasMusicAdapter&&entry.provider!=='music'?'music':null));
                 if(altProvider){
-                  const altRes=await this.app.musicProviders.get(altProvider).search(query,{limit:3}).catch(()=>null);
+                  const altRes=await this.app.musicProviders.get(altProvider).search(query,{limit:3,video:altProvider==='youtube'?wantsVideo:false}).catch(()=>null);
                   for(const cand of (altRes?.items||[]).slice(0,2)){
                     if(this.closed||(s.stopGeneration||0)!==cancel)break;
-                    const altTrack={...cand,entryId:entry.entryId,requester:entry.requester};
-                    media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(altTrack,{video:wantsVideo})).catch(()=>null);
+                    const altTrack={...cand,mediaType:wantsVideo?'video':(cand.mediaType||entry.mediaType),entryId:entry.entryId,requester:entry.requester};
+                    media=await this.#awaitMedia(s,()=>this.app.musicLibrary.acquire(altTrack,acquireOpts)).catch(()=>null);
                     if(media)break;
                   }
                 }
@@ -155,11 +300,25 @@ export class QueueManager extends EventEmitter {
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
         const track=media?{...media.track,entryId:entry.entryId,requester:entry.requester}:entry;
         if(wantsVideo&&track.capabilities)track.capabilities={...track.capabilities,video:true};
-        const source=track.filePath||track.streamUrl||track.audioUrl;if(!source)throw new MusicError('NO_SOURCE','This track has no playable media.');
+        const rawSource=track.filePath||track.streamUrl||track.audioUrl;if(!rawSource)throw new MusicError('NO_SOURCE','This track has no playable media.');
+        let source=rawSource;
+        let remoteProxy=false;
+        if(!track.filePath && track.streamUrl && /^https?:\/\//i.test(track.streamUrl) && typeof this.app?.videoServer?.registerRemoteStream==='function'){
+          const isHls = Boolean(track.isHls || track.format === 'hls' || /\.m3u8(\?|$)/i.test(track.streamUrl));
+          const proxied=this.app.videoServer.registerRemoteStream({
+            url:track.streamUrl,
+            headers:track.streamHeaders||{},
+            isHls,
+            contentType: isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'
+          });
+          if(proxied){source=proxied;remoteProxy=true;}
+        }
+        const subMode=s.subtitleMode||'screen';
+        const subtitlePath=subMode==='screen' && track.subtitlePath && existsSync(track.subtitlePath)?track.subtitlePath:null;
         const playbackId=randomUUID();calledNative=true;
         const eq=s.eqPreset||(s.bass?'bass':'off');
         const isVideo=track.mediaType==='video';
-        const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq};
+        const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath};
         let r;
         try {
           r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
@@ -174,30 +333,46 @@ export class QueueManager extends EventEmitter {
             throw playErr;
           }
         }
-        if(previous){s.history.push(previous);if(s.history.length>25)s.history.shift();}
-        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.playbackId=playbackId;s.status='playing';s.connected=true;s.lastError=null;s.lastNotice=null;s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=null;s.failures=0;s.skipVotes=[];
-        try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}
+        if(previous&&sameDeckPrevious&&!s.suppressHistoryOnce){hist.push(previous);if(hist.length>25)hist.shift();}
+        if(previous&&sameDeckPrevious&&preservePreviousToEnd&&previous.entryId!==entry.entryId&&!q.some(t=>t.entryId===previous.entryId)){
+          q.push({...previous,resumePositionSeconds:Number.isFinite(s.positionSeconds)?s.positionSeconds:(previous.resumePositionSeconds||0)});
+        }
+        s.suppressHistoryOnce=false;
+        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=null;s.failures=0;s.skipVotes=[];
+        this.prefetch(s);
+        if(!previous||!s.volumeConfirmed||s.appliedVolume!==s.volume){
+          try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;s.appliedVolume=s.volume;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}
+        }
         this.emit('track_start',{chatId:s.chatId,track:s.currentTrack,session:s});
-        this.app?.music?.requestCardLyrics?.(s);
-        this.prefetch(s);await this.updatePlayerCard(s.chatId);return s.currentTrack;
+        if(targetDeck==='music')this.app?.music?.requestCardLyrics?.(s);
+        if(aiDjActive&&aiDj?.generateIntroNote){
+          void aiDj.generateIntroNote(s,s.currentTrack,previous).then(()=>this.updatePlayerCard(s.chatId)).catch(()=>{});
+        }
+        await this.updatePlayerCard(s.chatId);return s.currentTrack;
       }catch(error){
         if(media&&['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED','RATE_LIMITED'].includes(error.code)){entry.queuedMedia=media;media=null;}
         media?.release();s.lastError=error instanceof MusicError?error.message:'The call or media source failed. Check account membership and call permissions.';
         this.log.warn({chatId:s.chatId,code:error.code||'PLAY_FAILED',backendKind:/^[A-Za-z0-9_]{1,80}$/.test(error.backendKind||'')?error.backendKind:undefined},'Music track could not start');this.emit('track_error',{chatId:s.chatId,track:entry,code:error.code||'PLAY_FAILED'});s.lastNotice=`Could not start ${entry.title}.`;
         if(['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED','RATE_LIMITED'].includes(error.code)){
-          s.lastNotice+=' Your selection is retained in the queue.';s.upcoming.unshift(entry);if(previous&&calledNative&&!s.upcoming.some(t=>t.entryId===previous.entryId))s.upcoming.unshift(previous);
+          s.lastNotice+=' Your selection is retained in the queue.';q.unshift(entry);if(previous&&sameDeckPrevious&&calledNative&&!q.some(t=>t.entryId===previous.entryId))q.unshift(previous);
           if(calledNative){this.#release(s);s.currentTrack=null;s.playbackId=null;s.connected=false;s.status='error';}
           else if(!previous)s.status='error';
           await this.updatePlayerCard(s.chatId);return null;
         }
-        if(s.radio?.seen&&entry?.id){s.radio.seen.push(entry.id);}
+        if(targetEntryId&&entry.entryId===targetEntryId&&!calledNative){
+          s.lastNotice=`Could not load ${entry.title}. Your selection is retained in the queue.`;
+          q.unshift(entry);
+          await this.updatePlayerCard(s.chatId);
+          return s.currentTrack;
+        }
+        if(targetDeck==='music'&&s.radio?.seen&&entry?.id){s.radio.seen.push(entry.id);}
       }
     }
     if(s.connected&&this.voice.idle){
       try{this.#assert(await this.voice.idle(s.chatId));}
       catch(error){if(error.code!=='NO_ACTIVE_CALL')throw error;s.connected=false;s.accountAlias=null;s.lastError='The voice chat has ended. Use /vc to prepare it again.';}
     }
-    if(previous){s.history.push(previous);if(s.history.length>25)s.history.shift();}
+    if(previous&&sameDeckPrevious){hist.push(previous);if(hist.length>25)hist.shift();}
     this.dropPrefetch(s);this.#release(s);s.currentTrack=null;s.playbackId=null;s.positionSeconds=null;s.status='idle';
     if(s.connected||s.prepared)this.#idle(s);
     this.emit('queue_empty',{chatId:s.chatId});await this.updatePlayerCard(s.chatId);return null;
@@ -208,8 +383,9 @@ export class QueueManager extends EventEmitter {
     return this.locks.run(Number(id), async () => {
       const s = this.getSession(id);
       if (s.status !== 'paused') {
-        if ((s.status === 'idle' || s.status === 'error') && (s.currentTrack || s.upcoming.length)) {
-          return this.#next(s, { manual: true });
+        const deckQ = this.#deckQueue(s, s.activeDeck || 'music');
+        if ((s.status === 'idle' || s.status === 'error') && (s.currentTrack || deckQ.length)) {
+          return this.#next(s, { manual: true, deck: s.activeDeck || 'music' });
         }
         return false;
       }
@@ -227,21 +403,49 @@ export class QueueManager extends EventEmitter {
       }
     });
   }
-  async skip(id) { return this.locks.run(Number(id), () => this.#next(this.getSession(id), { manual: true })); }
-  async previous(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const track = s.history.at(-1); if (!track) return null; s.history.pop(); if (s.currentTrack) s.upcoming.unshift(s.currentTrack); s.upcoming=s.upcoming.filter(t=>t.entryId!==track.entryId); s.upcoming.unshift(track); return this.#next(s, { manual: true }); }); }
+  async skip(id) { this.sessions.get(Number(id))?.prepareAbort?.abort(); return this.locks.run(Number(id), () => { const s = this.getSession(id); return this.#next(s, { manual: true, deck: s.activeDeck || 'music' }); }); }
+  async previous(id) {
+    this.sessions.get(Number(id))?.prepareAbort?.abort();
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const deck = s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie' ? 'movie' : 'music';
+      const hist = this.#deckHistory(s, deck);
+      const track = hist.at(-1);
+      if (!track) return null;
+      hist.pop();
+      if (deck === 'movie') {
+        if (s.currentTrack?.provider === 'movie') s.movieUpcoming.unshift(s.currentTrack);
+        s.movieUpcoming = s.movieUpcoming.filter(t => t.entryId !== track.entryId);
+        s.movieUpcoming.unshift(track);
+      } else {
+        if (s.currentTrack && s.currentTrack.provider !== 'movie') s.upcoming.unshift(s.currentTrack);
+        s.upcoming = s.upcoming.filter(t => t.entryId !== track.entryId);
+        s.upcoming.unshift(track);
+      }
+      if (s.prefetched?.entryId !== track.entryId) this.dropPrefetch(s);
+      return this.#next(s, { manual: true, deck });
+    });
+  }
   async #finishStop(s) {
     this.#assert(await this.voice.stop(s.chatId,{leaveMembership:!s.isChannel}));
     this.#release(s);s.connected=false;s.prepared=false;s.accountAlias=null;s.playbackId=null;s.stopPending=false;s.stopRetryAfter=0;s.lastError=null;
     this.app?.music?.setup?.forget(s.chatId);
   }
-  requestStop(id) {const s=this.getSession(id);s.stopGeneration=(s.stopGeneration||0)+1;s.prepareAbort?.abort();if(s.radio)s.radio.enabled=false;}
+  requestStop(id) {const s=this.getSession(id);s.stopGeneration=(s.stopGeneration||0)+1;s.prepareAbort?.abort();if(s.radio&&s.activeDeck!=='movie')s.radio.enabled=false;}
   async stop(id) {
     this.requestStop(id);
     return this.locks.run(Number(id), async () => {
       const s=this.getSession(id);this.#cancelIdle(s);
-      if(s.radio)s.radio.enabled=false;
-      this.dropPrefetch(s);for(const t of s.upcoming)t.queuedMedia?.release?.();
-      s.upcoming=[];s.currentTrack=null;s.positionSeconds=null;s.status='idle';s.lastNotice=null;s.stopPending=true;
+      this.dropPrefetch(s);
+      if (s.activeDeck === 'movie') {
+        for(const t of s.movieUpcoming)t.queuedMedia?.release?.();
+        s.movieUpcoming=[];
+      } else {
+        if(s.radio)s.radio.enabled=false;
+        for(const t of s.upcoming)t.queuedMedia?.release?.();
+        s.upcoming=[];
+      }
+      s.currentTrack=null;s.positionSeconds=null;s.status='idle';s.lastNotice=null;s.liveSubCue='';s.stopPending=true;
       try { await this.#finishStop(s); }
       catch(error) {s.status='error';s.lastError='Queue cleared, but immediate call/group departure was not confirmed. Cleanup will retry.';s.stopRetryAfter=Date.now()+30000;throw error;}
       finally {await this.updatePlayerCard(id);}
@@ -257,13 +461,108 @@ export class QueueManager extends EventEmitter {
     try{return await Promise.race([work,cancelled]);}
     finally{controller.signal.removeEventListener('abort',onAbort);if(s.prepareAbort===controller)s.prepareAbort=null;}
   }
-  async setVolume(id, value) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const volume = Number(value); if (!Number.isFinite(volume) || volume < 0 || volume > 200) throw new MusicError('INVALID_VOLUME', 'Use a volume between 0 and 200. Levels above 100 may clip.'); if (s.connected) this.#assert(await this.voice.setVolume(id, volume)); s.volume = volume; s.volumeConfirmed=true; await this.updatePlayerCard(id); return volume; }); }
+  async setVolume(id, value, { skipCardUpdate = false } = {}) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const volume = Number(value); if (!Number.isFinite(volume) || volume < 0 || volume > 200) throw new MusicError('INVALID_VOLUME', 'Use a volume between 0 and 200. Levels above 100 may clip.'); if (s.connected) this.#assert(await this.voice.setVolume(id, volume)); s.volume = volume; s.volumeConfirmed=true; s.appliedVolume=volume; if (!skipCardUpdate) await this.updatePlayerCard(id); return volume; }); }
   async seek(id, seconds) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const value = Number(seconds); if (!s.currentTrack?.capabilities?.seek || !Number.isFinite(value) || value < 0 || value >= s.currentTrack.durationSeconds || !['playing','paused'].includes(s.status)) throw new MusicError('CANNOT_SEEK', 'Choose a position inside the current seekable track.'); const r = this.#assert(await this.voice.seek(id, value)); s.positionSeconds = r.position_seconds ?? null; await this.updatePlayerCard(id); return true; }); }
   toggleLoopMode(id) { const s = this.getSession(id); const modes = ['off','track','queue']; s.loopMode = modes[(modes.indexOf(s.loopMode) + 1) % 3]; return s.loopMode; }
   shuffle(id) { const q = this.getSession(id).upcoming; for (let i=q.length-1; i>0; i--) { const j=Math.floor(Math.random()*(i+1)); [q[i],q[j]]=[q[j],q[i]]; } this.dropPrefetch(this.getSession(id));this.prefetch(this.getSession(id));return q.length; }
   clearQueue(id) { const s = this.getSession(id); const count = s.upcoming.length;for(const t of s.upcoming)t.queuedMedia?.release?.();this.dropPrefetch(s);s.upcoming = [];if(s.radio)s.radio.enabled=false; if (!s.currentTrack && (s.connected||s.prepared)) this.#idle(s); return count; }
+  clearMovieQueue(id) { const s = this.getSession(id); const count = s.movieUpcoming.length; for (const t of s.movieUpcoming) t.queuedMedia?.release?.(); s.movieUpcoming = []; if (!s.currentTrack && (s.connected || s.prepared)) this.#idle(s); return count; }
   removeTrack(id, entryId) { const s = this.getSession(id); const index = typeof entryId === 'number' ? entryId : s.upcoming.findIndex(t => t.entryId === entryId); if(index<0||index>=s.upcoming.length)return null;const removed=s.upcoming.splice(index,1)[0];removed.queuedMedia?.release?.();if(s.prefetched?.entryId===removed.entryId)this.dropPrefetch(s);this.prefetch(s);return removed; }
-  async playNow(id,entryId){return this.locks.run(Number(id),async()=>{const s=this.getSession(id),index=s.upcoming.findIndex(t=>t.entryId===entryId);if(index<0)throw new MusicError('STALE_PLAYER','That queued recording is no longer available.');const [entry]=s.upcoming.splice(index,1);s.upcoming.unshift(entry);if(s.prefetched?.entryId!==entryId)this.dropPrefetch(s);return this.#next(s,{manual:true});});}
+  removeMovieTrack(id, entryId) { const s = this.getSession(id); const index = typeof entryId === 'number' ? entryId : s.movieUpcoming.findIndex(t => t.entryId === entryId); if (index < 0 || index >= s.movieUpcoming.length) return null; const removed = s.movieUpcoming.splice(index, 1)[0]; removed.queuedMedia?.release?.(); return removed; }
+  async playNow(id,entryId){this.sessions.get(Number(id))?.prepareAbort?.abort();return this.locks.run(Number(id),async()=>{const s=this.getSession(id),index=s.upcoming.findIndex(t=>t.entryId===entryId);if(index<0)throw new MusicError('STALE_PLAYER','That queued recording is not available.');const [entry]=s.upcoming.splice(index,1);s.upcoming.unshift(entry);if(s.prefetched?.entryId!==entryId)this.dropPrefetch(s);s.activeDeck='music';s.view='player';const hadActive=Boolean(s.currentTrack&&s.currentTrack.entryId!==entryId&&['playing','paused','buffering'].includes(s.status));return this.#next(s,{manual:true,targetEntryId:entryId,preservePreviousToEnd:hadActive,deck:'music'});});}
+  async playQueuedMovieNow(id, entryId) {
+    this.sessions.get(Number(id))?.prepareAbort?.abort();
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const index = s.movieUpcoming.findIndex(t => t.entryId === entryId);
+      if (index < 0) throw new MusicError('STALE_PLAYER', 'That queued movie/episode is no longer available.');
+      const [entry] = s.movieUpcoming.splice(index, 1);
+      s.movieUpcoming.unshift(entry);
+      this.dropPrefetch(s);
+      s.activeDeck = 'movie';
+      s.view = 'cinema';
+      const hadActive = Boolean(s.currentTrack && s.currentTrack.entryId !== entryId && ['playing', 'paused', 'buffering'].includes(s.status));
+      return this.#next(s, { manual: true, targetEntryId: entryId, preservePreviousToEnd: hadActive, deck: 'movie' });
+    });
+  }
+  promoteMovieTrack(id, entryId) {
+    const s = this.getSession(id);
+    const index = s.movieUpcoming.findIndex(t => t.entryId === entryId);
+    if (index < 0) throw new MusicError('STALE_PLAYER', 'That queued movie/episode is no longer available.');
+    const [entry] = s.movieUpcoming.splice(index, 1);
+    entry.votes = [];
+    s.movieUpcoming.unshift(entry);
+    this.emit('queue_updated', { chatId: s.chatId, session: s });
+    return entry;
+  }
+  async playImmediateAndContinue(id,track){
+    if (track?.provider === 'movie') {
+      const res = await this.addMovies(id, [track], { playNow: true });
+      return { track: res?.[0]?.track || track, replaced: null, interrupted: null };
+    }
+    this.sessions.get(Number(id))?.prepareAbort?.abort();
+    return this.locks.run(Number(id),async()=>{
+      const s=this.getSession(id);
+      if(s.stopPending)throw new MusicError('DEPARTURE_PENDING','Wait for call/group departure to be confirmed, then run /vc to start again.');
+      this.#cancelIdle(s);
+      const active=['playing','paused','buffering'].includes(s.status)&&Boolean(s.currentTrack);
+      const replaced=active?{...s.currentTrack}:null;
+      const incoming=queueEntry(track);
+      s.upcoming.unshift(incoming);
+      s.activeDeck='music';
+      if(s.view==='cinema'||s.view==='mqueue')s.view='player';
+      if(s.prefetched?.entryId!==incoming.entryId)this.dropPrefetch(s);
+      for(const u of s.upcoming.slice(0,3))this.#warmTrack(s,u);
+      const played=await this.#next(s,{manual:true,targetEntryId:incoming.entryId,preservePreviousToEnd:active,deck:'music'});
+      return {track:played,replaced,interrupted:replaced};
+    });
+  }
+  async switchDeck(id, targetDeck) {
+    const target = targetDeck === 'movie' ? 'movie' : 'music';
+    this.sessions.get(Number(id))?.prepareAbort?.abort();
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      if (s.activeDeck !== target && s.currentTrack) {
+        const curDeck = this.#deckForTrack(s.currentTrack);
+        const curQ = this.#deckQueue(s, curDeck);
+        if (!curQ.some(t => t.entryId === s.currentTrack.entryId)) {
+          curQ.unshift({ ...s.currentTrack, resumePositionSeconds: Number.isFinite(s.positionSeconds) ? s.positionSeconds : (s.currentTrack.resumePositionSeconds || 0) });
+        }
+        try { if (s.connected && this.voice?.idle) await this.voice.idle(id); } catch {}
+        this.#release(s);
+        this.dropPrefetch(s);
+        s.currentTrack = null;
+        s.playbackId = null;
+        s.positionSeconds = null;
+        s.status = 'idle';
+        s.liveSubCue = '';
+      }
+      s.activeDeck = target;
+      s.view = target === 'movie' ? 'cinema' : 'player';
+      const targetQ = this.#deckQueue(s, target);
+      if (!s.currentTrack && targetQ.length && (s.connected || s.prepared)) {
+        await this.#next(s, { manual: true, deck: target });
+      } else {
+        await this.updatePlayerCard(id, { forceEdit: true });
+      }
+      return s;
+    });
+  }
+  async setSubtitleMode(id, mode) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const valid = ['screen', 'live', 'off'].includes(mode) ? mode : 'screen';
+      s.subtitleMode = valid;
+      s.liveSubCue = '';
+      this.db?.setSetting?.(`music.submode.${id}`, valid);
+      if (s.connected && s.currentTrack?.subtitlePath && typeof this.voice?.setSubtitle === 'function') {
+        const subArg = valid === 'screen' ? s.currentTrack.subtitlePath : null;
+        await this.voice.setSubtitle(id, subArg).catch(() => {});
+      }
+      await this.updatePlayerCard(id);
+      return valid;
+    });
+  }
   async handleStreamEnded(id, playbackId) {
     return this.locks.run(Number(id), async () => { const s = this.sessions.get(Number(id)); if (!s || !playbackId || playbackId !== s.playbackId || s.status !== 'playing') return false; await this.#next(s); return true; });
   }
@@ -271,7 +570,7 @@ export class QueueManager extends EventEmitter {
   #idle(s) {
     this.#cancelIdle(s); const generation = s.generation,armedAt=Date.now(),armedMonotonic=performance.now();s.idleDeadline=armedAt+this.idleTimeoutMs;
     const leave = () => this.locks.run(s.chatId, async () => {
-      if (this.closed || s.generation !== generation || s.currentTrack || s.upcoming.length || s.status !== 'idle') return;
+      if (this.closed || s.generation !== generation || s.currentTrack || s.upcoming.length || (s.movieUpcoming?.length || 0) || s.status !== 'idle') return;
       try { const groupLeft=Boolean(s.prepared&&!s.isChannel);this.#assert(await this.voice.stop(s.chatId,{leaveMembership:groupLeft})); s.connected = false;s.prepared=false;this.app?.music?.setup?.forget(s.chatId);this.db?.setSetting?.(`music.idleReceipt.${s.chatId}`,{armedAt,departedAt:Date.now(),elapsedMs:Math.round(performance.now()-armedMonotonic),groupLeft});s.lastNotice=groupLeft?'Ten idle minutes completed; the assistant left the call and group.':'Ten idle minutes completed; the assistant left the call.'; s.accountAlias = null; s.idleTimeout = null; await this.updatePlayerCard(s.chatId); }
       catch { s.lastError = 'Idle departure failed; retrying shortly.'; s.idleTimeout = setTimeout(() => void leave(), 30000); s.idleTimeout.unref?.(); }
     });
@@ -292,7 +591,8 @@ export class QueueManager extends EventEmitter {
           s.connected = false;
           this.#release(s);
           if (s.currentTrack) {
-            s.upcoming.unshift(s.currentTrack);
+            const curQ = s.currentTrack.provider === 'movie' ? s.movieUpcoming : s.upcoming;
+            curQ.unshift(s.currentTrack);
             s.currentTrack = null;
           }
           s.playbackId = null;
@@ -303,14 +603,31 @@ export class QueueManager extends EventEmitter {
           s.positionSeconds = Number.isFinite(r.info.position_seconds) ? r.info.position_seconds : null;
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}
           if(r.info.status === 'recovering'){s.lastError='Reconnecting this stream; other destinations are unaffected.';s.positionSeconds=null;}
+          if (s.subtitleMode === 'live' && s.currentTrack?.subtitlePath && Number.isFinite(s.positionSeconds)) {
+            const cues = this.app?.subtitles?.loadCues?.(s.currentTrack.subtitlePath);
+            const cue = cues?.length ? getCueAt(cues, s.positionSeconds * 1000) : null;
+            const nextCueText = cue?.text || '';
+            if (nextCueText !== (s.liveSubCue || '')) {
+              s.liveSubCue = nextCueText;
+              if (nextCueText) {
+                this.emit('subtitle_cue', { chatId: s.chatId, cue: nextCueText, positionSeconds: s.positionSeconds, track: s.currentTrack });
+                if (Date.now() - (s.lastSubEdit || 0) >= 3500) {
+                  s.lastSubEdit = Date.now();
+                  s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+                }
+              }
+            }
+          } else if (s.liveSubCue) {
+            s.liveSubCue = '';
+          }
           if (r.info.status === 'ended' && s.status === 'playing') await this.#next(s);
           else if (r.info.status === 'error' && r.info.publisher_muted) { s.status='error';s.positionSeconds=null;s.lastError='Telegram muted the playback account. Allow it to speak, then stop and retry playback. Your current recording and queue are retained.'; }
           else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
         }
         s.failures = 0;
-        if(s.status==='playing'&&(!s.prefetched||(s.radio?.enabled&&s.upcoming.length<3))){this.prefetch(s);}
+        if(s.status==='playing'&&(!s.prefetched||((s.radio?.enabled||this.app?.music?.aiDj?.isEnabled?.(s))&&s.upcoming.length<3))){this.prefetch(s);}
       } catch { s.failures = (s.failures || 0) + 1; s.positionSeconds = null; s.lastError = 'Playback status unavailable; reconnecting to the engine.'; }
-      if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+5000;await this.updatePlayerCard(s.chatId);}
+      if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+10000;if(!s.overlayView&&(s.view==='player'||s.view==='cinema'))await this.updatePlayerCard(s.chatId);}
     })));
   }
   setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; }
@@ -326,10 +643,11 @@ export class QueueManager extends EventEmitter {
     }
     return updated;
   }
-  async updatePlayerView(s, { preview = null } = {}) {
+  async updatePlayerView(s, { preview = null, forceEdit = false } = {}) {
     return this.cardLocks.run(s.panelToken || s.chatId, async () => {
       const api = s.api || this.app?.telegram?.api;
-      if (!s.screenMessageId || !api || Date.now() < (s.editAfter || 0)) return false;
+      if (!s.screenMessageId || !api || (!forceEdit && Date.now() < (s.editAfter || 0))) return false;
+      if (!preview && !forceEdit && s.overlayView && (Date.now() - (s.overlayAt || 0) < 180000)) return false;
       const screen = this.app?.screens?.get('music'); if (!screen) return false;
       const previews = this.app?.music?.previews;
       if (!preview) {
@@ -338,9 +656,24 @@ export class QueueManager extends EventEmitter {
       }
       if (preview && (!previews?.current(s, preview.request) || s.view !== 'player')) return false;
       const display = preview ? { ...s, fullPreview: { ...s.fullPreview, status: 'ready', fileId: 'attach://music_full_audio', track: preview.media.track } } : s;
-      const rich = display.view === 'radio' ? screen.renderRadio(display) : display.view === 'queue' ? screen.renderQueue(display, display.page) : display.view === 'lyrics' ? screen.renderLyrics?.(display) : display.view === 'volume' ? screen.renderVolumePicker(display) : display.view === 'accounts' ? screen.renderAccounts(display) : display.view === 'options' ? screen.renderOptions(display) : screen.renderPlayer(display);
+      if (display.view === 'queue' || display.view === 'mqueue') {
+        const qLen = display.view === 'mqueue' ? (display.movieUpcoming?.length || 0) : (display.upcoming?.length || 0);
+        const totalQueuePages = Math.max(1, Math.ceil(qLen / 5));
+        if ((display.page || 0) >= totalQueuePages) display.page = totalQueuePages - 1;
+      }
+      const effectiveView = (display.view === 'player' && (display.activeDeck === 'movie' || display.currentTrack?.provider === 'movie')) ? 'cinema' : display.view;
+      const rich = effectiveView === 'radio' ? screen.renderRadio(display)
+        : effectiveView === 'queue' ? screen.renderQueue(display, display.page)
+        : effectiveView === 'mqueue' ? (screen.renderMovieQueue ? screen.renderMovieQueue(display, display.page) : screen.renderQueue(display, display.page))
+        : effectiveView === 'cinema' ? (screen.renderCinemaPlayer ? screen.renderCinemaPlayer(display) : screen.renderPlayer(display))
+        : effectiveView === 'lyrics' ? screen.renderLyrics?.(display)
+        : effectiveView === 'volume' ? screen.renderVolumePicker(display)
+        : effectiveView === 'accounts' ? screen.renderAccounts(display)
+        : effectiveView === 'options' ? screen.renderOptions(display)
+        : effectiveView === 'voteset' ? (screen.renderVoteSettings ? screen.renderVoteSettings(display) : screen.renderOptions(display))
+        : screen.renderPlayer(display);
       if (!rich) return false;
-      const content = JSON.stringify(rich); if (!preview && content === s.lastRender) return true;
+      const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
       try {
         const files = preview ? await audioUpload(preview.media) : null;
         // A track/control can change while reading the file. Never upload stale audio.
@@ -361,8 +694,42 @@ export class QueueManager extends EventEmitter {
       } catch (e) {
         if (preview) throw e;
         const desc = String(e?.description || e?.message || '');
-        if (/message to edit not found|message_id_invalid|chat not found/i.test(desc)) {
+        if (/message is not modified/i.test(desc)) {
+          s.lastRender = content;
+          return true;
+        }
+        if (/message to edit not found|message_id_invalid|message can't be edited|there is no text in the message to edit/i.test(desc)) {
+          const oldMsgId = s.screenMessageId;
+          const now = Date.now();
+          if (oldMsgId && now - (s._lastCardReplaceAt || 0) >= 8000 && typeof api.sendRichMessage === 'function') {
+            s._lastCardReplaceAt = now;
+            try {
+              const replacement = await api.sendRichMessage(s.playerChatId, rich);
+              if (replacement?.message_id) {
+                if (oldMsgId !== replacement.message_id && typeof api.deleteMessage === 'function') {
+                  await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
+                }
+                if (s.panelToken && this.app?.music?.channelPanels?.registerMessage) {
+                  this.app.music.channelPanels.registerMessage(s.panelToken, replacement.message_id);
+                } else {
+                  s.screenMessageId = replacement.message_id;
+                }
+                s.lastRender = content;
+                s.editAfter = 0;
+                return true;
+              }
+            } catch {}
+          }
           s.screenMessageId = null;
+          s.lastRender = null;
+          s.editAfter = 0;
+          return false;
+        }
+        if (/chat not found/i.test(desc)) {
+          s.screenMessageId = null;
+          s.lastRender = null;
+          s.editAfter = 0;
+          return false;
         }
         s.editAfter = Date.now() + Math.max(3, Number(e.retry_after || e.parameters?.retry_after || 5)) * 1000;
         this.log.debug({ chatId: s.chatId }, 'Player edit deferred'); return false;
@@ -372,10 +739,10 @@ export class QueueManager extends EventEmitter {
   async shutdown() {
     this.closed = true;this.eventAbort.abort(); clearInterval(this.poller);for(const s of this.sessions.values())s.prepareAbort?.abort();
     await Promise.allSettled([...this.sessions.values()].map(s => this.locks.run(s.chatId, async () => {
-      this.#cancelIdle(s);this.dropPrefetch(s);for(const t of s.upcoming)t.queuedMedia?.release?.();let confirmed=!s.connected&&!s.prepared;
+      this.#cancelIdle(s);this.dropPrefetch(s);for(const t of s.upcoming)t.queuedMedia?.release?.();for(const t of (s.movieUpcoming||[]))t.queuedMedia?.release?.();let confirmed=!s.connected&&!s.prepared;
       try{if(s.connected||s.prepared||s.stopPending)this.#assert(await this.voice.stop(s.chatId,{leaveMembership:!s.isChannel}));confirmed=true;if(s.prepared){s.prepared=false;this.app?.music?.setup?.forget(s.chatId);}}
       catch{s.lastError='The service is stopping, but call departure has not been confirmed.';}
-      finally{this.#release(s);s.connected=!confirmed;s.currentTrack=null;s.upcoming=[];s.playbackId=null;s.positionSeconds=null;s.status='stopped';s.view='player';if(confirmed){s.accountAlias=null;s.lastError=null;}await this.updatePlayerCard(s.chatId);}
+      finally{this.#release(s);s.connected=!confirmed;s.currentTrack=null;s.upcoming=[];s.movieUpcoming=[];s.playbackId=null;s.positionSeconds=null;s.status='stopped';s.view='player';if(confirmed){s.accountAlias=null;s.lastError=null;}await this.updatePlayerCard(s.chatId);}
     })));
     await Promise.allSettled([...this.prefetchWork,...this.eventJobs]);
   }

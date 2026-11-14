@@ -1,8 +1,10 @@
 import {audioFileId} from './preview.js';
 import {mkdir,open,stat,unlink,rename,readdir} from 'node:fs/promises';
+import {existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {createHash,randomUUID} from 'node:crypto';
 import {normalizeTrack,MusicError} from './model.js';
+import {extractEmbeddedArtwork} from './studioCanvas.js';
 
 /** Bot-API files only: bounded intake, no arbitrary URLs and no credential URLs in tracks/logs. */
 export class TelegramMedia {
@@ -20,7 +22,7 @@ export class TelegramMedia {
    if(this.items.get(id)?.[wantsVideo?'video':'audio']&&this.library.active.has(this.items.get(id)[wantsVideo?'video':'audio'].key))return this.acquire({providerId:id},{video:wantsVideo});
    if(this.items.size>=200&&!this.items.has(id)){const evict=[...this.items].find(([,r])=>Object.values(r).every(x=>!this.library.refs.get(x.key)));if(!evict)throw new MusicError('UPLOAD_LIMIT','Shared-media storage is busy. Clear an unused queue first.');this.items.delete(evict[0]);}
    await this.library.cleanup();await mkdir(this.library.root,{recursive:true,mode:0o700});
-   let used=0;for(const name of await readdir(this.library.root))used+=(await stat(join(this.library.root,name))).size;
+   let used=0;for(const name of await readdir(this.library.root)){const st=await stat(join(this.library.root,name));if(st.isFile())used+=st.size;}
    if(used+this.library.maxBytes*3>this.library.quotaBytes)throw new MusicError('CACHE_FULL','Music storage is busy. Try again after queued tracks finish.');
    const prefix=join(this.library.root,`.partial-${randomUUID()}`),source=prefix+'.source',written=[];
    try{
@@ -35,20 +37,26 @@ export class TelegramMedia {
      const out=await open(source,'wx',0o600);let bytes=0;
      try{for await(const chunk of response.body){bytes+=chunk.length;if(bytes>max){await response.body.cancel?.().catch(()=>{});throw new MusicError('FILE_TOO_LARGE','Telegram media exceeded the size limit.');}await out.write(chunk);}}finally{await out.close();}
      }
-    const checked=JSON.parse((await this.library.runner('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_type','-of','json',source],{timeout:15000})).stdout),duration=Number(checked.format?.duration);
+    const checked=JSON.parse((await this.library.runner(this.library.ffprobe,['-v','error','-show_entries','format=duration:stream=codec_type','-of','json',source],{timeout:15000})).stdout),duration=Number(checked.format?.duration);
     const hasSourceVideo=Boolean(checked.streams?.some(s=>s.codec_type==='video'));
     if(!Number.isFinite(duration)||duration<=0||duration>7200||!checked.streams?.some(s=>s.codec_type==='audio'))throw new MusicError('INVALID_MEDIA','Media must have playable audio and a known duration up to two hours.');
     const title=String(file.title||file.file_name||message.caption||'Shared recording').replace(/\.(mp3|mp4|ogg|m4a|wav|webm)$/i,'').slice(0,160),artist=String(file.performer||message.from?.first_name||'Shared in Telegram').slice(0,100);
     const records=this.items.get(id)||{};
+    let canvasFile=null;
+    if(wantsVideo&&!hasSourceVideo&&this.library.studioCanvas){
+     const embArt=await extractEmbeddedArtwork(this.library.runner,this.library.ffmpeg,source,prefix+'.emb.jpg');
+     canvasFile=await this.library.studioCanvas.renderFrame({title,artist,durationSeconds:duration,provider:'telegram',artworkPath:embArt}).catch(()=>null);
+    }
     for(const isVideo of [false,...(wantsVideo?[true]:[])]){
      if(records[isVideo?'video':'audio']&&this.library.active.has(records[isVideo?'video':'audio'].key))continue;
      const key=createHash('sha256').update(`telegram:${id}:${isVideo}`).digest('hex'),ext=isVideo?'mp4':'mp3',tmp=prefix+'.'+ext,target=join(this.library.root,key+'.'+ext);
      const args=['-nostdin','-hide_banner','-loglevel','error','-y'];
-     if(isVideo&&hasSourceVideo)args.push('-i',source,'-map','0:v:0','-map','0:a:0','-vf','scale=-2:360,fps=24','-c:v','libx264','-preset','veryfast','-crf','25','-c:a','aac','-b:a','160k','-movflags','+faststart');
-     else if(isVideo)args.push('-f','lavfi','-i','color=c=0x0f172a:s=640x360:r=24','-i',source,'-map','0:v:0','-map','1:a:0','-c:v','libx264','-preset','veryfast','-crf','26','-c:a','aac','-b:a','160k','-shortest','-movflags','+faststart');
+     if(isVideo&&hasSourceVideo)args.push('-i',source,'-map','0:v:0','-map','0:a:0','-vf','scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p','-c:v','libx264','-preset','veryfast','-crf','20','-af','loudnorm=I=-16:TP=-1.5:LRA=11','-c:a','aac','-b:a','192k','-movflags','+faststart');
+     else if(isVideo&&typeof canvasFile==='string'&&existsSync(canvasFile))args.push('-loop','1','-framerate','15','-i',canvasFile,'-i',source,'-map','0:v:0','-map','1:a:0','-vf','scale=1280:720:flags=lanczos,format=yuv420p','-c:v','libx264','-preset','veryfast','-tune','stillimage','-crf','19','-af','loudnorm=I=-16:TP=-1.5:LRA=11','-c:a','aac','-b:a','192k','-shortest','-movflags','+faststart');
+     else if(isVideo)args.push('-f','lavfi','-i','color=c=0x0b1021:s=1280x720:r=15','-i',source,'-map','0:v:0','-map','1:a:0','-c:v','libx264','-preset','veryfast','-tune','stillimage','-crf','22','-af','loudnorm=I=-16:TP=-1.5:LRA=11','-c:a','aac','-b:a','192k','-shortest','-movflags','+faststart');
      else args.push('-i',source,'-map','0:a:0','-vn','-c:a','libmp3lame','-q:a','2');
      args.push('-ar','48000','-ac','2','-fs',String(this.library.maxBytes),tmp);await this.library.runner(this.library.ffmpeg,args,{timeout:180000,maxBuffer:1024*1024});
-     const verified=JSON.parse((await this.library.runner('ffprobe',['-v','error','-show_entries','format=duration:stream=codec_type','-of','json',tmp],{timeout:15000})).stdout);
+     const verified=JSON.parse((await this.library.runner(this.library.ffprobe,['-v','error','-show_entries','format=duration:stream=codec_type','-of','json',tmp],{timeout:15000})).stdout);
      if(!verified.streams?.some(s=>s.codec_type==='audio')||(isVideo&&!verified.streams.some(s=>s.codec_type==='video'))||Number(verified.format?.duration)<duration-1||(await stat(tmp)).size>=this.library.maxBytes)throw new MusicError('INVALID_MEDIA','The converted recording was incomplete.');
      await rename(tmp,target);written.push(target);
      const track=normalizeTrack({providerId:id,title,artist,durationSeconds:duration,filePath:target,mediaType:isVideo?'video':'audio',availability:'resolved',capabilities:{stream:true,download:true,seek:true,video:isVideo}},'telegram');

@@ -7,8 +7,8 @@ import { TelegramController } from '../src/telegram/bot.js';
 import { createNsfwScreen } from '../src/telegram/screens/nsfw.js';
 import { createDashboardScreen } from '../src/telegram/screens/dashboard.js';
 import { createPinterestScreen } from '../src/telegram/screens/pinterest.js';
-import { searchNsfw, NSFW_CATEGORIES } from '../src/wallpaper/nsfwSearch.js';
-import { encodeCallback } from '../src/telegram/rich.js';
+import { searchNsfw, searchXvideos, searchAdultMovies, resolveXvideosStream, NSFW_CATEGORIES } from '../src/wallpaper/nsfwSearch.js';
+import { encodeCallback, decodeCallback } from '../src/telegram/rich.js';
 
 test('nsfwSearch: multi-provider search returns valid wallpapers and media across categories', async () => {
   // 1. Uncensored Hentai
@@ -692,6 +692,159 @@ test('TelegramController: live music search returns playable audio (not article 
   assert.equal(shazamTriggered, false, 'Inline audio drop must not trigger Shazam audio recognition');
   assert.equal(stateInputHandled, false, 'Inline audio drop must not trigger MUSIC_SEARCH_INPUT state handler');
   assert.equal(sm.for(77777).state, States.IDLE, 'Active input state should be cleanly reset after inline media drop');
+});
+
+test('Dedicated 18+ Adult Movies & XVideos Hub: search, stream resolution, separate menus, VC queue, spoiler download & group lock', async (t) => {
+  const db = new Database(':memory:');
+  t.after(() => db.close());
+  const settings = new SettingsManager(db);
+  const sm = new StateMachine({ db });
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  globalThis.fetch = async (urlStr) => {
+    const u = String(urlStr);
+    if (u.startsWith('https://www.xvideos.com/?k=')) {
+      return {
+        ok: true,
+        text: async () => `
+          <div class="thumb-block" data-id="9001">
+            <div class="thumb"><img data-src="https://img.example/xv1.jpg" data-pvv="https://cdn.example/xv1_pvv.mp4"/></div>
+            <div class="thumb-under">
+              <p class="title"><a href="/video.xv9001/passion_test" title="Passion Night Test">Passion Night Test</a></p>
+              <span class="duration">14 min</span>
+            </div>
+          </div>
+        `
+      };
+    }
+    if (u.startsWith('https://www.xvideos.com/video.xv9001/')) {
+      return {
+        ok: true,
+        text: async () => `
+          <script>
+            html5player.setVideoUrlHigh('https://cdn.example/xv1_high.mp4');
+            html5player.setVideoUrlLow('https://cdn.example/xv1_low.mp4');
+            html5player.setVideoHLS('https://cdn.example/xv1.m3u8');
+          </script>
+        `
+      };
+    }
+    if (u.includes('eporner.com/api/v2/video/search/')) {
+      return {
+        ok: true,
+        json: async () => ({
+          videos: [
+            { id: 'am99', title: 'Midnight Feature 18+', length_sec: 1500, length_min: '25:00', embed: 'https://www.eporner.com/embed/am99/', url: 'https://www.eporner.com/video-am99/', default_thumb: { src: 'https://img.example/am99.jpg' } },
+            { id: 'clip1', title: 'Short Clip', length_sec: 120, length_min: '2:00', embed: 'https://www.eporner.com/embed/clip1/', url: 'https://www.eporner.com/video-clip1/' }
+          ]
+        })
+      };
+    }
+    if (u === 'https://www.eporner.com/embed/am99/') {
+      return { ok: true, text: async () => `<script>hash = '0123456789abcdef0123456789abcdef';</script>` };
+    }
+    if (u.includes('eporner.com/xhr/video/am99')) {
+      return { ok: true, json: async () => ({ sources: { mp4: { '720p HD': { src: 'https://cdn.example/am99_720.mp4' } } } }) };
+    }
+    return { ok: false, status: 404, text: async () => '', arrayBuffer: async () => new ArrayBuffer(0) };
+  };
+
+  // 1. Direct scraper helpers resolve high-res MP4/HLS streams cleanly
+  const xvStream = await resolveXvideosStream('https://www.xvideos.com/video.xv9001/passion_test');
+  assert.equal(xvStream.streamUrl, 'https://cdn.example/xv1_high.mp4');
+  assert.equal(xvStream.hlsUrl, 'https://cdn.example/xv1.m3u8');
+
+  const xvSearch = await searchXvideos({ query: 'passion_unit_test', limit: 5 });
+  assert.equal(xvSearch.category, NSFW_CATEGORIES.XVIDEOS_VIDEO);
+  assert.equal(xvSearch.results.length, 1);
+  assert.equal(xvSearch.results[0].videoUrl, 'https://cdn.example/xv1_high.mp4');
+
+  const amSearch = await searchAdultMovies({ query: 'midnight_unit_test', limit: 5, minMinutes: 15 });
+  assert.equal(amSearch.category, NSFW_CATEGORIES.ADULT_MOVIES);
+  assert.equal(amSearch.results.length, 1);
+  assert.equal(amSearch.results[0].id, 'am_am99');
+  assert.equal(amSearch.results[0].duration, '25:00');
+
+  // 2. Verify Screen separation, Group Lock, VC streaming & spoiler download
+  const sentRich = [];
+  const addedMovies = [];
+  const downloaded = [];
+  const mockApi = {
+    me: { id: 99, username: 'LancyBot' },
+    getChatMember: async () => ({ status: 'member' }),
+    sendRichMessage: async (chatId, rich) => {
+      sentRich.push({ chatId, rich });
+      return { message_id: 400 + sentRich.length };
+    },
+    editMessageRich: async (chatId, msgId, rich) => {
+      sentRich.push({ chatId, msgId, rich, edited: true });
+      return { message_id: msgId };
+    },
+    sendMessage: async () => ({ message_id: 500 }),
+    deleteMessage: async () => true,
+    answerCallbackQuery: async () => true
+  };
+
+  const app = {
+    db,
+    settings,
+    sm,
+    telegram: { api: mockApi },
+    music: {
+      destination: (c) => c.chatId,
+      authorize: async () => true,
+      prepare: async () => true,
+      player: async () => ({ screenMessageId: 700 })
+    },
+    musicQueueManager: {
+      getSession: () => ({ activeDeck: 'movie', screenMessageId: null }),
+      addMovies: async (dest, tracks, opts) => {
+        addedMovies.push({ dest, tracks, opts });
+      }
+    },
+    movieDownloader: {
+      sendSingleVideo: async (c, track, opts) => {
+        downloaded.push({ chatId: c.chatId, track, opts });
+        return { ok: true };
+      }
+    }
+  };
+
+  const nsfw = createNsfwScreen({ app });
+  db.setSetting('nsfw.ageVerified.555', true);
+
+  // Main menu exposes separate 18+ Adult Movies and XVideos hubs
+  await nsfw.open({ tgId: '555', chatId: 555, api: mockApi, sm });
+  const mainMenuJson = JSON.stringify(sentRich.at(-1).rich);
+  assert.match(mainMenuJson, /18\+ Adult Movies/);
+  assert.match(mainMenuJson, /XVideos Streaming & Download/);
+
+  // Group Lock blocks /xvideos in locked group chats
+  db.setSetting('nsfw.groupEnabled.-10099', false);
+  await nsfw.openXvideosHub({ tgId: '555', chatId: -10099, isGroup: true, api: mockApi, sm });
+  assert.match(JSON.stringify(sentRich.at(-1).rich), /18\+ STUDIO LOCKED IN THIS GROUP/);
+
+  // Unlock group -> execute XVideos search -> stream to VC & download with spoiler: true
+  db.setSetting('nsfw.groupEnabled.-10099', true);
+  await nsfw.executeXvideosSearch({ tgId: '555', chatId: -10099, isGroup: true, api: mockApi, sm }, 'passion_unit_test');
+  const xvPageRich = sentRich.at(-1).rich;
+  const xvButtons = xvPageRich.blocks.filter(b => b.type === 'buttons').flatMap(b => b.buttons);
+  const vcBtn = xvButtons.find(b => String(b.text).includes('▶ VC'));
+  const dlBtn = xvButtons.find(b => String(b.text).includes('⬇ MP4'));
+  assert.ok(vcBtn && dlBtn, 'XVideos paginated card should render VC play & MP4 download buttons');
+
+  const vcDecoded = decodeCallback(vcBtn.callback_data);
+  await nsfw.handle({ tgId: '555', chatId: -10099, isGroup: true, api: mockApi, sm, query: { id: 'q1' } }, vcDecoded.action, vcDecoded.args);
+  assert.equal(addedMovies.length, 1);
+  assert.equal(addedMovies[0].tracks[0].isAdult, true);
+  assert.equal(addedMovies[0].tracks[0].streamUrl, 'https://cdn.example/xv1_high.mp4');
+
+  const dlDecoded = decodeCallback(dlBtn.callback_data);
+  await nsfw.handle({ tgId: '555', chatId: -10099, isGroup: true, api: mockApi, sm, query: { id: 'q2' } }, dlDecoded.action, dlDecoded.args);
+  assert.equal(downloaded.length, 1);
+  assert.equal(downloaded[0].opts.spoiler, true);
 });
 
 

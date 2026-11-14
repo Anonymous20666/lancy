@@ -3,7 +3,9 @@ import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
 import { normalizeTrack, MusicError } from './model.js';
-import { searchYouTubeFast } from '../media/youtubeSearch.js';
+import { searchYouTubeFast, isNonMusicOrNews } from '../media/youtubeSearch.js';
+import { resolveAndDownloadAudio } from '../media/musicResolver.js';
+import { resolveFfmpegPath } from '../media/convert.js';
 const exec = promisify(execFile);
 const UA = 'Lancy/1.0 (https://github.com/Anonymous20666/lancy)';
 const YOUTUBE_HOSTS = new Set(['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com', 'youtu.be']);
@@ -25,20 +27,89 @@ export class YouTubeProvider {
     if (direct && offset) return { items: [], nextOffset: null };
     if (this.runner === exec && !direct) {
       try {
-        const fastRaw = await searchYouTubeFast(String(query).slice(0, 180), 'NG', { wide: true, radio, filterDuration });
-        const fastItems = (fastRaw || [])
-          .filter(x => /^[\w-]{11}$/.test(x?.videoId || '') && !/^short$/i.test(String(x?.duration || '')) && !x?.isLive && x?.duration !== 'LIVE')
-          .map(x => normalizeTrack({
-            providerId: x.videoId,
-            title: x.title,
-            artist: x.author,
-            duration: x.duration,
-            artwork: x.thumb || `https://i.ytimg.com/vi/${x.videoId}/hqdefault.jpg`,
-            sourceRef: `https://www.youtube.com/watch?v=${x.videoId}`,
-            availability: 'unresolved',
-            isLive: Boolean(x.isLive || x.duration === 'LIVE')
-          }, this.id))
-          .filter(t => !t.isLive && t.duration !== 'LIVE' && (!t.durationSeconds || (t.durationSeconds >= 30 && t.durationSeconds <= 7200)));
+        const fastRaw = await searchYouTubeFast(String(query).slice(0, 180), 'NG', { wide: true, radio, filterDuration, video });
+        let fastItems = (fastRaw || [])
+          .filter(x => /^[\w-]{11}$/.test(x?.videoId || '') && !/^short$/i.test(String(x?.duration || '')) && !x?.isLive && x?.duration !== 'LIVE' && !isNonMusicOrNews(x?.title, x?.author, query))
+          .map(x => ({
+            ...normalizeTrack({
+              providerId: x.videoId,
+              title: x.title,
+              artist: x.author,
+              duration: x.duration,
+              viewCount: Number(x.viewCount) || 0,
+              views: x.views || '',
+              publishedText: x.publishedText || '',
+              publishedAgeDays: x.publishedAgeDays ?? null,
+              mediaType: video ? 'video' : 'audio',
+              artwork: x.thumb || `https://i.ytimg.com/vi/${x.videoId}/hqdefault.jpg`,
+              sourceRef: `https://www.youtube.com/watch?v=${x.videoId}`,
+              availability: 'unresolved',
+              isLive: Boolean(x.isLive || x.duration === 'LIVE')
+            }, this.id),
+            isArtistChannel: Boolean(x.isArtistChannel)
+          }))
+          .filter(t => !t.isLive && t.duration !== 'LIVE' && (!t.durationSeconds || (t.durationSeconds >= 30 && t.durationSeconds <= 14400)));
+        if (fastItems.length > 1) {
+          const stopWords = new Set(['official', 'music', 'video', 'audio', 'lyrics', 'lyric', 'song', 'track', 'hd', 'hq', 'ft', 'feat', 'the', 'and', 'for', 'with']);
+          const rawQ = String(query || '').toLowerCase();
+          const dashParts = rawQ.split(/\s*[—–-]\s*/).filter(Boolean);
+          const tokenize = (str) => String(str || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2 && !stopWords.has(w));
+          const allTokens = [...new Set(tokenize(rawQ))];
+          const titlePartTokens = dashParts.length >= 2 ? tokenize(dashParts[0]) : allTokens;
+          const artistPartTokens = dashParts.length >= 2 ? tokenize(dashParts.slice(1).join(' ')) : [];
+          const queryAsksStatic = /\b(lyric|lyrics|audio|topic)\b/i.test(rawQ);
+          const queryAsksInst = /\b(instrumental|karaoke|beats?|remix)\b/i.test(rawQ);
+
+          const mvScore = (t) => {
+            const title = String(t.title || '');
+            const artist = String(t.artist || '');
+            const titleLower = title.toLowerCase();
+            const artistLower = artist.toLowerCase();
+            const combined = `${titleLower} ${artistLower}`;
+            if (isNonMusicOrNews(title, artist, rawQ)) return -500;
+            let s = 0;
+            let titleHits = 0;
+            for (const tok of titlePartTokens) {
+              if (titleLower.includes(tok)) {
+                s += 18;
+                titleHits++;
+              }
+            }
+            if (titlePartTokens.length > 0 && titleHits === titlePartTokens.length) s += 15;
+            for (const tok of artistPartTokens) {
+              if (combined.includes(tok)) s += 12;
+            }
+            for (const tok of allTokens) {
+              if (combined.includes(tok)) s += 8;
+            }
+            const matchesSong = titlePartTokens.length === 0 || titleHits > 0;
+            if (!matchesSong) s -= 45;
+            if (!queryAsksInst && /\b(instrumental|karaoke|type\s*beat|reaction|interview|podcast|review|explained|how to|tutorial|cover\s*by|sped\s*up|slowed)\b/i.test(title)) s -= 35;
+
+            const isOfficialMV = /\b(official\s*(music\s*)?video|\bmusic\s*video\b|\bofficial\s*video\b|\bm\/?v\b)\b/i.test(title);
+            const isVisualizer = /\b(official\s*visualizer|visualizer|performance\s*video|live\s*performance)\b/i.test(title);
+            const isStaticAudio = /\b(official\s*audio|audio\s*only|lyric\s*video|lyrics|provided\s*to\s*youtube)\b/i.test(title) || /\s-\s*topic$/i.test(artist);
+            const isVevoOrArtist = Boolean(t.isArtistChannel) || /\bvevo\b/i.test(artist);
+
+            // Only grant Music Video preference when the result actually matches the requested song/artist!
+            // Never force an unrelated music video when a song has no official video.
+            if (matchesSong) {
+              if (isVevoOrArtist) s += 12;
+              if (video) {
+                if (isOfficialMV) s += 24;
+                else if (isVisualizer) s += 14;
+                else if (isVevoOrArtist && !isStaticAudio) s += 12;
+                else if (!queryAsksStatic && isStaticAudio) s += 4;
+              } else {
+                if (isOfficialMV || isStaticAudio || isVevoOrArtist) s += 10;
+              }
+            }
+            if ((t.viewCount || 0) >= 1_000_000) s += 4;
+            else if ((t.viewCount || 0) >= 100_000) s += 2;
+            return s;
+          };
+          fastItems = [...fastItems].sort((a, b) => mvScore(b) - mvScore(a));
+        }
         if (fastItems.length > offset) {
           return {
             items: fastItems.slice(offset, offset + limit),
@@ -49,7 +120,7 @@ export class YouTubeProvider {
     }
     const { stdout } = await this.runner('yt-dlp', ['--ignore-config', '--no-warnings', '--skip-download', '--flat-playlist', '--dump-single-json', '--playlist-start', String(offset + 1), '--playlist-end', String(end), '--socket-timeout', '10', '--', target], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
     const info = JSON.parse(stdout); const entries = info.entries || [info];
-    const items = entries.filter(x => /^[\w-]{11}$/.test(x?.id || '')).map(x => normalizeTrack({ providerId: x.id, title: x.track || x.title, artist: x.artist || x.uploader || x.channel, durationSeconds: x.duration, artwork: x.thumbnail || x.thumbnails?.at(-1)?.url || `https://i.ytimg.com/vi/${x.id}/hqdefault.jpg`, sourceRef: `https://www.youtube.com/watch?v=${x.id}`, availability: 'unresolved' }, this.id));
+    const items = entries.filter(x => /^[\w-]{11}$/.test(x?.id || '')).map(x => normalizeTrack({ providerId: x.id, title: x.track || x.title, artist: x.artist || x.uploader || x.channel, durationSeconds: x.duration, viewCount: Number(x.view_count) || 0, mediaType: video ? 'video' : 'audio', artwork: x.thumbnail || x.thumbnails?.at(-1)?.url || `https://i.ytimg.com/vi/${x.id}/hqdefault.jpg`, sourceRef: `https://www.youtube.com/watch?v=${x.id}`, availability: 'unresolved' }, this.id));
     return { items: items.slice(0, limit), nextOffset: !direct && items.length > limit && offset + limit < 30 ? offset + limit : null };
   }
   async download(track, path, { video = false, maxBytes = 48 * 1024 * 1024 } = {}) {
@@ -57,7 +128,7 @@ export class YouTubeProvider {
     if (!/^[\w-]{11}$/.test(track.providerId)) throw new MusicError('INVALID_TRACK', 'Invalid track identifier.');
     const target = `https://www.youtube.com/watch?v=${track.providerId}`;
     const buildArgs = (fmt, { useCookies = false, useAndroidClient = false } = {}) => {
-      const a = ['--ignore-config', '--no-playlist', '--no-warnings', '--no-progress', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2', '--max-filesize', String(maxBytes), '--match-filter', 'duration <= 7200 & !is_live', '--restrict-filenames', '-f', fmt, '-o', path, '--print', 'after_move:%()j'];
+      const a = ['--ignore-config', '--no-playlist', '--no-warnings', '--no-progress', '--socket-timeout', '15', '--retries', '2', '--fragment-retries', '2', '--concurrent-fragments', '4', '--max-filesize', String(maxBytes), '--match-filter', 'duration <= 14400 & !is_live', '--restrict-filenames', '-f', fmt, '-o', path, '--print', 'after_move:%()j'];
       if (this.runner === exec) {
         if (existsSync('/usr/bin/node')) a.push('--js-runtimes', 'node:/usr/bin/node');
         if (existsSync('/data/cache/yt-dlp')) a.push('--cache-dir', '/data/cache/yt-dlp');
@@ -68,7 +139,7 @@ export class YouTubeProvider {
       a.push('--', target);
       return a;
     };
-    const primaryFmt = video ? (this.runner === exec ? 'b[ext=mp4][vcodec^=avc1][height<=360]/bv*[vcodec^=avc1][height<=360]+ba[acodec^=mp4a]/bv*[height<=360]+ba/b[height<=360]' : 'bv*[height<=360]+ba/b[height<=360]') : 'bestaudio/best';
+    const primaryFmt = video ? (this.runner === exec ? 'b[ext=mp4][vcodec^=avc1][height<=720][height>=480]/bv*[vcodec^=avc1][height<=720][height>=480]+ba[acodec^=mp4a]/bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/b[height<=720]' : 'bv*[height<=720]+ba/b[height<=720]') : 'bestaudio/best';
     let stdout;
     if (this.runner !== exec) {
       ({ stdout } = await this.runner('yt-dlp', buildArgs(primaryFmt), { timeout: 180000, maxBuffer: 4 * 1024 * 1024 }));
@@ -77,7 +148,7 @@ export class YouTubeProvider {
       try {
         ({ stdout } = await this.runner('yt-dlp', buildArgs(primaryFmt, { useCookies: hasCookies }), { timeout: 120000, maxBuffer: 4 * 1024 * 1024 }));
       } catch (firstErr) {
-        const fallbackFmt = video ? 'b[height<=480]/bv*[height<=480]+ba/bestaudio/best' : 'bestaudio/best';
+        const fallbackFmt = video ? 'b[height<=720]/bv*[height<=720]+ba/b[height<=480]/bestaudio/best' : 'bestaudio/best';
         ({ stdout } = await this.runner('yt-dlp', buildArgs(fallbackFmt, { useCookies: !hasCookies, useAndroidClient: true }), { timeout: 120000, maxBuffer: 4 * 1024 * 1024 }).catch(() => { throw firstErr; }));
       }
     }
@@ -122,55 +193,159 @@ export class PlayMusicProvider {
       .replace(/^(music|song|track|audio|play):\s*/i, '')
       .trim();
     if (!clean) throw new MusicError('EMPTY_QUERY', 'Search by song title, artist, or music genre.');
-    try {
-      const res = await fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(clean)}&entity=song&limit=30`, {
+    const safeOffset = Math.max(0, Number(offset) || 0);
+    const safeLimit = Math.max(1, Math.min(25, Number(limit) || 5));
+    const apiBatch = 25;
+    const apiOffset = Math.floor(safeOffset / apiBatch) * apiBatch;
+    const sliceStart = safeOffset - apiOffset;
+    const [itRes, dzRes] = await Promise.allSettled([
+      fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(clean)}&entity=song&limit=${apiBatch}&offset=${apiOffset}`, {
         headers: { 'User-Agent': UA },
-        signal: AbortSignal.timeout(5000)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const items = (data?.results || [])
-          .filter(t => t?.trackName && t?.artistName && t?.trackTimeMillis >= 40000 && t?.trackTimeMillis <= 900000)
-          .map(t => normalizeTrack({
-            providerId: String(t.trackId || createHash('sha256').update(`${t.artistName}-${t.trackName}`).digest('hex').slice(0, 16)),
-            title: t.trackName,
-            artist: t.artistName,
-            album: t.collectionName || null,
-            durationSeconds: Math.round(t.trackTimeMillis / 1000),
-            artwork: t.artworkUrl100?.replace('100x100bb', '600x600bb') || t.artworkUrl100 || null,
-            sourceRef: t.trackViewUrl || null,
-            availability: 'unresolved',
-            capabilities: { stream: true, download: true, seek: true, video: false }
-          }, this.id));
-        if (items.length > offset) {
-          return {
-            items: items.slice(offset, offset + limit),
-            nextOffset: items.length > offset + limit && offset + limit < 30 ? offset + limit : null
-          };
-        }
+        signal: AbortSignal.timeout(4500)
+      }).then(r => (r.ok ? r.json() : null)),
+      fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&index=${apiOffset}&limit=${apiBatch}`, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(4500)
+      }).then(r => (r.ok ? r.json() : null)),
+    ]);
+
+    const items = [];
+    const seen = new Set();
+    const pushItem = (norm) => {
+      const dedupKey = `${norm.artist}|${norm.title}`.toLowerCase().replace(/[^a-z0-9|]/g, '');
+      if (seen.has(dedupKey)) return;
+      seen.add(dedupKey);
+      items.push(norm);
+    };
+
+    if (dzRes.status === 'fulfilled' && Array.isArray(dzRes.value?.data)) {
+      for (const d of dzRes.value.data) {
+        if (!d?.title || !d?.artist?.name) continue;
+        const dur = Number(d.duration || 0);
+        if (dur > 0 && (dur < 40 || dur > 900)) continue;
+        pushItem(normalizeTrack({
+          providerId: String(d.id || createHash('sha256').update(`${d.artist.name}-${d.title}`).digest('hex').slice(0, 16)),
+          title: d.title,
+          artist: d.artist.name,
+          album: d.album?.title || null,
+          durationSeconds: dur || 180,
+          viewCount: Number(d.rank) || 0,
+          artwork: d.album?.cover_xl || d.album?.cover_big || d.album?.cover_medium || null,
+          sourceRef: d.link || null,
+          availability: 'unresolved',
+          capabilities: { stream: true, download: true, seek: true, video: false }
+        }, this.id));
       }
-    } catch {}
+    }
+
+    if (itRes.status === 'fulfilled' && Array.isArray(itRes.value?.results)) {
+      for (const t of itRes.value.results) {
+        if (!t?.trackName || !t?.artistName || (t?.trackTimeMillis && (t.trackTimeMillis < 40000 || t.trackTimeMillis > 900000))) continue;
+        const releaseMs = t.releaseDate ? Date.parse(t.releaseDate) : NaN;
+        const publishedAgeDays = Number.isFinite(releaseMs) ? Math.max(0, Math.round((Date.now() - releaseMs) / 86400000)) : null;
+        pushItem(normalizeTrack({
+          providerId: String(t.trackId || createHash('sha256').update(`${t.artistName}-${t.trackName}`).digest('hex').slice(0, 16)),
+          title: t.trackName,
+          artist: t.artistName,
+          album: t.collectionName || null,
+          durationSeconds: Math.round(t.trackTimeMillis / 1000),
+          publishedAgeDays,
+          artwork: t.artworkUrl100?.replace('100x100bb', '600x600bb') || t.artworkUrl100 || null,
+          sourceRef: t.trackViewUrl || null,
+          availability: 'unresolved',
+          capabilities: { stream: true, download: true, seek: true, video: false }
+        }, this.id));
+      }
+    }
+
+    if (items.length > sliceStart) {
+      const pageItems = items.slice(sliceStart, sliceStart + safeLimit);
+      const hasMoreLocal = items.length > sliceStart + safeLimit;
+      const mayHaveNextBatch = Boolean((dzRes.status === 'fulfilled' && dzRes.value?.next) || (itRes.status === 'fulfilled' && (itRes.value?.results?.length || 0) >= apiBatch));
+      const next = safeOffset + pageItems.length;
+      return {
+        items: pageItems,
+        nextOffset: (hasMoreLocal || mayHaveNextBatch) && next < 150 ? next : null
+      };
+    }
     return { items: [], nextOffset: null };
   }
   async download(track, path, { video = false, maxBytes = 48 * 1024 * 1024 } = {}) {
     const cleanQuery = `${track.artist || ''} ${track.title}`.trim();
     const diskCachePattern = `/data/audio_cache/${track.providerId}.mp3`;
-    if (existsSync(diskCachePattern) && statSync(diskCachePattern).size > 40000) {
+    if (!video && existsSync(diskCachePattern) && statSync(diskCachePattern).size > 40000) {
       const buf = readFileSync(diskCachePattern);
       writeFileSync(path, buf);
       return normalizeTrack({ ...track, filePath: path, availability: 'resolved' }, this.id);
     }
     let matchedVideoId = null;
-    try {
-      const fastItems = await searchYouTubeFast(`${cleanQuery} official audio`, 'NG', { wide: true });
-      const best = (fastItems || []).find(v => !v.isLive && v.duration !== 'LIVE' && v.duration !== 'HD');
-      if (best?.videoId) matchedVideoId = best.videoId;
-    } catch {}
+    let matchedRealMusicVideo = false;
+    const titleWords = String(track.title || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2 && !['official', 'music', 'video', 'audio', 'feat', 'ft', 'the'].includes(w));
+    const artistWords = String(track.artist || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2);
+    const matchesTrackTitle = (candTitle) => {
+      if (!titleWords.length) return true;
+      const lower = String(candTitle || '').toLowerCase();
+      return titleWords.some(w => lower.includes(w));
+    };
+    const matchesArtist = (candTitle, candAuthor) => {
+      if (!artistWords.length) return true;
+      const combined = `${candTitle || ''} ${candAuthor || ''}`.toLowerCase();
+      return artistWords.some(w => combined.includes(w));
+    };
+
+    if (video && this.runner === exec) {
+      try {
+        const mvItems = await searchYouTubeFast(`${cleanQuery} official music video`, 'NG', { wide: true, video: true });
+        const mvFiltered = (mvItems || []).filter(v =>
+          !v.isLive &&
+          v.duration !== 'LIVE' &&
+          v.duration !== 'HD' &&
+          !isNonMusicOrNews(v.title, v.author, cleanQuery) &&
+          !/\b(slowed|reverb|nightcore|karaoke|instrumental|reaction|shorts|interview|podcast|review|cover\s*by)\b/i.test(String(v.title || '')) &&
+          matchesTrackTitle(v.title) &&
+          matchesArtist(v.title, v.author)
+        );
+        const mvBest = mvFiltered.find(v =>
+          /\b(official\s*(music\s*)?video|\bmusic\s*video\b|\bofficial\s*video\b|\bm\/?v\b|visualizer|performance\s*video)\b/i.test(String(v.title || '')) ||
+          ((Boolean(v.isArtistChannel) || /\bvevo\b/i.test(String(v.author || ''))) && !/\b(official\s*audio|audio\s*only|provided\s*to\s*youtube)\b/i.test(String(v.title || '')) && !/\s-\s*topic$/i.test(String(v.author || '')))
+        );
+        if (mvBest?.videoId) {
+          matchedVideoId = mvBest.videoId;
+          matchedRealMusicVideo = true;
+        }
+      } catch {}
+    }
+
+    if (!matchedVideoId) {
+      try {
+        const fastItems = await searchYouTubeFast(`${cleanQuery} official audio`, 'NG', { wide: true });
+        const filtered = (fastItems || []).filter(v =>
+          !v.isLive &&
+          v.duration !== 'LIVE' &&
+          v.duration !== 'HD' &&
+          !isNonMusicOrNews(v.title, v.author, cleanQuery) &&
+          !/\b(slowed|reverb|nightcore|karaoke|instrumental|reaction|shorts)\b/i.test(String(v.title || '')) &&
+          matchesTrackTitle(v.title)
+        );
+        const best = filtered.find(v => /\b(official audio|topic|audio)\b/i.test(`${v.title} ${v.author}`)) || filtered[0];
+        if (best?.videoId) matchedVideoId = best.videoId;
+      } catch {}
+    }
+
+    if (!video && existsSync(diskCachePattern) && statSync(diskCachePattern).size > 40000) {
+      const buf = readFileSync(diskCachePattern);
+      writeFileSync(path, buf);
+      return normalizeTrack({ ...track, filePath: path, availability: 'resolved' }, this.id);
+    }
 
     const targetUrl = matchedVideoId ? `https://www.youtube.com/watch?v=${matchedVideoId}` : `ytsearch1:${cleanQuery} audio`;
     const cookieArgs = existsSync('/data/youtube_cookies.txt') ? ['--cookies', '/data/youtube_cookies.txt'] : [];
+    const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
 
-    const buildArgs = (target) => {
+    const buildArgs = (target, { asVideo = false } = {}) => {
+      const fmt = asVideo
+        ? 'b[ext=mp4][vcodec^=avc1][height<=720][height>=480]/bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/b[height<=720]'
+        : 'ba[ext=m4a]/ba/b';
       const a = [
         '--ignore-config',
         '--no-playlist',
@@ -180,35 +355,84 @@ export class PlayMusicProvider {
         '--retries', '2',
         '--fragment-retries', '2',
         '--max-filesize', String(maxBytes),
-        '--match-filter', 'duration <= 900 & !is_live',
+        '--match-filter', 'duration <= 14400 & !is_live',
         '--restrict-filenames',
-        '-f', 'ba/b',
+        '-f', fmt,
         '-o', path,
         '--print', 'after_move:%()j'
       ];
       if (this.runner === exec) {
         if (existsSync('/usr/bin/node')) a.push('--js-runtimes', 'node:/usr/bin/node');
         if (existsSync('/data/cache/yt-dlp')) a.push('--cache-dir', '/data/cache/yt-dlp');
+        if (ffmpegBin) a.push('--ffmpeg-location', ffmpegBin);
         if (cookieArgs.length) a.push(...cookieArgs);
       }
+      if (asVideo) a.push('--merge-output-format', 'mp4');
       a.push('--', target);
       return a;
     };
 
-    try {
-      await this.runner('yt-dlp', buildArgs(targetUrl), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
-    } catch (ytErr) {
+    let downloadedAsVideo = false;
+    if (video && matchedRealMusicVideo && matchedVideoId && this.runner === exec) {
       try {
-        await this.runner('yt-dlp', buildArgs(`scsearch1:${cleanQuery}`), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
-      } catch {
-        throw ytErr;
+        await this.runner('yt-dlp', buildArgs(targetUrl, { asVideo: true }), { timeout: 90000, maxBuffer: 4 * 1024 * 1024 });
+        if (existsSync(path) && statSync(path).size >= 40000) {
+          downloadedAsVideo = true;
+        }
+      } catch {}
+    }
+
+    if (!downloadedAsVideo) {
+      if (existsSync(diskCachePattern) && statSync(diskCachePattern).size > 40000) {
+        const buf = readFileSync(diskCachePattern);
+        writeFileSync(path, buf);
+        return normalizeTrack({
+          ...track,
+          filePath: path,
+          availability: 'resolved',
+          capabilities: { stream: true, download: true, seek: true, video }
+        }, this.id);
+      }
+      try {
+        if (!matchedVideoId && this.runner === exec) {
+          throw new Error('no matched youtube video id — use multi-source resolver');
+        }
+        await this.runner('yt-dlp', buildArgs(targetUrl, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+        if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
+          throw new Error('yt-dlp produced no output file');
+        }
+      } catch (ytErr) {
+        const rescue = await resolveAndDownloadAudio({
+          query: cleanQuery,
+          trackId: matchedVideoId,
+          tempPath: path,
+          ffmpegPath: ffmpegBin,
+          minSeconds: 30,
+          meta: { title: track.title, artist: track.artist || 'Music' },
+          skipYouTube: true,
+        }).catch(() => null);
+        if (!rescue?.ok || (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000))) {
+          try {
+            await this.runner('yt-dlp', buildArgs(`scsearch1:${cleanQuery}`, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+            if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
+              throw new Error('scsearch1 produced no output file');
+            }
+          } catch {
+            throw ytErr;
+          }
+        }
+      }
+      if (this.runner === exec && existsSync(path) && statSync(path).size > 40000) {
+        try {
+          writeFileSync(diskCachePattern, readFileSync(path));
+        } catch {}
       }
     }
     return normalizeTrack({
       ...track,
       filePath: path,
       availability: 'resolved',
-      capabilities: { stream: true, download: true, seek: true, video: false }
+      capabilities: { stream: true, download: true, seek: true, video }
     }, this.id);
   }
 }
@@ -232,14 +456,43 @@ export class ProviderRegistry {
     if (options?.video && provider !== 'youtube') throw new MusicError('VIDEO_UNSUPPORTED', 'Choose a permitted YouTube video, or reply /vidc to a video file. Audius and Music are audio-only.');
     if (options?.video && !this.get('youtube').enabled) throw new MusicError('PROVIDER_DISABLED', 'Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
     const q = m ? m[2] : query;
+    const videoFallback = options?.video ? (this.adapters.has('music') ? 'music' : null) : (provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null));
+    const canBlendMusic = Boolean(
+      provider === 'youtube' &&
+      !explicit &&
+      !youtubeId(query) &&
+      !options?.radio &&
+      this.adapters.has('music') &&
+      this.get('youtube')?.runner === exec &&
+      !(Number(options?.offset) > 0)
+    );
     try {
-      const res = await this.get(provider).search(q, options);
-      if ((res.items && res.items.length > 0) || explicit || youtubeId(query)) {
+      const [res, musicRes] = await Promise.all([
+        this.get(provider).search(q, options),
+        canBlendMusic ? this.get('music').search(q, { offset: 0, limit: 3 }).catch(() => null) : Promise.resolve(null)
+      ]);
+      const ytItems = Array.isArray(res?.items) ? res.items : [];
+      const musicItems = Array.isArray(musicRes?.items) ? musicRes.items : [];
+      if (ytItems.length === 0 && musicItems.length > 0) {
+        return { ...musicRes, provider: 'music' };
+      }
+      if (canBlendMusic && musicItems.length > 0 && ytItems.length > 0) {
+        const dashParts = String(q || '').toLowerCase().split(/\s*[—–-]\s*/).filter(Boolean);
+        const titleTokens = (dashParts[0] || q).toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2);
+        const topYtTitle = String(ytItems[0]?.title || '').toLowerCase();
+        const ytMatchesTitle = titleTokens.length === 0 || titleTokens.some(w => topYtTitle.includes(w));
+        if (!ytMatchesTitle) {
+          const limit = Number(options?.limit) || 5;
+          const blended = [...musicItems.slice(0, 2), ...ytItems].slice(0, limit);
+          return { ...res, items: blended, provider };
+        }
+      }
+      if (ytItems.length > 0 || explicit || youtubeId(query)) {
         return { ...res, provider };
       }
     } catch (err) {
       if (explicit || youtubeId(query)) throw err;
-      const fallback = provider === 'music' ? (this.adapters.get('youtube')?.enabled ? 'youtube' : 'audius') : (provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null));
+      const fallback = provider === 'music' ? (this.adapters.get('youtube')?.enabled ? 'youtube' : 'audius') : videoFallback;
       if (fallback && this.adapters.has(fallback)) {
         try {
           const fallbackRes = await this.get(fallback).search(q, options);
@@ -248,7 +501,7 @@ export class ProviderRegistry {
       }
       throw err;
     }
-    const fallback = provider === 'music' ? (this.adapters.get('youtube')?.enabled ? 'youtube' : 'audius') : (provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null));
+    const fallback = provider === 'music' ? (this.adapters.get('youtube')?.enabled ? 'youtube' : 'audius') : videoFallback;
     if (fallback && this.adapters.has(fallback)) {
       try {
         const fallbackRes = await this.get(fallback).search(q, options);

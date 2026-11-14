@@ -21,6 +21,8 @@ export const NSFW_CATEGORIES = {
   REAL_WALLPAPERS: 'real_wallpapers',
   REAL_CLIPS: 'real_clips',
   REAL_FULL_VIDEOS: 'real_videos',
+  ADULT_MOVIES: 'adult_movies',
+  XVIDEOS_VIDEO: 'xvideos',
   // Backward compatibility aliases
   VIDEOS: 'real_videos',
   ANIMATED: 'hentai_clips'
@@ -34,6 +36,8 @@ export const CATEGORY_SUGGESTIONS = {
   [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['Asian Model', 'Latina', 'Brunette', 'Blonde', 'Glamour', 'Boudoir', 'Baddie', 'Fitness'],
   [NSFW_CATEGORIES.REAL_CLIPS]: ['Teaser Clip', 'Asian Clip', 'Latina Clip', 'Glamour Preview', 'Baddie Teaser'],
   [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['Asian', 'Latina', 'Brunette', 'Blonde', 'Baddie', 'Glamour'],
+  [NSFW_CATEGORIES.ADULT_MOVIES]: ['Full Movie', 'Passionate', 'Couples', 'Romantic 18+', 'Brunette', 'Asian'],
+  [NSFW_CATEGORIES.XVIDEOS_VIDEO]: ['Trending', 'Asian', 'Latina', 'Brunette', 'Blonde', 'Amateur'],
   all: ['Tifa', 'Asian Model', 'Makima', 'Latina', 'Genshin', 'Glamour']
 };
 
@@ -1226,6 +1230,12 @@ export async function searchNsfw({ query = '', category = 'all', page = 0, limit
       case 'videos':
         items = await fetch18PlusVideos(cleanQuery, page, limit, NSFW_CATEGORIES.REAL_FULL_VIDEOS, signal);
         break;
+      case NSFW_CATEGORIES.XVIDEOS_VIDEO:
+        items = (await searchXvideos({ query: cleanQuery, page, limit, signal })).results || [];
+        break;
+      case NSFW_CATEGORIES.ADULT_MOVIES:
+        items = (await searchAdultMovies({ query: cleanQuery, page, limit, signal })).results || [];
+        break;
       default: {
         // Multi-source hybrid mix
         const [uncensored, realWallpapers, vids] = await Promise.all([
@@ -1268,6 +1278,299 @@ export async function searchNsfw({ query = '', category = 'all', page = 0, limit
   try {
     const res = await searchPromise;
     return res;
+  } finally {
+    inFlightRequests.delete(cacheKey);
+  }
+}
+
+/**
+ * Resolve direct high-res MP4 / HLS stream URLs from an XVideos watch page.
+ */
+export async function resolveXvideosStream(pageUrl, signal = null) {
+  const url = String(pageUrl || '').trim();
+  if (!url || !/^https?:\/\/([a-z0-9-]+\.)*xvideos\./i.test(url)) return null;
+  const headers = {
+    'User-Agent': USER_AGENT,
+    'Referer': 'https://www.xvideos.com/'
+  };
+  try {
+    const res = await fetch(url, {
+      headers,
+      signal: signal || AbortSignal.timeout(6500)
+    });
+    if (!res.ok) return null;
+    const html = await res.text();
+    const highMatch = html.match(/html5player\.setVideoUrlHigh\s*\(\s*['"]([^'"]+)['"]/i);
+    const lowMatch = html.match(/html5player\.setVideoUrlLow\s*\(\s*['"]([^'"]+)['"]/i);
+    const hlsMatch = html.match(/html5player\.setVideoHLS\s*\(\s*['"]([^'"]+)['"]/i);
+    const jsonContentMatch = html.match(/"contentUrl"\s*:\s*"([^"]+\.mp4[^"]*)"/i);
+
+    const highUrl = (highMatch?.[1] || jsonContentMatch?.[1] || '').replace(/\\\//g, '/') || null;
+    const lowUrl = (lowMatch?.[1] || '').replace(/\\\//g, '/') || null;
+    const hlsUrl = (hlsMatch?.[1] || '').replace(/\\\//g, '/') || null;
+    const fallbackUrls = [...new Set([highUrl, lowUrl, hlsUrl].filter(Boolean))];
+    const streamUrl = highUrl || lowUrl || hlsUrl || null;
+    if (!streamUrl) return null;
+    return {
+      streamUrl,
+      highUrl,
+      lowUrl,
+      hlsUrl,
+      fallbackUrls,
+      headers
+    };
+  } catch (err) {
+    log.debug({ err: err?.message, url }, 'xvideos stream resolution failed');
+    return null;
+  }
+}
+
+/**
+ * Dedicated XVideos search & trending catalog resolver.
+ */
+export async function searchXvideos({
+  query = '',
+  page = 0,
+  limit = 15,
+  sort = 'relevance',
+  signal = null
+} = {}) {
+  const cleanQuery = String(query || '').trim();
+  if (isBlockedNsfwQuery(cleanQuery)) {
+    return { results: [], category: NSFW_CATEGORIES.XVIDEOS_VIDEO, total: 0, page, blocked: true };
+  }
+  const pageNum = Math.max(0, Number(page) || 0);
+  const maxItems = Math.max(1, Math.min(30, Number(limit) || 15));
+  const cacheKey = `xv_${sort}_${cleanQuery.toLowerCase()}_${pageNum}_${maxItems}`;
+
+  const cached = searchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
+    return cached.data;
+  }
+  if (inFlightRequests.has(cacheKey)) {
+    try { return await inFlightRequests.get(cacheKey); } catch {}
+  }
+
+  const job = (async () => {
+    const isTrending = !cleanQuery || /^(trending|hot|popular|top|best)$/i.test(cleanQuery);
+    const sortParam = sort && sort !== 'relevance' ? `&sort=${encodeURIComponent(sort)}` : '';
+    const targetUrl = isTrending
+      ? `https://www.xvideos.com/${pageNum > 0 ? `new/${pageNum}` : ''}`
+      : `https://www.xvideos.com/?k=${encodeURIComponent(cleanQuery)}${pageNum > 0 ? `&p=${pageNum}` : ''}${sortParam}`;
+
+    const results = [];
+    try {
+      const res = await fetch(targetUrl, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: signal || AbortSignal.timeout(8000)
+      });
+      if (!res.ok) return { results, category: NSFW_CATEGORIES.XVIDEOS_VIDEO, total: 0, page: pageNum };
+      const html = await res.text();
+      const $ = cheerio.load(html);
+      const blocks = [];
+      $('.thumb-block').each((i, el) => {
+        const titleA = $(el).find('.thumb-under p.title a');
+        const title = (titleA.attr('title') || titleA.text() || '').trim();
+        const href = titleA.attr('href') || '';
+        const img = $(el).find('.thumb img, img');
+        const thumb = img.attr('data-src') || img.attr('src') || null;
+        const pvvUrl = img.attr('data-pvv') || $(el).attr('data-pvv') || null;
+        const duration = $(el).find('.duration').text().trim() || 'HD';
+        if (!title || !href || href.startsWith('#') || isBlockedNsfwQuery(title)) return;
+        const fullPageUrl = href.startsWith('http') ? href : `https://www.xvideos.com${href.startsWith('/') ? '' : '/'}${href}`;
+        blocks.push({
+          id: $(el).attr('data-id') || `xv_${i}`,
+          title,
+          fullPageUrl,
+          thumb,
+          pvvUrl: pvvUrl && pvvUrl.endsWith('.mp4') ? pvvUrl : null,
+          duration
+        });
+      });
+
+      const sliced = blocks.slice(0, maxItems);
+      await Promise.all(
+        sliced.slice(0, 6).map(async (b) => {
+          b.resolved = await resolveXvideosStream(b.fullPageUrl, signal).catch(() => null);
+        })
+      );
+
+      for (const b of sliced) {
+        const fallbackUrls = [...new Set([
+          ...(b.resolved?.fallbackUrls || []),
+          b.pvvUrl
+        ].filter(Boolean))];
+        const videoUrl = b.resolved?.streamUrl || b.pvvUrl || null;
+        results.push({
+          id: String(b.id),
+          title: b.title.slice(0, 80),
+          type: 'video',
+          mediaType: 'video',
+          isAdult: true,
+          mediaUrl: videoUrl || b.thumb || b.fullPageUrl,
+          videoUrl,
+          hlsUrl: b.resolved?.hlsUrl || null,
+          fallbackUrls,
+          thumbUrl: b.thumb || b.pvvUrl || null,
+          pageUrl: b.fullPageUrl,
+          duration: b.duration,
+          headers: { Referer: 'https://www.xvideos.com/', 'User-Agent': USER_AGENT },
+          streamHeaders: { Referer: 'https://www.xvideos.com/', 'User-Agent': USER_AGENT },
+          category: NSFW_CATEGORIES.XVIDEOS_VIDEO,
+          source: 'XVideos'
+        });
+      }
+    } catch (err) {
+      log.debug({ err: err?.message, query: cleanQuery }, 'xvideos search failed');
+    }
+
+    const payload = {
+      results,
+      category: NSFW_CATEGORIES.XVIDEOS_VIDEO,
+      total: results.length,
+      page: pageNum
+    };
+    searchCache.set(cacheKey, { data: payload, timestamp: Date.now() });
+    return payload;
+  })();
+
+  inFlightRequests.set(cacheKey, job);
+  try {
+    return await job;
+  } finally {
+    inFlightRequests.delete(cacheKey);
+  }
+}
+
+/**
+ * Dedicated 18+ Adult Full-Length Movies search (separate from SFW /movie Cinema).
+ * Targets feature-length HD MP4 adult films (>= minMinutes).
+ */
+export async function searchAdultMovies({
+  query = '',
+  page = 0,
+  limit = 12,
+  minMinutes = 12,
+  signal = null
+} = {}) {
+  const cleanQuery = String(query || '').trim();
+  if (isBlockedNsfwQuery(cleanQuery)) {
+    return { results: [], category: NSFW_CATEGORIES.ADULT_MOVIES, total: 0, page, blocked: true };
+  }
+  const pageNum = Math.max(0, Number(page) || 0);
+  const maxItems = Math.max(1, Math.min(20, Number(limit) || 12));
+  const minSec = Math.max(60, (Number(minMinutes) || 12) * 60);
+  const cacheKey = `adult_movies_${cleanQuery.toLowerCase()}_${pageNum}_${maxItems}_${minSec}`;
+
+  const cached = searchCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
+    return cached.data;
+  }
+  if (inFlightRequests.has(cacheKey)) {
+    try { return await inFlightRequests.get(cacheKey); } catch {}
+  }
+
+  const job = (async () => {
+    const results = [];
+    try {
+      const searchQ = cleanQuery
+        ? (/movie|film|full/i.test(cleanQuery) ? cleanQuery : `${cleanQuery} full`)
+        : 'full movie';
+      const apiUrl = `https://www.eporner.com/api/v2/video/search/?query=${encodeURIComponent(searchQ)}&per_page=30&page=${pageNum + 1}&thumbsize=big&order=top-weekly&format=json`;
+      const res = await fetch(apiUrl, {
+        headers: { 'User-Agent': USER_AGENT },
+        signal: signal || AbortSignal.timeout(7000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const rawVideos = Array.isArray(data?.videos) ? data.videos : [];
+        const safe = rawVideos.filter(v => v?.id && v?.embed && !isBlockedNsfwQuery(`${v.title || ''} ${v.keywords || ''}`));
+        let longForm = safe.filter(v => Number(v.length_sec) >= minSec);
+        if (longForm.length < 3) {
+          longForm = safe.filter(v => Number(v.length_sec) >= 300);
+        }
+        if (longForm.length === 0) longForm = safe;
+
+        const candidates = longForm
+          .sort((a, b) => (Number(b.length_sec) || 0) - (Number(a.length_sec) || 0))
+          .slice(0, maxItems);
+
+        const resolved = await Promise.all(candidates.map(async (v) => {
+          try {
+            const embedRes = await fetch(v.embed, {
+              headers: { 'User-Agent': USER_AGENT },
+              signal: signal || AbortSignal.timeout(5000)
+            });
+            if (!embedRes.ok) return null;
+            const embedHtml = await embedRes.text();
+            const hashMatch = embedHtml.match(/hash\s*[:=]\s*['"]([a-f0-9]{32})['"]/i);
+            if (!hashMatch) return null;
+
+            const h36 = epornerHexToBase36(hashMatch[1]);
+            const xhrUrl = `https://www.eporner.com/xhr/video/${v.id}?hash=${h36}&domain=www.eporner.com&fallback=false&embed=true&supportedFormats=mp4`;
+            const xhrRes = await fetch(xhrUrl, {
+              headers: { 'User-Agent': USER_AGENT, 'Referer': v.embed },
+              signal: signal || AbortSignal.timeout(5000)
+            });
+            if (!xhrRes.ok) return null;
+            const xhrData = await xhrRes.json();
+            const mp4Sources = xhrData?.sources?.mp4 || {};
+            const ordered = [
+              mp4Sources['720p HD']?.src || mp4Sources['720p']?.src,
+              mp4Sources['1080p HD']?.src || mp4Sources['1080p']?.src,
+              mp4Sources['480p']?.src,
+              mp4Sources['360p']?.src,
+              mp4Sources['240p']?.src
+            ].filter(Boolean);
+            const primaryUrl = ordered[0];
+            if (!primaryUrl) return null;
+
+            return {
+              id: `am_${v.id}`,
+              title: String(v.title || cleanQuery || '18+ Feature Film').slice(0, 80),
+              type: 'video',
+              mediaType: 'video',
+              isAdult: true,
+              mediaUrl: primaryUrl,
+              videoUrl: primaryUrl,
+              fallbackUrls: ordered,
+              thumbUrl: v.default_thumb?.src || v.thumbs?.[0]?.src || null,
+              pageUrl: v.url || v.embed,
+              width: 1920,
+              height: 1080,
+              durationSec: Number(v.length_sec) || 0,
+              duration: `${v.length_min || 'Full HD'}`,
+              headers: { Referer: v.embed, 'User-Agent': USER_AGENT },
+              streamHeaders: { Referer: v.embed, 'User-Agent': USER_AGENT },
+              category: NSFW_CATEGORIES.ADULT_MOVIES,
+              source: '18+ Adult Cinema'
+            };
+          } catch {
+            return null;
+          }
+        }));
+
+        for (const item of resolved) {
+          if (item) results.push(item);
+        }
+      }
+    } catch (err) {
+      log.debug({ err: err?.message, query: cleanQuery }, 'adult movies search failed');
+    }
+
+    const payload = {
+      results,
+      category: NSFW_CATEGORIES.ADULT_MOVIES,
+      total: results.length,
+      page: pageNum
+    };
+    searchCache.set(cacheKey, { data: payload, timestamp: Date.now() });
+    return payload;
+  })();
+
+  inFlightRequests.set(cacheKey, job);
+  try {
+    return await job;
   } finally {
     inFlightRequests.delete(cacheKey);
   }

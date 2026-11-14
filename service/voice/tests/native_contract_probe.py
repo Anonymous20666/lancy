@@ -30,11 +30,12 @@ async def main():
                     assert stream.microphone is not None
                     assert (stream.camera is not None) is video
                     if bass:
-                        assert 'bass=g=3' in stream.microphone.path
+                        assert 'equalizer=f=48' in stream.microphone.path
+                        assert 'equalizer=f=230' in stream.microphone.path
                     else:
-                        assert 'bass=' not in stream.microphone.path
+                        assert 'equalizer=f=48' not in stream.microphone.path
                     if video:
-                        assert 'bass=' not in stream.camera.path
+                        assert 'equalizer=f=48' not in stream.camera.path
                     native = StreamParams.get_stream_params(stream)
                     if inspect.isawaitable(native): native = await native
                     assert native is not None

@@ -100,3 +100,17 @@ class SetupTests(unittest.IsolatedAsyncioTestCase):
    self.bridge.events.put_nowait({'chat_id':-1,'playback_id':'fixture-source','status':'ended'})
    response=await client.get('/events',headers={'Authorization':'Bearer '+token});body=await response.json();self.assertEqual(body['events'][0]['playback_id'],'fixture-source');self.assertNotIn('session',str(body))
   finally:await client.close()
+
+ async def test_refresh_health_preserves_available_status_on_transient_rate_limit_or_timeout(self):
+  self.bridge.factory = None
+  acc = self.bridge.accounts['one']
+  acc['uid'] = 55
+  acc['me_checked_at'] = 0
+  FloodWait = type('FloodWait', (Exception,), {'value': 8})
+  self.client.get_me.side_effect = FloodWait()
+  await self.bridge.refresh_health()
+  self.assertEqual(acc['status'], 'available')
+  self.client.get_me.side_effect = TimeoutError('identity rpc stalled')
+  with self.assertRaises(MODULE.VoiceFailure) as caught:
+   await self.bridge.setup({'chat_id': -1, 'stage': 'identity'})
+  self.assertEqual(caught.exception.code, 'CALL_FAILED')

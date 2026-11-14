@@ -2,8 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { KeyedLock, MusicError } from './model.js';
 
 // Compact wire actions keep scoped callbacks below Telegram's 64-byte bound.
-export const PANEL_ACTIONS = ['player','previous','pause','resume','skip','seekby','queue','lyrics','volume','options','loop','shuffle','bass','accounts','pin','preview','stop','leave','qpage','lypage','clear','remove','setvol','selectaccount','seek','prompt','playnow','radio','rpage','rpick','rstart','roff','channels','retry','eq','voteskip','catmenu','catpick','genresub','infinact'];
-const LOCAL = new Set(['destination','userId','botKey','screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom']);
+export const PANEL_ACTIONS = ['player','previous','pause','resume','skip','seekby','queue','lyrics','volume','options','loop','shuffle','bass','accounts','pin','preview','stop','leave','qpage','lypage','clear','remove','setvol','selectaccount','seek','prompt','playnow','radio','rpage','rpick','rstart','roff','channels','retry','eq','voteskip','catmenu','catpick','genresub','infinact','aidj','submode','movie','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','voteset','setvotethresh','votequeue','launchpoll','downloadnow','downloadq'];
+const LOCAL = new Set(['destination','userId','botKey','screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom','overlayView','overlayAt']);
 
 /** Many verified administrators' private views; one authoritative destination queue.
  * No channel messages are sent, and a callback never relies on the latest DM binding. */
@@ -90,7 +90,7 @@ export class ChannelPanels {
           panelActive: true, checkedAt: Date.now(), pinned: false, fullPreview: null };
         this.panels.set(panelToken, p);
       }
-      p.panelActive = true; p.checkedAt = Date.now(); p.view = 'player'; p.api = ctx.api; p.panelNotice = null;
+      p.panelActive = true; p.checkedAt = Date.now(); p.view = 'player'; p.overlayView = null; p.overlayAt = 0; p.api = ctx.api; p.panelNotice = null;
       const state = this.state(p);
       if (state.status === 'stopped') {
         state.status = 'idle';
@@ -118,7 +118,16 @@ export class ChannelPanels {
       catch { p.panelNotice = 'This private dashboard could not be pinned. Use More → Pin player to retry; channel playback is unaffected.'; }
       this.savePersistedPanels();
       if (!shouldSendNew) {
-        await this.app.musicQueueManager.updatePlayerView(state);
+        const updated = await this.app.musicQueueManager.updatePlayerView(state, { forceEdit: true });
+        if (!updated && !p.screenMessageId) {
+          const rich = this.app.screens.get('music').renderPlayer(state);
+          const sent = await api.sendRichMessage(p.playerChatId, rich);
+          this.registerMessage(p.panelToken, sent.message_id);
+          p.lastRender = JSON.stringify(rich);
+          p.pinned = false;
+          try { await this.pin(p.panelToken, { force: true }); } catch {}
+          this.savePersistedPanels();
+        }
       }
       return state;
     });
@@ -172,7 +181,7 @@ export class ChannelPanels {
         try { await this.service.authorize({ api, tgId: p.userId, chatId: p.playerChatId }, true, p.destination); p.checkedAt = Date.now(); }
         catch {
           p.panelActive = false; p.lastRender = null; p.fullPreview = null;
-          await api.editMessageText(p.playerChatId, p.screenMessageId, 'Channel dashboard locked: administrator access could not be verified. Use /channel @channelname in private chat after access is restored.').catch(() => {});
+          await api.editMessageText(p.playerChatId, p.screenMessageId, '🔒 Channel dashboard locked: administrator access could not be verified. Use /channel @channelname in private chat after access is restored.').catch(() => {});
           continue;
         }
       }
@@ -183,7 +192,7 @@ export class ChannelPanels {
   async close(ctx, destination) {
     const p = this.find(ctx, destination); if (!p) return false;
     p.panelActive = false;
-    await p.api.editMessageText(p.playerChatId, p.screenMessageId, 'Channel control dashboard closed. The shared channel playback was not stopped.').catch(() => {});
+    await p.api.editMessageText(p.playerChatId, p.screenMessageId, '📭 Channel control dashboard closed. The shared channel playback was not stopped.').catch(() => {});
     if (p.pinned) await p.api.call('unpinChatMessage', { chat_id: p.playerChatId, message_id: p.screenMessageId }).catch(() => {});
     this.panels.delete(p.panelToken);
     this.savePersistedPanels();

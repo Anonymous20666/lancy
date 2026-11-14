@@ -6,16 +6,26 @@ export class CallSetup {
   managed() { return this.app.db.getSetting('music.managedMemberships',{}); }
   remember(id,alias,isChannel) {
     const entries=this.managed();entries[id]={alias,isChannel,approvedAt:Date.now()};this.app.db.setSetting('music.managedMemberships',entries);
-    const s=this.app.musicQueueManager.getSession(id);s.prepared=true;s.accountAlias=alias;s.isChannel=isChannel;this.app.musicQueueManager.armPreparedIdle(id);
+    const s=this.app.musicQueueManager.getSession(id);s.prepared=true;s.preparedAt=Date.now();s.accountAlias=alias;s.isChannel=isChannel;this.app.musicQueueManager.armPreparedIdle(id);
   }
-  forget(id) { const entries=this.managed();delete entries[id];this.app.db.setSetting('music.managedMemberships',entries); }
+  forget(id) {
+    const entries=this.managed();delete entries[id];this.app.db.setSetting('music.managedMemberships',entries);
+    const s=this.app.musicQueueManager?.sessions?.get?.(Number(id));if(s)s.preparedAt=0;
+  }
   async prepare(ctx,id=this.service.destination(ctx)) {
     return this.lock.run(Number(id),async()=>{
       const state=this.app.musicQueueManager.getSession(id),generation=state.stopGeneration||0;
       const current=()=>{if((state.stopGeneration||0)!==generation)throw new MusicError('SETUP_CANCELLED','Assistant setup was cancelled by Stop.');};
       const checked=async operation=>{const result=await operation;current();return result;};
       try{await checked(this.service.authorize(ctx,true,id));}catch(error){if(error.code==='BOT_ADMIN_REQUIRED')throw new MusicError('BOT_SETUP_PERMISSIONS','Make Lancy a channel administrator with Invite users, Add new administrators and Manage video chats / live streams. Then retry setup.');throw error;}
-      const chat=await checked(ctx.api.getChat(id)),botId=ctx.api.me?.id || (await ctx.api.getMe?.().catch(()=>null))?.id;
+      if(state.connected&&state.prepared&&state.preparedAt&&(Date.now()-state.preparedAt<120000)&&state.accountAlias&&(!state.preferredAccount||state.preferredAccount===state.accountAlias)){
+        return {created:false,reused:true,destination:id};
+      }
+      const [chat, me] = await checked(Promise.all([
+        ctx.api.getChat(id),
+        ctx.api.me?.id ? Promise.resolve(ctx.api.me) : ctx.api.getMe?.().catch(()=>null)
+      ]));
+      const botId=me?.id;
       const bot=botId?await ctx.api.getChatMember(id,botId).catch(()=>null):null;
       const missing=[];
       if(!bot||!['administrator','creator'].includes(bot.status))missing.push('administrator');

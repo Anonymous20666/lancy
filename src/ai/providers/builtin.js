@@ -47,6 +47,9 @@ const TASK_SYSTEM = {
   shorten: 'You shorten text while keeping the vibe.',
   elegant: 'You rewrite text to sound more elegant and refined.',
   playful: 'You rewrite text to sound more playful and fun.',
+  music_dj: 'You are Lancy X, an energetic Spotify-style AI DJ hosting a live Telegram music video session. Write ONE crisp 14–22 word liner note introducing the exact track and artist given. ONLY reference the provided artist, track, and vibe; never invent biographies, bands, nationalities, or image/policy refusals.',
+  music_dj_curate: 'You are Lancy X, a Spotify-style AI DJ music curator aware of current charts and global hits. Output ONLY 4 real "Artist - Song Title" lines matching the vibe and current trends, without numbering or commentary.',
+  music_dj_chat: 'You are Lancy X, a conversational Spotify-style AI DJ chatting with listeners in a live Telegram music session. Answer concisely in 1–3 punchy sentences strictly grounded in the provided charts and session state. Never invent fake songs or mention image policies.',
   chat: 'You are Lancy — warm, playful, feminine, confident, helpful, slightly Gen-Z, never robotic, never annoying. You never overuse emojis. You NEVER perform critical actions (publishing, changing security settings) — you only chat and suggest.'
 };
 
@@ -80,6 +83,12 @@ export class BuiltinProvider {
         return this.#rewrite(input, 'elegant', seed, context);
       case 'playful':
         return this.#rewrite(input, 'chaotic', seed, context);
+      case 'music_dj':
+        return this.#musicDjIntro(seed, context);
+      case 'music_dj_curate':
+        return this.#musicDjCurate(context);
+      case 'music_dj_chat':
+        return this.#musicDjChat(input, seed, context);
       case 'chat':
       default:
         return this.#chat(input, style, seed, context);
@@ -132,6 +141,48 @@ export class BuiltinProvider {
       return String(input).split('\n')[0].slice(0, 120);
     }
     return sentences.slice(0, 2).join(' ');
+  }
+
+  #musicDjIntro(seed, context) {
+    const title = context.nextTrack || 'this track';
+    const artist = context.artist || 'featured artist';
+    const vibe = context.vibe || 'Spotify Live Mix';
+    const scope = context.isChannel ? 'Live broadcast' : 'Up next on deck';
+    const bassNote = context.eq && context.eq !== 'off' ? ' Clean sub-bass locked in.' : '';
+    const lines = [
+      `${scope}: spinning "${title}" by ${artist} — tuned to ${vibe}.${bassNote}`,
+      `Transitioning smooth into ${artist} — "${title}" keeps the ${vibe} wave rolling.${bassNote}`,
+      `Trending radar locked: "${title}" (${artist}) is up next in ${vibe}.${bassNote}`,
+      `Cueing up ${artist}'s "${title}" right now — HD video & studio dynamics.${bassNote}`
+    ];
+    return pick(lines, seed);
+  }
+
+  #musicDjCurate(context) {
+    const trending = Array.isArray(context.trending) ? context.trending : [];
+    const avoid = new Set((context.avoidArtists || []).map((a) => String(a).toLowerCase()));
+    const picks = trending
+      .filter((t) => t?.artist && t?.title && !avoid.has(String(t.artist).toLowerCase()))
+      .slice(0, 4)
+      .map((t) => `${t.artist} - ${t.title}`);
+    if (picks.length) return picks.join('\n');
+    const vibe = context.vibe || 'Global Trending';
+    return `${vibe} trending hits\n${vibe} official music video\n${vibe} popular songs\n${vibe} classics`;
+  }
+
+  #musicDjChat(input, seed, context) {
+    const trending = Array.isArray(context.trending) ? context.trending : [];
+    const topStr = trending.slice(0, 3).map((t) => `${t.artist} – ${t.title}`).join(', ');
+    if (/\b(?:trend(?:ing)?|chart(?:s|ing)?|new|latest|hot|popular|top)\b/i.test(input) && topStr) {
+      return `Right now the global charts are lighting up with ${topStr}. Tell me if you want me to spin any of these in HD video or lock a fresh vibe!`;
+    }
+    const now = context.nowPlaying ? `Currently spinning ${context.nowPlaying}. ` : '';
+    const replies = [
+      `${now}Say what artist, song, or mood you want next — I'll queue the HD music videos and dial in the clean bass.`,
+      `${now}Locking in the Spotify X deck. Drop a genre, vibe, or "what's trending" and I'll mix it live.`,
+      `${now}You're in the booth with Lancy X! Ask for any track, chill R&B, Afrobeats, or heavy clean bass.`
+    ];
+    return pick(replies, seed);
   }
 
   #chat(input, style, seed, context) {

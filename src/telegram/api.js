@@ -1,3 +1,4 @@
+import { openAsBlob, existsSync, statSync } from 'node:fs';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 import { RichMessageBuilder } from './rich.js';
@@ -72,6 +73,7 @@ export class TelegramAPI {
     const url = `${this.baseUrl}/${method}`;
     let body;
     let headers = {};
+    let totalUploadBytes = 0;
     if (files && Object.keys(files).length > 0) {
       const form = new FormData();
       for (const [key, value] of Object.entries(params)) {
@@ -79,8 +81,19 @@ export class TelegramAPI {
         form.append(key, typeof value === 'object' ? JSON.stringify(value) : String(value));
       }
       for (const [field, file] of Object.entries(files)) {
-        const { buffer, filename = field, contentType = 'application/octet-stream' } = file;
-        form.append(field, new Blob([buffer], { type: contentType }), filename);
+        if (!file) continue;
+        const { buffer, filePath, blob, filename = field, contentType = 'application/octet-stream' } = file;
+        if (blob) {
+          totalUploadBytes += Number(blob.size) || 0;
+          form.append(field, blob, filename);
+        } else if (filePath && existsSync(filePath)) {
+          try { totalUploadBytes += statSync(filePath).size; } catch {}
+          const fileBlob = await openAsBlob(filePath, { type: contentType });
+          form.append(field, fileBlob, filename);
+        } else if (buffer !== undefined && buffer !== null) {
+          totalUploadBytes += Number(buffer.byteLength ?? buffer.length) || 0;
+          form.append(field, new Blob([buffer], { type: contentType }), filename);
+        }
       }
       body = form;
     } else {
@@ -88,17 +101,34 @@ export class TelegramAPI {
       body = JSON.stringify(params);
     }
 
+    const effectiveTimeoutMs = totalUploadBytes > 15 * 1024 * 1024
+      ? Math.max(timeoutMs, 900000)
+      : timeoutMs;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs);
     let response;
     try {
       response = await fetch(url, { method: 'POST', body, headers, signal: controller.signal });
     } catch (error) {
       clearTimeout(timer);
-      const err = new Error(`Telegram request failed (${method}): ${error.message}`);
-      err.code = 'NETWORK';
-      err.retryable = true;
-      throw err;
+      if (this.isLocalServer && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(this.apiRoot) && totalUploadBytes <= 48 * 1024 * 1024) {
+        try {
+          const fallbackUrl = `https://api.telegram.org/bot${this.token}/${method}`;
+          const fbCtrl = new AbortController();
+          const fbTimer = setTimeout(() => fbCtrl.abort(), effectiveTimeoutMs);
+          try {
+            response = await fetch(fallbackUrl, { method: 'POST', body, headers, signal: fbCtrl.signal });
+          } finally {
+            clearTimeout(fbTimer);
+          }
+        } catch {}
+      }
+      if (!response) {
+        const err = new Error(`Telegram request failed (${method}): ${error.message}`);
+        err.code = 'NETWORK';
+        err.retryable = true;
+        throw err;
+      }
     }
     clearTimeout(timer);
 
@@ -236,6 +266,11 @@ export class TelegramAPI {
         files: { video: { buffer: video, filename: extra.filename ?? 'video.mp4', contentType: 'video/mp4' } }
       });
     }
+    if (video && typeof video === 'object' && video.filePath) {
+      return this.call('sendVideo', { chat_id: chatId, video: 'attach://video', ...extra }, {
+        files: { video: { filePath: video.filePath, filename: video.filename ?? extra.filename ?? 'video.mp4', contentType: video.contentType ?? 'video/mp4' } }
+      });
+    }
     const params = { chat_id: chatId, ...extra };
     if (files?.video) {
       params.video = 'attach://video';
@@ -368,10 +403,16 @@ export class TelegramAPI {
   async readFileBytes(filePath, { maxBytes = Infinity, signal } = {}) {
     if (this.isLocalServer && String(filePath).startsWith('/')) {
       const { stat, readFile } = await import('node:fs/promises');
-      const root = process.env.TELEGRAM_LOCAL_FILES_ROOT || '/var/lib/telegram-bot-api';
       const { resolve } = await import('node:path');
       const full = resolve(filePath);
-      if (!full.startsWith(resolve(root) + '/')) throw new Error('Telegram local file is outside the configured Bot API data directory');
+      const allowedRoots = [
+        process.env.TELEGRAM_LOCAL_FILES_ROOT || '/var/lib/telegram-bot-api',
+        '/var/lib/telegram-bot-api',
+        '/data/telegram-bot-api'
+      ].map((r) => resolve(r) + '/');
+      if (!allowedRoots.some((rootPrefix) => full.startsWith(rootPrefix))) {
+        throw new Error('Telegram local file is outside the configured Bot API data directory');
+      }
       if ((await stat(full)).size > maxBytes) throw new Error('Telegram file exceeds the size limit');
       return readFile(full);
     }
@@ -456,6 +497,8 @@ export class TelegramAPI {
         'message',
         'callback_query',
         'edited_message',
+        'channel_post',
+        'edited_channel_post',
         'inline_query',
         'chosen_inline_result',
         'chat_member',
