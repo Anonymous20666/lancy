@@ -1182,3 +1182,367 @@ test('MovieDownloader delivers single MP4 with spoiler option and paginated Bot 
   const p1Json = JSON.stringify(sentRich.at(-1).rich);
   assert.match(p1Json, /◀ Prev \(1–3\)/);
 });
+
+test('MovieStreamResolver rejects wrong sequels, short-title substrings, Episode-1 fallbacks, short HLS teasers, and Stage-1 subtitle leaks', async (t) => {
+  // 1. Sequel mismatch: "John Wick: Chapter 4" (2023) must reject "John Wick (2014)"
+  const mkApi = (overrides = {}) => ({
+    getPlayback: async () => ({ available: false }),
+    ...overrides
+  });
+  const resolverSequel = new MovieStreamResolver({
+    movieApi: mkApi(),
+    fetchImpl: async () => ({ ok: false, status: 403 }),
+    thenkiri: {
+      thenkiriSearch: async () => ({
+        results: [{ title: 'John Wick (2014) Full Movie', url: 'https://thenkiri.example/jw1' }]
+      }),
+      thenkiriDetails: async () => ({
+        sources: [{ title: 'John Wick 2014 HD', label: 'Download Movie', url: 'https://downloadwella.com/jw1' }]
+      }),
+      thenkiriGetLink: async () => ({ url: 'https://cdn.example/jw1.mp4', headers: {}, format: 'mp4' })
+    }
+  });
+  const jw4Res = await resolverSequel.resolve({
+    type: 'movie',
+    id: '603692',
+    title: 'John Wick: Chapter 4',
+    year: 2023,
+    fetchSubtitles: false
+  });
+  assert.equal(jw4Res.ok, false);
+
+  // 2. Short-title word boundary: "Us" (2019) must NOT match "Music Movie (2019)"
+  const resolverUs = new MovieStreamResolver({
+    movieApi: mkApi(),
+    fetchImpl: async () => ({ ok: false, status: 403 }),
+    thenkiri: {
+      thenkiriSearch: async () => ({
+        results: [{ title: 'Music Movie (2019) Full HD', url: 'https://thenkiri.example/music' }]
+      }),
+      thenkiriDetails: async () => ({
+        sources: [{ title: 'Music Movie 2019', label: 'Download Movie', url: 'https://downloadwella.com/music' }]
+      }),
+      thenkiriGetLink: async () => ({ url: 'https://cdn.example/music.mp4', headers: {}, format: 'mp4' })
+    }
+  });
+  const usRes = await resolverUs.resolve({
+    type: 'movie',
+    id: '458723',
+    title: 'Us',
+    year: 2019,
+    fetchSubtitles: false
+  });
+  assert.equal(usRes.ok, false);
+
+  // 3. Episode-1 fallback guard + Archive box-set episode matching for S01E05
+  const resolverEpGuard = new MovieStreamResolver({
+    movieApi: mkApi(),
+    fetchImpl: async (url) => {
+      const s = String(url);
+      if (s.includes('archive.org/advancedsearch')) {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              docs: [{ identifier: 'BreakingBadS01Box', title: 'Breaking Bad (2008) Season 1', year: 2008 }]
+            }
+          })
+        };
+      }
+      if (s.includes('archive.org/metadata/BreakingBadS01Box')) {
+        return {
+          ok: true,
+          json: async () => ({
+            metadata: { title: 'Breaking Bad (2008) Season 1' },
+            files: [
+              { name: 'Breaking.Bad.S01E01.720p.mp4', length: '2800', size: String(500e6) },
+              { name: 'Breaking.Bad.S01E05.720p.mp4', length: '2820', size: String(520e6) }
+            ]
+          })
+        };
+      }
+      if (s.includes('Breaking.Bad.S01E05.720p.mp4')) {
+        return { ok: true, status: 206, headers: { get: () => 'video/mp4' } };
+      }
+      return { ok: false, status: 403 };
+    },
+    thenkiri: {
+      thenkiriSearch: async () => ({
+        results: [{ title: 'Breaking Bad (2008) TV Series', url: 'https://thenkiri.example/bb' }]
+      }),
+      thenkiriDetails: async () => ({
+        sources: [
+          { title: 'Breaking Bad S01E01', seasonNumber: 1, episodeNumber: 1, label: 'Episode 1', url: 'https://downloadwella.com/bb-e1' },
+          { title: 'Breaking Bad S01E02', seasonNumber: 1, episodeNumber: 2, label: 'Episode 2', url: 'https://downloadwella.com/bb-e2' }
+        ]
+      }),
+      thenkiriGetLink: async () => {
+        throw new Error('Must never resolve S01E01 when S01E05 was requested');
+      }
+    }
+  });
+  const ep5Res = await resolverEpGuard.resolve({
+    type: 'tv',
+    id: '1396',
+    title: 'Breaking Bad',
+    year: 2008,
+    season: 1,
+    episode: 5,
+    durationSeconds: 2800,
+    fetchSubtitles: false
+  });
+  assert.equal(ep5Res.ok, true);
+  assert.equal(ep5Res.source, 'archive_org');
+  assert.match(ep5Res.track.streamUrl, /S01E05/);
+
+  // 4. Reject short 18s HLS VOD teaser on root_stream & prevent Stage-1 subtitles leaking to Stage-2 encode
+  const fakeTs = Buffer.concat([Buffer.from([0x47, 0x40, 0x11, 0x10]), Buffer.alloc(64 * 1024, 1)]);
+  const srv = http.createServer((req, res) => {
+    if (req.url === '/teaser.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end('#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\n/seg1.ts\n#EXTINF:6.0,\n/seg2.ts\n#EXTINF:6.0,\n/seg3.ts\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (req.url?.startsWith('/seg')) {
+      res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': fakeTs.length });
+      res.end(fakeTs);
+      return;
+    }
+    res.writeHead(404);
+    res.end('missing');
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => srv.close(r)));
+  const port = srv.address().port;
+
+  const seenHintSets = [];
+  const resolverStageIsolation = new MovieStreamResolver({
+    movieApi: {
+      getPlayback: async () => ({
+        available: true,
+        root_stream: { direct_url: `http://127.0.0.1:${port}/teaser.m3u8` },
+        subtitles: [{ url: 'https://stage1.example/wrong-route.srt', label: 'English' }]
+      })
+    },
+    subtitles: {
+      resolveForMedia: async (args) => {
+        seenHintSets.push(args.subtitleHints);
+        return null;
+      }
+    },
+    fetchImpl: (url, opts) => (
+      String(url).startsWith(`http://127.0.0.1:${port}/`)
+        ? fetch(url, opts)
+        : Promise.resolve({ ok: false, status: 403 })
+    ),
+    thenkiri: {
+      thenkiriSearch: async () => ({
+        results: [{ title: 'Inception (2010) Full Movie', url: 'https://thenkiri.example/inc' }]
+      }),
+      thenkiriDetails: async () => ({
+        sources: [{ title: 'Inception 2010 Full Movie', label: 'Download Movie', url: 'https://downloadwella.com/inc' }]
+      }),
+      thenkiriGetLink: async () => ({ url: 'https://cdn.example/inc_stage2.mkv', headers: {}, format: 'mkv' })
+    }
+  });
+  const isoRes = await resolverStageIsolation.resolve({
+    type: 'movie',
+    id: '27205',
+    title: 'Inception',
+    year: 2010,
+    durationSeconds: 7200,
+    fetchSubtitles: true
+  });
+  assert.equal(isoRes.ok, true);
+  assert.match(isoRes.track.streamUrl, /inc_stage2\.mkv/);
+  assert.equal(seenHintSets.length, 1);
+  assert.deepEqual(seenHintSets[0], []);
+});
+
+test('MovieUi clears previous TV episodes, selections, playback, and dlManifest when loading another title', async (t) => {
+  const h = buildTestHarness(t);
+  const ctx = h.makeCtx(-10050);
+
+  await h.screen.handleCommand(ctx, '/movie', ['Breaking', 'Bad']);
+  const ms = h.app.movieSessions.getLatestForChat(-10050);
+  await h.screen.handle({ ...ctx, query: { id: 'q-bb' }, messageId: ms.messageId }, 'mv', [ms.id, 'pk', '0']);
+  assert.equal(ms.mediaItem.id, '1396');
+  await h.screen.handle({ ...ctx, query: { id: 'q-e1' }, messageId: ms.messageId }, 'mv', [ms.id, 'tg', '1-1']);
+  await h.screen.handle({ ...ctx, query: { id: 'q-e2' }, messageId: ms.messageId }, 'mv', [ms.id, 'tg', '1-2']);
+  assert.equal(h.app.movieSessions.totalSelectedCount(ms), 2);
+  ms.playback = { streamUrl: 'https://stale.example/bb.mp4' };
+  ms.dlManifest = [{ title: 'Stale EP1' }];
+  ms.dlPage = 2;
+
+  // Pick second search result (Inception, movie) into the same session -> zero cross-title bleed
+  await h.screen.handle({ ...ctx, query: { id: 'q-inc' }, messageId: ms.messageId }, 'mv', [ms.id, 'pk', '1']);
+  assert.equal(ms.mediaItem.id, '27205');
+  assert.equal(ms.view, 'movie');
+  assert.equal(ms.seasons.length, 0);
+  assert.equal(ms.episodes.length, 0);
+  assert.equal(ms.episodeCache.size, 0);
+  assert.equal(ms.selectedBySeason.size, 0);
+  assert.equal(h.app.movieSessions.totalSelectedCount(ms), 0);
+  assert.notEqual(ms.playback?.streamUrl, 'https://stale.example/bb.mp4');
+  assert.equal(ms.dlManifest, null);
+  assert.equal(ms.dlPage, 0);
+});
+
+test('SubtitleService rejects wrong-episode OpenSubtitles candidates, strips promo cues, and scopes cache by stream signature', async () => {
+  const subDir = mkdtempSync(join(tmpdir(), 'lancy-sub-reg-'));
+  const wrongSrt = '1\n00:00:01,000 --> 00:00:03,000\nWrong E01 line\n';
+  const goodSrtWithPromo = [
+    '1',
+    '00:00:01,000 --> 00:00:04,000',
+    'Downloaded from YTS.MX - Subtitles by OpenSubtitles.org',
+    '',
+    ...Array.from({ length: 12 }, (_, idx) => {
+      const startSec = 10 + idx * 5;
+      const endSec = startSec + 3;
+      const line = idx === 0 ? 'Say my name.' : `Dialogue line ${idx + 1}`;
+      return `${idx + 2}\n00:00:${String(startSec).padStart(2, '0')},000 --> 00:00:${String(endSec).padStart(2, '0')},000\n${line}\n`;
+    })
+  ].join('\n');
+
+  let openSubCalls = 0;
+  const subSvc = new SubtitleService({
+    cacheDir: subDir,
+    fetchImpl: async (url) => {
+      const s = String(url);
+      if (s.includes('hint-a.srt')) {
+        const srtA = Array.from({ length: 6 }, (_, i) => `${i + 1}\n00:00:${String(2 + i * 5).padStart(2, '0')},000 --> 00:00:${String(5 + i * 5).padStart(2, '0')},000\n${i === 0 ? 'Hint Stream A' : `A line ${i + 1}`}\n`).join('\n');
+        return { ok: true, arrayBuffer: async () => Buffer.from(srtA, 'utf8') };
+      }
+      if (s.includes('hint-b.srt')) {
+        const srtB = Array.from({ length: 6 }, (_, i) => `${i + 1}\n00:00:${String(2 + i * 5).padStart(2, '0')},000 --> 00:00:${String(5 + i * 5).padStart(2, '0')},000\n${i === 0 ? 'Hint Stream B' : `B line ${i + 1}`}\n`).join('\n');
+        return { ok: true, arrayBuffer: async () => Buffer.from(srtB, 'utf8') };
+      }
+      if (s.includes('rest.opensubtitles.org')) {
+        openSubCalls += 1;
+        return {
+          ok: true,
+          json: async () => ([
+            {
+              IDSubtitleFile: '101',
+              MovieName: 'Breaking Bad',
+              MovieReleaseName: 'Breaking.Bad.S01E01.720p',
+              SeriesSeason: '1',
+              SeriesEpisode: '1',
+              SubLanguageID: 'eng',
+              SubFormat: 'srt',
+              SubDownloadsCnt: '999999',
+              SubDownloadLink: 'https://dl.opensubtitles.test/wrong.srt.gz'
+            },
+            {
+              IDSubtitleFile: '105',
+              MovieName: 'Breaking Bad',
+              MovieReleaseName: 'Breaking.Bad.S01E05.720p',
+              SeriesSeason: '1',
+              SeriesEpisode: '5',
+              SubLanguageID: 'eng',
+              SubFormat: 'srt',
+              SubDownloadsCnt: '1200',
+              SubDownloadLink: 'https://dl.opensubtitles.test/e05.srt.gz'
+            }
+          ])
+        };
+      }
+      if (s.includes('dl.opensubtitles.test/wrong.srt.gz')) {
+        return { ok: true, arrayBuffer: async () => gzipSync(Buffer.from(wrongSrt, 'utf8')) };
+      }
+      if (s.includes('dl.opensubtitles.test/e05.srt.gz')) {
+        return { ok: true, arrayBuffer: async () => gzipSync(Buffer.from(goodSrtWithPromo, 'utf8')) };
+      }
+      return { ok: false, status: 404 };
+    }
+  });
+
+  // 1. Wrong episode only -> must reject cleanly
+  const ep2None = await subSvc.resolveForMedia({
+    title: 'Breaking Bad',
+    year: 2008,
+    season: 1,
+    episode: 2,
+    streamUrl: 'https://cdn.example/bb-s01e02.mp4'
+  });
+  assert.equal(ep2None, null);
+
+  // 2. Exact episode S01E05 picks E05 over higher-download E01 and strips promo cue
+  const ep5Sub = await subSvc.resolveForMedia({
+    title: 'Breaking Bad',
+    year: 2008,
+    season: 1,
+    episode: 5,
+    streamUrl: 'https://cdn.example/bb-s01e05-encodeA.mp4'
+  });
+  assert.ok(ep5Sub);
+  assert.equal(ep5Sub.cues.length, 12);
+  assert.equal(ep5Sub.cues[0].text, 'Say my name.');
+  assert.equal(ep5Sub.cues.some((c) => /YTS\.MX|OpenSubtitles/i.test(c.text)), false);
+
+  // 3. Stream signature isolation: Stream A uses Hint A, Stream B (same title) uses Hint B instead of cached Hint A
+  const resA = await subSvc.resolveForMedia({
+    title: 'Inception',
+    year: 2010,
+    streamUrl: 'https://cdn.example/inception-encodeA.m3u8',
+    subtitleHints: [{ url: 'https://sub.example/hint-a.srt', label: 'English' }]
+  });
+  const resB = await subSvc.resolveForMedia({
+    title: 'Inception',
+    year: 2010,
+    streamUrl: 'https://cdn.example/inception-encodeB.mp4',
+    subtitleHints: [{ url: 'https://sub.example/hint-b.srt', label: 'English' }]
+  });
+  assert.equal(resA.cues[0].text, 'Hint Stream A');
+  assert.equal(resB.cues[0].text, 'Hint Stream B');
+  assert.ok(openSubCalls >= 1);
+});
+
+test('VideoStreamingServer coalesces concurrent HLS child-segment fetches across mic & camera FFmpeg pipelines', async (t) => {
+  const segPayload = Buffer.concat([Buffer.from([0x47, 0x40, 0x11, 0x10]), Buffer.from('COALESCED_SEGMENT_BYTES')]);
+  let upstreamSegHits = 0;
+  const upstream = http.createServer((req, res) => {
+    if (req.url === '/master.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end('#EXTM3U\n#EXT-X-VERSION:3\n#EXTINF:6.0,\n/seg/0.ts\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (req.url === '/seg/0.ts') {
+      upstreamSegHits += 1;
+      setTimeout(() => {
+        res.writeHead(200, { 'Content-Type': 'video/mp2t', 'Content-Length': segPayload.length });
+        res.end(segPayload);
+      }, 35);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  const upPort = upstream.address().port;
+
+  const srv = new VideoStreamingServer({ port: 0, cacheDir: mkdtempSync(join(tmpdir(), 'lancy-coal-vc-')), audioCacheDir: mkdtempSync(join(tmpdir(), 'lancy-coal-ac-')) });
+  await srv.start();
+  t.after(async () => {
+    await srv.stop();
+    await new Promise((r) => upstream.close(r));
+  });
+
+  const proxyUrl = srv.registerRemoteStream({ url: `http://127.0.0.1:${upPort}/master.m3u8`, isHls: true });
+  const m3u8Text = await (await fetch(proxyUrl)).text();
+  const segUrl = m3u8Text.split(/\r?\n/).find((l) => /^http:\/\/127\.0\.0\.1:\d+\/movie-proxy\//i.test(l.trim())).trim();
+
+  // Simultaneous fetches simulating microphone + camera FFmpeg pipelines -> 1 upstream download
+  const [r1, r2] = await Promise.all([fetch(segUrl), fetch(segUrl)]);
+  assert.equal(r1.status, 200);
+  assert.equal(r2.status, 200);
+  assert.deepEqual(Buffer.from(await r1.arrayBuffer()), segPayload);
+  assert.deepEqual(Buffer.from(await r2.arrayBuffer()), segPayload);
+  assert.equal(upstreamSegHits, 1);
+
+  // Subsequent read hits bounded in-memory segment cache without another upstream fetch
+  const r3 = await fetch(segUrl);
+  assert.equal(r3.status, 200);
+  assert.deepEqual(Buffer.from(await r3.arrayBuffer()), segPayload);
+  assert.equal(upstreamSegHits, 1);
+});

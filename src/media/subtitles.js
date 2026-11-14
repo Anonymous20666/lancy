@@ -111,25 +111,67 @@ function cleanTitleForSearch(title) {
     .trim();
 }
 
+const PROMO_SUB_RE = /\b(?:opensubtitles\.(?:org|com)|osdb\.link|subscene\.com|yify-?subtitles|addic7ed\.com|podnapisi\.net|hoofoot\.ru|advertise\s+your\s+product|api\.opensubtitles|ai\.opensubtitles)\b/i;
+
+function isPromoCueText(text = '') {
+  return PROMO_SUB_RE.test(String(text || ''));
+}
+
+function tokenizeSubTitle(text = '') {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
 function scoreSubtitleCandidate(sub, { title, year, season, episode } = {}) {
-  let score = 0;
   const subName = String(sub?.SubFileName || sub?.MovieReleaseName || '').toLowerCase();
   const movieName = String(sub?.MovieName || '').toLowerCase();
   const clean = cleanTitleForSearch(title).toLowerCase();
-  const words = clean.split(/\s+/).filter((w) => w.length >= 2);
-  for (const w of words) {
-    if (movieName.includes(w) || subName.includes(w)) score += 10;
+  const titleWords = tokenizeSubTitle(clean).filter((w) => w.length >= 2 && !['the', 'and', 'for', 'with'].includes(w));
+  const candToks = new Set([
+    ...tokenizeSubTitle(movieName),
+    ...tokenizeSubTitle(subName)
+  ]);
+
+  let matchedWords = 0;
+  for (const w of titleWords) {
+    if (candToks.has(w)) matchedWords += 1;
   }
-  if (year && Number(sub?.MovieYear) === Number(year)) score += 20;
+  if (titleWords.length > 0 && matchedWords === 0) return -100;
+  if (titleWords.length >= 2 && matchedWords / titleWords.length < 0.75) return -80;
+
+  let score = matchedWords * 12;
+  if (titleWords.length > 0 && matchedWords === titleWords.length) score += 12;
+
+  const candYear = Number(sub?.MovieYear || 0);
+  if (year && candYear > 1900) {
+    if (candYear === Number(year)) score += 20;
+    else if (Math.abs(candYear - Number(year)) > 1) return -60;
+  }
+
   if (season && episode) {
-    if (Number(sub?.SeriesSeason) === Number(season) && Number(sub?.SeriesEpisode) === Number(episode)) score += 45;
-    const seTag = `s${String(season).padStart(2, '0')}e${String(episode).padStart(2, '0')}`;
+    const tS = Number(season);
+    const tE = Number(episode);
+    const cS = Number(sub?.SeriesSeason || 0);
+    const cE = Number(sub?.SeriesEpisode || 0);
+    if ((cS && cS !== tS) || (cE && cE !== tE)) return -100;
+    const seMatch = subName.match(/\bs(\d{1,2})e(\d{1,3})\b/i);
+    if (seMatch && (Number(seMatch[1]) !== tS || Number(seMatch[2]) !== tE)) return -100;
+
+    if (cS === tS && cE === tE) score += 45;
+    const seTag = `s${String(tS).padStart(2, '0')}e${String(tE).padStart(2, '0')}`;
     if (subName.includes(seTag)) score += 35;
-  } else if (String(sub?.MovieKind || '').toLowerCase() === 'movie') {
-    score += 10;
+  } else {
+    if (sub?.SeriesSeason || sub?.SeriesEpisode || /\bs\d{1,2}e\d{1,3}\b/i.test(subName)) return -80;
+    if (String(sub?.MovieKind || '').toLowerCase() === 'movie') score += 10;
   }
+
   if (String(sub?.SubFormat || '').toLowerCase() === 'srt') score += 8;
-  if (sub?.SubBad === '1') score -= 40;
+  if (sub?.SubBad === '1') score -= 60;
   score += Math.min(12, Math.log10((Number(sub?.SubDownloadsCnt) || 1) + 1) * 3);
   return score;
 }
@@ -167,27 +209,60 @@ export class SubtitleService {
     }
   }
 
-  async resolveForMedia({ title, year, imdbId, season, episode, streamUrl, headers, language = 'eng', subtitleHints = [] } = {}) {
-    const cacheKey = `${title || ''}|${year || ''}|${imdbId || ''}|${season || ''}|${episode || ''}|${language}`;
-    const filePath = this.#cacheFilePath(cacheKey);
-    if (existsSync(filePath)) {
-      const cues = this.loadCues(filePath);
-      if (cues.length > 5) return { found: true, filePath, cues, language, source: 'cache' };
+  #streamSignature({ streamUrl = '', subtitleHints = [] } = {}) {
+    const hintKey = (Array.isArray(subtitleHints) ? subtitleHints : [])
+      .map((h) => String(h?.url || h?.file || '').trim())
+      .filter(Boolean)
+      .slice(0, 4)
+      .join(',');
+    if (hintKey) return createHash('sha1').update(`hints|${hintKey}`).digest('hex').slice(0, 10);
+    if (streamUrl) {
+      try {
+        const u = new URL(String(streamUrl));
+        return createHash('sha1').update(`${u.origin}${u.pathname}`).digest('hex').slice(0, 10);
+      } catch {
+        return createHash('sha1').update(String(streamUrl)).digest('hex').slice(0, 10);
+      }
+    }
+    return 'meta';
+  }
+
+  async resolveForMedia({ title, year, imdbId, season, episode, streamUrl, headers, streamSource = '', language = 'eng', subtitleHints = [] } = {}) {
+    const metaKey = `${title || ''}|${year || ''}|${imdbId || ''}|${season || ''}|${episode || ''}|${language}`;
+    const hasHints = Array.isArray(subtitleHints) && subtitleHints.length > 0;
+    const streamSig = this.#streamSignature({ streamUrl, subtitleHints });
+    const streamFilePath = this.#cacheFilePath(`${metaKey}|${streamSig}`);
+    const fallbackFilePath = this.#cacheFilePath(`${metaKey}|os_v2`);
+
+    if (existsSync(streamFilePath)) {
+      const cues = this.loadCues(streamFilePath);
+      if (cues.length >= 5) return { found: true, filePath: streamFilePath, cues, language, source: 'cache' };
     }
 
-    // 1. Try direct subtitle hints returned with stream/playback metadata (.vtt/.srt)
-    if (Array.isArray(subtitleHints) && subtitleHints.length) {
-      const hintRes = await this.#fetchFromSubtitleHints(subtitleHints, { language, title }, filePath).catch(() => null);
+    // 1. Try direct subtitle hints returned with this specific video stream (.vtt/.srt)
+    if (hasHints) {
+      const hintRes = await this.#fetchFromSubtitleHints(subtitleHints, { language, title }, streamFilePath).catch(() => null);
       if (hintRes) return hintRes;
     }
 
-    // 2. Fallback: OpenSubtitles public REST lookup (matches full movie/episode)
-    const osRes = await this.#fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language }, filePath).catch(() => null);
+    // 2. Direct container tracks (MKV/MP4 from fallback catalogs) carry frame-exact embedded subtitles
+    const isHls = /\.m3u8(\?|$)/i.test(String(streamUrl || '')) || String(streamSource).includes('tmdb');
+    if (streamUrl && !isHls) {
+      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, streamFilePath).catch(() => null);
+      if (emb) return emb;
+    }
+
+    // 3. OpenSubtitles lookup (strict score threshold + promo cue cleanup, scoped to os_v2 key)
+    if (existsSync(fallbackFilePath)) {
+      const cues = this.loadCues(fallbackFilePath);
+      if (cues.length >= 10) return { found: true, filePath: fallbackFilePath, cues, language, source: 'cache' };
+    }
+    const osRes = await this.#fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language }, fallbackFilePath).catch(() => null);
     if (osRes) return osRes;
 
-    // 3. Fallback: extract embedded subtitle stream (0:s:0) if local/stream MKV carries one
-    if (streamUrl) {
-      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, filePath).catch(() => null);
+    // 4. Last resort: check embedded stream even if HLS/unknown URL
+    if (streamUrl && isHls) {
+      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, streamFilePath).catch(() => null);
       if (emb) return emb;
     }
 
@@ -231,7 +306,7 @@ export class SubtitleService {
         } else if (typeof res.text === 'function') {
           text = await res.text();
         }
-        const cues = parseSrt(text);
+        const cues = parseSrt(text).filter((c) => !isPromoCueText(c.text));
         if (cues.length < 5) continue;
         const canonicalSrt = serializeSrt(cues);
         writeFileSync(outPath, canonicalSrt, 'utf8');
@@ -277,6 +352,7 @@ export class SubtitleService {
     const ranked = rows
       .filter((r) => r?.SubDownloadLink && String(r?.SubFormat || '').toLowerCase() === 'srt')
       .map((r) => ({ item: r, score: scoreSubtitleCandidate(r, { title, year, season, episode }) }))
+      .filter((r) => r.score >= 28)
       .sort((a, b) => b.score - a.score);
 
     for (const { item } of ranked.slice(0, 3)) {
@@ -290,9 +366,10 @@ export class SubtitleService {
         const srtText = (item.SubDownloadLink.endsWith('.gz') || (buf[0] === 0x1f && buf[1] === 0x8b))
           ? gunzipSync(buf).toString('utf8')
           : buf.toString('utf8');
-        const cues = parseSrt(srtText);
+        const cues = parseSrt(srtText).filter((c) => !isPromoCueText(c.text));
         if (cues.length < 10) continue;
-        writeFileSync(outPath, srtText, 'utf8');
+        const canonicalSrt = serializeSrt(cues);
+        writeFileSync(outPath, canonicalSrt, 'utf8');
         this.cueCache.set(outPath, cues);
         return {
           found: true,

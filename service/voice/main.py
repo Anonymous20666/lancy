@@ -94,18 +94,74 @@ def strip_reconnect_at_eof(cmd_str):
     return shlex.join(out)
 
 
-def rewrite_video_ffmpeg_command(cmd_str, width, height, *, subtitle_path=None, stream_index=None, video_count=1, is_image=False):
-    """Ensure a single consolidated -vf pipeline outputting exact width:height yuv420p frames matching VideoParameters."""
+def _upsert_ffmpeg_input_sync_flags(args, *, pre_seek=None, copyts=False):
+    """Ensure -copyts and input -ss appear strictly before -i when hybrid synchronized seeking is active."""
+    cleaned = []
+    skip_next = False
+    for tok in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if tok == '-copyts':
+            continue
+        if (pre_seek is not None or copyts) and tok == '-ss':
+            skip_next = True
+            continue
+        cleaned.append(tok)
+
+    prefix = []
+    if copyts:
+        prefix.append('-copyts')
+    if pre_seek is not None and pre_seek > 0.05:
+        prefix.extend(['-ss', f'{float(pre_seek):.3f}'])
+    if not prefix:
+        return cleaned
+
+    out = []
+    inserted = False
+    for tok in cleaned:
+        if not inserted and tok == '-i':
+            out.extend(prefix)
+            inserted = True
+        out.append(tok)
+    if not inserted:
+        out = prefix + out
+    return out
+
+
+def rewrite_video_ffmpeg_command(
+    cmd_str,
+    width,
+    height,
+    *,
+    subtitle_path=None,
+    stream_index=None,
+    video_count=1,
+    is_image=False,
+    fps=None,
+    trim_start=None,
+    normalize_pts=False,
+    pre_seek=None,
+    copyts=False,
+):
+    """Ensure a single consolidated -vf pipeline outputting exact width:height yuv420p frames aligned to audio PTS."""
     w = max(2, int(width) - (int(width) % 2))
     h = max(2, int(height) - (int(height) % 2))
-    vf_parts = [f'scale={w}:{h}:flags=lanczos', 'setsar=1']
+    vf_parts = []
+    if trim_start is not None and not is_image:
+        vf_parts.append(f'trim=start={float(trim_start):.3f}')
+    if (normalize_pts or trim_start is not None) and not is_image:
+        vf_parts.append('setpts=PTS-STARTPTS')
+    if fps is not None and not is_image and int(fps) > 0:
+        vf_parts.append(f'fps=fps={int(fps)}')
+    vf_parts.extend([f'scale={w}:{h}:flags=lanczos', 'setsar=1'])
     if subtitle_path:
         esc_sub = str(subtitle_path).replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'").replace('[', '\\[').replace(']', '\\]')
         vf_parts.append(f"subtitles='{esc_sub}':force_style='FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H60000000,BorderStyle=1,Outline=2,Shadow=1,MarginV=22'")
     vf_parts.append('format=yuv420p')
     vf_expr = ','.join(vf_parts)
 
-    args = shlex.split(str(cmd_str))
+    args = _upsert_ffmpeg_input_sync_flags(shlex.split(str(cmd_str)), pre_seek=pre_seek, copyts=copyts)
     cleaned = []
     skip_next = False
     has_map = False
@@ -134,6 +190,158 @@ def rewrite_video_ffmpeg_command(cmd_str, width, height, *, subtitle_path=None, 
     if not inserted_vf:
         out_args.extend(['-vf', vf_expr])
     return shlex.join(out_args)
+
+
+def rewrite_audio_ffmpeg_command(
+    cmd_str,
+    *,
+    stream_index=None,
+    audio_count=1,
+    pre_seek=None,
+    copyts=False,
+    trim_start=None,
+    normalize_pts=False,
+    strip_first_pts_zero=False,
+):
+    """Align microphone FFmpeg stream selection, trim offset, and PTS to the active video pipeline."""
+    args = _upsert_ffmpeg_input_sync_flags(shlex.split(str(cmd_str)), pre_seek=pre_seek, copyts=copyts)
+    cleaned = []
+    skip_next = False
+    af_value = None
+    has_map = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if skip_next:
+            skip_next = False
+            i += 1
+            continue
+        if tok == '-reconnect_at_eof':
+            skip_next = True
+            i += 1
+            continue
+        if tok in {'-af', '-filter:a'} and i + 1 < len(args):
+            af_value = args[i + 1]
+            i += 2
+            continue
+        if tok == '-map':
+            has_map = True
+        cleaned.append(tok)
+        i += 1
+
+    af_parts = []
+    if trim_start is not None:
+        af_parts.append(f'atrim=start={float(trim_start):.3f}')
+    if normalize_pts or trim_start is not None:
+        af_parts.append('asetpts=PTS-STARTPTS')
+    base_af = af_value or 'aresample=48000:async=1'
+    if strip_first_pts_zero:
+        base_af = re.sub(r':first_pts=0\b', '', base_af)
+    if af_parts:
+        base_af = ','.join(af_parts) + ',' + base_af
+
+    out_args = []
+    inserted_map = False
+    inserted_af = False
+    for tok in cleaned:
+        if not inserted_map and tok == '-f':
+            if not has_map and stream_index is not None and audio_count > 1:
+                out_args.extend(['-map', f'0:{int(stream_index)}'])
+            out_args.extend(['-vn', '-sn', '-dn'])
+            inserted_map = True
+        if not inserted_af and tok.startswith('pipe:'):
+            out_args.extend(['-af', base_af])
+            inserted_af = True
+        out_args.append(tok)
+    if not inserted_af:
+        out_args.extend(['-af', base_af])
+    return shlex.join(out_args)
+
+
+def _parse_start_time(val):
+    try:
+        num = float(val)
+        if num == num and abs(num) < 1e7:
+            return num
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _pick_primary_audio_stream(audio_streams):
+    if not audio_streams:
+        return None
+    def score(st):
+        disp = st.get('disposition') or {}
+        tags = st.get('tags') or {}
+        lang = str(tags.get('language') or '').lower()
+        title = str(tags.get('title') or '').lower()
+        pts = 0
+        if disp.get('default'):
+            pts += 30
+        if lang in {'eng', 'en', 'und', ''}:
+            pts += 15
+        if any(k in title for k in ('commentary', 'description', 'descriptive', 'director')):
+            pts -= 50
+        return pts
+    return max(audio_streams, key=score)
+
+
+async def probe_media_stream_info(path):
+    """Probe primary video and audio stream indices, dimensions, and start timestamps in one bounded call."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error', '-probesize', '2000000', '-analyzeduration', '2000000',
+            '-show_entries', 'stream=index,codec_type,codec_name,width,height,start_time',
+            '-show_entries', 'stream_tags=language,title:stream_disposition=default,attached_pic:format=start_time',
+            '-of', 'json', str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        info = json.loads((stdout or b'{}').decode('utf-8'))
+        all_streams = info.get('streams') or []
+        fmt_start = _parse_start_time((info.get('format') or {}).get('start_time'))
+        video_streams = [
+            s for s in all_streams
+            if s.get('codec_type') == 'video' and int(s.get('width') or 0) > 0 and int(s.get('height') or 0) > 0
+        ]
+        if not video_streams:
+            return None
+        primary_video = next(
+            (s for s in video_streams if not (s.get('disposition') or {}).get('attached_pic') and str(s.get('codec_name') or '').lower() not in IMAGE_CODECS),
+            None,
+        )
+        is_image = primary_video is None
+        chosen_video = primary_video or video_streams[0]
+        v_idx = chosen_video.get('index')
+        v_start = _parse_start_time(chosen_video.get('start_time'))
+        if v_start is None:
+            v_start = fmt_start
+
+        audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
+        chosen_audio = _pick_primary_audio_stream(audio_streams)
+        a_idx = chosen_audio.get('index') if chosen_audio else None
+        a_start = _parse_start_time(chosen_audio.get('start_time')) if chosen_audio else None
+        if chosen_audio and a_start is None:
+            a_start = fmt_start
+
+        return {
+            'width': int(chosen_video['width']),
+            'height': int(chosen_video['height']),
+            'stream_index': int(v_idx) if v_idx is not None else None,
+            'video_count': len(video_streams),
+            'is_image': is_image,
+            'video_start_time': v_start,
+            'audio_stream_index': int(a_idx) if a_idx is not None else None,
+            'audio_count': len(audio_streams),
+            'audio_start_time': a_start,
+        }
+    except Exception:
+        if proc and proc.returncode is None:
+            try: proc.kill()
+            except Exception: pass
+    return None
 
 
 async def probe_video_stream_info(path):
@@ -491,22 +699,29 @@ class Bridge:
         if not sub_path or not offset_sec or offset_sec <= 0.25:
             return sub_path
         try:
-            text = Path(sub_path).read_text(encoding='utf-8', errors='replace')
-            shift_ms = int(offset_sec * 1000)
+            text = Path(sub_path).read_text(encoding='utf-8', errors='replace').lstrip('\ufeff')
+            shift_ms = int(float(offset_sec) * 1000)
             out_blocks = []
             idx = 1
             def to_ms(ts):
-                m = re.match(r'^(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})$', ts.strip())
-                if not m: return None
-                return (((int(m[1]) * 60) + int(m[2])) * 60 + int(m[3])) * 1000 + int(m[4].ljust(3, '0')[:3])
+                cleaned = ts.strip()
+                m = re.match(r'^(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})$', cleaned)
+                if m:
+                    return (((int(m[1]) * 60) + int(m[2])) * 60 + int(m[3])) * 1000 + int(m[4].ljust(3, '0')[:3])
+                s = re.match(r'^(\d{1,2}):(\d{2})[,.](\d{1,3})$', cleaned)
+                if s:
+                    return ((int(s[1]) * 60) + int(s[2])) * 1000 + int(s[3].ljust(3, '0')[:3])
+                return None
             def fmt_ms(ms):
                 ms = max(0, int(ms))
                 rem, msec = divmod(ms, 1000)
                 rem, sec = divmod(rem, 60)
                 hr, mn = divmod(rem, 60)
                 return f'{hr:02d}:{mn:02d}:{sec:02d},{msec:03d}'
-            for block in re.split(r'\r?\n\r?\n+', text.replace('\r\n', '\n')):
+            for block in re.split(r'\r?\n\r?\n+', text.replace('\r\n', '\n').replace('\r', '\n')):
                 lines = [l for l in block.split('\n') if l.strip()]
+                if not lines or re.match(r'^(?:WEBVTT|NOTE\b|STYLE\b|REGION\b)', lines[0], re.I):
+                    continue
                 ti = next((i for i, l in enumerate(lines) if '-->' in l), -1)
                 if ti < 0: continue
                 parts = [p.strip().split()[0] for p in lines[ti].split('-->')]
@@ -515,7 +730,7 @@ class Bridge:
                 if st is None or en is None or en <= shift_ms: continue
                 nst = max(0, st - shift_ms)
                 nen = max(nst + 250, en - shift_ms)
-                body = '\n'.join(lines[ti + 1:])
+                body = re.sub(r'<[^>]+>|\{\\[^}]+\}', '', '\n'.join(lines[ti + 1:])).strip()
                 if body:
                     out_blocks.append(f'{idx}\n{fmt_ms(nst)} --> {fmt_ms(nen)}\n{body}')
                     idx += 1
@@ -641,11 +856,50 @@ class Bridge:
         play_stream = stream
         if Stream is not None and callable(getattr(stream, 'check_stream', None)):
             await stream.check_stream()
+            info = (await probe_media_stream_info(call['path'])) or (await probe_video_stream_info(call['path'])) if video_active else None
+            sync_trim_start = None
+            sync_pre_seek = None
+            sync_copyts = False
+            sync_normalize_pts = False
+            sub_shift_offset = float(call.get('offset') or 0.0)
+            target_fps = 30
+            if getattr(stream, 'camera', None) is not None:
+                target_fps = int(getattr(stream.camera.parameters, 'frame_rate', 30) or 30)
+
+            if video_active and info and not info.get('is_image', False):
+                v_start = info.get('video_start_time')
+                a_start = info.get('audio_start_time')
+                if v_start is not None or a_start is not None:
+                    if v_start is not None and a_start is not None and abs(v_start - a_start) <= 15.0:
+                        common_start = max(v_start, a_start)
+                    else:
+                        common_start = v_start if v_start is not None else a_start
+                    offset_val = float(call.get('offset') or 0.0)
+                    drift = abs((v_start or 0.0) - (a_start or 0.0)) if (v_start is not None and a_start is not None) else 0.0
+                    sync_normalize_pts = True
+                    if offset_val > 0.05 or drift >= 0.025:
+                        sync_copyts = True
+                        sync_trim_start = float(common_start) + offset_val
+                        sync_pre_seek = max(0.0, offset_val - 8.0) if offset_val > 8.5 else 0.0
+                        if v_start is not None:
+                            sub_shift_offset = max(0.0, sync_trim_start - float(v_start))
+
             if getattr(stream, 'microphone', None) is not None and getattr(stream.microphone, 'path', None):
-                if call.get('remote_proxy') or '-reconnect_at_eof' in str(stream.microphone.path):
+                if video_active and not (info and info.get('is_image', False)):
+                    stream.microphone.path = rewrite_audio_ffmpeg_command(
+                        stream.microphone.path,
+                        stream_index=info.get('audio_stream_index') if info else None,
+                        audio_count=info.get('audio_count', 1) if info else 1,
+                        pre_seek=sync_pre_seek,
+                        copyts=sync_copyts,
+                        trim_start=sync_trim_start,
+                        normalize_pts=sync_normalize_pts or bool(sync_copyts),
+                        strip_first_pts_zero=True,
+                    )
+                elif call.get('remote_proxy') or '-reconnect_at_eof' in str(stream.microphone.path):
                     stream.microphone.path = strip_reconnect_at_eof(stream.microphone.path)
+
             if video_active and getattr(stream, 'camera', None) is not None:
-                info = await probe_video_stream_info(call['path'])
                 scaled = compute_target_video_size(info['width'], info['height'], max_w, max_h, adjust_by_height=True) if info else None
                 cam_w = int(getattr(stream.camera.parameters, 'width', max_w) or max_w)
                 cam_h = int(getattr(stream.camera.parameters, 'height', max_h) or max_h)
@@ -653,7 +907,8 @@ class Bridge:
                 stream.camera.parameters.width = final_w
                 stream.camera.parameters.height = final_h
                 sub_raw = call.get('subtitle_path')
-                active_sub = self.shift_subtitle(sub_raw, call.get('offset') or 0.0, call.get('playback_id')) if (sub_raw and Path(sub_raw).is_file()) else None
+                active_sub = self.shift_subtitle(sub_raw, sub_shift_offset, call.get('playback_id')) if (sub_raw and Path(sub_raw).is_file()) else None
+                is_img = info.get('is_image', False) if info else False
                 stream.camera.path = rewrite_video_ffmpeg_command(
                     stream.camera.path,
                     final_w,
@@ -661,7 +916,12 @@ class Bridge:
                     subtitle_path=active_sub,
                     stream_index=info.get('stream_index') if info else None,
                     video_count=info.get('video_count', 1) if info else 1,
-                    is_image=info.get('is_image', False) if info else False,
+                    is_image=is_img,
+                    fps=target_fps if not is_img else None,
+                    trim_start=sync_trim_start if not is_img else None,
+                    normalize_pts=(sync_normalize_pts or not is_img),
+                    pre_seek=sync_pre_seek if not is_img else None,
+                    copyts=sync_copyts if not is_img else False,
                 )
             play_stream = Stream(
                 microphone=getattr(stream, 'microphone', None),
@@ -1111,7 +1371,7 @@ def make_app(bridge, token):
     app.router.add_post('/accounts/register', register); app.router.add_post('/accounts/configure', configure)
     app.router.add_post('/destination/setup', setup); app.router.add_post('/destination/existing-group', existing)
     app.router.add_post('/call/play', play); app.router.add_get('/call/status', status)
-    app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek}', control)
+    app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek|subtitle}', control)
     async def cleanup(_): await bridge.shutdown()
     app.on_cleanup.append(cleanup)
     return app

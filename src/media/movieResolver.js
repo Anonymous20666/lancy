@@ -14,7 +14,7 @@ import { normalizeTrack } from '../music/model.js';
 
 const execFileAsync = promisify(execFile);
 
-const TRAILER_RE = /\b(trailer|teaser|promo|sneak\s*peek|clip|featurette|preview|recap|review|reaction|ending\s*explained|behind\s*the\s*scenes|making\s*of|soundtrack|ost|theme\s*song|short\s*film)\b/i;
+const TRAILER_RE = /\b(trailer|teaser|promo|sneak\s*peek|clip|featurette|preview|recap|review|reaction|ending\s*explained|explained|summary|behind\s*the\s*scenes|making\s*of|soundtrack|ost|theme\s*song|short\s*film|parody|spoof|compilation|highlights|interview|deleted\s+scene|bloopers?|gag\s+reel|music\s+video|status\s+video)\b/i;
 const DIRECT_VIDEO_RE = /\.(mkv|mp4|webm|m3u8)(\?|$)/i;
 const AD_OR_BAD_DOMAIN_RE = /(hai8g\.|doubleclick|googlesyndication|adsterra|popads|shorte\.st|adf\.ly|ouo\.io|facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me\/)/i;
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36';
@@ -24,6 +24,24 @@ const CINEMA_PLAYER_HEADERS = {
   Referer: 'https://player.cinezo.live/',
   Origin: 'https://player.cinezo.live',
   'User-Agent': UA
+};
+
+const STOP_WORDS = new Set([
+  'the', 'a', 'an', 'and', 'of', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'from',
+  'movie', 'series', 'film', 'full', 'download', 'watch', 'online', 'free', 'hd',
+  '1080p', '720p', '480p', '360p', '2160p', '4k', 'webrip', 'web', 'dl', 'bluray',
+  'brrip', 'hdrip', 'x264', 'x265', 'hevc', 'aac', 'mp4', 'mkv', 'season', 'episode'
+]);
+const NUMERAL_NORMALIZE = {
+  ii: '2', two: '2',
+  iii: '3', three: '3',
+  iv: '4', four: '4',
+  v: '5', five: '5',
+  vi: '6', six: '6',
+  vii: '7', seven: '7',
+  viii: '8', eight: '8',
+  ix: '9', nine: '9',
+  x: '10', ten: '10'
 };
 
 function isTrailerLike(text = '') {
@@ -40,46 +58,144 @@ function extractQualityLabel(raw = '') {
   return 'HD';
 }
 
-function significantTokens(text = '') {
+function tokenizeWords(text = '') {
   return String(text || '')
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/['’]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
     .split(/\s+/)
-    .filter((w) => w.length >= 2 && !['the', 'and', 'for', 'with', 'part', 'movie', 'series', 'film', 'full', 'download', 'hd', '1080p', '720p', '480p'].includes(w));
+    .filter(Boolean);
 }
 
-function scoreTitleMatch(targetTitle, targetYear, candidateText, { isTv = false, season = null } = {}) {
-  const candLower = String(candidateText || '').toLowerCase();
+function normalizeToken(tok) {
+  return NUMERAL_NORMALIZE[tok] || tok;
+}
+
+function extractSequelNumbers(text = '', { ignoreYear = null } = {}) {
+  const nums = new Set();
+  const raw = String(text || '').toLowerCase();
+  const toks = tokenizeWords(raw);
+  for (let i = 0; i < toks.length; i++) {
+    const prev = toks[i - 1] || '';
+    const norm = normalizeToken(toks[i]);
+    if (!/^\d{1,2}$/.test(norm)) continue;
+    const n = Number(norm);
+    if (n < 2 || n > 19) continue;
+    if (['s', 'season', 'ep', 'episode', 'e'].includes(prev)) continue;
+    if (/^s\d{1,2}e\d{1,3}$/i.test(prev)) continue;
+    if (ignoreYear && String(ignoreYear) === norm) continue;
+    nums.add(String(n));
+  }
+  return nums;
+}
+
+function significantTokens(text = '') {
+  const rawToks = tokenizeWords(text);
+  const out = [];
+  for (let i = 0; i < rawToks.length; i++) {
+    const t = rawToks[i];
+    if (t === 'part' || t === 'vol' || t === 'chapter') {
+      const next = normalizeToken(rawToks[i + 1] || '');
+      if (/^\d{1,2}$/.test(next)) continue;
+    }
+    const norm = normalizeToken(t);
+    if (/^\d{1,2}$/.test(norm)) {
+      out.push(norm);
+      continue;
+    }
+    if (STOP_WORDS.has(t)) continue;
+    if (t.length >= 2) out.push(t);
+  }
+  if (!out.length) {
+    return rawToks.filter((t) => !STOP_WORDS.has(t) && t.length >= 1);
+  }
+  return [...new Set(out)];
+}
+
+function scoreTitleMatch(targetTitle, targetYear, candidateText, { isTv = false, season = null, episode = null } = {}) {
+  const candRaw = String(candidateText || '');
+  const candLower = candRaw.toLowerCase();
   if (!candLower || isTrailerLike(candLower)) return -100;
-  let score = 0;
+
+  // Strip TV episode markers when comparing title words unless checking season/episode explicitly
+  const candForTitle = isTv
+    ? candLower.replace(/\b(?:s\d{1,2}\s*e\d{1,3}|season\s*\d{1,2}|episode\s*\d{1,3})\b/gi, ' ')
+    : candLower;
+  const candTokList = tokenizeWords(candForTitle).map(normalizeToken);
+  const candTokSet = new Set(candTokList);
+
   const words = significantTokens(targetTitle);
+  if (!words.length) return -60;
+
   let matchedWords = 0;
   for (const w of words) {
-    if (candLower.includes(w)) {
-      score += 12;
+    if (candTokSet.has(w)) {
+      matchedWords += 1;
+    } else if (w.length >= 4 && candTokList.some((ct) => ct.startsWith(w) && ct.length <= w.length + 2)) {
       matchedWords += 1;
     }
   }
-  if (words.length > 0 && matchedWords === 0) return -50;
-  if (words.length >= 2 && matchedWords / words.length < 0.6) score -= 25;
-  if (targetYear && candLower.includes(String(targetYear))) score += 20;
+  if (matchedWords === 0) return -60;
+
+  const coverage = matchedWords / words.length;
+  if (words.length >= 2 && coverage < 0.75) return -50;
+  if (words.length === 1 && matchedWords < 1) return -50;
+
+  // Guard sequel/installment mismatches (e.g. "John Wick 4" vs "John Wick", or "Dune Part Two" vs "Dune")
+  const targetSeq = extractSequelNumbers(targetTitle);
+  const candSeq = extractSequelNumbers(candForTitle);
+  for (const sNum of targetSeq) {
+    if (!candSeq.has(sNum)) return -70;
+  }
+  if (targetSeq.size === 0 && !isTv) {
+    for (const cNum of candSeq) {
+      if (Number(cNum) >= 2 && Number(cNum) <= 9) return -55;
+    }
+  }
+
+  let score = matchedWords * 14;
+  if (coverage === 1) score += 12;
+
+  // Penalize overly broad candidates when target title is very short (e.g., 1 word like "Us", "Her", "Up")
+  const nonStopCand = candTokList.filter((t) => !STOP_WORDS.has(t) && !/^(19\d\d|20\d\d)$/.test(t));
+  if (words.length === 1 && nonStopCand.length > words.length + 2) {
+    score -= (nonStopCand.length - (words.length + 1)) * 6;
+  }
+
+  // Year match & mismatch guard
+  const candYears = [...candRaw.matchAll(/\b(19[3-9]\d|20[0-3]\d)\b/g)].map((m) => Number(m[1]));
+  if (targetYear) {
+    const yNum = Number(targetYear);
+    if (candYears.includes(yNum)) score += 20;
+    else if (candYears.some((cy) => Math.abs(cy - yNum) <= 1)) score += 8;
+    else if (candYears.length > 0 && candYears.every((cy) => Math.abs(cy - yNum) > 1)) score -= 55;
+  }
+
   if (isTv && season) {
-    const sPad = String(season).padStart(2, '0');
-    if (new RegExp(`\\b(s0?${Number(season)}\\b|season\\s*0?${Number(season)}\\b|s${sPad})`, 'i').test(candLower)) {
+    const sNum = Number(season);
+    const sPad = String(sNum).padStart(2, '0');
+    const parsed = parseEpisodeCode(candRaw);
+    if (parsed.seasonNumber != null && parsed.seasonNumber !== sNum) return -60;
+    if (episode != null && parsed.episodeNumber != null && parsed.episodeNumber !== Number(episode)) return -60;
+    if (new RegExp(`\\b(s0?${sNum}(?:e\\d+)?|season\\s*0?${sNum}\\b|s${sPad})`, 'i').test(candLower)) {
       score += 18;
     }
   }
-  if (!isTv && /\b(hollywood\s*movie|nollywood|bollywood|k-drama|anime|download|full\s*movie)\b/i.test(candLower)) score += 8;
+  if (!isTv && /\b(hollywood\s*movie|nollywood|bollywood|k-drama|anime|download|full\s*movie)\b/i.test(candLower)) score += 6;
   return score;
 }
 
 function parseEpisodeCode(text = '') {
   const s = String(text || '');
-  const se = s.match(/S(\d{1,2})\s*E(\d{1,3})/i) || s.match(/Season\s*(\d{1,2})\D+Episode\s*(\d{1,3})/i);
+  const se = s.match(/\bS(\d{1,2})\s*E(\d{1,3})\b/i)
+    || s.match(/Season\s*(\d{1,2})\D+Episode\s*(\d{1,3})\b/i)
+    || s.match(/\b(\d{1,2})x(\d{2,3})\b/i);
   if (se) return { seasonNumber: Number(se[1]), episodeNumber: Number(se[2]) };
-  const ep = s.match(/(?:Episode|Ep|E)\s*0*(\d{1,3})\b/i);
-  if (ep) return { seasonNumber: null, episodeNumber: Number(ep[1]) };
-  return { seasonNumber: null, episodeNumber: null };
+  const sOnly = s.match(/\b(?:Season|S)\s*0*(\d{1,2})\b/i);
+  const ep = s.match(/(?:^|[\s._\-\[(])(?:Episode|Ep|E)\s*0*(\d{1,3})(?=$|[\s._\-\])])/i);
+  if (ep) return { seasonNumber: sOnly ? Number(sOnly[1]) : null, episodeNumber: Number(ep[1]) };
+  return { seasonNumber: sOnly ? Number(sOnly[1]) : null, episodeNumber: null };
 }
 
 function matchEpisodeSource(sources, { type = 'movie', season = null, episode = null }) {
@@ -102,7 +218,7 @@ function matchEpisodeSource(sources, { type = 'movie', season = null, episode = 
       if (sNum != null && sNum !== targetS) return false;
       return true;
     });
-    if (exact.length) return exact;
+    return exact;
   }
 
   return clean
@@ -119,7 +235,7 @@ function matchEpisodeSource(sources, { type = 'movie', season = null, episode = 
     });
 }
 
-function buildSearchQueries({ title, year = null, type = 'movie', season = null, episode = null }) {
+function buildSearchQueries({ title, year = null, type = 'movie', season = null }) {
   const base = String(title || '').trim();
   const noParen = base.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
   const isTv = String(type).toLowerCase() === 'tv';
@@ -128,8 +244,6 @@ function buildSearchQueries({ title, year = null, type = 'movie', season = null,
   if (isTv && season) out.push(`${noParen} S${String(season).padStart(2, '0')}`);
   if (noParen) out.push(noParen);
   if (base && base !== noParen) out.push(base);
-  const simple = noParen.split(/\s*[:\-–—]\s*/)[0]?.trim();
-  if (simple && simple.length >= 3 && !out.includes(simple)) out.push(simple);
   return [...new Set(out)];
 }
 
@@ -156,7 +270,7 @@ export class MovieStreamResolver {
     this.log = log || logger().child({ module: 'movie-resolver' });
   }
 
-  async #probeHttpStream(url, headers = {}) {
+  async #probeHttpStream(url, headers = {}, { minDuration = 0 } = {}) {
     if (!url || !/^https?:\/\//i.test(url)) return null;
     if (/\.mpd(\?|$)|\/manifest\.mpd/i.test(url)) return null;
     try {
@@ -176,6 +290,13 @@ export class MovieStreamResolver {
       if (isHls) {
         const body = await res.text?.().catch(() => '');
         if (!body || !body.includes('#EXTM3U')) return null;
+      } else if (minDuration >= 600) {
+        const cr = String(res.headers?.get?.('content-range') || '');
+        const crMatch = cr.match(/\/(\d+)\s*$/);
+        const totalBytes = crMatch ? Number(crMatch[1]) : (res.status === 200 ? Number(res.headers?.get?.('content-length') || 0) : 0);
+        if (Number.isFinite(totalBytes) && totalBytes > 0 && totalBytes < 1024 * 1024) {
+          return null;
+        }
       }
       return {
         url,
@@ -188,7 +309,7 @@ export class MovieStreamResolver {
     }
   }
 
-  async #probeHlsPlaylistAndSegment(playlistUrl, headers = {}, depth = 0) {
+  async #probeHlsPlaylistAndSegment(playlistUrl, headers = {}, depth = 0, { minDuration = 0 } = {}) {
     if (!playlistUrl || !/^https?:\/\//i.test(playlistUrl) || depth > 2) return null;
     try {
       const res = await this.fetchImpl(playlistUrl, {
@@ -220,7 +341,7 @@ export class MovieStreamResolver {
           return scoreH(b.height) - scoreH(a.height);
         });
         for (const v of variants.slice(0, 2)) {
-          const nested = await this.#probeHlsPlaylistAndSegment(v.uri, headers, depth + 1);
+          const nested = await this.#probeHlsPlaylistAndSegment(v.uri, headers, depth + 1, { minDuration });
           if (nested) {
             return {
               ...nested,
@@ -229,6 +350,17 @@ export class MovieStreamResolver {
           }
         }
         return null;
+      }
+
+      if (minDuration >= 600 && lines.some((l) => /^#EXT-X-ENDLIST\b/i.test(l))) {
+        let totalVodSec = 0;
+        for (const l of lines) {
+          const m = l.match(/^#EXTINF:([0-9.]+)/i);
+          if (m) totalVodSec += Number(m[1]) || 0;
+        }
+        if (totalVodSec > 0 && totalVodSec < Math.min(180, minDuration * 0.25)) {
+          return null;
+        }
       }
 
       const firstSegLine = lines.find((l) => !l.startsWith('#'));
@@ -260,10 +392,34 @@ export class MovieStreamResolver {
     }
   }
 
-  async #resolveFromTmdbStreamNetwork({ type = 'movie', id, season = null, episode = null, durationSeconds = null } = {}) {
+  #routePayloadMatchesTarget(data, { tmdbId, imdbId = null, title = '', year = null, isTv = false, season = null, episode = null }) {
+    if (!data || typeof data !== 'object') return false;
+    const respTmdb = data.tmdbId ?? data.tmdb_id ?? data.id ?? data.mediaId;
+    if (respTmdb != null && /^\d+$/.test(String(respTmdb)) && String(respTmdb) !== String(tmdbId)) {
+      return false;
+    }
+    const respImdb = data.imdbId ?? data.imdb_id;
+    if (imdbId && respImdb && String(respImdb).replace(/^tt/i, '') !== String(imdbId).replace(/^tt/i, '')) {
+      return false;
+    }
+    if (isTv && episode != null) {
+      const respS = data.season ?? data.seasonNumber;
+      const respE = data.episode ?? data.episodeNumber;
+      if (respS != null && season != null && Number(respS) !== Number(season)) return false;
+      if (respE != null && Number(respE) !== Number(episode)) return false;
+    }
+    const respTitle = data.title || data.name || data.movieTitle;
+    if (title && respTitle && scoreTitleMatch(title, year, String(respTitle), { isTv, season }) < 0) {
+      return false;
+    }
+    return true;
+  }
+
+  async #resolveFromTmdbStreamNetwork({ type = 'movie', id, imdbId = null, title = '', year = null, season = null, episode = null, durationSeconds = null } = {}) {
     const tmdbId = String(id || '').trim();
     if (!/^\d+$/.test(tmdbId)) return { stream: null, subtitleHints: [] };
     const isTv = String(type).toLowerCase() === 'tv';
+    const minDuration = durationSeconds ? Number(durationSeconds) : 0;
     const baseQuery = isTv
       ? `/tv?id=${encodeURIComponent(tmdbId)}&season=${Number(season || 1)}&episode=${Number(episode || 1)}&mode=json`
       : `/movie?id=${encodeURIComponent(tmdbId)}&mode=json`;
@@ -291,10 +447,35 @@ export class MovieStreamResolver {
 
     const seenStreamUrls = new Set();
     const candidates = [];
-    const seenSubUrls = new Set();
-    const subtitleHints = [];
+    const siblingSubUrls = new Set();
+    const siblingSubtitleHints = [];
 
-    const addCandidate = (rawUrl, { typeHint = '', qualityHint = '' } = {}) => {
+    const normalizeSubList = (rawSubs) => {
+      const list = [];
+      const localSeen = new Set();
+      for (const sub of (Array.isArray(rawSubs) ? rawSubs : [])) {
+        const subUrl = String(sub?.file || sub?.url || '').trim();
+        if (!subUrl || !/^https?:\/\//i.test(subUrl) || localSeen.has(subUrl)) continue;
+        localSeen.add(subUrl);
+        const langRaw = String(sub?.lang || sub?.language || sub?.label || 'Subtitles').trim();
+        const isEng = /\b(en|eng|english)\b/i.test(langRaw);
+        const item = {
+          language: isEng ? 'English' : langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Subtitles',
+          label: isEng ? 'English Subtitles' : `${langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Feature'} Subtitles`,
+          url: subUrl,
+          type: sub?.type || (/\.vtt(\?|$)/i.test(subUrl) ? 'vtt' : 'srt')
+        };
+        list.push(item);
+        if (!siblingSubUrls.has(subUrl)) {
+          siblingSubUrls.add(subUrl);
+          siblingSubtitleHints.push(item);
+        }
+      }
+      list.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
+      return list;
+    };
+
+    const addCandidate = (rawUrl, { typeHint = '', qualityHint = '', routeSubs = [] } = {}) => {
       const url = String(rawUrl || '').trim();
       if (!url || !/^https?:\/\//i.test(url) || seenStreamUrls.has(url)) return;
       if (AD_OR_BAD_DOMAIN_RE.test(url) || isTrailerLike(url)) return;
@@ -310,52 +491,43 @@ export class MovieStreamResolver {
       if (qLabel === '720p') rank += 8;
       else if (qLabel === '1080p') rank += 6;
       else if (qLabel === '480p') rank += 2;
-      candidates.push({ url, isHls, qualityLabel: qLabel, rank });
+      candidates.push({ url, isHls, qualityLabel: qLabel, rank, routeSubs });
     };
 
     for (const item of settled) {
       if (item.status !== 'fulfilled' || !item.value) continue;
       const data = item.value;
+      if (!this.#routePayloadMatchesTarget(data, { tmdbId, imdbId, title, year, isTv, season, episode })) continue;
+
+      const routeSubs = normalizeSubList(data.subtitles);
       const srcObj = data.source || data.stream;
       if (srcObj && typeof srcObj === 'object') {
         const tHint = srcObj.type || '';
-        if (srcObj.url) addCandidate(srcObj.url, { typeHint: tHint, qualityHint: srcObj.quality || '' });
-        if (srcObj.playlist) addCandidate(srcObj.playlist, { typeHint: 'hls' });
+        if (srcObj.url) addCandidate(srcObj.url, { typeHint: tHint, qualityHint: srcObj.quality || '', routeSubs });
+        if (srcObj.playlist) addCandidate(srcObj.playlist, { typeHint: 'hls', routeSubs });
         if (Array.isArray(srcObj.qualities)) {
           for (const q of srcObj.qualities) {
-            if (typeof q === 'string') addCandidate(q, { typeHint: tHint });
-            else if (q?.url) addCandidate(q.url, { typeHint: q.type || tHint, qualityHint: q.quality || q.label || '' });
+            if (typeof q === 'string') addCandidate(q, { typeHint: tHint, routeSubs });
+            else if (q?.url) addCandidate(q.url, { typeHint: q.type || tHint, qualityHint: q.quality || q.label || '', routeSubs });
           }
         } else if (srcObj.qualities && typeof srcObj.qualities === 'object') {
           for (const [qKey, qVal] of Object.entries(srcObj.qualities)) {
-            if (typeof qVal === 'string') addCandidate(qVal, { typeHint: tHint, qualityHint: qKey });
-            else if (qVal?.url) addCandidate(qVal.url, { typeHint: qVal.type || tHint, qualityHint: qKey });
+            if (typeof qVal === 'string') addCandidate(qVal, { typeHint: tHint, qualityHint: qKey, routeSubs });
+            else if (qVal?.url) addCandidate(qVal.url, { typeHint: qVal.type || tHint, qualityHint: qKey, routeSubs });
           }
         }
       }
-
-      const rawSubs = Array.isArray(data.subtitles) ? data.subtitles : [];
-      for (const sub of rawSubs) {
-        const subUrl = String(sub?.file || sub?.url || '').trim();
-        if (!subUrl || !/^https?:\/\//i.test(subUrl) || seenSubUrls.has(subUrl)) continue;
-        seenSubUrls.add(subUrl);
-        const langRaw = String(sub?.lang || sub?.language || sub?.label || 'Subtitles').trim();
-        const isEng = /\b(en|eng|english)\b/i.test(langRaw);
-        subtitleHints.push({
-          language: isEng ? 'English' : langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Subtitles',
-          label: isEng ? 'English Subtitles' : `${langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Feature'} Subtitles`,
-          url: subUrl,
-          type: sub?.type || (/\.vtt(\?|$)/i.test(subUrl) ? 'vtt' : 'srt')
-        });
-      }
     }
 
-    subtitleHints.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
+    siblingSubtitleHints.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
     candidates.sort((a, b) => b.rank - a.rank);
 
     for (const cand of candidates.slice(0, 6)) {
+      const mergedRouteSubs = cand.routeSubs.length
+        ? [...cand.routeSubs, ...siblingSubtitleHints.filter((s) => !cand.routeSubs.some((r) => r.url === s.url))]
+        : siblingSubtitleHints;
       if (cand.isHls) {
-        const probedHls = await this.#probeHlsPlaylistAndSegment(cand.url, CINEMA_PLAYER_HEADERS);
+        const probedHls = await this.#probeHlsPlaylistAndSegment(cand.url, CINEMA_PLAYER_HEADERS, 0, { minDuration });
         if (probedHls) {
           return {
             stream: {
@@ -366,16 +538,16 @@ export class MovieStreamResolver {
               durationSeconds: durationSeconds || null,
               qualityLabel: probedHls.qualityLabel !== 'HD' ? probedHls.qualityLabel : cand.qualityLabel,
               source: 'movie_tmdb_stream',
-              subtitleHints
+              subtitleHints: mergedRouteSubs
             },
-            subtitleHints
+            subtitleHints: mergedRouteSubs
           };
         }
       } else {
-        const probedDirect = await this.#probeHttpStream(cand.url, CINEMA_PLAYER_HEADERS);
+        const probedDirect = await this.#probeHttpStream(cand.url, CINEMA_PLAYER_HEADERS, { minDuration });
         if (probedDirect) {
           if (probedDirect.isHls) {
-            const hlsCheck = await this.#probeHlsPlaylistAndSegment(probedDirect.url, CINEMA_PLAYER_HEADERS);
+            const hlsCheck = await this.#probeHlsPlaylistAndSegment(probedDirect.url, CINEMA_PLAYER_HEADERS, 0, { minDuration });
             if (!hlsCheck) continue;
             return {
               stream: {
@@ -386,9 +558,9 @@ export class MovieStreamResolver {
                 durationSeconds: durationSeconds || null,
                 qualityLabel: cand.qualityLabel,
                 source: 'movie_tmdb_stream',
-                subtitleHints
+                subtitleHints: mergedRouteSubs
               },
-              subtitleHints
+              subtitleHints: mergedRouteSubs
             };
           }
           return {
@@ -400,24 +572,24 @@ export class MovieStreamResolver {
               durationSeconds: durationSeconds || null,
               qualityLabel: cand.qualityLabel,
               source: 'movie_tmdb_stream',
-              subtitleHints
+              subtitleHints: mergedRouteSubs
             },
-            subtitleHints
+            subtitleHints: mergedRouteSubs
           };
         }
       }
     }
 
-    return { stream: null, subtitleHints };
+    return { stream: null, subtitleHints: [] };
   }
 
-  async #probeWithRefererVariants(url) {
+  async #probeWithRefererVariants(url, probeOpts = {}) {
     for (const headers of [
       {},
       { Referer: 'https://holaflix.xyz/', Origin: 'https://holaflix.xyz' },
       { Referer: 'https://holaflix.cc/', Origin: 'https://holaflix.cc' }
     ]) {
-      const probed = await this.#probeHttpStream(url, headers);
+      const probed = await this.#probeHttpStream(url, headers, probeOpts);
       if (probed) return probed;
     }
     return null;
@@ -463,10 +635,10 @@ export class MovieStreamResolver {
       for (const item of (searchRes?.results || [])) {
         if (!item?.url || seenUrls.has(item.url)) continue;
         seenUrls.add(item.url);
-        const s = scoreTitleMatch(title, year, item.title || item.url, { isTv, season });
-        if (s > 0) rankedPosts.push({ ...item, score: s });
+        const s = scoreTitleMatch(title, year, item.title || item.url, { isTv, season, episode });
+        if (s >= 14) rankedPosts.push({ ...item, score: s });
       }
-      if (rankedPosts.some((p) => p.score >= 22)) break;
+      if (rankedPosts.some((p) => p.score >= 28)) break;
     }
     rankedPosts.sort((a, b) => b.score - a.score);
 
@@ -540,10 +712,10 @@ export class MovieStreamResolver {
           const postTitle = m[2].replace(/<[^>]+>/g, '').replace(/&#\d+;/g, ' ').trim();
           if (seen.has(postUrl)) continue;
           seen.add(postUrl);
-          const sc = scoreTitleMatch(title, year, postTitle, { isTv, season });
-          if (sc > 0) ranked.push({ url: postUrl, title: postTitle, score: sc });
+          const sc = scoreTitleMatch(title, year, postTitle, { isTv, season, episode });
+          if (sc >= 14) ranked.push({ url: postUrl, title: postTitle, score: sc });
         }
-        if (ranked.some((r) => r.score >= 20)) break;
+        if (ranked.some((r) => r.score >= 28)) break;
       } catch {}
     }
 
@@ -572,19 +744,19 @@ export class MovieStreamResolver {
       if (!res?.ok || typeof res.json !== 'function') return null;
       const data = await res.json();
       const docs = (Array.isArray(data?.response?.docs) ? data.response.docs : [])
-        .map((d) => ({ ...d, score: scoreTitleMatch(cleanTitle, year, `${d.title || ''} ${d.year || ''}`, { isTv, season }) }))
-        .filter((d) => d.identifier && d.score >= 12)
+        .map((d) => ({ ...d, score: scoreTitleMatch(cleanTitle, year, `${d.title || ''} ${d.year || ''}`, { isTv, season, episode }) }))
+        .filter((d) => d.identifier && d.score >= 18)
         .sort((a, b) => b.score - a.score);
 
       for (const doc of docs.slice(0, 3)) {
-        const resolved = await this.#resolveArchiveIdentifier(doc.identifier, minDuration);
+        const resolved = await this.#resolveArchiveIdentifier(doc.identifier, minDuration, { isTv, season, episode });
         if (resolved) return resolved;
       }
     } catch {}
     return null;
   }
 
-  async #resolveArchiveIdentifier(identifier, minDuration = 1800) {
+  async #resolveArchiveIdentifier(identifier, minDuration = 1800, { isTv = false, season = null, episode = null } = {}) {
     if (!identifier) return null;
     try {
       const metaRes = await this.fetchImpl(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
@@ -600,6 +772,14 @@ export class MovieStreamResolver {
       const videos = files
         .filter((f) => {
           if (!f?.name || !/\.(mp4|mkv)$/i.test(f.name) || isTrailerLike(f.name)) return false;
+          if (isTv && episode != null) {
+            const parsed = parseEpisodeCode(f.name);
+            if (parsed.episodeNumber != null && parsed.episodeNumber !== Number(episode)) return false;
+            if (parsed.seasonNumber != null && season != null && parsed.seasonNumber !== Number(season)) return false;
+            if (parsed.episodeNumber == null && files.some((other) => /\.(mp4|mkv)$/i.test(other?.name || '') && parseEpisodeCode(other.name).episodeNumber === Number(episode))) {
+              return false;
+            }
+          }
           const lenSec = Number(f.length);
           const sizeBytes = Number(f.size || 0);
           if (Number.isFinite(lenSec) && lenSec > 0 && lenSec < minDuration) return false;
@@ -673,9 +853,9 @@ export class MovieStreamResolver {
           .map((p) => ({
             url: p?.link,
             title: String(p?.title?.rendered || p?.slug || '').replace(/<[^>]+>/g, '').replace(/&#\d+;/g, ' ').trim(),
-            score: scoreTitleMatch(cleanTitle, year, String(p?.title?.rendered || p?.slug || ''), { isTv, season })
+            score: scoreTitleMatch(cleanTitle, year, String(p?.title?.rendered || p?.slug || ''), { isTv, season, episode })
           }))
-          .filter((p) => p.url && p.score >= 12)
+          .filter((p) => p.url && p.score >= 18)
           .sort((a, b) => b.score - a.score);
 
         for (const post of ranked.slice(0, 2)) {
@@ -708,12 +888,12 @@ export class MovieStreamResolver {
           const dmData = await dmRes.json();
           const dmCandidates = (Array.isArray(dmData?.list) ? dmData.list : [])
             .filter((v) => v?.url && !isTrailerLike(v.title || '') && Number(v.duration || 0) >= minDuration)
-            .map((v) => ({ ...v, score: scoreTitleMatch(cleanTitle, year, v.title, { isTv, season }) }))
-            .filter((v) => v.score >= 16)
+            .map((v) => ({ ...v, score: scoreTitleMatch(cleanTitle, year, v.title, { isTv, season, episode }) }))
+            .filter((v) => v.score >= 20)
             .sort((a, b) => b.score - a.score);
 
           for (const cand of dmCandidates.slice(0, 2)) {
-            const ytRes = await this.#extractYtDlpStream(cand.url, { title: cleanTitle, year, isTv, minDuration, strictTitle: true });
+            const ytRes = await this.#extractYtDlpStream(cand.url, { title: cleanTitle, year, isTv, season, episode, minDuration, strictTitle: true });
             if (ytRes) return ytRes;
           }
         }
@@ -751,7 +931,7 @@ export class MovieStreamResolver {
       if (!info || isTrailerLike(`${info.title || ''} ${info.description || ''}`)) return null;
       const dur = Number(info.duration || 0);
       if (!dur || dur < minDuration) return null;
-      if (strictTitle && scoreTitleMatch(title, year, info.title, { isTv }) < 10) return null;
+      if (strictTitle && scoreTitleMatch(title, year, info.title, { isTv, season, episode }) < 18) return null;
       const url = info.url || info.requested_downloads?.[0]?.url;
       if (!url || !/^https?:\/\//i.test(url)) return null;
       if (info.vcodec === 'none' || info.acodec === 'none') return null;
@@ -793,9 +973,9 @@ export class MovieStreamResolver {
         if (isTrailerLike(e.title || '')) return false;
         const dur = Number(e.duration || 0);
         if (!dur || dur < minDuration) return false;
-        return scoreTitleMatch(cleanTitle, year, e.title, { isTv, season }) >= 12;
+        return scoreTitleMatch(cleanTitle, year, e.title, { isTv, season, episode }) >= 18;
       })
-      .sort((a, b) => scoreTitleMatch(cleanTitle, year, b.title, { isTv, season }) - scoreTitleMatch(cleanTitle, year, a.title, { isTv, season }));
+      .sort((a, b) => scoreTitleMatch(cleanTitle, year, b.title, { isTv, season, episode }) - scoreTitleMatch(cleanTitle, year, a.title, { isTv, season, episode }));
 
     for (const cand of candidates.slice(0, 3)) {
       if (cand.directStreamUrl) {
@@ -812,6 +992,8 @@ export class MovieStreamResolver {
         title: cleanTitle,
         year,
         isTv,
+        season,
+        episode,
         minDuration
       });
       if (extracted) return extracted;
@@ -855,8 +1037,9 @@ export class MovieStreamResolver {
     const root = playback?.rootStream;
     if (root) {
       const candidateUrls = [root.direct_url, root.hls_url].filter(Boolean);
+      const minDuration = durationSeconds ? Number(durationSeconds) : 0;
       for (const candUrl of candidateUrls) {
-        const probed = await this.#probeWithRefererVariants(candUrl);
+        const probed = await this.#probeWithRefererVariants(candUrl, { minDuration });
         if (probed) {
           resolvedStream = {
             url: probed.url,
@@ -874,12 +1057,10 @@ export class MovieStreamResolver {
     }
     if (!resolvedStream) {
       emit('⏳ [1/5] Primary route unavailable — checking alternate HD routes…');
-      const netRes = await this.#resolveFromTmdbStreamNetwork({ type, id, season, episode, durationSeconds }).catch(() => ({ stream: null, subtitleHints: [] }));
-      if (Array.isArray(netRes?.subtitleHints) && netRes.subtitleHints.length) {
-        tmdbSubtitleHints = netRes.subtitleHints;
-      }
+      const netRes = await this.#resolveFromTmdbStreamNetwork({ type, id, imdbId, title, year, season, episode, durationSeconds }).catch(() => ({ stream: null, subtitleHints: [] }));
       if (netRes?.stream) {
         resolvedStream = netRes.stream;
+        tmdbSubtitleHints = Array.isArray(netRes?.subtitleHints) ? netRes.subtitleHints : [];
         emit(`✅ [1/5] Alternate HD stream ready (${resolvedStream.qualityLabel || 'HD'})`);
       }
     }
@@ -919,10 +1100,11 @@ export class MovieStreamResolver {
     let subtitleInfo = null;
     if (resolvedStream && fetchSubtitles && this.subtitles) {
       emit('💬 [Subs] Matching & syncing subtitles…');
+      const allowApiSubs = resolvedStream.source === 'movie_api_root' || resolvedStream.source === 'movie_tmdb_stream';
       const mergedHints = [
         ...(Array.isArray(resolvedStream.subtitleHints) ? resolvedStream.subtitleHints : []),
-        ...tmdbSubtitleHints,
-        ...(Array.isArray(playback?.subtitles) ? playback.subtitles : [])
+        ...(allowApiSubs ? tmdbSubtitleHints : []),
+        ...(allowApiSubs && Array.isArray(playback?.subtitles) ? playback.subtitles : [])
       ];
       subtitleInfo = await this.subtitles.resolveForMedia({
         type,
@@ -933,6 +1115,8 @@ export class MovieStreamResolver {
         season,
         episode,
         streamUrl: resolvedStream.url,
+        headers: resolvedStream.headers,
+        streamSource: resolvedStream.source,
         subtitleHints: mergedHints
       }).catch(() => null);
       if (subtitleInfo?.filePath || subtitleInfo?.found) {

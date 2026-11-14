@@ -41,6 +41,9 @@ export class VideoStreamingServer {
     this.activeDownloads = new Map();
     this.activeAudioDownloads = new Map();
     this.remoteStreams = new Map();
+    this.segmentCache = new Map();
+    this.segmentCacheBytes = 0;
+    this.inflightSegments = new Map();
 
     try {
       mkdirSync(this.cacheDir, { recursive: true });
@@ -77,6 +80,9 @@ export class VideoStreamingServer {
   }
 
   async stop() {
+    this.segmentCache.clear();
+    this.segmentCacheBytes = 0;
+    this.inflightSegments.clear();
     if (this.server) {
       await new Promise((resolve) => this.server.close(resolve));
       this.server = null;
@@ -508,6 +514,43 @@ export class VideoStreamingServer {
     }).join('\n');
   }
 
+  #getCachedSegment(token) {
+    const item = this.segmentCache.get(token);
+    if (!item) return null;
+    if (Date.now() > item.expiresAt) {
+      this.segmentCache.delete(token);
+      this.segmentCacheBytes = Math.max(0, this.segmentCacheBytes - item.body.length);
+      return null;
+    }
+    return item;
+  }
+
+  #putCachedSegment(token, body, contentType) {
+    const maxEntry = 12 * 1024 * 1024;
+    const maxTotal = 48 * 1024 * 1024;
+    if (!Buffer.isBuffer(body) || !body.length || body.length > maxEntry) return;
+    const prev = this.segmentCache.get(token);
+    if (prev) {
+      this.segmentCache.delete(token);
+      this.segmentCacheBytes = Math.max(0, this.segmentCacheBytes - prev.body.length);
+    }
+    const now = Date.now();
+    for (const [k, v] of this.segmentCache) {
+      if (now > v.expiresAt) {
+        this.segmentCache.delete(k);
+        this.segmentCacheBytes = Math.max(0, this.segmentCacheBytes - v.body.length);
+      }
+    }
+    while (this.segmentCacheBytes + body.length > maxTotal && this.segmentCache.size) {
+      const oldestKey = this.segmentCache.keys().next().value;
+      const oldest = this.segmentCache.get(oldestKey);
+      this.segmentCache.delete(oldestKey);
+      if (oldest) this.segmentCacheBytes = Math.max(0, this.segmentCacheBytes - oldest.body.length);
+    }
+    this.segmentCache.set(token, { body, contentType, expiresAt: now + 30_000 });
+    this.segmentCacheBytes += body.length;
+  }
+
   async #handleMovieProxy(req, res, token) {
     const entry = this.remoteStreams.get(token);
     if (!entry || Date.now() > entry.expiresAt) {
@@ -515,12 +558,95 @@ export class VideoStreamingServer {
       res.end('Stream expired or not found');
       return;
     }
+    const cacheableSegment = Boolean(entry.isChildSegment && req.method === 'GET' && !req.headers.range);
+    if (cacheableSegment) {
+      const cached = this.#getCachedSegment(token);
+      if (cached) {
+        res.writeHead(200, {
+          'Content-Type': cached.contentType,
+          'Content-Length': cached.body.length,
+          'Cache-Control': 'no-store'
+        });
+        res.end(cached.body);
+        return;
+      }
+      if (this.inflightSegments.has(token)) {
+        const shared = await this.inflightSegments.get(token).catch(() => null);
+        if (shared?.body) {
+          res.writeHead(200, {
+            'Content-Type': shared.contentType,
+            'Content-Length': shared.body.length,
+            'Cache-Control': 'no-store'
+          });
+          res.end(shared.body);
+          return;
+        }
+      }
+    }
     const upstreamHeaders = {
       ...(entry.headers || {}),
       'User-Agent': entry.headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
     };
     if (req.headers.range && !entry.isHls) upstreamHeaders.Range = req.headers.range;
     if (req.headers['if-range'] && !entry.isHls) upstreamHeaders['If-Range'] = req.headers['if-range'];
+
+    if (cacheableSegment) {
+      const loader = (async () => {
+        const up = await fetch(entry.url, {
+          method: 'GET',
+          headers: upstreamHeaders,
+          redirect: 'follow',
+          signal: AbortSignal.timeout(20_000)
+        });
+        if (!up.ok) return { status: up.status, headers: {}, body: null };
+        const cl = Number(up.headers.get('content-length') || 0);
+        if (cl > 12 * 1024 * 1024) {
+          return { status: up.status, streamThrough: up, headers: {} };
+        }
+        const buf = Buffer.from(await up.arrayBuffer());
+        const ctypeOut = entry.forceContentType || up.headers.get('content-type') || entry.contentType || 'video/mp2t';
+        this.#putCachedSegment(token, buf, ctypeOut);
+        return { status: 200, contentType: ctypeOut, body: buf };
+      })().finally(() => {
+        this.inflightSegments.delete(token);
+      });
+      this.inflightSegments.set(token, loader);
+      try {
+        const fetched = await loader;
+        if (fetched?.body) {
+          res.writeHead(200, {
+            'Content-Type': fetched.contentType,
+            'Content-Length': fetched.body.length,
+            'Cache-Control': 'no-store'
+          });
+          res.end(fetched.body);
+          return;
+        }
+        if (fetched?.streamThrough) {
+          const pass = {};
+          for (const h of ['content-type', 'content-length']) {
+            const v = fetched.streamThrough.headers.get(h);
+            if (v) pass[h] = v;
+          }
+          if (entry.forceContentType) pass['content-type'] = entry.forceContentType;
+          res.writeHead(fetched.status, pass);
+          const nodeStream = Readable.fromWeb(fetched.streamThrough.body);
+          nodeStream.on('error', () => { try { res.end(); } catch {} });
+          res.on('close', () => { try { nodeStream.destroy(); } catch {} });
+          nodeStream.pipe(res);
+          return;
+        }
+        res.writeHead(fetched?.status || 502, { 'Content-Type': 'text/plain' });
+        res.end('Upstream movie segment unavailable');
+        return;
+      } catch {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end('Upstream movie stream unreachable');
+        }
+        return;
+      }
+    }
 
     const controller = new AbortController();
     req.on('close', () => controller.abort());

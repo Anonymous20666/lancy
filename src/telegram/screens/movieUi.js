@@ -400,6 +400,16 @@ export function createMovieUi({
 
   async function loadItemIntoSession(ms, item) {
     ms.mediaItem = item;
+    ms.playback = null;
+    ms.seasons = [];
+    ms.episodes = [];
+    ms.epPage = 0;
+    ms.seasonPage = 0;
+    ms.seasonNumber = 1;
+    ms.episodeCache?.clear?.();
+    ms.selectedBySeason?.clear?.();
+    ms.dlManifest = null;
+    ms.dlPage = 0;
     ms.notice = null;
     ms.logLines = null;
     if (item.type === 'tv') {

@@ -356,3 +356,186 @@ class StreamSyncAndGeometryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('-reconnect_streamed 1', stripped_audio)
         self.assertNotIn('-reconnect_at_eof', rewritten_video)
         self.assertIn('scale=1280:686:flags=lanczos,setsar=1,format=yuv420p', rewritten_video)
+
+
+class AvSyncAndSubtitleRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_call_subtitle_route_registered_and_not_404(self):
+        token = 'test-sub-route-' + 'x' * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = Bridge(tmp)
+            engine = FakeEngine()
+            bridge.accounts['main'] = {
+                'alias': 'main',
+                'status': 'ready',
+                'engine': engine,
+                'client': types.SimpleNamespace(me=types.SimpleNamespace(id=1)),
+                'group_grants': set(),
+            }
+            bridge.calls[-1] = {
+                'alias': 'main',
+                'status': 'idle',
+                'path': str(Path(tmp) / 'movie.mp4'),
+                'offset': 0.0,
+                'video': True,
+                'bass': False,
+                'playback_id': 'pb-1',
+            }
+            client = TestClient(TestServer(make_app(bridge, token)))
+            await client.start_server()
+            try:
+                res = await client.post(
+                    '/call/subtitle',
+                    json={'chat_id': -1, 'subtitle_path': None},
+                    headers={'Authorization': f'Bearer {token}'},
+                )
+                self.assertEqual(res.status, 200)
+                body = await res.json()
+                self.assertTrue(body.get('ok'))
+            finally:
+                await client.close()
+
+    def test_shift_subtitle_handles_bom_short_webvtt_timestamps_and_strips_tags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vtt_path = Path(tmp) / 'subs.vtt'
+            vtt_path.write_text(
+                '\ufeffWEBVTT\nKind: captions\n\nNOTE ignore this block\n\n'
+                '00:05.500 --> 00:09.000 align:start\n'
+                '<i>First</i> {\\an8}line\n\n'
+                '00:12.000 --> 00:15.250\n'
+                'Second line\n',
+                encoding='utf-8',
+            )
+            bridge = Bridge(tmp)
+            shifted_path = bridge.shift_subtitle(str(vtt_path), 4.0, 'pb-bom')
+            self.assertIsNotNone(shifted_path)
+            shifted_text = Path(shifted_path).read_text(encoding='utf-8')
+            self.assertIn('00:00:01,500 --> 00:00:05,000', shifted_text)
+            self.assertIn('First line', shifted_text)
+            self.assertNotIn('<i>', shifted_text)
+            self.assertNotIn('{\\an8}', shifted_text)
+            self.assertNotIn('WEBVTT', shifted_text)
+            self.assertIn('00:00:08,000 --> 00:00:11,250', shifted_text)
+
+    def test_rewrite_audio_and_video_sync_flags_and_strips_first_pts_zero(self):
+        audio_cmd = (
+            'ffmpeg -ss 12.5 -i http://127.0.0.1:3055/movie.mp4 '
+            '-f s16le -ac 2 -ar 48000 -af aresample=48000:async=1:first_pts=0 pipe:1'
+        )
+        video_cmd = (
+            'ffmpeg -ss 12.5 -i http://127.0.0.1:3055/movie.mp4 '
+            '-f rawvideo -r 30 -pix_fmt yuv420p pipe:1'
+        )
+        rw_audio = MODULE.rewrite_audio_ffmpeg_command(
+            audio_cmd,
+            stream_index=2,
+            audio_count=2,
+            pre_seek=9.0,
+            copyts=True,
+            trim_start=12.5,
+            normalize_pts=True,
+            strip_first_pts_zero=True,
+        )
+        rw_video = MODULE.rewrite_video_ffmpeg_command(
+            video_cmd,
+            1280,
+            720,
+            stream_index=0,
+            video_count=1,
+            fps=30,
+            trim_start=12.5,
+            normalize_pts=True,
+            pre_seek=9.0,
+            copyts=True,
+        )
+        self.assertIn('-copyts', rw_audio)
+        self.assertIn('-copyts', rw_video)
+        self.assertIn('-ss 9.000', rw_audio)
+        self.assertIn('-ss 9.000', rw_video)
+        self.assertIn('-map 0:2', rw_audio)
+        self.assertIn('atrim=start=12.500,asetpts=PTS-STARTPTS', rw_audio)
+        self.assertNotIn(':first_pts=0', rw_audio)
+        self.assertIn('trim=start=12.500,setpts=PTS-STARTPTS,fps=fps=30', rw_video)
+
+    async def test_probe_selects_primary_audio_track_and_end_to_end_ffmpeg_av_sync(self):
+        import shutil
+        import subprocess
+        if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            self.skipTest('ffmpeg/ffprobe binary unavailable')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            # 1. Multi-audio-track MKV (track 1 = commentary, track 2 = default eng) -> probe selects eng
+            multi_mkv = tmp_dir / 'multi.mkv'
+            mk_proc = subprocess.run(
+                [
+                    'ffmpeg', '-y',
+                    '-f', 'lavfi', '-i', 'testsrc=duration=2:size=320x240:rate=24',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+                    '-f', 'lavfi', '-i', 'sine=frequency=880:duration=2',
+                    '-map', '0:v:0', '-map', '1:a:0', '-map', '2:a:0',
+                    '-metadata:s:a:0', 'language=spa', '-metadata:s:a:0', 'title=Director Commentary',
+                    '-metadata:s:a:1', 'language=eng', '-metadata:s:a:1', 'title=English Main',
+                    '-disposition:a:0', '0', '-disposition:a:1', 'default',
+                    str(multi_mkv),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(mk_proc.returncode, 0, mk_proc.stderr)
+            info = await MODULE.probe_media_stream_info(str(multi_mkv))
+            self.assertEqual(info['audio_count'], 2)
+            self.assertEqual(info['audio_stream_index'], 2)
+
+            # 2. MPEG-TS with non-zero container start_time (10.0s) -> rewritten mic & cam stay synced
+            src_ts = tmp_dir / 'offset.ts'
+            ts_proc = subprocess.run(
+                [
+                    'ffmpeg', '-y',
+                    '-f', 'lavfi', '-i', 'testsrc=duration=8:size=320x240:rate=24',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=8',
+                    '-output_ts_offset', '10.0',
+                    '-c:v', 'mpeg2video', '-c:a', 'mp2',
+                    str(src_ts),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ts_proc.returncode, 0, ts_proc.stderr)
+            ts_info = await MODULE.probe_media_stream_info(str(src_ts))
+            common_start = max(ts_info['video_start_time'], ts_info['audio_start_time'])
+
+            for seek_off in (0.0, 4.5):
+                trim_at = common_start + seek_off
+                pre_seek = max(0.0, seek_off - 4.0) if seek_off > 4.0 else 0.0
+                out_pcm = tmp_dir / f'mic_{seek_off}.pcm'
+                out_yuv = tmp_dir / f'cam_{seek_off}.yuv'
+
+                base_a = f'ffmpeg -y -i {src_ts} -f s16le -ac 2 -ar 48000 -af aresample=48000:async=1:first_pts=0 pipe:1'
+                base_v = f'ffmpeg -y -i {src_ts} -f rawvideo -r 30 -pix_fmt yuv420p pipe:1'
+                cmd_a = MODULE.rewrite_audio_ffmpeg_command(
+                    base_a,
+                    pre_seek=pre_seek,
+                    copyts=True,
+                    trim_start=trim_at,
+                    normalize_pts=True,
+                    strip_first_pts_zero=True,
+                ).replace('pipe:1', str(out_pcm))
+                cmd_v = MODULE.rewrite_video_ffmpeg_command(
+                    base_v,
+                    320,
+                    240,
+                    fps=30,
+                    pre_seek=pre_seek,
+                    copyts=True,
+                    trim_start=trim_at,
+                    normalize_pts=True,
+                ).replace('pipe:1', str(out_yuv))
+
+                ra = subprocess.run(cmd_a, shell=True, capture_output=True, text=True)
+                rv = subprocess.run(cmd_v, shell=True, capture_output=True, text=True)
+                self.assertEqual(ra.returncode, 0, ra.stderr)
+                self.assertEqual(rv.returncode, 0, rv.stderr)
+
+                mic_dur = out_pcm.stat().st_size / (48000 * 2 * 2)
+                cam_dur = (out_yuv.stat().st_size / (320 * 240 * 3 // 2)) / 30.0
+                self.assertLess(abs(mic_dur - cam_dur), 0.12, f'offset={seek_off}: mic={mic_dur:.3f}s cam={cam_dur:.3f}s')
