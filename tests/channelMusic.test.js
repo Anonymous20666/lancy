@@ -112,7 +112,7 @@ test('global and custom-prefix command menus preserve unrelated commands and exp
  const base=[{command:'game',description:'Existing games'},{command:'play',description:'old misleading quality'}];
  const publicMenu=withMusicCommands(base),admin=withMusicCommands(base,{admin:true}),privateMenu=withMusicCommands(base,{privateChat:true}),custom=withMusicCommands(base,{admin:true,prefix:'!'});
  assert.ok(publicMenu.some(c=>c.command==='game'));assert.ok(publicMenu.some(c=>c.command==='play'));assert.ok(!publicMenu.some(c=>c.command==='addq'));
- for(const c of ADMIN_MUSIC_COMMANDS)assert.ok(admin.some(x=>x.command===c.command));assert.ok(privateMenu.some(c=>c.command==='channel'));
+ for(const c of ADMIN_MUSIC_COMMANDS)assert.ok(admin.some(x=>x.command===c.command));assert.ok(!privateMenu.some(c=>c.command==='channel'));assert.ok(!privateMenu.some(c=>c.command==='destination'));assert.ok(privateMenu.some(c=>c.command==='movie'));
  assert.ok(custom.find(c=>c.command==='addq').description.startsWith('[!addq]'));assert.ok(!JSON.stringify(custom).includes('320k'));
 });
 test('actual command registration publishes separate group/admin scopes and custom-prefix admin scopes',async()=>{
@@ -123,15 +123,19 @@ test('actual command registration publishes separate group/admin scopes and cust
 });
 
 
-test('closed-private bot admits verified channel admins only to scoped music, not AI or owner account management',async t=>{
+test('closed-private bot retires DM /channel onboarding and keeps existing verified panels strictly scoped away from AI or owner account management',async t=>{
  const h=setup(t),db=new Database(':memory:');t.after(()=>db.close());
  const settings=new SettingsManager(db,{env:{OWNER_IDS:'1000'}});h.app.settings=settings;h.app.db=db;
  h.api.answerCallbackQuery=async()=>true;
  const c=new TelegramController({api:h.api,db,settings,sm:h.app.sm,screens:h.app.screens,app:h.app});
  const from={id:10,is_bot:false,first_name:'Admin'},chat={id:10,type:'private'};
  assert.equal(c.isAllowed(10).ok,false);
+ // DM /channel no longer opens remote channel panels for closed-private users
  await c.handleUpdate({message:{message_id:1,from,chat,text:'/channel @onechannel'}});
- const panel=h.app.music.channelPanels.find(h.ctx(),-10011);assert.ok(panel?.screenMessageId);
+ assert.equal(h.app.music.channelPanels.find(h.ctx(),-10011),undefined);
+ // Even if a panel session was explicitly provisioned, AI/owner account commands remain blocked in closed private mode
+ const panel=await h.open(10,-10011);
+ assert.ok(panel?.screenMessageId);
  const count=h.sent.length;
  await c.handleUpdate({message:{message_id:2,from,chat,text:'Discuss this private AI topic'}});
  await c.handleUpdate({message:{message_id:3,from,chat,text:'/accounts list'}});assert.equal(h.sent.length,count);
@@ -194,27 +198,30 @@ test('group dashboard replies enforce admin additions but explicit play remains 
  await h.screen.handlePlayerReply(member,{text:'Artist recording',reply_to_message:reply});assert.equal(modes.length,0);assert.match(h.sent.at(-1).text,/administrators/);
  await h.screen.handlePlayerReply(member,{text:'play Artist recording',reply_to_message:reply});await h.screen.handlePlayerReply(admin,{text:'add track Artist recording',reply_to_message:reply});assert.deepEqual(modes,['download','queue']);assert.equal(h.calls.length,0);
 });
-test('closed-private channel music honors existing personal custom command prefixes',async t=>{
- const h=setup(t);h.app.db.getUserPrefix=()=>'!';const ctx=h.ctx(),source={text:'!channel @onechannel'};
- assert.equal(h.screen.privateChannelRequest(ctx,source),true);assert.equal(await h.screen.handlePrivateChannel(ctx,source),true);assert.ok(h.app.music.channelPanels.find(ctx,-10011));
+test('closed-private DM retires /channel and /destination while custom prefix works safely inside actual channels',async t=>{
+ const h=setup(t);h.app.db.getUserPrefix=()=>'!';const ctx=h.ctx();
+ assert.equal(h.screen.privateChannelRequest(ctx,{text:'!channel @onechannel'}),false);
+ assert.equal(h.screen.privateChannelRequest(ctx,{text:'/destination @onechannel'}),false);
+ const chanHandled=await h.screen.handleCommand({...h.ctx(),chatId:-10011,isChannel:true,channelAdminVerified:true},'/player',[]);
+ assert.equal(chanHandled,true);
 });
 
-test('repeated /channel command always posts a fresh dashboard at the bottom of the chat and unpins old',async t=>{
+test('DM /channel shows DM Downloader & Broadcast Guide while in-channel /player opens and replaces cleanly',async t=>{
  const h=setup(t),db=new Database(':memory:');t.after(()=>db.close());
  const settings=new SettingsManager(db,{env:{OWNER_IDS:'1000'}});h.app.settings=settings;h.app.db=db;
- const p1=await h.open(10,-10011);
- assert.ok(p1.screenMessageId);
- const firstId=p1.screenMessageId;
+ await h.screen.handleCommand({...h.ctx(),chatId:10,tgId:'10',isChannel:false},'/channel',['@onechannel']);
  assert.equal(h.sent.length,1);
+ const guideRich=JSON.stringify(h.sent[0].rich||{});
+ assert.match(guideRich,/Movie Downloads|Download Movies/);
+ assert.equal(h.app.music.channelPanels.find(h.ctx(10),-10011),undefined);
  h.app.music.rates.clear();
- // Simulate user sending /channel @onechannel again later in DM
- const c=new TelegramController({api:h.api,db,settings,sm:h.app.sm,screens:h.app.screens,app:h.app});
- const from={id:10,is_bot:false,first_name:'Admin'},chat={id:10,type:'private'};
- await c.handleUpdate({message:{message_id:888,from,chat,text:'/channel @onechannel'}});
- assert.equal(h.sent.length,2);
- const p2=h.app.music.channelPanels.find(h.ctx(10),-10011);
- assert.notEqual(p2.screenMessageId,firstId);
- assert.ok(h.pins.some(p=>p.method==='unpinChatMessage'&&p.message_id===firstId));
+ const chanMsgs=[];
+ const chanApi={...h.api,sendRichMessage:async(id,rich)=>{const message_id=900+chanMsgs.length;chanMsgs.push({id,rich,message_id});return{message_id};},editMessageRich:async(id,message_id,rich)=>({message_id,rich})};
+ const c=new TelegramController({api:chanApi,db,settings,sm:h.app.sm,screens:h.app.screens,app:h.app});
+ await c.handleUpdate({channel_post:{message_id:501,chat:{id:-10011,type:'channel',title:'One'},sender_chat:{id:-10011,type:'channel'},text:'/player'}});
+ const s=h.app.musicQueueManager.getSession(-10011);
+ assert.equal(s.screenMessageId,900);
+ assert.equal(chanMsgs.length,1);
 });
 
 test('channel custom genre flow (Chinese and Japanese traditional instrumental songs) starts non-stop broadcast without STALE_PLAYER error',async t=>{

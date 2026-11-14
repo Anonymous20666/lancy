@@ -14,12 +14,15 @@ import { normalizeTrack } from '../music/model.js';
 
 const execFileAsync = promisify(execFile);
 
-const TRAILER_RE = /\b(trailer|teaser|promo|sneak\s*peek|clip|featurette|preview|recap|review|reaction|ending\s*explained|explained|summary|behind\s*the\s*scenes|making\s*of|soundtrack|ost|theme\s*song|short\s*film|parody|spoof|compilation|highlights|interview|deleted\s+scene|bloopers?|gag\s+reel|music\s+video|status\s+video)\b/i;
+const TRAILER_RE = /\b(trailer|teaser|promo|sneak\s*peek|clip|featurette|preview|recap|review|reaction|ending\s*explained|explained|summary|behind\s*the\s*scenes|making\s*of|soundtrack|ost|theme\s*song|short\s*film|parody|spoof|compilation|highlights|interview|deleted\s+scene|bloopers?|gag\s+reel|music\s+video|status\s+video|gameplay|playthrough|walkthrough|longplay|speedrun|cutscenes?|no\s*commentary|audiobook|podcast|video\s*essay|retrospective|easter\s*eggs|iceberg|tribute|fan\s*film)\b/i;
+const GAME_NOISE_RE = /\b(?:the\s+game|video\s+game|pc\s+game|nintendo|playstation|ps[1-5]|xbox|wii|ds)\b/i;
+const PREVIEW_PATH_RE = /(?:^|[_./-])(?:index_)?preview(?:[_./-]|$)/i;
 const DIRECT_VIDEO_RE = /\.(mkv|mp4|webm|m3u8)(\?|$)/i;
 const AD_OR_BAD_DOMAIN_RE = /(hai8g\.|doubleclick|googlesyndication|adsterra|popads|shorte\.st|adf\.ly|ouo\.io|facebook\.com|twitter\.com|x\.com|instagram\.com|t\.me\/)/i;
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36';
-const CINEMA_STREAM_NODES = ['https://proxy1.flikhub.net', 'https://proxy3.flikhub.net'];
-const CINEMA_STREAM_ROUTES = ['sadie', 'zendaya', 'scarlet', 'berlin', 'lookmovie', 'meowtv', 'vidnest'];
+const CINEMA_STREAM_NODES = ['https://proxy1.flikhub.net', 'https://proxy.yenime.net', 'https://proxy3.flikhub.net'];
+const CINEMA_STREAM_ROUTES = ['berlin', 'scarlet', 'zendaya', 'lookmovie', 'meowtv', 'vidnest', 'sadie'];
+const PUNKFLIX_HOST = 'https://punkflix.net';
 const CINEMA_PLAYER_HEADERS = {
   Referer: 'https://player.cinezo.live/',
   Origin: 'https://player.cinezo.live',
@@ -31,6 +34,19 @@ const STOP_WORDS = new Set([
   'movie', 'series', 'film', 'full', 'download', 'watch', 'online', 'free', 'hd',
   '1080p', '720p', '480p', '360p', '2160p', '4k', 'webrip', 'web', 'dl', 'bluray',
   'brrip', 'hdrip', 'x264', 'x265', 'hevc', 'aac', 'mp4', 'mkv', 'season', 'episode'
+]);
+const RELEASE_TAG_WORDS = new Set([
+  'feature', 'special', 'uncut', 'dvd', 'dvdrip', 'bdrip', 'hdtv', 'cam', 'ts', 'print',
+  'paramount', 'warner', 'universal', 'sony', 'disney', 'pixar', 'fox', 'netflix', 'amzn',
+  'dsnp', 'hmax', 'hulu', 'direct', 'complete', 'edition', 'directors', 'cut', 'unrated',
+  'remastered', 'restored', 'extended', 'proper', 'repack', 'hdr', 'sdr', 'uhd', 'fhd',
+  'sd', 'hq', 'english', 'eng', 'en', 'hindi', 'hin', 'spanish', 'french', 'dual',
+  'audio', 'multi', 'sub', 'subbed', 'subtitles', 'subtitle', 'srt', 'dub', 'dubbed',
+  'h264', 'h265', 'av1', 'ac3', 'dts', 'avi', 'mov', 'yts', 'yify', 'rarbg', 'etrg',
+  'evo', 'sparks', 'nkiri', 'thenkiri', 'netnaija', 'fzmovies', 'toxicwap', 'awafim',
+  'hollywood', 'bollywood', 'nollywood', 'kdrama', 'drama', 'anime', 'tv', 'show',
+  'official', 'movies', 'films', 'hdmovies', 'boxset', 'collection', 'streaming',
+  '10bit', '60fps', '5', '7', 'ddp5', 'ddp'
 ]);
 const NUMERAL_NORMALIZE = {
   ii: '2', two: '2',
@@ -44,8 +60,19 @@ const NUMERAL_NORMALIZE = {
   x: '10', ten: '10'
 };
 
-function isTrailerLike(text = '') {
-  return TRAILER_RE.test(String(text || ''));
+function isTrailerLike(text = '', targetTitle = '') {
+  const s = String(text || '');
+  if (TRAILER_RE.test(s) || PREVIEW_PATH_RE.test(s)) return true;
+  if (GAME_NOISE_RE.test(s) && !GAME_NOISE_RE.test(String(targetTitle || '')) && !/\bgame\b/i.test(String(targetTitle || ''))) {
+    return true;
+  }
+  return false;
+}
+
+function parseIso8601Duration(raw = '') {
+  const m = String(raw || '').match(/^PT(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?$/i);
+  if (!m) return 0;
+  return Math.round((Number(m[1] || 0) * 3600) + (Number(m[2] || 0) * 60) + Number(m[3] || 0));
 }
 
 function extractQualityLabel(raw = '') {
@@ -74,7 +101,9 @@ function normalizeToken(tok) {
 
 function extractSequelNumbers(text = '', { ignoreYear = null } = {}) {
   const nums = new Set();
-  const raw = String(text || '').toLowerCase();
+  const raw = String(text || '')
+    .toLowerCase()
+    .replace(/\b(?:5\.1|7\.1|2\.0|10\s*bit)\b/gi, ' ');
   const toks = tokenizeWords(raw);
   for (let i = 0; i < toks.length; i++) {
     const prev = toks[i - 1] || '';
@@ -113,34 +142,39 @@ function significantTokens(text = '') {
   return [...new Set(out)];
 }
 
-function scoreTitleMatch(targetTitle, targetYear, candidateText, { isTv = false, season = null, episode = null } = {}) {
+export function scoreTitleMatch(targetTitle, targetYear, candidateText, { isTv = false, season = null, episode = null, episodeTitle = null } = {}) {
   const candRaw = String(candidateText || '');
   const candLower = candRaw.toLowerCase();
-  if (!candLower || isTrailerLike(candLower)) return -100;
+  if (!candLower || isTrailerLike(candLower, targetTitle)) return -100;
 
-  // Strip TV episode markers when comparing title words unless checking season/episode explicitly
-  const candForTitle = isTv
-    ? candLower.replace(/\b(?:s\d{1,2}\s*e\d{1,3}|season\s*\d{1,2}|episode\s*\d{1,3})\b/gi, ' ')
-    : candLower;
+  // Strip TV episode markers and audio/bitrate specs before token matching
+  const candCleaned = candLower
+    .replace(/\b(?:5\.1|7\.1|2\.0|10\s*bit)\b/gi, ' ')
+    .replace(/\b(?:s\d{1,2}\s*e\d{1,3}|season\s*\d{1,2}|episode\s*\d{1,3})\b/gi, ' ');
+  const candForTitle = isTv ? candCleaned : candLower.replace(/\b(?:5\.1|7\.1|2\.0|10\s*bit)\b/gi, ' ');
   const candTokList = tokenizeWords(candForTitle).map(normalizeToken);
   const candTokSet = new Set(candTokList);
 
   const words = significantTokens(targetTitle);
   if (!words.length) return -60;
+  const wordSet = new Set(words);
+  const epWordSet = new Set(episodeTitle ? significantTokens(episodeTitle) : []);
 
   let matchedWords = 0;
   for (const w of words) {
     if (candTokSet.has(w)) {
       matchedWords += 1;
-    } else if (w.length >= 4 && candTokList.some((ct) => ct.startsWith(w) && ct.length <= w.length + 2)) {
+    } else if (w.length >= 4 && (candTokSet.has(`${w}s`) || candTokSet.has(`${w}es`))) {
       matchedWords += 1;
     }
   }
   if (matchedWords === 0) return -60;
 
   const coverage = matchedWords / words.length;
-  if (words.length >= 2 && coverage < 0.75) return -50;
-  if (words.length === 1 && matchedWords < 1) return -50;
+  // Require every significant title token for 1..4 word titles so partial collisions
+  // (e.g. "The Three Musketeers" vs "Barbie and the Three Musketeers") never match.
+  if (words.length <= 4 && coverage < 1) return -55;
+  if (words.length >= 5 && coverage < 0.85) return -55;
 
   // Guard sequel/installment mismatches (e.g. "John Wick 4" vs "John Wick", or "Dune Part Two" vs "Dune")
   const targetSeq = extractSequelNumbers(targetTitle);
@@ -157,10 +191,26 @@ function scoreTitleMatch(targetTitle, targetYear, candidateText, { isTv = false,
   let score = matchedWords * 14;
   if (coverage === 1) score += 12;
 
-  // Penalize overly broad candidates when target title is very short (e.g., 1 word like "Us", "Her", "Up")
-  const nonStopCand = candTokList.filter((t) => !STOP_WORDS.has(t) && !/^(19\d\d|20\d\d)$/.test(t));
-  if (words.length === 1 && nonStopCand.length > words.length + 2) {
-    score -= (nonStopCand.length - (words.length + 1)) * 6;
+  // Penalize unrequested extra story words across ALL title lengths (prevents "Barbie" matching
+  // "Barbie and the Three Musketeers" or "The Three Musketeers" matching "Barbie and the Three Musketeers")
+  const extraStoryWords = [];
+  for (const ct of candTokList) {
+    if (!ct || STOP_WORDS.has(ct) || RELEASE_TAG_WORDS.has(ct)) continue;
+    if (/^(19\d\d|20\d\d|\d{3,4}p?)$/.test(ct)) continue;
+    if (wordSet.has(ct) || epWordSet.has(ct)) continue;
+    const isPluralVariant = words.some((w) => w.length >= 4 && (ct === `${w}s` || ct === `${w}es`));
+    if (isPluralVariant) continue;
+    if (ct.length >= 2) extraStoryWords.push(ct);
+  }
+  const uniqueExtraCount = new Set(extraStoryWords).size;
+  if (uniqueExtraCount > 0) {
+    if (words.length === 1) {
+      score -= uniqueExtraCount * 28;
+    } else if (words.length === 2) {
+      score -= uniqueExtraCount * 26;
+    } else {
+      score -= uniqueExtraCount * 20;
+    }
   }
 
   // Year match & mismatch guard
@@ -267,6 +317,7 @@ export class MovieStreamResolver {
     this.ytSearchFn = ytSearchFn;
     this.enableYtDlp = enableYtDlp !== null ? Boolean(enableYtDlp) : (Boolean(ytSearchFn) || fetchImpl === fetch);
     this.enableWebFallback = enableWebFallback;
+    this.hostCooldowns = new Map();
     this.log = log || logger().child({ module: 'movie-resolver' });
   }
 
@@ -286,14 +337,14 @@ export class MovieStreamResolver {
       if (!res?.ok && res?.status !== 206) return null;
       const ctype = String(res.headers?.get?.('content-type') || '').toLowerCase();
       if (ctype.includes('text/html') || ctype.includes('application/json') || ctype.includes('dash+xml')) return null;
+      const cr = String(res.headers?.get?.('content-range') || '');
+      const crMatch = cr.match(/\/(\d+)\s*$/);
+      const totalBytes = crMatch ? Number(crMatch[1]) : (res.status === 200 ? Number(res.headers?.get?.('content-length') || 0) : 0);
       const isHls = ctype.includes('mpegurl') || /\.m3u8(\?|$)/i.test(url);
       if (isHls) {
         const body = await res.text?.().catch(() => '');
         if (!body || !body.includes('#EXTM3U')) return null;
       } else if (minDuration >= 600) {
-        const cr = String(res.headers?.get?.('content-range') || '');
-        const crMatch = cr.match(/\/(\d+)\s*$/);
-        const totalBytes = crMatch ? Number(crMatch[1]) : (res.status === 200 ? Number(res.headers?.get?.('content-length') || 0) : 0);
         if (Number.isFinite(totalBytes) && totalBytes > 0 && totalBytes < 1024 * 1024) {
           return null;
         }
@@ -302,6 +353,7 @@ export class MovieStreamResolver {
         url,
         headers,
         isHls,
+        sizeBytes: Number.isFinite(totalBytes) && totalBytes > 0 ? totalBytes : null,
         contentType: ctype || (isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4')
       };
     } catch {
@@ -309,7 +361,7 @@ export class MovieStreamResolver {
     }
   }
 
-  async #probeHlsPlaylistAndSegment(playlistUrl, headers = {}, depth = 0, { minDuration = 0 } = {}) {
+  async #probeHlsPlaylistAndSegment(playlistUrl, headers = {}, depth = 0, { minDuration = 0, preferredHeight = null } = {}) {
     if (!playlistUrl || !/^https?:\/\//i.test(playlistUrl) || depth > 2) return null;
     try {
       const res = await this.fetchImpl(playlistUrl, {
@@ -327,38 +379,78 @@ export class MovieStreamResolver {
       const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
       const isMaster = lines.some((l) => /^#EXT-X-STREAM-INF:/i.test(l));
       if (isMaster) {
+        const masterUrl = res.url || playlistUrl;
+        const hasMediaAudio = lines.some((l) => /^#EXT-X-MEDIA:/i.test(l) && /\bTYPE=AUDIO\b/i.test(l));
+        const masterSubs = [];
+        for (const line of lines) {
+          if (!/^#EXT-X-MEDIA:/i.test(line) || !/\bTYPE=SUBTITLES\b/i.test(line)) continue;
+          const uriM = line.match(/\bURI="([^"]+)"/i);
+          if (!uriM) continue;
+          const nameM = line.match(/\bNAME="([^"]+)"/i);
+          const langM = line.match(/\bLANGUAGE="([^"]+)"/i);
+          const langRaw = (langM?.[1] || nameM?.[1] || 'en').trim();
+          const isEn = /^(en|eng|english)/i.test(langRaw);
+          masterSubs.push({
+            language: isEn ? 'English' : langRaw,
+            label: isEn ? 'English Subtitles' : `${nameM?.[1] || langRaw} Subtitles`,
+            url: new URL(uriM[1], masterUrl).toString(),
+            headers,
+            tier: 'same_route',
+            type: 'vtt'
+          });
+        }
         const variants = [];
         for (let i = 0; i < lines.length; i++) {
           if (!/^#EXT-X-STREAM-INF:/i.test(lines[i])) continue;
           const nextUri = lines.slice(i + 1).find((l) => l && !l.startsWith('#'));
           if (!nextUri) continue;
           const resMatch = lines[i].match(/RESOLUTION=\d+x(\d+)/i);
+          const avgBwMatch = lines[i].match(/AVERAGE-BANDWIDTH=(\d+)/i);
+          const bwMatch = lines[i].match(/\bBANDWIDTH=(\d+)/i);
           const height = resMatch ? Number(resMatch[1]) : 720;
-          variants.push({ uri: new URL(nextUri, res.url || playlistUrl).toString(), height });
+          const bwBps = Number(avgBwMatch?.[1] || bwMatch?.[1] || 0);
+          variants.push({
+            uri: new URL(nextUri, masterUrl).toString(),
+            height,
+            bandwidthKbps: bwBps > 0 ? Math.round(bwBps / 1000) : null
+          });
         }
+        const targetH = Number(preferredHeight || 0);
         variants.sort((a, b) => {
+          if (targetH > 0) {
+            const fitA = a.height <= targetH ? 1000 + a.height : (500 - a.height);
+            const fitB = b.height <= targetH ? 1000 + b.height : (500 - b.height);
+            return fitB - fitA;
+          }
           const scoreH = (h) => (h === 720 ? 30 : h <= 1080 ? 20 : 10);
           return scoreH(b.height) - scoreH(a.height);
         });
         for (const v of variants.slice(0, 2)) {
-          const nested = await this.#probeHlsPlaylistAndSegment(v.uri, headers, depth + 1, { minDuration });
+          const nested = await this.#probeHlsPlaylistAndSegment(v.uri, headers, depth + 1, { minDuration, preferredHeight });
           if (nested) {
+            const estDur = nested.durationSeconds || minDuration || 0;
+            const estSizeBytes = (v.bandwidthKbps && estDur > 0) ? Math.round((v.bandwidthKbps * 1000 / 8) * estDur) : null;
             return {
               ...nested,
-              qualityLabel: v.height ? `${v.height}p` : nested.qualityLabel
+              url: (hasMediaAudio && !targetH) || (masterSubs.length && !targetH) ? masterUrl : (hasMediaAudio ? masterUrl : nested.url),
+              subtitleHints: [...(masterSubs || []), ...(nested.subtitleHints || [])],
+              qualityLabel: v.height ? `${v.height}p` : nested.qualityLabel,
+              sizeBytes: estSizeBytes || nested.sizeBytes || null,
+              variants: variants.map(({ uri, height, bandwidthKbps }) => ({ url: uri, height, bandwidthKbps }))
             };
           }
         }
         return null;
       }
 
+      let totalVodSec = 0;
       if (minDuration >= 600 && lines.some((l) => /^#EXT-X-ENDLIST\b/i.test(l))) {
-        let totalVodSec = 0;
         for (const l of lines) {
           const m = l.match(/^#EXTINF:([0-9.]+)/i);
           if (m) totalVodSec += Number(m[1]) || 0;
         }
-        if (totalVodSec > 0 && totalVodSec < Math.min(180, minDuration * 0.25)) {
+        const minAllowedVod = minDuration >= 1200 ? Math.max(480, Math.round(minDuration * 0.6)) : Math.min(240, Math.round(minDuration * 0.35));
+        if (totalVodSec > 0 && totalVodSec < minAllowedVod) {
           return null;
         }
       }
@@ -383,39 +475,166 @@ export class MovieStreamResolver {
         url: res.url || playlistUrl,
         headers,
         isHls: true,
+        isDash: false,
         format: 'hls',
         contentType: 'application/vnd.apple.mpegurl',
-        qualityLabel: extractQualityLabel(playlistUrl)
+        qualityLabel: extractQualityLabel(playlistUrl),
+        durationSeconds: totalVodSec > 0 ? Math.round(totalVodSec) : null
       };
     } catch {
       return null;
     }
   }
 
-  #routePayloadMatchesTarget(data, { tmdbId, imdbId = null, title = '', year = null, isTv = false, season = null, episode = null }) {
+  async #probeDashManifest(mpdUrl, headers = {}, { minDuration = 0, durationSeconds = null } = {}) {
+    if (!mpdUrl || !/^https?:\/\//i.test(mpdUrl)) return null;
+    try {
+      const res = await this.fetchImpl(mpdUrl, {
+        method: 'GET',
+        headers: {
+          'User-Agent': UA,
+          ...headers
+        },
+        signal: AbortSignal.timeout(7000)
+      });
+      if (!res?.ok || typeof res.text !== 'function') return null;
+      const xml = await res.text();
+      if (!xml || !/<MPD\b/i.test(xml) || !/<AdaptationSet\b/i.test(xml)) return null;
+
+      const durMatch = xml.match(/\bmediaPresentationDuration="([^"]+)"/i);
+      const mpdSeconds = durMatch ? parseIso8601Duration(durMatch[1]) : 0;
+      const minAllowed = minDuration >= 1200 ? Math.max(480, Math.round(minDuration * 0.6)) : Math.min(240, Math.round(minDuration * 0.35));
+      if (minDuration >= 600 && mpdSeconds > 0 && mpdSeconds < minAllowed) {
+        return null;
+      }
+      if (minDuration >= 1200 && mpdSeconds > Math.round(minDuration * 1.45)) {
+        return null;
+      }
+
+      const baseMatch = xml.match(/<BaseURL>([^<]+)<\/BaseURL>/i);
+      const repMatch = xml.match(/<Representation\b[^>]*\bid="([^"]+)"/i);
+      const initMatch = xml.match(/<SegmentTemplate\b[^>]*\binitialization="([^"]+)"/i);
+      if (baseMatch && initMatch && repMatch) {
+        try {
+          const decodedBase = baseMatch[1].trim().replace(/&amp;/g, '&');
+          const absBase = new URL(decodedBase, res.url || mpdUrl).toString();
+          const initName = initMatch[1].replace(/\$RepresentationID\$/g, repMatch[1]);
+          const initUrl = new URL(initName, absBase).toString();
+          const initRes = await this.fetchImpl(initUrl, {
+            method: 'GET',
+            headers: {
+              'User-Agent': UA,
+              Range: 'bytes=0-511',
+              ...headers
+            },
+            signal: AbortSignal.timeout(6000)
+          });
+          if (!initRes?.ok && initRes?.status !== 206) return null;
+          const initType = String(initRes.headers?.get?.('content-type') || '').toLowerCase();
+          if (initType.includes('text/html') || initType.includes('application/json')) return null;
+        } catch {
+          return null;
+        }
+      }
+
+      const heights = [...xml.matchAll(/(?:\bheight|\bmaxHeight)="(\d+)"/gi)].map((m) => Number(m[1])).filter(Boolean);
+      const maxH = heights.length ? Math.max(...heights) : 0;
+      const qualityLabel = maxH >= 2160 ? '4K' : maxH ? `${maxH}p` : extractQualityLabel(mpdUrl);
+
+      return {
+        url: res.url || mpdUrl,
+        headers,
+        isHls: false,
+        isDash: true,
+        format: 'dash',
+        contentType: 'application/dash+xml',
+        durationSeconds: mpdSeconds || durationSeconds || null,
+        qualityLabel
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  #routePayloadMatchesTarget(data, { tmdbId, imdbId = null, title = '', year = null, isTv = false, season = null, episode = null, episodeTitle = null }) {
     if (!data || typeof data !== 'object') return false;
-    const respTmdb = data.tmdbId ?? data.tmdb_id ?? data.id ?? data.mediaId;
+    const meta = (data.meta && typeof data.meta === 'object') ? data.meta : {};
+    const isEpisodeObj = isTv && (
+      String(data.type || meta.type || '').toLowerCase() === 'episode'
+      || meta.episode_number != null
+      || meta.episodeNumber != null
+      || meta.season_number != null
+      || meta.seasonNumber != null
+      || data.season != null
+      || data.episode != null
+      || (meta.air_date != null && meta.first_air_date == null && meta.release_date == null)
+    );
+    const respTmdb = isEpisodeObj
+      ? (data.tmdbId ?? data.tmdb_id ?? data.seriesId ?? data.showId ?? meta.tmdbId ?? meta.tmdb_id ?? meta.show_id)
+      : (data.tmdbId ?? data.tmdb_id ?? data.id ?? data.mediaId ?? meta.tmdbId ?? meta.tmdb_id ?? meta.id);
     if (respTmdb != null && /^\d+$/.test(String(respTmdb)) && String(respTmdb) !== String(tmdbId)) {
       return false;
     }
-    const respImdb = data.imdbId ?? data.imdb_id;
+    const respImdb = data.imdbId ?? data.imdb_id ?? meta.imdbId ?? meta.imdb_id;
     if (imdbId && respImdb && String(respImdb).replace(/^tt/i, '') !== String(imdbId).replace(/^tt/i, '')) {
       return false;
     }
     if (isTv && episode != null) {
-      const respS = data.season ?? data.seasonNumber;
-      const respE = data.episode ?? data.episodeNumber;
+      const respS = data.season ?? data.seasonNumber ?? meta.season ?? meta.seasonNumber ?? meta.season_number;
+      const respE = data.episode ?? data.episodeNumber ?? meta.episode ?? meta.episodeNumber ?? meta.episode_number;
       if (respS != null && season != null && Number(respS) !== Number(season)) return false;
       if (respE != null && Number(respE) !== Number(episode)) return false;
     }
-    const respTitle = data.title || data.name || data.movieTitle;
-    if (title && respTitle && scoreTitleMatch(title, year, String(respTitle), { isTv, season }) < 0) {
-      return false;
+    const respRelease = data.releaseDate ?? data.release_date ?? meta.release_date ?? meta.releaseDate ?? meta.first_air_date ?? meta.air_date;
+    const respYearMatch = respRelease ? String(respRelease).match(/\b(19\d\d|20\d\d)\b/) : null;
+    if (year && respYearMatch) {
+      const ry = Number(respYearMatch[1]);
+      if (isEpisodeObj) {
+        if (ry < Number(year) - 1) return false;
+      } else if (Math.abs(ry - Number(year)) > 1) {
+        return false;
+      }
+    }
+    const respTitle = data.title || data.name || data.movieTitle || meta.title || meta.name || meta.original_title || meta.original_name;
+    if (title && respTitle && !isEpisodeObj) {
+      if (scoreTitleMatch(title, year, String(respTitle), { isTv, season }) < 14) {
+        return false;
+      }
+    } else if (isEpisodeObj && episodeTitle && respTitle) {
+      if (scoreTitleMatch(episodeTitle, null, String(respTitle), { isTv: false }) < 14) {
+        return false;
+      }
     }
     return true;
   }
 
-  async #resolveFromTmdbStreamNetwork({ type = 'movie', id, imdbId = null, title = '', year = null, season = null, episode = null, durationSeconds = null } = {}) {
+  async #fetchRouteJson(routeName, endpoint, reqHeaders, { timeoutMs = 6000 } = {}) {
+    let host = '';
+    try { host = new URL(endpoint).host; } catch {}
+    const cooldownUntil = host ? (this.hostCooldowns?.get(host) || 0) : 0;
+    const now = Date.now();
+    if (cooldownUntil > now) {
+      const waitMs = Math.min(1800, cooldownUntil - now);
+      if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+    }
+    const res = await this.fetchImpl(endpoint, {
+      method: 'GET',
+      headers: reqHeaders,
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (res?.status === 429) {
+      const ra = Number(res.headers?.get?.('retry-after') || 0);
+      const backoffMs = Math.min(6000, Math.max(900, ra > 0 ? ra * 1000 : 1800));
+      if (host) this.hostCooldowns?.set(host, Date.now() + backoffMs);
+      return { _rateLimited: true, _host: host, _route: routeName, _endpoint: endpoint };
+    }
+    if (!res?.ok || typeof res.json !== 'function') return null;
+    const json = await res.json();
+    if (json && typeof json === 'object') json._route = routeName;
+    return json;
+  }
+
+  async #resolveFromTmdbStreamNetwork({ type = 'movie', id, imdbId = null, title = '', year = null, season = null, episode = null, episodeTitle = null, durationSeconds = null, preferredHeight = null } = {}) {
     const tmdbId = String(id || '').trim();
     if (!/^\d+$/.test(tmdbId)) return { stream: null, subtitleHints: [] };
     const isTv = String(type).toLowerCase() === 'tv';
@@ -424,168 +643,372 @@ export class MovieStreamResolver {
       ? `/tv?id=${encodeURIComponent(tmdbId)}&season=${Number(season || 1)}&episode=${Number(episode || 1)}&mode=json`
       : `/movie?id=${encodeURIComponent(tmdbId)}&mode=json`;
 
-    const targets = [];
-    for (const src of CINEMA_STREAM_ROUTES) {
-      targets.push(`${CINEMA_STREAM_NODES[0]}${baseQuery}&sources=${src}`);
-    }
-    for (const src of ['sadie', 'zendaya', 'scarlet']) {
-      targets.push(`${CINEMA_STREAM_NODES[1]}${baseQuery}&sources=${src}`);
-    }
-
     const reqHeaders = { ...CINEMA_PLAYER_HEADERS, 'User-Agent': UA };
-    const settled = await Promise.allSettled(
-      targets.map(async (endpoint) => {
-        const res = await this.fetchImpl(endpoint, {
-          method: 'GET',
-          headers: reqHeaders,
-          signal: AbortSignal.timeout(5500)
-        });
-        if (!res?.ok || typeof res.json !== 'function') return null;
-        return res.json();
-      })
-    );
-
     const seenStreamUrls = new Set();
-    const candidates = [];
+    const probedStreamUrls = new Set();
     const siblingSubUrls = new Set();
     const siblingSubtitleHints = [];
 
     const normalizeSubList = (rawSubs) => {
-      const list = [];
-      const localSeen = new Set();
-      for (const sub of (Array.isArray(rawSubs) ? rawSubs : [])) {
-        const subUrl = String(sub?.file || sub?.url || '').trim();
-        if (!subUrl || !/^https?:\/\//i.test(subUrl) || localSeen.has(subUrl)) continue;
-        localSeen.add(subUrl);
-        const langRaw = String(sub?.lang || sub?.language || sub?.label || 'Subtitles').trim();
-        const isEng = /\b(en|eng|english)\b/i.test(langRaw);
-        const item = {
-          language: isEng ? 'English' : langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Subtitles',
-          label: isEng ? 'English Subtitles' : `${langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Feature'} Subtitles`,
-          url: subUrl,
-          type: sub?.type || (/\.vtt(\?|$)/i.test(subUrl) ? 'vtt' : 'srt')
-        };
-        list.push(item);
-        if (!siblingSubUrls.has(subUrl)) {
-          siblingSubUrls.add(subUrl);
+      const list = this.#normalizeSubList(rawSubs, { headers: CINEMA_PLAYER_HEADERS });
+      for (const item of list) {
+        if (!siblingSubUrls.has(item.url)) {
+          siblingSubUrls.add(item.url);
           siblingSubtitleHints.push(item);
         }
       }
-      list.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
       return list;
     };
 
-    const addCandidate = (rawUrl, { typeHint = '', qualityHint = '', routeSubs = [] } = {}) => {
-      const url = String(rawUrl || '').trim();
-      if (!url || !/^https?:\/\//i.test(url) || seenStreamUrls.has(url)) return;
-      if (AD_OR_BAD_DOMAIN_RE.test(url) || isTrailerLike(url)) return;
-      if (/\.mpd(\?|$)|\/manifest\.mpd/i.test(url) || String(typeHint).toLowerCase() === 'dash') return;
-      seenStreamUrls.add(url);
-      let decoded = url;
-      try { decoded = decodeURIComponent(url); } catch {}
-      const isHls = String(typeHint).toLowerCase() === 'hls'
-        || /\.m3u8(\?|$)/i.test(url)
-        || /\.m3u8(\?|$)/i.test(decoded);
-      const qLabel = extractQualityLabel(`${qualityHint} ${decoded}`);
-      let rank = isHls ? 20 : 40;
-      if (qLabel === '720p') rank += 8;
-      else if (qLabel === '1080p') rank += 6;
-      else if (qLabel === '480p') rank += 2;
-      candidates.push({ url, isHls, qualityLabel: qLabel, rank, routeSubs });
-    };
+    const collectCandidates = (payloads) => {
+      const batch = [];
+      const addCandidate = (rawUrl, { typeHint = '', qualityHint = '', routeSubs = [], routeName = '', durationHint = null, hasRouteMetaProof = false } = {}) => {
+        const url = String(rawUrl || '').trim();
+        if (!url || !/^https?:\/\//i.test(url) || seenStreamUrls.has(url)) return;
+        let decoded = url;
+        try { decoded = decodeURIComponent(url); } catch {}
+        if (AD_OR_BAD_DOMAIN_RE.test(url) || isTrailerLike(decoded, title)) return;
 
-    for (const item of settled) {
-      if (item.status !== 'fulfilled' || !item.value) continue;
-      const data = item.value;
-      if (!this.#routePayloadMatchesTarget(data, { tmdbId, imdbId, title, year, isTv, season, episode })) continue;
+        // Verify embedded Zendaya slug/episode metadata when present to avoid title collisions
+        let hasSlugProof = false;
+        try {
+          const tParam = new URL(url).searchParams.get('t');
+          if (tParam && /^[A-Za-z0-9+/_=-]+$/.test(tParam)) {
+            const decodedToken = JSON.parse(Buffer.from(tParam, 'base64').toString('utf8'));
+            const metaR = decodedToken?.r;
+            if (metaR && typeof metaR === 'object') {
+              if (isTv && episode != null && Number(metaR.se || 0) > 0) {
+                if (Number(metaR.se) !== Number(season || 1) || Number(metaR.ep || 0) !== Number(episode)) return;
+                hasSlugProof = true;
+              }
+              if (title && metaR.slug) {
+                const slugWords = String(metaR.slug).replace(/-[A-Za-z0-9]{6,14}$/, '').replace(/-/g, ' ');
+                if (scoreTitleMatch(title, year, slugWords, { isTv }) < 14) return;
+                hasSlugProof = true;
+              }
+            }
+          }
+        } catch {}
 
-      const routeSubs = normalizeSubList(data.subtitles);
-      const srcObj = data.source || data.stream;
-      if (srcObj && typeof srcObj === 'object') {
+        seenStreamUrls.add(url);
+        const isDash = String(typeHint).toLowerCase() === 'dash'
+          || /\.mpd(\?|$)|\/manifest\.mpd/i.test(url)
+          || /\.mpd(\?|$)|\/manifest\.mpd/i.test(decoded);
+        const isHls = !isDash && (String(typeHint).toLowerCase() === 'hls'
+          || /\.m3u8(\?|$)/i.test(url)
+          || /\.m3u8(\?|$)/i.test(decoded));
+        const isSadie = routeName === 'sadie' || /internal\.sadie\./i.test(url);
+        const isPunkflix = routeName === 'punkflix' || /punkflix\.net/i.test(url);
+        const qLabel = extractQualityLabel(`${qualityHint} ${decoded}`);
+
+        let rank = isSadie
+          ? (isHls ? 10 : 12)
+          : isPunkflix
+            ? (isHls ? 52 : 55)
+            : isDash
+              ? 32
+              : (isHls ? 38 : 48);
+        if (hasSlugProof) rank += 14;
+        else if (hasRouteMetaProof) rank += 12;
+        const qHeight = Number(String(qLabel || '').match(/(\d{3,4})p/i)?.[1] || 0);
+        if (preferredHeight && qHeight > 0) {
+          rank += qHeight <= preferredHeight ? (12 + Math.round(qHeight / 100)) : -8;
+        } else if (qLabel === '720p') rank += 6;
+        else if (qLabel === '1080p') rank += 7;
+        else if (qLabel === '4K') rank += 4;
+        else if (qLabel === '480p') rank += 2;
+        batch.push({ url, isHls, isDash, qualityLabel: qLabel, rank, routeSubs, durationHint });
+      };
+
+      const pushSrcObj = (srcObj, { data, routeSubs, durHint, dataQualityHint, hasRouteMetaProof }) => {
+        if (!srcObj || typeof srcObj !== 'object') return;
+        const rName = srcObj.source || data._route || '';
         const tHint = srcObj.type || '';
-        if (srcObj.url) addCandidate(srcObj.url, { typeHint: tHint, qualityHint: srcObj.quality || '', routeSubs });
-        if (srcObj.playlist) addCandidate(srcObj.playlist, { typeHint: 'hls', routeSubs });
+        const candMeta = { qualityHint: dataQualityHint, routeSubs, routeName: rName, durationHint: durHint, hasRouteMetaProof };
+        if (srcObj.hls) addCandidate(srcObj.hls, { ...candMeta, typeHint: 'hls' });
+        if (srcObj.original) addCandidate(srcObj.original, { ...candMeta, typeHint: /\.m3u8/i.test(srcObj.original) ? 'hls' : tHint });
+        if (srcObj.url) addCandidate(srcObj.url, { ...candMeta, typeHint: tHint, qualityHint: srcObj.quality || dataQualityHint });
+        if (srcObj.playlist) addCandidate(srcObj.playlist, { ...candMeta, typeHint: 'hls' });
         if (Array.isArray(srcObj.qualities)) {
           for (const q of srcObj.qualities) {
-            if (typeof q === 'string') addCandidate(q, { typeHint: tHint, routeSubs });
-            else if (q?.url) addCandidate(q.url, { typeHint: q.type || tHint, qualityHint: q.quality || q.label || '', routeSubs });
+            if (typeof q === 'string') addCandidate(q, { ...candMeta, typeHint: tHint });
+            else if (q?.url) addCandidate(q.url, { ...candMeta, typeHint: q.type || tHint, qualityHint: q.quality || q.label || '' });
           }
         } else if (srcObj.qualities && typeof srcObj.qualities === 'object') {
           for (const [qKey, qVal] of Object.entries(srcObj.qualities)) {
-            if (typeof qVal === 'string') addCandidate(qVal, { typeHint: tHint, qualityHint: qKey, routeSubs });
-            else if (qVal?.url) addCandidate(qVal.url, { typeHint: qVal.type || tHint, qualityHint: qKey, routeSubs });
+            if (typeof qVal === 'string') addCandidate(qVal, { ...candMeta, typeHint: tHint, qualityHint: qKey });
+            else if (qVal?.url) addCandidate(qVal.url, { ...candMeta, typeHint: qVal.type || tHint, qualityHint: qKey });
           }
         }
-      }
-    }
+      };
 
-    siblingSubtitleHints.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
-    candidates.sort((a, b) => b.rank - a.rank);
+      for (const data of payloads) {
+        if (!data || data._rateLimited) continue;
+        if (!this.#routePayloadMatchesTarget(data, { tmdbId, imdbId, title, year, isTv, season, episode, episodeTitle })) continue;
 
-    for (const cand of candidates.slice(0, 6)) {
-      const mergedRouteSubs = cand.routeSubs.length
-        ? [...cand.routeSubs, ...siblingSubtitleHints.filter((s) => !cand.routeSubs.some((r) => r.url === s.url))]
-        : siblingSubtitleHints;
-      if (cand.isHls) {
-        const probedHls = await this.#probeHlsPlaylistAndSegment(cand.url, CINEMA_PLAYER_HEADERS, 0, { minDuration });
-        if (probedHls) {
-          return {
-            stream: {
-              url: probedHls.url,
-              headers: probedHls.headers,
-              format: 'hls',
-              isHls: true,
-              durationSeconds: durationSeconds || null,
-              qualityLabel: probedHls.qualityLabel !== 'HD' ? probedHls.qualityLabel : cand.qualityLabel,
-              source: 'movie_tmdb_stream',
-              subtitleHints: mergedRouteSubs
-            },
-            subtitleHints: mergedRouteSubs
-          };
+        const metaObj = (data.meta && typeof data.meta === 'object') ? data.meta : {};
+        const hasRouteMetaProof = Boolean(
+          data.tmdbId ?? data.tmdb_id ?? data.id ?? data.mediaId ?? metaObj.tmdbId ?? metaObj.tmdb_id ?? metaObj.id
+          ?? data.title ?? data.name ?? data.movieTitle ?? metaObj.title ?? metaObj.name ?? metaObj.original_title ?? metaObj.original_name
+        );
+        const routeSubs = normalizeSubList(data.subtitles);
+        const durHint = data.duration_ms ? Math.round(Number(data.duration_ms) / 1000) : null;
+        const dataQualityHint = data.quality?.resolution || data.quality?.video_codec || '';
+        const srcList = [
+          data.source || data.stream,
+          ...(Array.isArray(data.sources) ? data.sources : []),
+          ...(Array.isArray(data.streams) ? data.streams : [])
+        ].filter(Boolean);
+        for (const srcObj of srcList) {
+          pushSrcObj(srcObj, { data, routeSubs, durHint, dataQualityHint, hasRouteMetaProof });
         }
-      } else {
-        const probedDirect = await this.#probeHttpStream(cand.url, CINEMA_PLAYER_HEADERS, { minDuration });
-        if (probedDirect) {
-          if (probedDirect.isHls) {
-            const hlsCheck = await this.#probeHlsPlaylistAndSegment(probedDirect.url, CINEMA_PLAYER_HEADERS, 0, { minDuration });
-            if (!hlsCheck) continue;
+      }
+
+      siblingSubtitleHints.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
+      batch.sort((a, b) => b.rank - a.rank);
+      return batch;
+    };
+
+    const probeBatch = async (candList) => {
+      for (const cand of candList.slice(0, 8)) {
+        if (probedStreamUrls.has(cand.url)) continue;
+        probedStreamUrls.add(cand.url);
+        const sameSubs = (cand.routeSubs || []).map((s) => ({ ...s, tier: 'same_route' }));
+        const metaSubs = siblingSubtitleHints
+          .filter((s) => !sameSubs.some((r) => r.url === s.url))
+          .map((s) => ({ ...s, tier: 'meta_match' }));
+        const mergedRouteSubs = [...sameSubs, ...metaSubs];
+        if (cand.isDash) {
+          const probedDash = await this.#probeDashManifest(cand.url, CINEMA_PLAYER_HEADERS, {
+            minDuration: Math.max(minDuration, cand.durationHint || 0),
+            durationSeconds: cand.durationHint || durationSeconds
+          });
+          if (probedDash) {
             return {
               stream: {
-                url: hlsCheck.url,
-                headers: hlsCheck.headers,
-                format: 'hls',
-                isHls: true,
-                durationSeconds: durationSeconds || null,
-                qualityLabel: cand.qualityLabel,
+                url: probedDash.url,
+                headers: probedDash.headers,
+                format: 'dash',
+                isHls: false,
+                isDash: true,
+                durationSeconds: probedDash.durationSeconds || cand.durationHint || durationSeconds || null,
+                qualityLabel: probedDash.qualityLabel !== 'HD' ? probedDash.qualityLabel : cand.qualityLabel,
                 source: 'movie_tmdb_stream',
                 subtitleHints: mergedRouteSubs
               },
               subtitleHints: mergedRouteSubs
             };
           }
-          return {
-            stream: {
-              url: probedDirect.url,
-              headers: probedDirect.headers,
-              format: /\.mkv(\?|$)/i.test(probedDirect.url) ? 'mkv' : 'mp4',
-              isHls: false,
-              durationSeconds: durationSeconds || null,
-              qualityLabel: cand.qualityLabel,
-              source: 'movie_tmdb_stream',
+        } else if (cand.isHls) {
+          const effMin = Math.max(minDuration, cand.durationHint || 0);
+          const probedHls = await this.#probeHlsPlaylistAndSegment(cand.url, CINEMA_PLAYER_HEADERS, 0, {
+            minDuration: effMin,
+            preferredHeight
+          });
+          if (probedHls) {
+            if (effMin >= 1200 && probedHls.durationSeconds > 0 && probedHls.durationSeconds > Math.round(effMin * 1.45)) {
+              continue;
+            }
+            const allHlsSubs = [...(probedHls.subtitleHints || []), ...mergedRouteSubs];
+            return {
+              stream: {
+                url: probedHls.url,
+                headers: probedHls.headers,
+                format: 'hls',
+                isHls: true,
+                isDash: false,
+                durationSeconds: probedHls.durationSeconds || cand.durationHint || durationSeconds || null,
+                qualityLabel: probedHls.qualityLabel !== 'HD' ? probedHls.qualityLabel : cand.qualityLabel,
+                sizeBytes: probedHls.sizeBytes || null,
+                variants: probedHls.variants || null,
+                source: 'movie_tmdb_stream',
+                subtitleHints: allHlsSubs
+              },
+              subtitleHints: allHlsSubs
+            };
+          }
+        } else {
+          const probedDirect = await this.#probeHttpStream(cand.url, CINEMA_PLAYER_HEADERS, { minDuration });
+          if (probedDirect) {
+            if (probedDirect.isHls) {
+              const hlsCheck = await this.#probeHlsPlaylistAndSegment(probedDirect.url, CINEMA_PLAYER_HEADERS, 0, { minDuration, preferredHeight });
+              if (!hlsCheck) continue;
+              if (minDuration >= 1200 && hlsCheck.durationSeconds > 0 && hlsCheck.durationSeconds > Math.round(minDuration * 1.45)) {
+                continue;
+              }
+              const allHlsSubs = [...(hlsCheck.subtitleHints || []), ...mergedRouteSubs];
+              return {
+                stream: {
+                  url: hlsCheck.url,
+                  headers: hlsCheck.headers,
+                  format: 'hls',
+                  isHls: true,
+                  durationSeconds: hlsCheck.durationSeconds || durationSeconds || null,
+                  qualityLabel: hlsCheck.qualityLabel !== 'HD' ? hlsCheck.qualityLabel : cand.qualityLabel,
+                  sizeBytes: hlsCheck.sizeBytes || null,
+                  variants: hlsCheck.variants || null,
+                  source: 'movie_tmdb_stream',
+                  subtitleHints: allHlsSubs
+                },
+                subtitleHints: allHlsSubs
+              };
+            }
+            return {
+              stream: {
+                url: probedDirect.url,
+                headers: probedDirect.headers,
+                format: /\.mkv(\?|$)/i.test(probedDirect.url) ? 'mkv' : 'mp4',
+                isHls: false,
+                durationSeconds: durationSeconds || null,
+                qualityLabel: cand.qualityLabel,
+                sizeBytes: probedDirect.sizeBytes || null,
+                source: 'movie_tmdb_stream',
+                subtitleHints: mergedRouteSubs
+              },
               subtitleHints: mergedRouteSubs
-            },
-            subtitleHints: mergedRouteSubs
-          };
+            };
+          }
         }
       }
+      return null;
+    };
+
+    // Wave A: 1 multi-source request per distinct host to avoid nginx 429 burst bans
+    const waveASpecs = [
+      {
+        routeName: 'punkflix',
+        endpoint: isTv
+          ? `${PUNKFLIX_HOST}/tv/${encodeURIComponent(tmdbId)}/${Number(season || 1)}/${Number(episode || 1)}.json`
+          : `${PUNKFLIX_HOST}/movie/${encodeURIComponent(tmdbId)}.json`
+      },
+      {
+        routeName: 'zendaya',
+        endpoint: `${CINEMA_STREAM_NODES[1]}${baseQuery}&sources=zendaya,berlin,lookmovie,meowtv,vidnest&hevc=1`
+      },
+      {
+        routeName: 'flikhub1',
+        endpoint: `${CINEMA_STREAM_NODES[0]}${baseQuery}&sources=zendaya,berlin,scarlet,lookmovie,meowtv,vidnest`
+      },
+      {
+        routeName: 'flikhub3',
+        endpoint: `${CINEMA_STREAM_NODES[2]}${baseQuery}&sources=zendaya,berlin,scarlet,lookmovie,meowtv,vidnest`
+      }
+    ];
+
+    const waveAResults = await Promise.allSettled(
+      waveASpecs.map((s) => this.#fetchRouteJson(s.routeName, s.endpoint, reqHeaders))
+    );
+    const waveAPayloads = waveAResults
+      .filter((r) => r.status === 'fulfilled' && r.value)
+      .map((r) => r.value);
+    const waveACandidates = collectCandidates(waveAPayloads);
+    const waveAHit = await probeBatch(waveACandidates);
+    if (waveAHit) return waveAHit;
+
+    // Wave B: paced per-route fallback across alternate hosts only when Wave A had no playable stream
+    const secondaryRoutes = CINEMA_STREAM_ROUTES.filter((s) => s !== 'zendaya');
+    const waveBSpecs = secondaryRoutes.map((src, idx) => {
+      const host = CINEMA_STREAM_NODES[idx % CINEMA_STREAM_NODES.length];
+      return {
+        routeName: src,
+        endpoint: `${host}${baseQuery}&sources=${src}${host === CINEMA_STREAM_NODES[1] ? '&hevc=1' : ''}`
+      };
+    });
+    const waveBPayloads = [];
+    const paceMs = this.fetchImpl === fetch ? 180 : 0;
+    for (let i = 0; i < waveBSpecs.length; i += 2) {
+      const chunk = waveBSpecs.slice(i, i + 2);
+      const resChunk = await Promise.allSettled(
+        chunk.map((s) => this.#fetchRouteJson(s.routeName, s.endpoint, reqHeaders))
+      );
+      for (const r of resChunk) {
+        if (r.status === 'fulfilled' && r.value && !r.value._rateLimited) {
+          waveBPayloads.push(r.value);
+        }
+      }
+      if (paceMs > 0 && i + 2 < waveBSpecs.length) {
+        await new Promise((r) => setTimeout(r, paceMs));
+      }
+    }
+    const waveBCandidates = collectCandidates(waveBPayloads);
+    const waveBHit = await probeBatch(waveBCandidates);
+    if (waveBHit) return waveBHit;
+
+    // If Wave A got rate-limited on any host, do one backed-off retry on the non-limited node(s)
+    const rateLimited = waveAPayloads.some((p) => p?._rateLimited);
+    if (rateLimited) {
+      const retryRes = await Promise.allSettled(
+        waveASpecs.slice(1).map((s) => this.#fetchRouteJson(s.routeName, s.endpoint, reqHeaders))
+      );
+      const retryCandidates = collectCandidates(
+        retryRes.filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value)
+      );
+      const retryHit = await probeBatch(retryCandidates);
+      if (retryHit) return retryHit;
     }
 
     return { stream: null, subtitleHints: [] };
   }
 
+  #normalizeSubList(rawSubs, { headers = CINEMA_PLAYER_HEADERS } = {}) {
+    const list = [];
+    const localSeen = new Set();
+    for (const sub of (Array.isArray(rawSubs) ? rawSubs : [])) {
+      const subUrl = String(sub?.file || sub?.url || '').trim();
+      if (!subUrl || !/^https?:\/\//i.test(subUrl) || localSeen.has(subUrl)) continue;
+      localSeen.add(subUrl);
+      const langRaw = String(sub?.lang || sub?.language || sub?.label || 'Subtitles').trim();
+      const isEng = /\b(en|eng|english)\b/i.test(langRaw);
+      list.push({
+        language: isEng ? 'English' : langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Subtitles',
+        label: isEng ? 'English Subtitles' : `${langRaw.replace(/\[[^\]]*\]/g, '').trim() || 'Feature'} Subtitles`,
+        url: subUrl,
+        headers,
+        type: sub?.type || (/\.vtt(\?|$)/i.test(subUrl) ? 'vtt' : 'srt')
+      });
+    }
+    list.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
+    return list;
+  }
+
+  async #fetchTmdbSubtitleHints({ isTv = false, tmdbId, season = null, episode = null } = {}) {
+    const idStr = String(tmdbId || '').trim();
+    if (!/^\d+$/.test(idStr)) return [];
+    const reqHeaders = { ...CINEMA_PLAYER_HEADERS, 'User-Agent': UA };
+    const punkEndpoint = isTv
+      ? `${PUNKFLIX_HOST}/tv/${encodeURIComponent(idStr)}/${Number(season || 1)}/${Number(episode || 1)}.json`
+      : `${PUNKFLIX_HOST}/movie/${encodeURIComponent(idStr)}.json`;
+    const berlinEndpoint = isTv
+      ? `${CINEMA_STREAM_NODES[0]}/tv?id=${encodeURIComponent(idStr)}&season=${Number(season || 1)}&episode=${Number(episode || 1)}&mode=json&sources=berlin`
+      : `${CINEMA_STREAM_NODES[0]}/movie?id=${encodeURIComponent(idStr)}&mode=json&sources=berlin`;
+
+    const settled = await Promise.allSettled(
+      [punkEndpoint, berlinEndpoint].map(async (ep) => {
+        const res = await this.fetchImpl(ep, { method: 'GET', headers: reqHeaders, signal: AbortSignal.timeout(4500) });
+        if (!res?.ok || typeof res.json !== 'function') return null;
+        return res.json();
+      })
+    );
+    const out = [];
+    const seen = new Set();
+    for (const r of settled) {
+      if (r.status !== 'fulfilled' || !r.value?.subtitles) continue;
+      for (const item of this.#normalizeSubList(r.value.subtitles, { headers: CINEMA_PLAYER_HEADERS })) {
+        if (seen.has(item.url)) continue;
+        seen.add(item.url);
+        out.push({ ...item, tier: 'meta_match' });
+      }
+    }
+    out.sort((a, b) => (a.language === 'English' ? -1 : b.language === 'English' ? 1 : 0));
+    return out;
+  }
+
   async #probeWithRefererVariants(url, probeOpts = {}) {
     for (const headers of [
       {},
+      { ...CINEMA_PLAYER_HEADERS },
+      { Referer: 'https://punkflix.net/', Origin: 'https://punkflix.net' },
+      { Referer: 'https://cinezo.live/', Origin: 'https://cinezo.live' },
       { Referer: 'https://holaflix.xyz/', Origin: 'https://holaflix.xyz' },
       { Referer: 'https://holaflix.cc/', Origin: 'https://holaflix.cc' }
     ]) {
@@ -634,11 +1057,12 @@ export class MovieStreamResolver {
       ]);
       for (const item of (searchRes?.results || [])) {
         if (!item?.url || seenUrls.has(item.url)) continue;
+        if (isTrailerLike(`${item.title || ''} ${item.url}`, title)) continue;
         seenUrls.add(item.url);
         const s = scoreTitleMatch(title, year, item.title || item.url, { isTv, season, episode });
-        if (s >= 14) rankedPosts.push({ ...item, score: s });
+        if (s >= 22) rankedPosts.push({ ...item, score: s });
       }
-      if (rankedPosts.some((p) => p.score >= 28)) break;
+      if (rankedPosts.some((p) => p.score >= 32)) break;
     }
     rankedPosts.sort((a, b) => b.score - a.score);
 
@@ -710,12 +1134,12 @@ export class MovieStreamResolver {
         for (const m of html.matchAll(/<h[1-3][^>]*class=["'][^"']*entry-title[^"']*["'][^>]*>\s*<a[^>]+href=["'](https?:\/\/thenkiri\.ng\/[^"'?#]+\/)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
           const postUrl = m[1];
           const postTitle = m[2].replace(/<[^>]+>/g, '').replace(/&#\d+;/g, ' ').trim();
-          if (seen.has(postUrl)) continue;
+          if (seen.has(postUrl) || isTrailerLike(postTitle, title)) continue;
           seen.add(postUrl);
           const sc = scoreTitleMatch(title, year, postTitle, { isTv, season, episode });
-          if (sc >= 14) ranked.push({ url: postUrl, title: postTitle, score: sc });
+          if (sc >= 22) ranked.push({ url: postUrl, title: postTitle, score: sc });
         }
-        if (ranked.some((r) => r.score >= 28)) break;
+        if (ranked.some((r) => r.score >= 32)) break;
       } catch {}
     }
 
@@ -730,7 +1154,8 @@ export class MovieStreamResolver {
   async #resolveFromArchiveOrg(opts) {
     const { type, title, year, durationSeconds = null, season = null, episode = null } = opts;
     const isTv = String(type).toLowerCase() === 'tv';
-    const minDuration = durationSeconds ? Math.max(600, Math.floor(Number(durationSeconds) * 0.65)) : (isTv ? 900 : 2100);
+    const minDuration = durationSeconds ? Math.max(600, Math.floor(Number(durationSeconds) * 0.78)) : (isTv ? 900 : 2100);
+    const maxDuration = durationSeconds ? Math.round(Number(durationSeconds) * 1.35) : 0;
     const cleanTitle = String(title || '').replace(/["()]/g, ' ').replace(/\s+/g, ' ').trim();
     if (!cleanTitle) return null;
 
@@ -744,19 +1169,20 @@ export class MovieStreamResolver {
       if (!res?.ok || typeof res.json !== 'function') return null;
       const data = await res.json();
       const docs = (Array.isArray(data?.response?.docs) ? data.response.docs : [])
+        .filter((d) => d?.identifier && !isTrailerLike(`${d.title || ''} ${d.identifier}`, cleanTitle))
         .map((d) => ({ ...d, score: scoreTitleMatch(cleanTitle, year, `${d.title || ''} ${d.year || ''}`, { isTv, season, episode }) }))
-        .filter((d) => d.identifier && d.score >= 18)
+        .filter((d) => d.score >= 24)
         .sort((a, b) => b.score - a.score);
 
       for (const doc of docs.slice(0, 3)) {
-        const resolved = await this.#resolveArchiveIdentifier(doc.identifier, minDuration, { isTv, season, episode });
+        const resolved = await this.#resolveArchiveIdentifier(doc.identifier, minDuration, { title: cleanTitle, isTv, season, episode, maxDuration });
         if (resolved) return resolved;
       }
     } catch {}
     return null;
   }
 
-  async #resolveArchiveIdentifier(identifier, minDuration = 1800, { isTv = false, season = null, episode = null } = {}) {
+  async #resolveArchiveIdentifier(identifier, minDuration = 1800, { title = '', isTv = false, season = null, episode = null, maxDuration = 0 } = {}) {
     if (!identifier) return null;
     try {
       const metaRes = await this.fetchImpl(`https://archive.org/metadata/${encodeURIComponent(identifier)}`, {
@@ -766,12 +1192,12 @@ export class MovieStreamResolver {
       if (!metaRes?.ok || typeof metaRes.json !== 'function') return null;
       const meta = await metaRes.json();
       const metaTitle = `${meta?.metadata?.title || ''} ${identifier}`;
-      if (isTrailerLike(metaTitle)) return null;
+      if (isTrailerLike(metaTitle, title)) return null;
 
       const files = Array.isArray(meta?.files) ? meta.files : [];
       const videos = files
         .filter((f) => {
-          if (!f?.name || !/\.(mp4|mkv)$/i.test(f.name) || isTrailerLike(f.name)) return false;
+          if (!f?.name || !/\.(mp4|mkv)$/i.test(f.name) || isTrailerLike(f.name, title)) return false;
           if (isTv && episode != null) {
             const parsed = parseEpisodeCode(f.name);
             if (parsed.episodeNumber != null && parsed.episodeNumber !== Number(episode)) return false;
@@ -783,6 +1209,7 @@ export class MovieStreamResolver {
           const lenSec = Number(f.length);
           const sizeBytes = Number(f.size || 0);
           if (Number.isFinite(lenSec) && lenSec > 0 && lenSec < minDuration) return false;
+          if (maxDuration && Number.isFinite(lenSec) && lenSec > maxDuration) return false;
           if (!Number.isFinite(lenSec) && sizeBytes > 0 && sizeBytes < 45 * 1024 * 1024) return false;
           if (sizeBytes > 4.5 * 1024 * 1024 * 1024) return false; // prefer clean streams over huge >4.5GB remuxes
           return true;
@@ -819,9 +1246,10 @@ export class MovieStreamResolver {
         headers: {},
         format: chosen.name.toLowerCase().endsWith('.mkv') ? 'mkv' : 'mp4',
         durationSeconds: durSec,
+        sizeBytes: Number(chosen.size || 0) || probed.sizeBytes || null,
         source: 'archive_org',
         qualityLabel: extractQualityLabel(chosen.name),
-        subtitleHints
+        subtitleHints: subtitleHints.map((s) => ({ ...s, tier: 'same_route' }))
       };
     } catch {
       return null;
@@ -831,7 +1259,8 @@ export class MovieStreamResolver {
   async #resolveFromOpenWebSearch(opts) {
     const { type, title, year, season, episode, durationSeconds = null } = opts;
     const isTv = String(type).toLowerCase() === 'tv';
-    const minDuration = durationSeconds ? Math.max(600, Math.floor(Number(durationSeconds) * 0.65)) : (isTv ? 900 : 2100);
+    const minDuration = durationSeconds ? Math.max(600, Math.floor(Number(durationSeconds) * 0.78)) : (isTv ? 900 : 2100);
+    const maxDuration = durationSeconds ? Math.round(Number(durationSeconds) * 1.35) : 0;
     const cleanTitle = String(title || '').replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
     if (!cleanTitle) return null;
 
@@ -850,12 +1279,15 @@ export class MovieStreamResolver {
         if (!res?.ok || typeof res.json !== 'function') continue;
         const posts = await res.json();
         const ranked = (Array.isArray(posts) ? posts : [])
-          .map((p) => ({
-            url: p?.link,
-            title: String(p?.title?.rendered || p?.slug || '').replace(/<[^>]+>/g, '').replace(/&#\d+;/g, ' ').trim(),
-            score: scoreTitleMatch(cleanTitle, year, String(p?.title?.rendered || p?.slug || ''), { isTv, season, episode })
-          }))
-          .filter((p) => p.url && p.score >= 18)
+          .map((p) => {
+            const pTitle = String(p?.title?.rendered || p?.slug || '').replace(/<[^>]+>/g, '').replace(/&#\d+;/g, ' ').trim();
+            return {
+              url: p?.link,
+              title: pTitle,
+              score: scoreTitleMatch(cleanTitle, year, pTitle, { isTv, season, episode })
+            };
+          })
+          .filter((p) => p.url && !isTrailerLike(p.title, cleanTitle) && p.score >= 24)
           .sort((a, b) => b.score - a.score);
 
         for (const post of ranked.slice(0, 2)) {
@@ -873,7 +1305,7 @@ export class MovieStreamResolver {
       } catch {}
     }
 
-    // 2. Dailymotion long-form JSON catalog fallback (strict minDuration + zero trailers)
+    // 2. Dailymotion long-form JSON catalog fallback (strict minDuration + zero trailers/games)
     if (this.enableYtDlp) {
       try {
         const epTag = isTv && episode != null
@@ -887,13 +1319,19 @@ export class MovieStreamResolver {
         if (dmRes?.ok && typeof dmRes.json === 'function') {
           const dmData = await dmRes.json();
           const dmCandidates = (Array.isArray(dmData?.list) ? dmData.list : [])
-            .filter((v) => v?.url && !isTrailerLike(v.title || '') && Number(v.duration || 0) >= minDuration)
+            .filter((v) => {
+              if (!v?.url || isTrailerLike(v.title || '', cleanTitle)) return false;
+              const vDur = Number(v.duration || 0);
+              if (vDur < minDuration) return false;
+              if (maxDuration && vDur > maxDuration) return false;
+              return true;
+            })
             .map((v) => ({ ...v, score: scoreTitleMatch(cleanTitle, year, v.title, { isTv, season, episode }) }))
-            .filter((v) => v.score >= 20)
+            .filter((v) => v.score >= 24)
             .sort((a, b) => b.score - a.score);
 
           for (const cand of dmCandidates.slice(0, 2)) {
-            const ytRes = await this.#extractYtDlpStream(cand.url, { title: cleanTitle, year, isTv, season, episode, minDuration, strictTitle: true });
+            const ytRes = await this.#extractYtDlpStream(cand.url, { title: cleanTitle, year, isTv, season, episode, minDuration, maxDuration, strictTitle: true });
             if (ytRes) return ytRes;
           }
         }
@@ -925,13 +1363,14 @@ export class MovieStreamResolver {
     return JSON.parse(stdout || '{}');
   }
 
-  async #extractYtDlpStream(pageUrl, { title, year = null, isTv = false, minDuration = 1800, strictTitle = true } = {}) {
+  async #extractYtDlpStream(pageUrl, { title, year = null, isTv = false, season = null, episode = null, minDuration = 1800, maxDuration = 0, strictTitle = true } = {}) {
     try {
       const info = await this.#defaultYtExtract(pageUrl);
-      if (!info || isTrailerLike(`${info.title || ''} ${info.description || ''}`)) return null;
+      if (!info || isTrailerLike(`${info.title || ''} ${info.description || ''}`, title)) return null;
       const dur = Number(info.duration || 0);
       if (!dur || dur < minDuration) return null;
-      if (strictTitle && scoreTitleMatch(title, year, info.title, { isTv, season, episode }) < 18) return null;
+      if (maxDuration && dur > maxDuration) return null;
+      if (strictTitle && scoreTitleMatch(title, year, info.title, { isTv, season, episode }) < 24) return null;
       const url = info.url || info.requested_downloads?.[0]?.url;
       if (!url || !/^https?:\/\//i.test(url)) return null;
       if (info.vcodec === 'none' || info.acodec === 'none') return null;
@@ -951,7 +1390,8 @@ export class MovieStreamResolver {
   async #resolveFromYtDlpFullSearch(opts) {
     const { type, title, year, season, episode, durationSeconds = null } = opts;
     const isTv = String(type).toLowerCase() === 'tv';
-    const minDuration = durationSeconds ? Math.max(600, Math.floor(Number(durationSeconds) * 0.65)) : (isTv ? 900 : 2100);
+    const minDuration = durationSeconds ? Math.max(600, Math.floor(Number(durationSeconds) * 0.78)) : (isTv ? 900 : 2100);
+    const maxDuration = durationSeconds ? Math.round(Number(durationSeconds) * 1.35) : 0;
     const cleanTitle = String(title || '').replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim();
     if (!cleanTitle) return null;
 
@@ -970,10 +1410,11 @@ export class MovieStreamResolver {
     const candidates = (Array.isArray(entries) ? entries : [])
       .filter((e) => {
         if (!e?.url && !e?.webpage_url && !e?.directStreamUrl) return false;
-        if (isTrailerLike(e.title || '')) return false;
+        if (isTrailerLike(e.title || '', cleanTitle)) return false;
         const dur = Number(e.duration || 0);
         if (!dur || dur < minDuration) return false;
-        return scoreTitleMatch(cleanTitle, year, e.title, { isTv, season, episode }) >= 18;
+        if (maxDuration && dur > maxDuration) return false;
+        return scoreTitleMatch(cleanTitle, year, e.title, { isTv, season, episode }) >= 24;
       })
       .sort((a, b) => scoreTitleMatch(cleanTitle, year, b.title, { isTv, season, episode }) - scoreTitleMatch(cleanTitle, year, a.title, { isTv, season, episode }));
 
@@ -994,7 +1435,8 @@ export class MovieStreamResolver {
         isTv,
         season,
         episode,
-        minDuration
+        minDuration,
+        maxDuration
       });
       if (extracted) return extracted;
     }
@@ -1007,49 +1449,99 @@ export class MovieStreamResolver {
       id,
       title,
       year = null,
+      releaseDate: rawReleaseDate = null,
       season = null,
       episode = null,
       episodeTitle = null,
       durationSeconds = null,
       artwork = null,
       imdbId = null,
-      fetchSubtitles = true
+      rating = null,
+      genres = null,
+      overview = null,
+      fetchSubtitles = true,
+      preferredHeight: rawPreferredHeight = null
     } = opts;
+    const preferredHeight = Number(rawPreferredHeight || extra?.preferredHeight || 0) || null;
     const emit = typeof opts.onProgress === 'function'
       ? opts.onProgress
       : (typeof extra?.onProgress === 'function' ? extra.onProgress : () => {});
 
     const isTv = String(type).toLowerCase() === 'tv';
     let playback = null;
+    let detailMeta = null;
 
     if (this.movieApi && id) {
-      try {
-        playback = await this.movieApi.getPlaybackInfo(isTv ? 'tv' : 'movie', id, { season, episode });
-      } catch (err) {
-        this.log?.debug?.({ err: err?.message, id }, 'movie playback info unavailable');
+      const needDetail = !year || !imdbId || !rawReleaseDate || (!durationSeconds && !isTv);
+      const [pbRes, dtRes] = await Promise.allSettled([
+        this.movieApi.getPlaybackInfo?.(isTv ? 'tv' : 'movie', id, { season, episode }),
+        needDetail ? (isTv ? this.movieApi.getTvShow?.(id) : this.movieApi.getMovie?.(id)) : Promise.resolve(null)
+      ]);
+      if (pbRes.status === 'fulfilled') playback = pbRes.value || null;
+      else this.log?.debug?.({ err: pbRes.reason?.message, id }, 'movie playback info unavailable');
+      if (dtRes.status === 'fulfilled' && dtRes.value && (!dtRes.value.id || String(dtRes.value.id) === String(id))) {
+        detailMeta = dtRes.value;
       }
     }
+
+    const effectiveYear = year ?? detailMeta?.year ?? null;
+    const effectiveReleaseDate = rawReleaseDate ?? detailMeta?.releaseDate ?? playback?.releaseDate ?? null;
+    const effectiveImdbId = imdbId ?? detailMeta?.imdbId ?? null;
+    const effectiveArtwork = artwork || detailMeta?.poster || detailMeta?.backdrop || null;
+    const effectiveDurationSeconds = durationSeconds ?? detailMeta?.runtimeSeconds ?? detailMeta?.durationSeconds ?? null;
+    const effectiveRating = rating ?? detailMeta?.rating ?? null;
+    const effectiveGenres = Array.isArray(genres) && genres.length ? genres : (Array.isArray(detailMeta?.genres) ? detailMeta.genres : null);
+    const effectiveOverview = overview || detailMeta?.overview || null;
 
     // 1. Primary Root Streams & TMDB Direct Stream Network (HTTP 200/206 or verified HLS)
     emit('⏳ [1/5] Checking primary HD stream route…');
     let resolvedStream = null;
     let tmdbSubtitleHints = [];
     const root = playback?.rootStream;
+    const effectiveMinDuration = Number(
+      effectiveDurationSeconds
+      || (root?.duration_ms ? Math.round(Number(root.duration_ms) / 1000) : 0)
+      || 0
+    );
     if (root) {
-      const candidateUrls = [root.direct_url, root.hls_url].filter(Boolean);
-      const minDuration = durationSeconds ? Number(durationSeconds) : 0;
+      const candidateUrls = [root.hls_url, root.direct_url].filter(Boolean);
       for (const candUrl of candidateUrls) {
-        const probed = await this.#probeWithRefererVariants(candUrl, { minDuration });
+        if (isTrailerLike(candUrl, title)) continue;
+        const probed = await this.#probeWithRefererVariants(candUrl, { minDuration: effectiveMinDuration });
         if (probed) {
-          resolvedStream = {
-            url: probed.url,
-            headers: probed.headers,
-            format: probed.isHls ? 'hls' : (root.container || 'mp4'),
-            isHls: Boolean(probed.isHls),
-            durationSeconds: root.duration_ms ? Math.round(root.duration_ms / 1000) : durationSeconds,
-            qualityLabel: extractQualityLabel(root.quality?.resolution || root.quality?.video_codec),
-            source: 'movie_api_root'
-          };
+          if (probed.isHls) {
+            const hlsVerified = await this.#probeHlsPlaylistAndSegment(probed.url, probed.headers, 0, {
+              minDuration: effectiveMinDuration,
+              preferredHeight
+            });
+            if (!hlsVerified) continue;
+            const rootQ = extractQualityLabel(root.quality?.resolution || root.quality?.video_codec);
+            resolvedStream = {
+              url: hlsVerified.url,
+              headers: hlsVerified.headers,
+              format: 'hls',
+              isHls: true,
+              isDash: false,
+              durationSeconds: root.duration_ms ? Math.round(root.duration_ms / 1000) : (hlsVerified.durationSeconds || effectiveDurationSeconds),
+              qualityLabel: hlsVerified.qualityLabel !== 'HD' ? hlsVerified.qualityLabel : rootQ,
+              sizeBytes: root.size_bytes || hlsVerified.sizeBytes || null,
+              variants: hlsVerified.variants || null,
+              subtitleHints: hlsVerified.subtitleHints || [],
+              source: 'movie_api_root'
+            };
+          } else {
+            resolvedStream = {
+              url: probed.url,
+              headers: probed.headers,
+              format: root.container || 'mp4',
+              isHls: false,
+              isDash: false,
+              durationSeconds: root.duration_ms ? Math.round(root.duration_ms / 1000) : effectiveDurationSeconds,
+              sizeBytes: root.size_bytes || probed.sizeBytes || null,
+              qualityLabel: extractQualityLabel(root.quality?.resolution || root.quality?.video_codec),
+              source: 'movie_api_root'
+            };
+          }
           emit(`✅ [1/5] Primary HD stream ready (${resolvedStream.qualityLabel})`);
           break;
         }
@@ -1057,7 +1549,18 @@ export class MovieStreamResolver {
     }
     if (!resolvedStream) {
       emit('⏳ [1/5] Primary route unavailable — checking alternate HD routes…');
-      const netRes = await this.#resolveFromTmdbStreamNetwork({ type, id, imdbId, title, year, season, episode, durationSeconds }).catch(() => ({ stream: null, subtitleHints: [] }));
+      const netRes = await this.#resolveFromTmdbStreamNetwork({
+        type,
+        id,
+        imdbId: effectiveImdbId,
+        title,
+        year: effectiveYear,
+        season,
+        episode,
+        episodeTitle,
+        durationSeconds: effectiveMinDuration || effectiveDurationSeconds,
+        preferredHeight
+      }).catch(() => ({ stream: null, subtitleHints: [] }));
       if (netRes?.stream) {
         resolvedStream = netRes.stream;
         tmdbSubtitleHints = Array.isArray(netRes?.subtitleHints) ? netRes.subtitleHints : [];
@@ -1068,23 +1571,23 @@ export class MovieStreamResolver {
     // 2. Primary Web Catalog (Zero-Trailer, direct MKV/MP4)
     if (!resolvedStream && title) {
       emit('🔎 [2/5] Searching HD feature stream index…');
-      resolvedStream = await this.#resolveFromThenkiriCatalog({ type, title, year, season, episode });
+      resolvedStream = await this.#resolveFromThenkiriCatalog({ type, title, year: effectiveYear, season, episode });
       if (resolvedStream) emit(`✅ [2/5] HD feature stream ready (${resolvedStream.qualityLabel || 'HD'})`);
     }
 
     // 3. Extended Catalog Index
     if (!resolvedStream && this.enableWebFallback && title) {
       emit('🔎 [3/5] Scanning extended HD stream index…');
-      resolvedStream = await this.#resolveFromThenkiriNg({ type, title, year, season, episode });
+      resolvedStream = await this.#resolveFromThenkiriNg({ type, title, year: effectiveYear, season, episode });
       if (resolvedStream) emit(`✅ [3/5] Extended HD stream ready (${resolvedStream.qualityLabel || 'HD'})`);
     }
 
     // 4. Open Feature Index
     if (!resolvedStream && this.enableWebFallback && title) {
       emit('🔎 [4/5] Searching web full-feature catalog…');
-      resolvedStream = await this.#resolveFromArchiveOrg({ type, title, year, durationSeconds, season, episode });
+      resolvedStream = await this.#resolveFromArchiveOrg({ type, title, year: effectiveYear, durationSeconds: effectiveDurationSeconds, season, episode });
       if (!resolvedStream) {
-        resolvedStream = await this.#resolveFromOpenWebSearch({ type, title, year, season, episode, durationSeconds });
+        resolvedStream = await this.#resolveFromOpenWebSearch({ type, title, year: effectiveYear, season, episode, durationSeconds: effectiveDurationSeconds });
       }
       if (resolvedStream) emit(`✅ [4/5] Full-feature stream ready (${resolvedStream.qualityLabel || 'HD'})`);
     }
@@ -1092,7 +1595,7 @@ export class MovieStreamResolver {
     // 5. Full-Length Video Stream Verification (STRICT Zero-Trailer & min runtime guard)
     if (!resolvedStream && this.enableYtDlp && title) {
       emit('🎬 [5/5] Scanning full-length video streams (zero-trailer filter)…');
-      resolvedStream = await this.#resolveFromYtDlpFullSearch({ type, title, year, season, episode, durationSeconds });
+      resolvedStream = await this.#resolveFromYtDlpFullSearch({ type, title, year: effectiveYear, season, episode, durationSeconds: effectiveDurationSeconds });
       if (resolvedStream) emit(`✅ [5/5] Verified full-length stream (${resolvedStream.qualityLabel || 'HD'})`);
     }
 
@@ -1101,28 +1604,44 @@ export class MovieStreamResolver {
     if (resolvedStream && fetchSubtitles && this.subtitles) {
       emit('💬 [Subs] Matching & syncing subtitles…');
       const allowApiSubs = resolvedStream.source === 'movie_api_root' || resolvedStream.source === 'movie_tmdb_stream';
+      const streamScopedHints = (Array.isArray(resolvedStream.subtitleHints) ? resolvedStream.subtitleHints : [])
+        .map((h) => ({ ...h, tier: h?.tier || 'same_route' }));
+      let extraApiSubs = [];
+      if (allowApiSubs && id) {
+        extraApiSubs = await this.#fetchTmdbSubtitleHints({ isTv, tmdbId: id, season, episode }).catch(() => []);
+      }
+      const playbackApiSubs = (allowApiSubs && Array.isArray(playback?.subtitles))
+        ? playback.subtitles.map((h) => ({ ...h, tier: 'same_route' }))
+        : [];
+      const tmdbMetaSubs = allowApiSubs
+        ? tmdbSubtitleHints.map((h) => ({ ...h, tier: h?.tier || 'meta_match' }))
+        : [];
       const mergedHints = [
-        ...(Array.isArray(resolvedStream.subtitleHints) ? resolvedStream.subtitleHints : []),
-        ...(allowApiSubs ? tmdbSubtitleHints : []),
-        ...(allowApiSubs && Array.isArray(playback?.subtitles) ? playback.subtitles : [])
+        ...streamScopedHints,
+        ...playbackApiSubs,
+        ...tmdbMetaSubs,
+        ...extraApiSubs
       ];
       subtitleInfo = await this.subtitles.resolveForMedia({
         type,
         id,
-        imdbId,
+        imdbId: effectiveImdbId,
         title,
-        year,
+        year: effectiveYear,
         season,
         episode,
         streamUrl: resolvedStream.url,
         headers: resolvedStream.headers,
         streamSource: resolvedStream.source,
-        subtitleHints: mergedHints
+        subtitleHints: mergedHints,
+        durationSeconds: Number(resolvedStream.durationSeconds || effectiveDurationSeconds || 0) || null,
+        releaseHint: `${resolvedStream.qualityLabel || ''} ${resolvedStream.url || ''}`.trim()
       }).catch(() => null);
       if (subtitleInfo?.filePath || subtitleInfo?.found) {
-        const subLang = subtitleInfo.language && String(subtitleInfo.language).toLowerCase() !== 'eng'
-          ? `${String(subtitleInfo.language).toUpperCase()} Subtitles`
-          : 'English Subtitles';
+        const subLang = subtitleInfo.label
+          || (subtitleInfo.language && String(subtitleInfo.language).toLowerCase() !== 'eng'
+            ? `${String(subtitleInfo.language).toUpperCase()} Subtitles`
+            : 'English Subtitles');
         emit(`✅ [Subs] Synced: ${subLang}`);
       } else {
         emit('ℹ️ [Subs] No external subtitles matched — streaming clean video.');
@@ -1130,6 +1649,24 @@ export class MovieStreamResolver {
     }
 
     if (!resolvedStream) {
+      let releaseDate = effectiveReleaseDate || null;
+      if (!releaseDate && this.movieApi && id && !detailMeta) {
+        const detail = await (isTv ? this.movieApi.getTvShow?.(id) : this.movieApi.getMovie?.(id))?.catch?.(() => null);
+        releaseDate = detail?.releaseDate || null;
+      }
+      const relStr = releaseDate ? String(releaseDate).slice(0, 10) : '';
+      const todayStr = new Date().toISOString().slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(relStr) && relStr > todayStr) {
+        emit(`❌ Upcoming release (${relStr}) — full stream isn't released yet.`);
+        return {
+          ok: false,
+          track: null,
+          playback,
+          subtitles: null,
+          webappUrl: null,
+          reason: `"${title || 'This title'}" releases on ${relStr} — full stream isn't available yet.`
+        };
+      }
       emit('❌ No playable full-length feature stream found for this title.');
       return {
         ok: false,
@@ -1143,28 +1680,39 @@ export class MovieStreamResolver {
 
     const displayTitle = isTv && episode != null
       ? `${title} · S${String(season || 1).padStart(2, '0')}E${String(episode).padStart(2, '0')}${episodeTitle ? ` — ${episodeTitle}` : ''}`
-      : `${title}${year ? ` (${year})` : ''}`;
+      : `${title}${effectiveYear ? ` (${effectiveYear})` : ''}`;
 
     const qualityTag = extractQualityLabel(resolvedStream.qualityLabel, resolvedStream.format);
     const metaSubtitle = isTv && episode != null
-      ? `${year ? `${year} · ` : ''}S${String(season || 1).padStart(2, '0')}E${String(episode).padStart(2, '0')} · ${qualityTag}`
-      : `${year ? `${year} · ` : ''}Feature Film · ${qualityTag}`;
+      ? `${effectiveYear ? `${effectiveYear} · ` : ''}S${String(season || 1).padStart(2, '0')}E${String(episode).padStart(2, '0')} · ${qualityTag}`
+      : `${effectiveYear ? `${effectiveYear} · ` : ''}Feature Film · ${qualityTag}`;
+
+    const isDash = Boolean(resolvedStream.isDash || resolvedStream.format === 'dash' || /\.mpd(\?|$)/i.test(resolvedStream.url));
+    const isHls = !isDash && Boolean(resolvedStream.isHls || resolvedStream.format === 'hls' || /\.m3u8(\?|$)/i.test(resolvedStream.url));
 
     const track = normalizeTrack({
       id: `${isTv ? 'tv' : 'mv'}:${id || title}:${season || 0}:${episode || 0}`,
       provider: 'movie',
       title: displayTitle,
       artist: metaSubtitle,
-      artwork: artwork || null,
-      durationSeconds: Number(resolvedStream.durationSeconds || durationSeconds || 0) || null,
+      artwork: effectiveArtwork || null,
+      year: effectiveYear || null,
+      rating: effectiveRating,
+      genres: effectiveGenres,
+      overview: effectiveOverview,
+      durationSeconds: Number(resolvedStream.durationSeconds || effectiveDurationSeconds || 0) || null,
       mediaType: 'video',
       streamUrl: resolvedStream.url,
       streamHeaders: resolvedStream.headers || {},
-      format: resolvedStream.format || (resolvedStream.isHls ? 'hls' : 'mp4'),
-      isHls: Boolean(resolvedStream.isHls || resolvedStream.format === 'hls' || /\.m3u8(\?|$)/i.test(resolvedStream.url)),
+      format: resolvedStream.format || (isDash ? 'dash' : isHls ? 'hls' : 'mp4'),
+      isHls,
+      isDash,
       subtitlePath: subtitleInfo?.filePath || null,
       subtitleLabel: subtitleInfo?.label || null,
       subtitleCuesCount: subtitleInfo?.cues?.length || 0,
+      subtitleTracks: Array.isArray(subtitleInfo?.tracks) ? subtitleInfo.tracks : [],
+      sizeBytes: resolvedStream.sizeBytes || null,
+      variants: resolvedStream.variants || null,
       capabilities: {
         seek: true,
         video: true
@@ -1176,6 +1724,8 @@ export class MovieStreamResolver {
       track,
       playback,
       subtitles: subtitleInfo,
+      variants: resolvedStream.variants || null,
+      sizeBytes: resolvedStream.sizeBytes || null,
       source: resolvedStream.source,
       webappUrl: null
     };

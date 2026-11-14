@@ -83,7 +83,7 @@ export class MovieApiClient {
     this.cache = new TtlCache(350);
   }
 
-  async #getJson(path, query = null, { ttlMs = 180_000 } = {}) {
+  async #getJson(path, query = null, { ttlMs = 180_000, forceRefresh = false } = {}) {
     const url = new URL(`${this.baseUrl}${path.startsWith('/') ? path : `/${path}`}`);
     if (query) {
       for (const [k, v] of Object.entries(query)) {
@@ -91,7 +91,7 @@ export class MovieApiClient {
       }
     }
     const cacheKey = url.toString();
-    if (ttlMs > 0) {
+    if (ttlMs > 0 && !forceRefresh) {
       const hit = this.cache.get(cacheKey);
       if (hit) return hit;
     }
@@ -124,10 +124,51 @@ export class MovieApiClient {
     };
   }
 
-  async trending({ window = 'day', type = 'all', page = 1 } = {}) {
-    const data = await this.#getJson('/trending', { window, type, page }, { ttlMs: 300_000 });
-    const results = (data?.results || []).map((x) => normalizeListItem(x, type === 'tv' ? 'tv' : 'movie')).filter(Boolean);
-    return { window, type, count: results.length, results };
+  async trending({ window = 'day', type = 'all', page = 1, includeUpcoming = false, forceRefresh = false } = {}) {
+    const primaryFallback = type === 'tv' ? 'tv' : 'movie';
+    const requests = [
+      this.#getJson('/trending', { window, type, page }, { ttlMs: 60_000, forceRefresh })
+        .then((d) => ({ items: d?.results || [], fallbackType: primaryFallback }))
+    ];
+    if (window === 'day' && type === 'all' && Number(page) === 1) {
+      requests.push(
+        this.#getJson('/trending', { window: 'day', type: 'movie', page: 1 }, { ttlMs: 60_000, forceRefresh })
+          .then((d) => ({ items: d?.results || [], fallbackType: 'movie' })),
+        this.#getJson('/trending', { window: 'day', type: 'tv', page: 1 }, { ttlMs: 60_000, forceRefresh })
+          .then((d) => ({ items: d?.results || [], fallbackType: 'tv' })),
+        this.#getJson('/trending', { window: 'week', type: 'all', page: 1 }, { ttlMs: 120_000, forceRefresh })
+          .then((d) => ({ items: d?.results || [], fallbackType: 'movie' })),
+        this.#getJson('/popular', { type: 'movie', page: 1 }, { ttlMs: 180_000, forceRefresh })
+          .then((d) => ({ items: d?.results || [], fallbackType: 'movie' }))
+      );
+    }
+
+    const settled = await Promise.allSettled(requests);
+    const primaryRes = settled[0];
+    if (primaryRes.status === 'rejected' && settled.every((r) => r.status === 'rejected')) {
+      throw primaryRes.reason;
+    }
+
+    const seen = new Set();
+    const merged = [];
+    for (const entry of settled) {
+      if (entry.status !== 'fulfilled' || !entry.value) continue;
+      for (const raw of entry.value.items) {
+        const norm = normalizeListItem(raw, entry.value.fallbackType);
+        if (!norm) continue;
+        const key = `${norm.type}:${norm.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(norm);
+      }
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    const results = includeUpcoming
+      ? merged
+      : merged.filter((item) => !item.releaseDate || String(item.releaseDate).slice(0, 10) <= today);
+    const finalResults = results.length ? results : merged;
+    return { window, type, count: finalResults.length, results: finalResults };
   }
 
   async popular({ type = 'movie', page = 1 } = {}) {
@@ -178,7 +219,10 @@ export class MovieApiClient {
       pool = res?.results || [];
     }
     if (!pool.length) return null;
-    return pool[Math.floor(Math.random() * pool.length)];
+    const today = new Date().toISOString().slice(0, 10);
+    const released = pool.filter((item) => !item.releaseDate || String(item.releaseDate).slice(0, 10) <= today);
+    const pickFrom = released.length ? released : pool;
+    return pickFrom[Math.floor(Math.random() * pickFrom.length)];
   }
 
   async getMovie(id) {

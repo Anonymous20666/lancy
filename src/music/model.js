@@ -10,10 +10,10 @@ export function normalizeTrack(raw, provider = raw.provider || 'legacy') {
     title: String(raw.title || 'Untitled').slice(0, 240),
     artist: raw.artist || raw.author || null, album: raw.album || null,
     durationSeconds: Number.isFinite(durationSeconds) && durationSeconds > 0 ? durationSeconds : null,
-    artwork: raw.artwork || raw.thumb || null,
+    artwork: raw.artwork || raw.poster || raw.backdrop || raw.thumbnailUrl || raw.thumb || null,
     sourceRef: raw.sourceRef || null, mediaType: raw.mediaType || 'audio',
     availability: raw.availability || 'unresolved',
-    capabilities: { stream: false, download: false, seek: false, video: false, ...raw.capabilities },
+    capabilities: { stream: false, download: false, seek: provider === 'movie', video: provider === 'movie', ...raw.capabilities },
   };
 }
 export function queueEntry(track) { return { ...normalizeTrack(track), entryId: randomUUID() }; }

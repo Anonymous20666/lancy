@@ -114,7 +114,6 @@ export class MediaWorkerPool extends EventEmitter {
   #spawnWorker(index) {
     if (this.closed) return null;
     const worker = new Worker(WORKER_SCRIPT, { eval: true });
-    worker.unref();
     worker._poolIndex = index;
     worker._busy = false;
 
@@ -141,6 +140,10 @@ export class MediaWorkerPool extends EventEmitter {
     worker.on('exit', () => {
       this.#handleWorkerExit(worker);
     });
+
+    // Unref AFTER attaching the 'message' listener (attaching 'message' refs the
+    // worker's MessagePort), so idle pool workers never keep tests/CLI alive.
+    worker.unref();
 
     this.workers.push(worker);
     this.idleWorkers.push(worker);
@@ -191,6 +194,9 @@ export class MediaWorkerPool extends EventEmitter {
       waiter(worker);
     } else if (!this.closed && this.workers.includes(worker)) {
       this.idleWorkers.push(worker);
+      worker.unref?.();
+    } else {
+      worker.unref?.();
     }
   }
 
@@ -209,6 +215,7 @@ export class MediaWorkerPool extends EventEmitter {
       }, timeoutMs + 2000);
       timer.unref?.();
       this.inflightMessages.set(id, { worker, resolve, reject, timer });
+      worker.ref?.();
       worker.postMessage({ id, type, payload });
     });
   }

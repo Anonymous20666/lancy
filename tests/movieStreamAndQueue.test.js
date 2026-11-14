@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { gzipSync } from 'node:zlib';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from '../src/core/db.js';
@@ -15,12 +15,13 @@ import { MovieApiClient, normalizeSeasonsList } from '../src/media/movieApi.js';
 import { MovieSessions } from '../src/media/movieSessions.js';
 import { MovieDownloader } from '../src/media/movieDownloader.js';
 import { SubtitleService, parseSrt, getCueAt, shiftSrtText } from '../src/media/subtitles.js';
-import { MovieStreamResolver } from '../src/media/movieResolver.js';
+import { MovieStreamResolver, scoreTitleMatch } from '../src/media/movieResolver.js';
 import { VideoStreamingServer } from '../src/media/streamingServer.js';
 import { MediaAiAgent } from '../src/ai/mediaAgent.js';
 import { createMusicScreen } from '../src/telegram/screens/music.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { decodeCallback, richTextToString } from '../src/telegram/rich.js';
+import { CinemaVcAnnouncer, normalizeAnnounceTitleKey } from '../src/music/cinemaAnnouncer.js';
 
 function createMockMovieFixture() {
   const sampleTv = {
@@ -1545,4 +1546,1162 @@ test('VideoStreamingServer coalesces concurrent HLS child-segment fetches across
   assert.equal(r3.status, 200);
   assert.deepEqual(Buffer.from(await r3.arrayBuffer()), segPayload);
   assert.equal(upstreamSegHits, 1);
+});
+
+test('Cinema Play Card attaches poster preview, avoids premature 100% live indicator, and cleans up stale live-log card on fallback', async (t) => {
+  const h = buildTestHarness(t);
+  const deletedIds = [];
+  const origDelete = h.api.deleteMessage;
+  const origEdit = h.api.editMessageRich;
+  let rejectReuseEdit = false;
+  h.api.deleteMessage = async (chatId, msgId) => {
+    deletedIds.push({ chatId, msgId });
+    return origDelete(chatId, msgId);
+  };
+  h.api.editMessageRich = async (chatId, msgId, rich) => {
+    if (rejectReuseEdit) throw new Error('Bad Request: message cannot be edited with media');
+    return origEdit(chatId, msgId, rich);
+  };
+
+  const session = {
+    chatId: -10077,
+    destination: -10077,
+    destinationTitle: 'Cinema Lounge',
+    isChannel: false,
+    activeDeck: 'movie',
+    status: 'playing',
+    positionSeconds: 5,
+    currentTrack: {
+      id: 'movie:27205:0:0',
+      provider: 'movie',
+      title: 'Inception (2010)',
+      artwork: 'https://image.tmdb.org/t/p/w780/inception.jpg',
+      durationSeconds: 3600,
+      mediaType: 'video'
+    },
+    movieUpcoming: [],
+    movieHistory: [],
+    upcoming: [],
+    subtitleMode: 'screen',
+    skipVotes: []
+  };
+
+  // 1. Live indicator at 5s / 3600s must show 0% (never 100%), and poster photo must be attached
+  const startCard = h.screen.renderCinemaPlayer(session);
+  const startPhoto = startCard.blocks.find((b) => b.type === 'photo');
+  assert.equal(startPhoto?.photo?.media, 'https://image.tmdb.org/t/p/w780/inception.jpg');
+  const startText = JSON.stringify(startCard);
+  assert.match(startText, /[░█]+\s+0%\s+0:05 \/ 1:00:00/);
+  assert.doesNotMatch(startText, /[░█]+\s+100%/);
+
+  // 2. Halfway (1800s / 3600s) -> 50%, near-end (3595s / 3600s) -> capped at 99%, exact end -> 100%
+  session.positionSeconds = 1800;
+  assert.match(JSON.stringify(h.screen.renderCinemaPlayer(session)), /[░█]+\s+50%\s+30:00 \/ 1:00:00/);
+  session.positionSeconds = 3595;
+  const nearEndText = JSON.stringify(h.screen.renderCinemaPlayer(session));
+  assert.match(nearEndText, /[░█]+\s+99%\s+59:55 \/ 1:00:00/);
+  assert.doesNotMatch(nearEndText, /[░█]+\s+100%/);
+  session.positionSeconds = 3600;
+  assert.match(JSON.stringify(h.screen.renderCinemaPlayer(session)), /[░█]+\s+100%\s+1:00:00 \/ 1:00:00/);
+
+  // 3. Music Play Card live indicator also never rounds prematurely to 100% while pos < dur
+  const musicCard = h.screen.renderMusicPlayer({
+    ...session,
+    activeDeck: 'music',
+    currentTrack: { id: 'yt:1', provider: 'youtube', title: 'Test Song', durationSeconds: 200, mediaType: 'audio' },
+    positionSeconds: 199
+  });
+  assert.match(JSON.stringify(musicCard), /[░█]+\s+99%/);
+  assert.doesNotMatch(JSON.stringify(musicCard), /[░█]+\s+100%/);
+
+  // 4. Buffering state falls back to queued movie's artwork thumbnail/poster
+  const bufferingCard = h.screen.renderCinemaPlayer({
+    ...session,
+    status: 'buffering',
+    currentTrack: null,
+    movieUpcoming: [{ title: 'Next Film', thumbnailUrl: 'https://cdn.example.org/thumb.jpg' }]
+  });
+  assert.equal(bufferingCard.blocks.find((b) => b.type === 'photo')?.photo?.media, 'https://cdn.example.org/thumb.jpg');
+
+  // 5. Morphing from Live Cinema Log (`reuseMessageId`) preserves poster in Play Card & cleans up stale log card if edit fails
+  const ctx = h.makeCtx(-10077);
+  h.qm.getSession(-10077).prepared = true;
+  h.service.prepare = async (_c, dest) => ({ destination: dest });
+  await h.screen.handleCommand(ctx, '/movie', ['Inception']);
+  const mvSess = h.app.movieSessions.getLatestForChat(-10077);
+  const incIdx = mvSess.results.findIndex((r) => String(r.id) === '27205');
+  await h.screen.handle({ ...ctx, query: { id: 'qpk-img' }, messageId: mvSess.messageId }, 'mv', [mvSess.id, 'pk', String(incIdx)]);
+  await h.screen.handle({ ...ctx, query: { id: 'qpm-img' }, messageId: mvSess.messageId }, 'mv', [mvSess.id, 'pm', '']);
+  const morphedEdit = h.editedMessages.at(-1);
+  assert.match(JSON.stringify(morphedEdit?.rich), /CINEMA VC/, 'Live Cinema Log must morph into Cinema Play Card');
+  assert.ok(morphedEdit?.rich?.blocks?.some((b) => b.type === 'photo'), 'Cinema Play Card morphed from Live Log must include poster photo block');
+  assert.doesNotMatch(JSON.stringify(morphedEdit?.rich), /[░█]+\s+100%/);
+
+  // Also verify fallback cleanup when reuseMessageId edit fails
+  const liveSess = h.qm.getSession(-10077);
+  liveSess.screenMessageId = null;
+  rejectReuseEdit = true;
+  const liveMsgId = 777;
+  await h.service.player({ ...ctx, reuseMessageId: liveMsgId }, -10077);
+  assert.ok(deletedIds.some((d) => d.msgId === liveMsgId), 'Stale live-log message must be deleted if reuse edit falls back to sendRichMessage');
+  assert.ok(h.sentMessages.at(-1)?.rich?.blocks?.some((b) => b.type === 'photo'), 'Fallback Play Card must attach poster photo block');
+});
+
+test('Restart auto-resume restores active movie playback from saved second, preserves queues, and auto-pins Play Card', async (t) => {
+  const h = buildTestHarness(t);
+  const pinnedCalls = [];
+  h.api.pinChatMessage = async (chatId, msgId, opts) => {
+    pinnedCalls.push({ chatId, msgId, opts });
+    return true;
+  };
+  h.api.getChat = async (id) => ({ id, type: 'supergroup', title: 'Midnight Cinema VC' });
+  const ctx = h.makeCtx(-100999);
+
+  // Idle dashboard open in group must never pin automatically
+  await h.service.player(ctx, -100999);
+  assert.equal(pinnedCalls.length, 0);
+
+  // Start playing movie #1 and queue movie #2, then advance progress and shut down
+  await h.qm.addMany(-100999, [
+    {
+      provider: 'movie',
+      providerId: '27205:0:0',
+      title: 'Inception (2010)',
+      mediaType: 'video',
+      streamUrl: 'https://cdn.example.org/inception.mp4',
+      durationSeconds: 3600,
+      artwork: 'https://image.tmdb.org/t/p/w780/inception.jpg'
+    },
+    {
+      provider: 'movie',
+      providerId: '157336:0:0',
+      title: 'Interstellar (2014)',
+      mediaType: 'video',
+      streamUrl: 'https://cdn.example.org/interstellar.mp4',
+      durationSeconds: 4200
+    }
+  ]);
+
+  const s1 = h.qm.getSession(-100999);
+  assert.equal(pinnedCalls.length, 1, 'Active Play Card must be auto-pinned in group');
+  assert.equal(pinnedCalls[0].opts?.disable_notification, true);
+  assert.equal(h.voiceCalls.play.at(-1)?.opts?.vcTitle, 'Inception (2010)');
+  s1.positionSeconds = 742;
+  await h.qm.shutdown();
+
+  const saved = h.app.db.getSetting('music.activePlaybackSnapshots', {});
+  assert.ok(saved['-100999']);
+  assert.equal(saved['-100999'].positionSeconds, 742);
+  assert.equal(saved['-100999'].currentTrack.title, 'Inception (2010)');
+  assert.equal(saved['-100999'].movieUpcoming.length, 1);
+
+  // Simulate fresh bot startup sharing the same DB & voice client
+  const restartedVoiceCalls = [];
+  const restartedVoice = {
+    play: async (_id, _url, opts) => { restartedVoiceCalls.push({ op: 'play', ...opts }); return { ok: true, account_alias: 'one' }; },
+    pause: async () => { restartedVoiceCalls.push({ op: 'pause' }); return { ok: true }; },
+    setVolume: async () => ({ ok: true }),
+    stop: async () => ({ ok: true }),
+    idle: async () => ({ ok: true }),
+    setup: async () => ({ ok: true }),
+    seek: async (_id, secs) => ({ ok: true, position_seconds: secs }),
+    getStatus: async () => ({ ok: true, active: false })
+  };
+  const restartedApp = { ...h.app };
+  const qm2 = new QueueManager({ app: restartedApp, voiceClient: restartedVoice, db: h.app.db, pollMs: 0 });
+  restartedApp.musicQueueManager = qm2;
+  t.after(async () => qm2.shutdown());
+
+  const restoredChats = await qm2.restoreActiveSessions({ api: h.api });
+  assert.deepEqual(restoredChats, [-100999]);
+  assert.equal(restartedVoiceCalls[0].op, 'play');
+  assert.equal(restartedVoiceCalls[0].startSeconds, 742);
+  assert.equal(restartedVoiceCalls[0].vcTitle, 'Inception (2010)');
+  const s2 = qm2.getSession(-100999);
+  assert.equal(s2.currentTrack.title, 'Inception (2010)');
+  assert.equal(s2.positionSeconds, 742);
+  assert.equal(s2.movieUpcoming.length, 1);
+  assert.equal(s2.movieUpcoming[0].title, 'Interstellar (2014)');
+  assert.equal(s2.pinned, true);
+
+  // Explicit /stop clears persisted snapshot so stopped sessions do not auto-resume later
+  await qm2.stop(-100999);
+  assert.equal(h.app.db.getSetting('music.activePlaybackSnapshots', {})['-100999'], undefined);
+});
+
+test('Forward (+30s), Reverse (-30s), Next, Prev work rapidly without expiry errors and auto-replace 48h cards', async (t) => {
+  const h = buildTestHarness(t);
+  const pinnedCalls = [];
+  h.api.pinChatMessage = async (chatId, msgId, opts) => {
+    pinnedCalls.push({ chatId, msgId, opts });
+    return true;
+  };
+  h.api.getChat = async (id) => ({ id, type: 'supergroup', title: 'Cinema Room' });
+
+  const voiceSeekCalls = [];
+  const origSeek = h.app.voiceClient?.seek;
+  void origSeek;
+
+  await h.qm.addMany(-100888, [
+    {
+      provider: 'movie',
+      providerId: 'm1:0:0',
+      title: 'Movie One',
+      mediaType: 'video',
+      streamUrl: 'https://cdn.example.org/m1.mp4',
+      capabilities: { seek: true, video: true } // durationSeconds intentionally omitted
+    },
+    {
+      provider: 'movie',
+      providerId: 'm2:0:0',
+      title: 'Movie Two',
+      mediaType: 'video',
+      streamUrl: 'https://cdn.example.org/m2.mp4',
+      durationSeconds: 300,
+      capabilities: { seek: true, video: true }
+    },
+    {
+      provider: 'movie',
+      providerId: 'm3:0:0',
+      title: 'Movie Three',
+      mediaType: 'video',
+      streamUrl: 'https://cdn.example.org/m3.mp4',
+      durationSeconds: 300,
+      capabilities: { seek: true, video: true }
+    }
+  ]);
+
+  // Override voice.seek to verify numeric return + unknown duration seek works cleanly
+  h.qm.voice.seek = async (_id, secs) => {
+    voiceSeekCalls.push(secs);
+    return { ok: true, position_seconds: secs };
+  };
+
+  const s = h.qm.getSession(-100888);
+  const ctx = h.makeCtx(-100888);
+  await h.service.player(ctx, -100888);
+  const liveMsgId = s.screenMessageId;
+  const staleRev = String(s.controlRevision || 0);
+
+  // Simulate transient null clock before first status poll
+  s.positionSeconds = null;
+
+  // Rapidly tap +30s twice and -30s once with the older controlRevision on the live card
+  await h.service.control({ ...ctx, query: { id: 'q1' }, messageId: liveMsgId }, 'seekby', ['30', staleRev]);
+  await h.service.control({ ...ctx, query: { id: 'q2' }, messageId: liveMsgId }, 'seekby', ['30', staleRev]);
+  await h.service.control({ ...ctx, query: { id: 'q3' }, messageId: liveMsgId }, 'seekby', ['-30', staleRev]);
+
+  assert.deepEqual(voiceSeekCalls, [30, 60, 30]);
+  assert.equal(s.positionSeconds, 30);
+
+  // VC Name row reflects currently playing movie title alongside chat label
+  const cinemaCard = h.screen.renderCinemaPlayer(s);
+  assert.match(JSON.stringify(cinemaCard), /Movie One · Cinema Room/);
+
+  // Next -> Next -> Prev -> Prev walks history backwards cleanly without STALE_PLAYER/SLOW_DOWN
+  await h.service.control({ ...ctx, query: { id: 'q4' }, messageId: liveMsgId }, 'skip', [staleRev]);
+  assert.equal(s.currentTrack.title, 'Movie Two');
+  await h.service.control({ ...ctx, query: { id: 'q5' }, messageId: liveMsgId }, 'skip', [staleRev]);
+  assert.equal(s.currentTrack.title, 'Movie Three');
+  await h.service.control({ ...ctx, query: { id: 'q6' }, messageId: liveMsgId }, 'previous', [staleRev]);
+  assert.equal(s.currentTrack.title, 'Movie Two');
+  await h.service.control({ ...ctx, query: { id: 'q7' }, messageId: liveMsgId }, 'previous', [staleRev]);
+  assert.equal(s.currentTrack.title, 'Movie One');
+
+  // Destructive actions with wrong revision still throw STALE_PLAYER
+  await assert.rejects(
+    h.service.control({ ...ctx, query: { id: 'q8' }, messageId: liveMsgId }, 'mclear', ['999999']),
+    (e) => e.code === 'STALE_PLAYER'
+  );
+
+  // 48h MESSAGE_EDIT_TIME_EXPIRED on card update automatically replaces & pins new card
+  const origEdit = h.api.editMessageRich;
+  h.api.editMessageRich = async () => {
+    const err = new Error('Bad Request: MESSAGE_EDIT_TIME_EXPIRED');
+    err.description = 'Bad Request: MESSAGE_EDIT_TIME_EXPIRED';
+    throw err;
+  };
+  await h.qm.updatePlayerCard(-100888, { forceEdit: true });
+  h.api.editMessageRich = origEdit;
+  assert.notEqual(s.screenMessageId, liveMsgId);
+  assert.ok(pinnedCalls.some((p) => p.msgId === s.screenMessageId));
+});
+
+test('Call-end resume preserves exact movie position across idle, paused/playing races, setup vc_title, and bot restart', async (t) => {
+  const h = buildTestHarness(t);
+  let callActive = true;
+  let lastEndedPos = null;
+  let livePos = 1845;
+  const setupCalls = [];
+
+  h.app.voiceClient.accounts = async () => ({ accounts: [{ alias: 'acc1', enabled: true, status: 'available' }] });
+  h.app.voiceClient.setup = async (id, stage, opts = {}) => {
+    setupCalls.push({ id, stage, ...opts });
+    if (stage === 'identity') return { ok: true, account_alias: 'acc1', user_id: 555 };
+    if (stage === 'start') {
+      callActive = true;
+      return { ok: true, account_alias: 'acc1', call_ready: true, created: true };
+    }
+    return { ok: true, account_alias: 'acc1' };
+  };
+  const origPlay = h.app.voiceClient.play;
+  h.app.voiceClient.play = async (id, source, opts = {}) => {
+    callActive = true;
+    return origPlay(id, source, opts);
+  };
+  h.app.voiceClient.resume = async () => {
+    if (!callActive) {
+      const err = new Error('No active call');
+      err.code = 'NO_ACTIVE_CALL';
+      throw err;
+    }
+    return { ok: true };
+  };
+  h.app.voiceClient.getStatus = async () => {
+    const sess = h.qm.getSession(-100777);
+    return callActive
+      ? { ok: true, active: true, info: { status: 'playing', playback_id: sess.playbackId, position_seconds: livePos, volume: 100 } }
+      : { ok: true, active: false, last_position_seconds: lastEndedPos };
+  };
+
+  await h.qm.addMovies(-100777, [{
+    provider: 'movie',
+    providerId: 'mov-call-end:0:0',
+    title: 'Edge of Tomorrow',
+    streamUrl: 'https://cdn.example.com/edge.m3u8',
+    artwork: 'https://image.tmdb.org/t/p/w500/edge.jpg',
+    mediaType: 'video',
+    durationSeconds: 6780,
+    capabilities: { seek: true, video: true }
+  }], { playNow: true });
+
+  const s = h.qm.getSession(-100777);
+  const ctx = h.makeCtx(-100777);
+  await h.service.player(ctx, -100777);
+  const liveMsgId = s.screenMessageId;
+  assert.equal(s.status, 'playing');
+
+  // Poll picks up 1845s (30:45), then call drops even while local positionSeconds was temporarily nulled
+  await h.qm.reconcile();
+  assert.equal(s.positionSeconds, 1845);
+  assert.equal(s.lastKnownPositionSeconds, 1845);
+  s.positionSeconds = null;
+
+  // 1. Call ends (!r.active) -> retains movie at index 0 with 1845s and renders Saved Card + Poster
+  callActive = false;
+  lastEndedPos = 1845;
+  await h.qm.reconcile();
+  assert.equal(s.connected, false);
+  assert.equal(s.status, 'idle');
+  assert.equal(s.currentTrack, null);
+  assert.equal(s.movieUpcoming.length, 1);
+  assert.equal(s.movieUpcoming[0].resumePositionSeconds, 1845);
+  assert.match(s.lastNotice, /Voice chat ended.*30:45.*Resume/);
+
+  const endedCard = h.screen.renderCinemaPlayer(s);
+  assert.equal(endedCard.blocks.find((b) => b.type === 'photo')?.photo?.media, 'https://image.tmdb.org/t/p/w500/edge.jpg');
+  assert.match(JSON.stringify(endedCard), /Saved at 30:45/);
+  assert.match(JSON.stringify(endedCard), /▶ Resume/);
+
+  // 2. Bot restarts while call-ended -> restores idle resumable queue & 1845s without auto-creating closed VC
+  const playCountBeforeBoot = h.voiceCalls.play.length;
+  const { QueueManager } = await import('../src/music/queueManager.js');
+  const qmBoot = new QueueManager({ app: { ...h.app }, voiceClient: h.app.voiceClient, db: h.app.db, pollMs: 0 });
+  t.after(() => qmBoot.shutdown());
+  await qmBoot.restoreActiveSessions({ api: h.api });
+  assert.equal(h.voiceCalls.play.length, playCountBeforeBoot);
+  const sBoot = qmBoot.getSession(-100777);
+  assert.equal(sBoot.status, 'idle');
+  assert.equal(sBoot.callEnded, true);
+  assert.equal(sBoot.movieUpcoming[0].resumePositionSeconds, 1845);
+  assert.equal(sBoot.screenMessageId, liveMsgId);
+
+  // 3. Tapping ▶ Resume via MusicService prepares VC with vc_title = movie title and resumes at 1845s
+  setupCalls.length = 0;
+  await h.service.control({ ...ctx, query: { id: 'q-res' }, messageId: liveMsgId }, 'resume', [String(s.controlRevision || 0)]);
+  const startSetup = setupCalls.find((c) => c.stage === 'start');
+  assert.equal(startSetup?.vc_title, 'Edge of Tomorrow');
+  assert.equal(h.voiceCalls.play.at(-1).opts.startSeconds, 1845);
+  assert.equal(s.status, 'playing');
+
+  // 4. Race A: User pauses, call ends silently in Telegram, user immediately taps Resume before poll
+  await h.qm.pause(-100777);
+  s.positionSeconds = 2110;
+  s.lastKnownPositionSeconds = 2110;
+  callActive = false;
+  lastEndedPos = 2110;
+  const pausedResumed = await h.qm.resume(-100777);
+  assert.ok(pausedResumed);
+  assert.equal(h.voiceCalls.play.at(-1).opts.startSeconds, 2110);
+  assert.equal(s.currentTrack.title, 'Edge of Tomorrow');
+
+  // 5. Race B: Status is still locally 'playing', call ends in Telegram, user runs /resume before poll
+  livePos = 2590;
+  await h.qm.reconcile();
+  callActive = false;
+  lastEndedPos = 2590;
+  const raceResumed = await h.qm.resume(-100777);
+  assert.ok(raceResumed);
+  assert.equal(h.voiceCalls.play.at(-1).opts.startSeconds, 2590);
+  assert.equal(s.currentTrack.title, 'Edge of Tomorrow');
+});
+
+test('Active Playing Card search stays isolated in Groups/Channels and sets overlayView in DM Channel Panels', async (t) => {
+  const h = buildTestHarness(t);
+  const groupCtx = h.makeCtx(-10050, { isChannel: false });
+  const session = h.qm.getSession(-10050);
+  session.prepared = true;
+
+  // 1. Start playing a movie in Group so active Playing Card exists at playerMsgId
+  await h.qm.addMovies(-10050, [{
+    id: 'movie:27205',
+    provider: 'movie',
+    title: 'Inception (2010)',
+    mediaType: 'video',
+    streamUrl: 'https://cdn.example/inception.mkv',
+    durationSeconds: 7200,
+    capabilities: { stream: true, seek: true, video: true }
+  }], { playNow: true });
+  await h.service.player(groupCtx, -10050);
+
+  const playerMsgId = session.screenMessageId;
+  assert.ok(playerMsgId);
+  assert.equal(session.status, 'playing');
+
+  // 2. User taps Movies button right on the active Playing Card -> opens a separate Search Card, leaving Playing Card intact
+  const editedBeforeSearch = h.editedMessages.filter((e) => Number(e.message_id) === Number(playerMsgId)).length;
+  await h.screen.handle({ ...groupCtx, query: { id: 'q-open-hub' }, messageId: playerMsgId }, 'moviehub', []);
+  const hubSent = h.sentMessages.at(-1);
+  assert.ok(hubSent?.message_id && hubSent.message_id !== playerMsgId, 'Movie hub must open as a separate card while playing');
+  assert.match(JSON.stringify(hubSent.rich), /Movie & Series Stream/);
+  const editedAfterHub = h.editedMessages.filter((e) => Number(e.message_id) === Number(playerMsgId)).length;
+  assert.equal(editedAfterHub, editedBeforeSearch, 'Active Playing Card must not be overwritten by Movie Hub');
+
+  // 3. Running reconcile / updatePlayerCard must not overwrite the separate Movie Hub card
+  const searchMs = h.app.movieSessions.getLatestForChat(-10050);
+  assert.equal(searchMs.messageId, hubSent.message_id);
+  const editsToSearchBefore = h.editedMessages.filter((e) => Number(e.message_id) === Number(searchMs.messageId)).length;
+  await h.qm.updatePlayerCard(-10050, { forceEdit: true });
+  const editsToSearchAfter = h.editedMessages.filter((e) => Number(e.message_id) === Number(searchMs.messageId)).length;
+  assert.equal(editsToSearchAfter, editsToSearchBefore, 'Reconcile must not overwrite Movie Search card back to Player Card');
+
+  // 4. DM Channel Panel: opening movie sets overlayView='movie' so ChannelPanels.update() never snaps panel back mid-search
+  h.api.me = { id: 999, username: 'LancyBot' };
+  h.api.getChat = async (id) => ({ id, type: Number(id) === -10011 ? 'channel' : 'private', title: 'Movie Channel' });
+  h.api.getChatMember = async () => ({ status: 'administrator', can_post_messages: true });
+  const chanSession = h.qm.getSession(-10011);
+  chanSession.isChannel = true;
+  chanSession.title = 'Movie Channel';
+  const dmCtx = h.makeCtx(10, { isChannel: false });
+  const panel = await h.app.music.channelPanels.open(dmCtx, chanSession);
+  const movieWire = PANEL_ACTIONS.indexOf('movie').toString(36);
+  const pcCtx = { ...dmCtx, messageId: panel.screenMessageId, query: { id: 'q-dm-mv', message: { message_id: panel.screenMessageId, chat: { id: 10 } } } };
+
+  await h.screen.handle(pcCtx, 'pc', [panel.panelToken, movieWire, 'hub', '0']);
+  assert.equal(panel.overlayView, 'movie');
+  const editsBeforePanelTick = h.editedMessages.length;
+  await h.qm.updatePlayerCard(-10011);
+  assert.equal(h.editedMessages.length, editsBeforePanelTick, 'Reconcile must not snap DM panel back while overlayView is active');
+});
+
+test('MovieStreamResolver handles punkflix Referer + master HLS audio/VTT subs, rejects preview clips, supports Zendaya DASH, and reports future releaseDates', async () => {
+  const tmpSubDir = mkdtempSync(join(tmpdir(), 'lancy-mv-res-'));
+  const srv = new VideoStreamingServer({ port: 0, cacheDir: tmpSubDir, audioCacheDir: tmpSubDir });
+  await srv.start();
+
+  try {
+    // 1. Master HLS with #EXT-X-MEDIA AUDIO + punkflix.net JSON signed VTT + cinezo Referer enforcement
+    const subSvc = new SubtitleService({
+      cacheDir: tmpSubDir,
+      fetchImpl: async (url, opts) => {
+        if (String(url).includes('3125aa.vtt')) {
+          assert.equal(opts?.headers?.Referer, 'https://player.cinezo.live/');
+          return {
+            ok: true,
+            status: 200,
+            arrayBuffer: async () => Buffer.from('WEBVTT\n\n00:01.000 --> 00:03.000\nLine one\n\n00:04.000 --> 00:06.000\nLine two\n\n00:07.000 --> 00:09.000\nLine three\n\n00:10.000 --> 00:12.000\nLine four\n\n00:13.000 --> 00:15.000\nLine five\n', 'utf8')
+          };
+        }
+        return { ok: false, status: 404 };
+      }
+    });
+
+    const mockApi = {
+      getPlaybackInfo: async () => ({
+        rootStream: {
+          hls_url: 'https://media.punkflix.net/s/abc123/index.m3u8',
+          duration_ms: 7200_000,
+          quality: { resolution: '1920x1080' }
+        },
+        subtitles: ['English']
+      }),
+      getMovie: async () => ({ id: '1003596', title: 'Avengers: Doomsday', releaseDate: '2026-12-16' })
+    };
+
+    const resolverMaster = new MovieStreamResolver({
+      movieApi: mockApi,
+      subtitles: subSvc,
+      enableYtDlp: false,
+      enableWebFallback: false,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        if (u === 'https://media.punkflix.net/s/abc123/index.m3u8') {
+          if (opts?.headers?.Referer !== 'https://player.cinezo.live/') return { ok: false, status: 403, headers: { get: () => 'text/plain' } };
+          return {
+            ok: true,
+            status: 200,
+            url: u,
+            headers: { get: () => 'application/vnd.apple.mpegurl' },
+            text: async () => [
+              '#EXTM3U',
+              '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="aud_en.m3u8"',
+              '#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="sub",NAME="English",LANGUAGE="en",URI="broken_sub.m3u8"',
+              '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080,AUDIO="aud",SUBTITLES="sub"',
+              'vid_1080.m3u8'
+            ].join('\n')
+          };
+        }
+        if (u === 'https://media.punkflix.net/s/abc123/vid_1080.m3u8') {
+          return {
+            ok: true,
+            status: 200,
+            url: u,
+            headers: { get: () => 'application/vnd.apple.mpegurl' },
+            text: async () => '#EXTM3U\n#EXTINF:2400.0,\nseg0.m4s\n#EXTINF:2400.0,\nseg1.m4s\n#EXT-X-ENDLIST\n'
+          };
+        }
+        if (u === 'https://media.punkflix.net/s/abc123/seg0.m4s') {
+          return { ok: true, status: 206, headers: { get: () => 'video/mp4' } };
+        }
+        if (u === 'https://punkflix.net/movie/27205.json') {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              subtitles: [{ lang: 'en', url: 'https://media.punkflix.net/subs/3125aa.vtt?k=sig' }]
+            })
+          };
+        }
+        return { ok: false, status: 404 };
+      }
+    });
+
+    const masterRes = await resolverMaster.resolve({ type: 'movie', id: '27205', title: 'Inception', year: 2010, durationSeconds: 7200 });
+    assert.equal(masterRes.ok, true);
+    assert.equal(masterRes.source, 'movie_api_root');
+    assert.equal(masterRes.track.streamUrl, 'https://media.punkflix.net/s/abc123/index.m3u8', 'Must keep master URL with #EXT-X-MEDIA AUDIO tracks intact');
+    assert.equal(masterRes.track.streamHeaders.Referer, 'https://player.cinezo.live/');
+    assert.ok(masterRes.subtitles?.found && masterRes.subtitles.cues.length === 5);
+
+    // 2. Rejects index_preview & <480s VOD previews for feature runtime, while resolving valid Zendaya DASH .mpd over Sadie AND proxying <BaseURL>
+    const upstreamMpd = http.createServer((req, res) => {
+      if (req.headers.referer !== 'https://player.cinezo.live/') {
+        res.writeHead(403);
+        res.end('Forbidden');
+        return;
+      }
+      if (req.url === '/heartland.mpd') {
+        res.writeHead(200, { 'Content-Type': 'application/dash+xml' });
+        res.end(`<?xml version="1.0"?><MPD mediaPresentationDuration="PT1H53M58S"><BaseURL>http://127.0.0.1:${upstreamPort}/seg/</BaseURL><Period><AdaptationSet><Representation id="0" width="1920" height="1080"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>`);
+        return;
+      }
+      if (req.url === '/seg/init-0.m4s') {
+        res.writeHead(206, { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-3/4' });
+        res.end(Buffer.from('INIT'));
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    await new Promise((r) => upstreamMpd.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstreamMpd.address().port;
+
+    try {
+      const resolverDash = new MovieStreamResolver({
+        movieApi: null,
+        subtitles: null,
+        enableYtDlp: false,
+        enableWebFallback: false,
+        fetchImpl: async (url, opts) => {
+          const u = String(url);
+          if (u.startsWith(`http://127.0.0.1:${upstreamPort}`)) return fetch(u, opts);
+          if (u.includes('sources=sadie')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                source: { url: 'https://cdn.example/720/index_preview_new_266.m3u8', type: 'hls' }
+              })
+            };
+          }
+          if (u.includes('sources=zendaya')) {
+            return {
+              ok: true,
+              status: 200,
+              json: async () => ({
+                source: { url: `http://127.0.0.1:${upstreamPort}/heartland.mpd`, type: 'dash' }
+              })
+            };
+          }
+          return { ok: false, status: 404 };
+        }
+      });
+
+      const dashRes = await resolverDash.resolve({ type: 'movie', id: '1543469', title: 'Heartland', year: 2026, durationSeconds: 6800, fetchSubtitles: false });
+      assert.equal(dashRes.ok, true);
+      assert.equal(dashRes.track.isDash, true);
+      assert.equal(dashRes.track.format, 'dash');
+      assert.match(dashRes.track.qualityLabel || dashRes.track.artist, /1080p/);
+
+      const proxiedMpdUrl = srv.registerRemoteStream({
+        url: dashRes.track.streamUrl,
+        headers: dashRes.track.streamHeaders,
+        isDash: true,
+        contentType: 'application/dash+xml'
+      });
+      assert.match(proxiedMpdUrl, /\.mpd$/);
+      const mpdXml = await fetch(proxiedMpdUrl).then((r) => r.text());
+      const rewrittenBase = mpdXml.match(/<BaseURL>([^<]+)<\/BaseURL>/)?.[1];
+      assert.match(rewrittenBase || '', /\/movie-proxy-base\/[a-f0-9]+\//);
+      const proxiedInit = await fetch(`${rewrittenBase}init-0.m4s`);
+      assert.equal(proxiedInit.status, 200);
+      assert.equal(await proxiedInit.text(), 'INIT');
+    } finally {
+      await new Promise((r) => upstreamMpd.close(r));
+    }
+
+    // 3. Unreleased future release reports clear release date notice instead of generic failure
+    const futureResolver = new MovieStreamResolver({
+      movieApi: mockApi,
+      subtitles: null,
+      enableYtDlp: false,
+      enableWebFallback: false,
+      fetchImpl: async () => ({ ok: false, status: 404 })
+    });
+    const unreleasedRes = await futureResolver.resolve({ type: 'movie', id: '1003596', title: 'Avengers: Doomsday', releaseDate: '2026-12-16', fetchSubtitles: false });
+    assert.equal(unreleasedRes.ok, false);
+    assert.match(unreleasedRes.reason, /2026-12-16/);
+  } finally {
+    await srv.stop();
+    rmSync(tmpSubDir, { recursive: true, force: true });
+  }
+});
+
+test('MovieApiClient.trending filters unreleased future films and merges fresh movie/tv results cleanly', async () => {
+  let dayAllHits = 0;
+  const api = new MovieApiClient({
+    baseUrl: 'https://example.test/api',
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.includes('/trending?window=day&type=all')) {
+        dayAllHits++;
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            results: [
+              { provider_id: '1003596', type: 'movie', title: 'Avengers: Doomsday', release_date: '2099-12-16' },
+              { provider_id: '27205', type: 'movie', title: 'Inception', release_date: '2010-07-16' }
+            ]
+          })
+        };
+      }
+      if (u.includes('/trending?window=day&type=tv')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            results: [
+              { provider_id: '5920', type: 'tv', title: 'The Mentalist', release_date: '2008-09-23' },
+              { provider_id: '27205', type: 'movie', title: 'Inception', release_date: '2010-07-16' }
+            ]
+          })
+        };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    }
+  });
+
+  const t1 = await api.trending({ window: 'day', type: 'all', page: 1 });
+  assert.equal(t1.results.some((r) => r.id === '1003596'), false, 'Upcoming future release must be excluded from Trending');
+  assert.deepEqual(t1.results.map((r) => r.id), ['27205', '5920']);
+  assert.equal(dayAllHits, 1);
+
+  await api.trending({ window: 'day', type: 'all', page: 1, forceRefresh: true });
+  assert.equal(dayAllHits, 2, 'forceRefresh must bypass Trending TTL cache');
+});
+
+test('CinemaVcAnnouncer notifies scoped bot_users with existing/fallback links, ignores non-admin linkless GCs & replays/resumes, and handles calert mute', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'lancy-cinema-announce-'));
+  const db = new Database(join(dir, 'test.sqlite'));
+  db.migrate();
+  try {
+    // Main bot users (bot_id = 0): active (1001, 1002), banned (1003), muted (1004)
+    db.run('INSERT INTO bot_users (bot_id, tg_id, username, first_name, is_banned) VALUES (?, ?, ?, ?, ?)', 0, 1001, 'alice', 'Alice', 0);
+    db.run('INSERT INTO bot_users (bot_id, tg_id, username, first_name, is_banned) VALUES (?, ?, ?, ?, ?)', 0, 1002, 'bob', 'Bob', 0);
+    db.run('INSERT INTO bot_users (bot_id, tg_id, username, first_name, is_banned) VALUES (?, ?, ?, ?, ?)', 0, 1003, 'banned', 'Banned', 1);
+    db.run('INSERT INTO bot_users (bot_id, tg_id, username, first_name, is_banned) VALUES (?, ?, ?, ?, ?)', 0, 1004, 'muted', 'Muted', 0);
+    db.setUserSetting(1004, 'cinema.vcNotifications', false);
+    // Cloned bot user (bot_id = 7)
+    db.run('INSERT INTO bot_users (bot_id, tg_id, username, first_name, is_banned) VALUES (?, ?, ?, ?, ?)', 7, 2001, 'cloneuser', 'Clone', 0);
+
+    const mainDms = [];
+    const cloneDms = [];
+    const apiCallLog = [];
+
+    const mainApi = {
+      me: { id: 999, username: 'LancyMainBot' },
+      getChat: async (cid) => {
+        if (cid === -1001) return { id: cid, type: 'supergroup', title: 'Movie Night Lounge', username: 'movienightlounge' };
+        if (cid === -1002) return { id: cid, type: 'supergroup', title: 'VIP Existing Link', invite_link: 'https://t.me/+ExistingLink777' };
+        if (cid === -1003) return { id: cid, type: 'supergroup', title: 'Private Admin GC' };
+        if (cid === -1004) return { id: cid, type: 'supergroup', title: 'Restricted Member GC' };
+        return { id: cid, type: 'supergroup', title: 'Unknown GC' };
+      },
+      call: async (method, params) => {
+        apiCallLog.push({ method, chatId: params?.chat_id });
+        if (method === 'createChatInviteLink' && params?.chat_id === -1003) {
+          return { invite_link: 'https://t.me/+GeneratedFallback99' };
+        }
+        if (params?.chat_id === -1004) {
+          const err = new Error('Bad Request: not enough rights to manage invite links');
+          err.error_code = 400;
+          throw err;
+        }
+        throw new Error('unexpected call');
+      },
+      sendRichMessage: async (uid, rich) => {
+        mainDms.push({ uid, rich });
+        return { message_id: mainDms.length };
+      },
+      answerCallbackQuery: async () => true
+    };
+
+    const cloneApi = {
+      me: { id: 777, username: 'CloneCinemaBot' },
+      getChat: async (cid) => ({ id: cid, type: 'supergroup', title: 'Clone Cinema', username: 'clonecinema' }),
+      sendRichMessage: async (uid, rich) => {
+        cloneDms.push({ uid, rich });
+        return { message_id: cloneDms.length };
+      }
+    };
+
+    const app = {
+      db,
+      settings: { get: (k) => (k === 'music.cinemaAnnounceEnabled' ? true : undefined) },
+      telegram: { api: mainApi, botUsername: 'LancyMainBot' },
+      musicQueueManager: { closed: false }
+    };
+    const announcer = new CinemaVcAnnouncer({ app, db, cooldownMs: 3600_000, pacingMs: 0 });
+
+    const barbieTrack = {
+      provider: 'movie',
+      title: 'Barbie and the Three Musketeers (2009)',
+      mediaType: 'video',
+      year: 2009,
+      rating: 7.4,
+      genres: ['Animation', 'Family'],
+      artwork: 'https://image.tmdb.org/t/p/w500/barbie.jpg',
+      overview: 'Corinne heads to Paris to pursue her dream of becoming a Musketeer.'
+    };
+
+    // 1. Public group -> sends rich DMs to 1001 & 1002 only
+    await announcer.onTrackStart({ chatId: -1001, track: barbieTrack, session: { botId: 0, api: mainApi } });
+    await announcer.flush();
+    assert.deepEqual(mainDms.map((d) => d.uid), [1001, 1002], 'Must deliver only to non-banned, non-muted users of bot_id=0');
+    const dmJson = JSON.stringify(mainDms[0].rich);
+    assert.match(dmJson, /Barbie and the Three Musketeers \(2009\)/);
+    assert.match(dmJson, /Movie Night Lounge/);
+    assert.match(dmJson, /https:\/\/t\.me\/movienightlounge/);
+    assert.match(dmJson, /https:\/\/t\.me\/movienightlounge\?voicechat/);
+    assert.match(dmJson, /calert/);
+
+    // 2. Replaying the same movie in the same group must NOT resend DMs
+    const replayRes = await announcer.onTrackStart({ chatId: -1001, track: barbieTrack, session: { botId: 0, api: mainApi } });
+    assert.equal(replayRes.skipped, 'already_announced');
+    assert.equal(mainDms.length, 2);
+
+    // 3. Different title triggers notification, and next episode of SAME TV show does NOT re-notify
+    assert.equal(normalizeAnnounceTitleKey('Breaking Bad · S01E01 — Pilot'), 'breaking bad');
+    assert.equal(normalizeAnnounceTitleKey('Breaking Bad · S02E05 — Breakage'), 'breaking bad');
+    await announcer.onTrackStart({
+      chatId: -1001,
+      track: { provider: 'movie', title: 'Breaking Bad · S01E01 — Pilot', mediaType: 'video', seriesId: '1396', seasonNumber: 1 },
+      session: { botId: 0, api: mainApi }
+    });
+    await announcer.flush();
+    assert.equal(mainDms.length, 4, 'Switching to a new title must announce once');
+
+    const ep2Res = await announcer.onTrackStart({
+      chatId: -1001,
+      track: { provider: 'movie', title: 'Breaking Bad · S01E02 — Cat\'s in the Bag', mediaType: 'video', seriesId: '1396', seasonNumber: 1 },
+      session: { botId: 0, api: mainApi }
+    });
+    assert.equal(ep2Res.skipped, 'already_announced', 'Subsequent TV episode of same show must not spam DMs');
+    assert.equal(mainDms.length, 4);
+
+    // 4. Restart / Call-end auto-resume is suppressed
+    const resumeSess = { botId: 0, api: mainApi, _suppressCinemaAnnounce: true };
+    const supRes = await announcer.onTrackStart({ chatId: -1001, track: { provider: 'movie', title: 'Inception (2010)', mediaType: 'video' }, session: resumeSess });
+    assert.equal(supRes.skipped, 'suppressed_resume');
+    assert.equal(resumeSess._suppressCinemaAnnounce, false);
+    assert.equal(mainDms.length, 4);
+
+    // 5. Private GC with existing chat.invite_link reuses existing link without calling createChatInviteLink
+    const callsBeforeExisting = apiCallLog.length;
+    await announcer.onTrackStart({ chatId: -1002, track: barbieTrack, session: { botId: 0, api: mainApi } });
+    await announcer.flush();
+    assert.equal(apiCallLog.length, callsBeforeExisting, 'Existing invite_link must be reused directly');
+    assert.equal(mainDms.length, 6);
+    assert.match(JSON.stringify(mainDms[4].rich), /ExistingLink777/);
+
+    // 6. Private GC without invite_link falls back to createChatInviteLink
+    await announcer.onTrackStart({ chatId: -1003, track: barbieTrack, session: { botId: 0, api: mainApi } });
+    await announcer.flush();
+    assert.equal(mainDms.length, 8);
+    assert.match(JSON.stringify(mainDms[6].rich), /GeneratedFallback99/);
+
+    // 7. Private GC WITHOUT admin invite permissions fails link resolution silently & NEVER interrupts VC
+    const noPermRes = await announcer.onTrackStart({ chatId: -1004, track: barbieTrack, session: { botId: 0, api: mainApi } });
+    assert.equal(noPermRes.skipped, 'no_invite_link');
+    assert.equal(mainDms.length, 8);
+
+    // 8. Cloned bot only notifies its own bot_id users
+    await announcer.onTrackStart({ chatId: -1005, track: barbieTrack, session: { botId: 7, api: cloneApi, botUsername: 'CloneCinemaBot' } });
+    await announcer.flush();
+    assert.deepEqual(cloneDms.map((d) => d.uid), [2001]);
+
+    // 9. calert mute/unmute button toggles per-user preference cleanly via music screen
+    const h = buildTestHarness(t);
+    const muteCtx = h.makeCtx(1001, {
+      tgId: 1001,
+      user: { id: 1001, first_name: 'Alice' },
+      messageId: 50,
+      query: { id: 'cb_mute' }
+    });
+    await h.screen.handle(muteCtx, 'calert', ['off']);
+    assert.equal(h.app.db.getUserSetting(1001, 'cinema.vcNotifications', true), false);
+    assert.match(h.callbackAnswers[0]?.text || '', /muted/i);
+    assert.match(JSON.stringify(h.editedMessages[0]?.rich || {}), /Re-enable Cinema Alerts/);
+
+    await h.screen.handle(muteCtx, 'calert', ['on']);
+    assert.equal(h.app.db.getUserSetting(1001, 'cinema.vcNotifications', true), true);
+    assert.match(h.callbackAnswers[1]?.text || '', /enabled/i);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('movieUi.renderResults displays full untruncated movie names & details in card body and clean numbered buttons only', async (t) => {
+  const h = buildTestHarness(t);
+  const ms = h.app.movieSessions.create({ chatId: -777, userId: 10, view: 'results' });
+  ms.query = 'Barbie Musketeers';
+  ms.results = [
+    {
+      id: '23566',
+      type: 'movie',
+      title: 'Barbie and the Three Musketeers — Extended Anniversary Collector Showcase Edition',
+      year: 2009,
+      rating: 7.4,
+      genres: ['Animation', 'Family'],
+      overview: 'Corinne leaves her countryside home for Paris hoping to become a royal Musketeer.'
+    },
+    {
+      id: '1396',
+      type: 'tv',
+      title: 'Breaking Bad',
+      year: 2008,
+      rating: 9.5,
+      genres: ['Drama', 'Crime'],
+      overview: 'A chemistry teacher enters a dangerous criminal underworld.'
+    },
+    {
+      id: '27205',
+      type: 'movie',
+      title: 'Inception',
+      year: 2010,
+      rating: 8.8,
+      genres: ['Sci-Fi', 'Action'],
+      overview: 'A skilled thief enters shared dreams to plant an idea.'
+    },
+    {
+      id: '122',
+      type: 'movie',
+      title: 'The Lord of the Rings: The Return of the King',
+      year: 2003,
+      rating: 8.5,
+      genres: ['Adventure', 'Fantasy'],
+      overview: 'Aragorn assumes the throne as Sauron attacks Minas Tirith.'
+    },
+    {
+      id: '94605',
+      type: 'tv',
+      title: 'Arcane',
+      year: 2021,
+      rating: 8.7,
+      genres: ['Animation', 'Action'],
+      overview: 'Sisters fight on opposite sides of a war between Piltover and Zaun.'
+    }
+  ];
+
+  const card = h.screen.movieUi.renderResults(h.makeCtx(-777), ms);
+  const extractBlocksText = (blk) => {
+    if (!blk) return '';
+    if (Array.isArray(blk)) return blk.map(extractBlocksText).join('\n');
+    if (blk.type === 'blockquote' || blk.type === 'details') return extractBlocksText(blk.blocks);
+    if (blk.text) return richTextToString(blk.text);
+    return '';
+  };
+  const bodyText = extractBlocksText(card.blocks.filter((b) => b.type !== 'buttons'));
+  assert.match(bodyText, /Barbie and the Three Musketeers — Extended Anniversary Collector Showcase Edition/);
+  assert.match(bodyText, /2009 · ⭐ 7\.4 · Animation, Family/);
+  assert.match(bodyText, /Corinne leaves her countryside home for Paris/);
+  assert.match(bodyText, /The Lord of the Rings: The Return of the King/);
+
+  const flatButtons = card.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  const pickButtons = flatButtons.filter((b) => {
+    const dec = decodeCallback(b.callback_data || '');
+    return dec?.action === 'mv' && dec?.args?.[1] === 'pk';
+  });
+  assert.deepEqual(
+    pickButtons.map((b) => richTextToString(b.text)),
+    ['#1 🎬', '#2 📺', '#3 🎬', '#4 🎬', '#5 📺'],
+    'Result selection buttons must use clean numbered badges without long movie names'
+  );
+  for (const btn of flatButtons) {
+    assert.doesNotMatch(richTextToString(btn.text), /Barbie|Musketeers|Inception|Breaking|Rings|Arcane/i);
+  }
+});
+
+test('MovieStreamResolver enforces strict exact-movie matching against wrong movies, data.meta mismatches, bad slugs, and game playthroughs', async () => {
+  // 1. Score guard checks
+  assert.ok(scoreTitleMatch('Barbie and the Three Musketeers', 2009, 'Barbie and the Three Musketeers (2009) 1080p 5.1 x264') >= 50);
+  assert.ok(scoreTitleMatch('Barbie and the Three Musketeers', 2009, 'The Three Musketeers (2011)') < 0);
+  assert.ok(scoreTitleMatch('Barbie and the Three Musketeers', 2009, 'Barbie (2023)') < 0);
+  assert.ok(scoreTitleMatch('Barbie and the Three Musketeers', 2009, 'Barbie in a Mermaid Tale (2010)') < 0);
+
+  // 2. Reject wrong meta.id / meta.title, wrong base64 t-token slug, and game playthroughs; play ONLY exact verified match
+  const badSlugToken = Buffer.from(JSON.stringify({ r: { slug: 'the-three-musketeers-2011-xyz12345' } })).toString('base64');
+  let ytExtractCalled = false;
+  const resolverStrict = new MovieStreamResolver({
+    movieApi: {
+      getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }),
+      getMovie: async () => ({
+        id: '23566',
+        type: 'movie',
+        title: 'Barbie and the Three Musketeers',
+        year: 2009,
+        releaseDate: '2009-09-15',
+        imdbId: 'tt1484922',
+        runtimeSeconds: 4860
+      })
+    },
+    subtitles: null,
+    enableYtDlp: true,
+    enableWebFallback: true,
+    thenkiri: {
+      thenkiriSearch: async () => ({ results: [{ title: 'The Three Musketeers (2011)', url: 'https://t.example/wrong' }] }),
+      thenkiriDetails: async () => ({ sources: [] }),
+      thenkiriGetLink: async () => null
+    },
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.includes('proxy1.flikhub.net') && u.includes('sources=berlin')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            meta: { id: 12345, title: 'The Three Musketeers', release_date: '2011-10-14' },
+            source: { url: 'https://cdn.example/wrong-musketeers-2011.mp4', type: 'mp4' }
+          })
+        };
+      }
+      if (u.includes('sources=zendaya')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            source: { url: `https://cdn.example/stream?t=${encodeURIComponent(badSlugToken)}`, type: 'mp4' }
+          })
+        };
+      }
+      if (u.includes('api.dailymotion.com/videos')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            list: [
+              { id: 'dm1', title: 'Barbie and the Three Musketeers The Game Full Walkthrough PS2', duration: 4860, url: 'https://dailymotion.com/video/dm1' },
+              { id: 'dm2', title: 'The Three Musketeers Full Movie 2011', duration: 4860, url: 'https://dailymotion.com/video/dm2' }
+            ]
+          })
+        };
+      }
+      if (u.includes('archive.org/advancedsearch')) {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              docs: [
+                { identifier: 'WrongMusketeers', title: 'The Three Musketeers', year: 2011 },
+                { identifier: 'Barbie3M2009', title: 'Barbie and the Three Musketeers', year: 2009 }
+              ]
+            }
+          })
+        };
+      }
+      if (u.includes('archive.org/metadata/Barbie3M2009')) {
+        return {
+          ok: true,
+          json: async () => ({
+            metadata: { title: 'Barbie and the Three Musketeers (2009)' },
+            files: [{ name: 'barbie_three_musketeers_2009_720p.mp4', length: '4860', size: String(700e6) }]
+          })
+        };
+      }
+      if (u.includes('archive.org/download/Barbie3M2009/barbie_three_musketeers_2009_720p.mp4')) {
+        return { ok: true, status: 206, headers: { get: () => 'video/mp4' } };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    },
+    ytSearchFn: async () => {
+      ytExtractCalled = true;
+      return [
+        { title: 'Barbie and the Three Musketeers Full Game Gameplay', duration: 4860, directStreamUrl: 'https://cdn.example/game.mp4' }
+      ];
+    }
+  });
+
+  const barbieRes = await resolverStrict.resolve({ type: 'movie', id: '23566', title: 'Barbie and the Three Musketeers', fetchSubtitles: false });
+  assert.equal(barbieRes.ok, true);
+  assert.match(barbieRes.track.streamUrl, /Barbie3M2009\/barbie_three_musketeers_2009_720p\.mp4/);
+  assert.equal(barbieRes.track.title, 'Barbie and the Three Musketeers (2009)');
+
+  // When NO verified movie source exists, must fail cleanly instead of returning a wrong film or game video
+  const resolverFail = new MovieStreamResolver({
+    movieApi: { getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }) },
+    subtitles: null,
+    enableYtDlp: true,
+    enableWebFallback: true,
+    thenkiri: { thenkiriSearch: async () => ({ results: [{ title: 'Barbie (2023)', url: 'https://t.example/b23' }] }), thenkiriDetails: async () => ({ sources: [] }), thenkiriGetLink: async () => null },
+    fetchImpl: async () => ({ ok: false, status: 404, text: async () => '' }),
+    ytSearchFn: async () => [
+      { title: 'Barbie and the Three Musketeers The Game Full Walkthrough', duration: 4860, directStreamUrl: 'https://cdn.example/game.mp4' },
+      { title: 'The Three Musketeers (2011) Full Movie', duration: 6600, directStreamUrl: 'https://cdn.example/wrong.mp4' }
+    ]
+  });
+  const strictFail = await resolverFail.resolve({ type: 'movie', id: '23566', title: 'Barbie and the Three Musketeers', year: 2009, durationSeconds: 4860, fetchSubtitles: false });
+  assert.equal(strictFail.ok, false, 'Must never substitute another movie or game walkthrough');
+
+  // Movies literally titled with "Game" (e.g. The Game (1997)) must still resolve properly
+  const resolverLiteralGame = new MovieStreamResolver({
+    movieApi: { getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }) },
+    subtitles: null,
+    enableYtDlp: true,
+    enableWebFallback: false,
+    fetchImpl: async () => ({ ok: false, status: 404, text: async () => '' }),
+    ytSearchFn: async () => [
+      { title: 'The Game (1997) Full Feature Movie HD', duration: 7740, directStreamUrl: 'https://cdn.example/the-game-1997.mp4' }
+    ]
+  });
+  const gameFilmRes = await resolverLiteralGame.resolve({ type: 'movie', id: '2649', title: 'The Game', year: 1997, durationSeconds: 7740, fetchSubtitles: false });
+  assert.equal(gameFilmRes.ok, true);
+  assert.equal(gameFilmRes.track.streamUrl, 'https://cdn.example/the-game-1997.mp4');
+  assert.equal(ytExtractCalled, false);
+});
+
+test('MovieStreamResolver avoids per-host 429 bursts, handles 429 backoff cleanly, and resolves TV episodes without episodeTitle', async () => {
+  const upstreamSrv = http.createServer((req, res) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/got_s1e1.mpd') {
+      res.writeHead(200, { 'Content-Type': 'application/dash+xml' });
+      res.end('<?xml version="1.0"?><MPD mediaPresentationDuration="PT1H1M37S"><BaseURL>http://127.0.0.1:' + upstreamSrv.address().port + '/seg/</BaseURL><Period><AdaptationSet><Representation id="0" width="1920" height="1080"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>');
+      return;
+    }
+    if (pathname === '/seg/init-0.m4s') {
+      res.writeHead(206, { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-3/4' });
+      res.end(Buffer.from('INIT'));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstreamSrv.listen(0, '127.0.0.1', r));
+  const upPort = upstreamSrv.address().port;
+
+  try {
+    const slugS1 = Buffer.from(JSON.stringify({ r: { se: 1, ep: 1, slug: 'game-of-thrones-AQP5Q48Qsq2' } })).toString('base64');
+    const slugS4 = Buffer.from(JSON.stringify({ r: { se: 4, ep: 9, slug: 'game-of-thrones-AQP5Q48Qsq2' } })).toString('base64');
+    const hostCounts = new Map();
+    let flikhub3Hits = 0;
+
+    const resolver = new MovieStreamResolver({
+      movieApi: { getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }) },
+      subtitles: null,
+      enableYtDlp: false,
+      enableWebFallback: false,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        if (u.startsWith(`http://127.0.0.1:${upPort}`)) return fetch(u, opts);
+        const parsed = new URL(u);
+        const host = parsed.host;
+        hostCounts.set(host, (hostCounts.get(host) || 0) + 1);
+        if (host === 'proxy1.flikhub.net' || host === 'proxy.yenime.net' || host === 'punkflix.net') {
+          return { ok: false, status: 429, headers: { get: () => '1' }, json: async () => ({}) };
+        }
+        if (host === 'proxy3.flikhub.net') {
+          flikhub3Hits++;
+          const isS4 = parsed.searchParams.get('season') === '4';
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              meta: isS4
+                ? { id: 63102, name: 'The Watchers on the Wall', season_number: 4, episode_number: 9, air_date: '2014-06-08' }
+                : { id: 63056, name: 'Winter Is Coming', season_number: 1, episode_number: 1, air_date: '2011-04-17' },
+              source: {
+                source: 'zendaya',
+                type: 'dash',
+                url: `http://127.0.0.1:${upPort}/got_s1e1.mpd?t=${encodeURIComponent(isS4 ? slugS4 : slugS1)}`
+              }
+            })
+          };
+        }
+        return { ok: false, status: 404 };
+      }
+    });
+
+    const res = await resolver.resolve({
+      type: 'tv',
+      id: '1399',
+      title: 'Game of Thrones',
+      season: 1,
+      episode: 1,
+      year: 2011,
+      durationSeconds: 3697,
+      fetchSubtitles: false
+    });
+    assert.equal(res.ok, true);
+    assert.equal(res.track.isDash, true);
+    assert.equal(res.track.format, 'dash');
+    assert.ok(flikhub3Hits >= 1);
+    assert.equal(hostCounts.get('proxy1.flikhub.net'), 1, 'Wave A must send at most 1 request per host without bursting 7 simultaneous calls');
+    assert.equal(hostCounts.get('proxy.yenime.net'), 1);
+
+    const resS4 = await resolver.resolve({
+      type: 'tv',
+      id: '1399',
+      title: 'Game of Thrones',
+      season: 4,
+      episode: 9,
+      year: 2011,
+      durationSeconds: 3060,
+      fetchSubtitles: false
+    });
+    assert.equal(resS4.ok, true, 'Later seasons airing years after show premiere must still pass episode metadata checks');
+    assert.equal(resS4.track.isDash, true);
+  } finally {
+    await new Promise((r) => upstreamSrv.close(r));
+  }
 });

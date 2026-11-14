@@ -38,6 +38,6 @@ export const PRIVATE_CHANNEL_COMMANDS = [
 const musicNames = new Set([...PUBLIC_MUSIC_COMMANDS, ...ADMIN_MUSIC_COMMANDS, ...PRIVATE_CHANNEL_COMMANDS].map(c => c.command));
 export function withMusicCommands(base, { admin = false, privateChat = false, prefix = '/' } = {}) {
   const result = [...base.filter(c => !musicNames.has(c.command)), ...PUBLIC_MUSIC_COMMANDS,
-    ...(admin || privateChat ? ADMIN_MUSIC_COMMANDS : []), ...(privateChat ? PRIVATE_CHANNEL_COMMANDS : [])];
+    ...(admin || privateChat ? ADMIN_MUSIC_COMMANDS : [])];
   return result.map(c => ({ ...c, description: prefix === '/' ? c.description : `[${prefix}${c.command}] ${c.description}`.slice(0, 256) }));
 }

@@ -122,7 +122,8 @@ export const DEFAULT_SETTINGS = {
     maxCacheMiB: 12288,
     maxFileMiB: 48,
     maxVideoMiB: 1500,           // Long VC video streams & movie nights (up to 4h / 1.5 GB)
-    cacheTtlMinutes: 1440
+    cacheTtlMinutes: 1440,
+    cinemaAnnounceEnabled: true
   },
 
   media: {

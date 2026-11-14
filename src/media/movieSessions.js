@@ -53,6 +53,9 @@ export class MovieSessions {
       dlManifest: s.dlManifest || null,
       dlPage: Number(s.dlPage || 0),
       dlMessageId: s.dlMessageId || null,
+      dlMediaMessageIds: Array.isArray(s.dlMediaMessageIds) ? s.dlMediaMessageIds.slice(-40) : [],
+      dlKeptPages: Array.isArray(s.dlKeptPages) ? [...new Set(s.dlKeptPages.map(Number))] : [],
+      dlKeptMessageIds: Array.isArray(s.dlKeptMessageIds) ? [...new Set(s.dlKeptMessageIds.map(Number))].slice(-80) : [],
       adultMode: s.adultMode || null,
       notice: s.notice || null,
       messageId: s.messageId || null,
@@ -83,6 +86,9 @@ export class MovieSessions {
       userId: raw.userId != null ? Number(raw.userId) : null,
       episodeCache: epCache,
       selectedBySeason: selMap,
+      dlMediaMessageIds: Array.isArray(raw.dlMediaMessageIds) ? raw.dlMediaMessageIds.map(Number).filter(Number.isFinite) : [],
+      dlKeptPages: Array.isArray(raw.dlKeptPages) ? [...new Set(raw.dlKeptPages.map(Number).filter(Number.isFinite))] : [],
+      dlKeptMessageIds: Array.isArray(raw.dlKeptMessageIds) ? [...new Set(raw.dlKeptMessageIds.map(Number).filter(Number.isFinite))] : [],
       logLines: null
     };
   }
@@ -147,15 +153,33 @@ export class MovieSessions {
   registerMessage(s, messageId, kind = 'card') {
     if (!s || !messageId) return;
     const msgId = Number(messageId);
-    if (!Array.isArray(s.activeCardIds)) s.activeCardIds = [];
-    if (!s.activeCardIds.includes(msgId)) s.activeCardIds.push(msgId);
-    if (s.activeCardIds.length > 10) s.activeCardIds = s.activeCardIds.slice(-10);
-    if (kind === 'dl') s.dlMessageId = msgId;
-    else s.messageId = msgId;
+    if (!Number.isFinite(msgId)) return;
+    if (kind === 'dl_media') {
+      if (!Array.isArray(s.dlMediaMessageIds)) s.dlMediaMessageIds = [];
+      if (!s.dlMediaMessageIds.includes(msgId)) s.dlMediaMessageIds.push(msgId);
+      if (s.dlMediaMessageIds.length > 40) s.dlMediaMessageIds = s.dlMediaMessageIds.slice(-40);
+      this.#scheduleSave();
+      return;
+    }
+    if (kind === 'dl') {
+      s.dlMessageId = msgId;
+    } else {
+      if (!Array.isArray(s.activeCardIds)) s.activeCardIds = [];
+      if (!s.activeCardIds.includes(msgId)) s.activeCardIds.push(msgId);
+      if (s.activeCardIds.length > 10) s.activeCardIds = s.activeCardIds.slice(-10);
+      s.messageId = msgId;
+    }
     if (Number.isFinite(s.chatId)) {
       this.byMessage.set(`${s.chatId}:${msgId}`, s.id);
     }
     this.#scheduleSave();
+  }
+
+  clearSlideMessages(s) {
+    if (!s) return;
+    s.dlMessageId = null;
+    s.dlMediaMessageIds = [];
+    this.touch(s);
   }
 
   getByMessage(chatId, messageId) {
@@ -198,6 +222,9 @@ export class MovieSessions {
       dlManifest: null,
       dlPage: 0,
       dlMessageId: null,
+      dlMediaMessageIds: [],
+      dlKeptPages: [],
+      dlKeptMessageIds: [],
       notice: null,
       messageId: null,
       activeCardIds: [],

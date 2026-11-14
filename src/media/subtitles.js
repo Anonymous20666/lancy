@@ -88,13 +88,13 @@ export function getCueAt(cues, positionMs) {
 }
 
 export function shiftSrtText(srtText, offsetSeconds = 0) {
-  const shiftMs = Math.max(0, Number(offsetSeconds) || 0) * 1000;
-  if (!shiftMs) return String(srtText || '');
+  const shiftMs = Math.round((Number(offsetSeconds) || 0) * 1000);
+  if (Math.abs(shiftMs) < 10) return String(srtText || '');
   const cues = parseSrt(srtText);
   const out = [];
   let idx = 1;
   for (const cue of cues) {
-    if (cue.endMs <= shiftMs) continue;
+    if (cue.endMs - shiftMs <= 0) continue;
     const startMs = Math.max(0, cue.startMs - shiftMs);
     const endMs = Math.max(startMs + 250, cue.endMs - shiftMs);
     out.push(`${idx++}\n${formatTimestampSrt(startMs)} --> ${formatTimestampSrt(endMs)}\n${cue.text}`);
@@ -127,7 +127,7 @@ function tokenizeSubTitle(text = '') {
     .filter(Boolean);
 }
 
-function scoreSubtitleCandidate(sub, { title, year, season, episode } = {}) {
+function scoreSubtitleCandidate(sub, { title, year, season, episode, releaseHint = '' } = {}) {
   const subName = String(sub?.SubFileName || sub?.MovieReleaseName || '').toLowerCase();
   const movieName = String(sub?.MovieName || '').toLowerCase();
   const clean = cleanTitleForSearch(title).toLowerCase();
@@ -171,15 +171,54 @@ function scoreSubtitleCandidate(sub, { title, year, season, episode } = {}) {
   }
 
   if (String(sub?.SubFormat || '').toLowerCase() === 'srt') score += 8;
+  if (/\b(?:web-?dl|webrip)\b/i.test(subName)) score += 4;
+  if (/\b(?:sdh|hi)\b/i.test(subName) || String(sub?.SubHearingImpaired || '') === '1') score -= 3;
+  if (releaseHint && /\b(?:bluray|bdrip|brrip|web-?dl|webrip|hdtv)\b/i.test(releaseHint)) {
+    const relTok = releaseHint.toLowerCase().match(/\b(bluray|bdrip|brrip|web-?dl|webrip|hdtv)\b/i)?.[1]?.replace('-', '') || '';
+    if (relTok && subName.replace(/-/g, '').includes(relTok)) score += 8;
+  }
   if (sub?.SubBad === '1') score -= 60;
   score += Math.min(12, Math.log10((Number(sub?.SubDownloadsCnt) || 1) + 1) * 3);
   return score;
 }
 
+const TEXT_SUBTITLE_CODECS = new Set(['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'mov_text', 'text']);
+
+function resolveFfprobeFromFfmpeg(ffmpegPath) {
+  const s = String(ffmpegPath || '').trim();
+  if (!s || s === 'ffmpeg') return 'ffprobe';
+  return s.replace(/ffmpeg(\.exe)?$/i, 'ffprobe$1');
+}
+
+function cuesFitDuration(cues, durationSeconds, { strictMinRatio = true } = {}) {
+  const dur = Number(durationSeconds || 0);
+  if (!Array.isArray(cues) || !cues.length || !Number.isFinite(dur) || dur < 600) return true;
+  const lastEndSec = (Number(cues[cues.length - 1]?.endMs) || 0) / 1000;
+  if (!lastEndSec) return false;
+  const ratio = lastEndSec / dur;
+  if (!strictMinRatio || cues.length < 20) return ratio <= 1.5;
+  return ratio >= 0.35 && ratio <= 1.35;
+}
+
+function dedupeOverlappingCues(cues = []) {
+  const sorted = [...cues].sort((a, b) => a.startMs - b.startMs);
+  const out = [];
+  for (const cue of sorted) {
+    const prev = out[out.length - 1];
+    if (prev && prev.text === cue.text && cue.startMs <= prev.endMs + 250) {
+      prev.endMs = Math.max(prev.endMs, cue.endMs);
+    } else {
+      out.push({ ...cue });
+    }
+  }
+  return out;
+}
+
 export class SubtitleService {
-  constructor({ cacheDir, ffmpeg = resolveFfmpegPath(process.env.FFMPEG_PATH || '') || 'ffmpeg', fetchImpl = fetch, runner = exec, log } = {}) {
+  constructor({ cacheDir, ffmpeg = resolveFfmpegPath(process.env.FFMPEG_PATH || '') || 'ffmpeg', ffprobe = null, fetchImpl = fetch, runner = exec, log } = {}) {
     this.cacheDir = cacheDir || '/tmp/lancy-subs';
     this.ffmpeg = ffmpeg;
+    this.ffprobe = ffprobe || resolveFfprobeFromFfmpeg(ffmpeg);
     this.fetch = fetchImpl;
     this.runner = runner;
     this.log = log || logger().child({ module: 'subtitles' });
@@ -210,77 +249,253 @@ export class SubtitleService {
   }
 
   #streamSignature({ streamUrl = '', subtitleHints = [] } = {}) {
+    let urlPart = '';
+    if (streamUrl) {
+      try {
+        const u = new URL(String(streamUrl));
+        urlPart = `${u.origin}${u.pathname}`;
+      } catch {
+        urlPart = String(streamUrl);
+      }
+    }
     const hintKey = (Array.isArray(subtitleHints) ? subtitleHints : [])
       .map((h) => String(h?.url || h?.file || '').trim())
       .filter(Boolean)
       .slice(0, 4)
       .join(',');
-    if (hintKey) return createHash('sha1').update(`hints|${hintKey}`).digest('hex').slice(0, 10);
-    if (streamUrl) {
-      try {
-        const u = new URL(String(streamUrl));
-        return createHash('sha1').update(`${u.origin}${u.pathname}`).digest('hex').slice(0, 10);
-      } catch {
-        return createHash('sha1').update(String(streamUrl)).digest('hex').slice(0, 10);
-      }
-    }
+    const combined = [urlPart, hintKey].filter(Boolean).join('|');
+    if (combined) return createHash('sha1').update(combined).digest('hex').slice(0, 12);
     return 'meta';
   }
 
-  async resolveForMedia({ title, year, imdbId, season, episode, streamUrl, headers, streamSource = '', language = 'eng', subtitleHints = [] } = {}) {
+  #canProbeMediaSource(streamUrl) {
+    if (!streamUrl) return false;
+    const isRemote = /^https?:\/\//i.test(String(streamUrl));
+    const isLocal = /^https?:\/\/(?:127\.0\.0\.1|localhost|\[::1\]):/i.test(String(streamUrl));
+    if (isRemote && !isLocal && this.fetch !== fetch && this.runner === exec) {
+      return false;
+    }
+    return true;
+  }
+
+  async resolveForMedia({
+    title,
+    year,
+    imdbId,
+    season,
+    episode,
+    streamUrl,
+    headers,
+    streamSource = '',
+    language = 'eng',
+    subtitleHints = [],
+    durationSeconds = null,
+    releaseHint = ''
+  } = {}) {
     const metaKey = `${title || ''}|${year || ''}|${imdbId || ''}|${season || ''}|${episode || ''}|${language}`;
-    const hasHints = Array.isArray(subtitleHints) && subtitleHints.length > 0;
-    const streamSig = this.#streamSignature({ streamUrl, subtitleHints });
-    const streamFilePath = this.#cacheFilePath(`${metaKey}|${streamSig}`);
-    const fallbackFilePath = this.#cacheFilePath(`${metaKey}|os_v2`);
+    const allHints = Array.isArray(subtitleHints) ? subtitleHints.filter((h) => h && (h.url || h.file)) : [];
+    const sameRouteHints = allHints.filter((h) => !h.tier || h.tier === 'same_route');
+    const metaHints = allHints.filter((h) => h.tier === 'meta_match');
+    const streamSig = this.#streamSignature({ streamUrl, subtitleHints: sameRouteHints.length ? sameRouteHints : allHints });
+    const streamFilePath = this.#cacheFilePath(`${metaKey}|${streamSig}|v3`);
+    const altHintPath = this.#cacheFilePath(`${metaKey}|${streamSig}|alt_hint_v3`);
+    const fallbackFilePath = this.#cacheFilePath(`${metaKey}|${streamSig === 'meta' ? '' : `${streamSig}|`}os_v3`);
+    const tracksFilePath = `${streamFilePath}.tracks.json`;
 
     if (existsSync(streamFilePath)) {
       const cues = this.loadCues(streamFilePath);
-      if (cues.length >= 5) return { found: true, filePath: streamFilePath, cues, language, source: 'cache' };
+      let savedTracks = [{ filePath: streamFilePath, language, label: 'Synced Subtitles', source: 'cache', cuesCount: cues.length }];
+      if (existsSync(tracksFilePath)) {
+        try {
+          const parsedTracks = JSON.parse(readFileSync(tracksFilePath, 'utf8'));
+          if (Array.isArray(parsedTracks) && parsedTracks.length) {
+            savedTracks = parsedTracks.filter((tr) => tr?.filePath && existsSync(tr.filePath));
+          }
+        } catch {}
+      }
+      const isRouteBound = ['embedded', 'subtitle_hint'].includes(savedTracks[0]?.source);
+      if (cues.length >= 5 && cuesFitDuration(cues, durationSeconds, { strictMinRatio: !isRouteBound })) {
+        return {
+          found: true,
+          filePath: savedTracks[0]?.filePath || streamFilePath,
+          cues,
+          language,
+          label: savedTracks[0]?.label || 'Synced Subtitles',
+          source: savedTracks[0]?.source || 'cache',
+          tracks: savedTracks
+        };
+      }
     }
 
-    // 1. Try direct subtitle hints returned with this specific video stream (.vtt/.srt)
-    if (hasHints) {
-      const hintRes = await this.#fetchFromSubtitleHints(subtitleHints, { language, title }, streamFilePath).catch(() => null);
-      if (hintRes) return hintRes;
+    const candidates = [];
+    const seenPaths = new Set();
+    const pushTrack = (res) => {
+      if (!res?.filePath || !res.cues?.length || seenPaths.has(res.filePath)) return;
+      seenPaths.add(res.filePath);
+      candidates.push(res);
+    };
+
+    const isContainerStream = Boolean(streamUrl) && !/\.(?:m3u8|mpd)(\?|$)/i.test(String(streamUrl));
+
+    // 1. Same-route subtitle hints attached to the exact resolved stream (.vtt/.srt / full HLS VTT)
+    if (sameRouteHints.length) {
+      const hintRes = await this.#fetchFromSubtitleHints(
+        sameRouteHints,
+        { language, title, defaultHeaders: headers, durationSeconds },
+        streamFilePath
+      ).catch(() => null);
+      if (hintRes) pushTrack(hintRes);
     }
 
-    // 2. Direct container tracks (MKV/MP4 from fallback catalogs) carry frame-exact embedded subtitles
-    const isHls = /\.m3u8(\?|$)/i.test(String(streamUrl || '')) || String(streamSource).includes('tmdb');
-    if (streamUrl && !isHls) {
-      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, streamFilePath).catch(() => null);
-      if (emb) return emb;
+    // 2. Embedded container text tracks (MKV/MP4) inspected cleanly via ffprobe BEFORE cross-host hints/OpenSubtitles
+    if (streamUrl && isContainerStream && this.#canProbeMediaSource(streamUrl)) {
+      const embPath = candidates.length ? altHintPath : streamFilePath;
+      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, embPath, { language }).catch(() => null);
+      if (emb && cuesFitDuration(emb.cues, durationSeconds, { strictMinRatio: false })) {
+        pushTrack(emb);
+      }
     }
 
-    // 3. OpenSubtitles lookup (strict score threshold + promo cue cleanup, scoped to os_v2 key)
-    if (existsSync(fallbackFilePath)) {
-      const cues = this.loadCues(fallbackFilePath);
-      if (cues.length >= 10) return { found: true, filePath: fallbackFilePath, cues, language, source: 'cache' };
+    // 3. Meta-matched hints from companion routes (only if no primary same-route/embedded track yet, or as Track #2)
+    if (metaHints.length) {
+      const metaOut = candidates.length ? altHintPath : streamFilePath;
+      if (!seenPaths.has(metaOut)) {
+        const metaRes = await this.#fetchFromSubtitleHints(
+          metaHints,
+          { language, title, defaultHeaders: headers, durationSeconds },
+          metaOut
+        ).catch(() => null);
+        if (metaRes) pushTrack(metaRes);
+      }
     }
-    const osRes = await this.#fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language }, fallbackFilePath).catch(() => null);
-    if (osRes) return osRes;
 
-    // 4. Last resort: check embedded stream even if HLS/unknown URL
-    if (streamUrl && isHls) {
-      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, streamFilePath).catch(() => null);
-      if (emb) return emb;
+    // 4. OpenSubtitles lookup (strict score + release tag + duration span validation)
+    if (candidates.length < 2) {
+      let osRes = null;
+      if (existsSync(fallbackFilePath)) {
+        const cachedOs = this.loadCues(fallbackFilePath);
+        if (cachedOs.length >= 10 && cuesFitDuration(cachedOs, durationSeconds)) {
+          osRes = { found: true, filePath: fallbackFilePath, cues: cachedOs, language, label: 'OpenSubtitles', source: 'opensubtitles' };
+        }
+      }
+      if (!osRes) {
+        osRes = await this.#fetchFromOpenSubtitles(
+          { title, year, imdbId, season, episode, language, durationSeconds, releaseHint: releaseHint || streamSource },
+          candidates.length ? fallbackFilePath : streamFilePath
+        ).catch(() => null);
+      }
+      if (osRes) pushTrack(osRes);
     }
 
-    return null;
+    // 5. Last resort: embedded stream even if HLS/unknown URL when nothing else found
+    if (!candidates.length && streamUrl && !isContainerStream && this.#canProbeMediaSource(streamUrl)) {
+      const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, streamFilePath, { language }).catch(() => null);
+      if (emb && cuesFitDuration(emb.cues, durationSeconds, { strictMinRatio: false })) pushTrack(emb);
+    }
+
+    if (!candidates.length) return null;
+
+    // Prioritize verified Embedded > Same-Route Hint > Meta-Match Hint > OpenSubtitles
+    const tierOrder = { embedded: 0, subtitle_hint: 1, meta_hint: 2, opensubtitles: 3 };
+    candidates.sort((a, b) => (tierOrder[a.source] ?? 9) - (tierOrder[b.source] ?? 9));
+
+    const tracks = candidates.slice(0, 3).map((c) => ({
+      filePath: c.filePath,
+      language: c.language || language,
+      label: c.label || 'Subtitles',
+      source: c.source,
+      cuesCount: c.cues.length
+    }));
+    const primary = candidates[0];
+    try {
+      writeFileSync(tracksFilePath, JSON.stringify(tracks), 'utf8');
+    } catch {}
+
+    return {
+      ...primary,
+      tracks
+    };
   }
 
-  async #fetchFromSubtitleHints(hints, { language = 'eng', title = '' }, outPath) {
+  async #fetchHlsVttPlaylist(playlistUrl, headers, durationSeconds = null) {
+    const res = await this.fetch(playlistUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...headers },
+      signal: AbortSignal.timeout(8000)
+    });
+    if (!res?.ok) return '';
+    const bufOrText = typeof res.arrayBuffer === 'function'
+      ? (() => res.arrayBuffer().then((ab) => {
+          const b = Buffer.from(ab);
+          return (b[0] === 0x1f && b[1] === 0x8b) ? gunzipSync(b).toString('utf8') : b.toString('utf8');
+        }))()
+      : res.text();
+    let text = await bufOrText;
+    if (!text || !text.trimStart().startsWith('#EXTM3U')) return text || '';
+
+    const rawLines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    // Handle nested variant subtitle playlist once if present
+    const nestedLine = rawLines.find((l) => !l.startsWith('#') && /\.m3u8(\?|$)/i.test(l));
+    if (nestedLine) {
+      const nestedUrl = new URL(nestedLine, playlistUrl).toString();
+      const nestedRes = await this.fetch(nestedUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...headers },
+        signal: AbortSignal.timeout(8000)
+      }).catch(() => null);
+      if (nestedRes?.ok && typeof nestedRes.text === 'function') {
+        text = await nestedRes.text();
+        playlistUrl = nestedUrl;
+      }
+    }
+
+    const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+    const segUrls = [];
+    const seen = new Set();
+    for (const line of lines) {
+      if (line.startsWith('#')) continue;
+      try {
+        const abs = new URL(line, playlistUrl).toString();
+        if (!seen.has(abs)) {
+          seen.add(abs);
+          segUrls.push(abs);
+        }
+      } catch {}
+    }
+    const maxSegs = Math.min(segUrls.length, 500);
+    const selected = segUrls.slice(0, maxSegs);
+    const parts = new Array(selected.length).fill('');
+    const deadline = Date.now() + 25_000;
+    const batchSize = 6;
+    for (let i = 0; i < selected.length && Date.now() < deadline; i += batchSize) {
+      const slice = selected.slice(i, i + batchSize);
+      await Promise.all(slice.map(async (segUrl, idx) => {
+        try {
+          const segRes = await this.fetch(segUrl, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...headers },
+            signal: AbortSignal.timeout(6500)
+          });
+          if (!segRes?.ok) return;
+          parts[i + idx] = typeof segRes.text === 'function'
+            ? await segRes.text()
+            : Buffer.from(await segRes.arrayBuffer()).toString('utf8');
+        } catch {}
+      }));
+    }
+    return parts.filter(Boolean).join('\n\n');
+  }
+
+  async #fetchFromSubtitleHints(hints, { language = 'eng', title = '', defaultHeaders = {}, durationSeconds = null }, outPath) {
     const wantEn = /^en/i.test(String(language || 'eng'));
     const ranked = (Array.isArray(hints) ? hints : [])
       .map((h) => ({
         url: String(h?.url || h?.file || '').trim(),
         lang: String(h?.language || h?.lang || h?.label || '').trim(),
-        headers: h?.headers && typeof h.headers === 'object' ? h.headers : {}
+        tier: h?.tier || 'same_route',
+        headers: { ...(defaultHeaders || {}), ...(h?.headers && typeof h.headers === 'object' ? h.headers : {}) }
       }))
       .filter((h) => /^https?:\/\//i.test(h.url))
       .map((h) => {
         const l = h.lang.toLowerCase();
-        let score = 0;
+        let score = h.tier === 'same_route' ? 20 : 0;
         if (wantEn && /\b(en|eng|english)\b/i.test(l)) score += 30;
         else if (!wantEn && l.includes(String(language).toLowerCase())) score += 30;
         if (/sdh|hearing|cc|forced/i.test(l)) score -= 4;
@@ -294,7 +509,7 @@ export class SubtitleService {
       try {
         const res = await this.fetch(cand.url, {
           headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...cand.headers },
-          signal: AbortSignal.timeout(7000)
+          signal: AbortSignal.timeout(8000)
         });
         if (!res?.ok) continue;
         let text = '';
@@ -306,26 +521,36 @@ export class SubtitleService {
         } else if (typeof res.text === 'function') {
           text = await res.text();
         }
-        const cues = parseSrt(text).filter((c) => !isPromoCueText(c.text));
-        if (cues.length < 5) continue;
+        if ((text && text.trimStart().startsWith('#EXTM3U')) || /\.m3u8(\?|$)/i.test(cand.url)) {
+          if (text.trimStart().startsWith('#EXTM3U')) {
+            text = await this.#fetchHlsVttPlaylist(cand.url, cand.headers, durationSeconds);
+          }
+        }
+        const rawCues = parseSrt(text).filter((c) => !isPromoCueText(c.text));
+        const cues = dedupeOverlappingCues(rawCues);
+        const strictMin = cand.tier === 'meta_match';
+        if (cues.length < 5 || !cuesFitDuration(cues, durationSeconds, { strictMinRatio: strictMin })) continue;
         const canonicalSrt = serializeSrt(cues);
         writeFileSync(outPath, canonicalSrt, 'utf8');
         this.cueCache.set(outPath, cues);
-        const cleanLabel = wantEn ? 'English Subtitles' : `${title ? `${title} · ` : ''}Subtitles`;
+        const isMetaTier = cand.tier === 'meta_match';
+        const cleanLabel = wantEn
+          ? (isMetaTier ? 'English Subtitles (Matched)' : 'English Subtitles')
+          : `${title ? `${title} · ` : ''}Subtitles`;
         return {
           found: true,
           filePath: outPath,
           cues,
           language,
           label: cleanLabel,
-          source: 'subtitle_hint'
+          source: isMetaTier ? 'meta_hint' : 'subtitle_hint'
         };
       } catch {}
     }
     return null;
   }
 
-  async #fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language = 'eng' }, outPath) {
+  async #fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language = 'eng', durationSeconds = null, releaseHint = '' }, outPath) {
     const parts = [];
     if (season && episode) {
       parts.push(`episode-${Number(episode)}`);
@@ -351,11 +576,11 @@ export class SubtitleService {
 
     const ranked = rows
       .filter((r) => r?.SubDownloadLink && String(r?.SubFormat || '').toLowerCase() === 'srt')
-      .map((r) => ({ item: r, score: scoreSubtitleCandidate(r, { title, year, season, episode }) }))
+      .map((r) => ({ item: r, score: scoreSubtitleCandidate(r, { title, year, season, episode, releaseHint }) }))
       .filter((r) => r.score >= 28)
       .sort((a, b) => b.score - a.score);
 
-    for (const { item } of ranked.slice(0, 3)) {
+    for (const { item } of ranked.slice(0, 4)) {
       try {
         const dlRes = await this.fetch(item.SubDownloadLink, {
           headers: { 'User-Agent': 'TemporaryUserAgent' },
@@ -367,7 +592,7 @@ export class SubtitleService {
           ? gunzipSync(buf).toString('utf8')
           : buf.toString('utf8');
         const cues = parseSrt(srtText).filter((c) => !isPromoCueText(c.text));
-        if (cues.length < 10) continue;
+        if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
         const canonicalSrt = serializeSrt(cues);
         writeFileSync(outPath, canonicalSrt, 'utf8');
         this.cueCache.set(outPath, cues);
@@ -384,20 +609,91 @@ export class SubtitleService {
     return null;
   }
 
-  async #extractEmbeddedSubtitle(streamUrl, headers, outPath) {
+  async #probeEmbeddedSubtitleStream(streamUrl, headers, { language = 'eng' } = {}) {
+    try {
+      const args = ['-v', 'error'];
+      const isHttp = /^https?:\/\//i.test(String(streamUrl));
+      if (isHttp) {
+        args.push('-rw_timeout', '3500000');
+      }
+      if (headers && typeof headers === 'object' && isHttp) {
+        const hdrStr = Object.entries(headers)
+          .filter(([k, v]) => k && v)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join('\r\n');
+        if (hdrStr) args.push('-headers', `${hdrStr}\r\n`);
+      }
+      args.push(
+        '-select_streams', 's',
+        '-show_entries', 'stream=index,codec_name:stream_tags=language,title:stream_disposition=default,forced',
+        '-of', 'json',
+        streamUrl
+      );
+      const { stdout } = await this.runner(this.ffprobe, args, { timeout: 6000, maxBuffer: 512 * 1024 });
+      const data = JSON.parse(String(stdout || '{}'));
+      const streams = (Array.isArray(data?.streams) ? data.streams : [])
+        .filter((s) => TEXT_SUBTITLE_CODECS.has(String(s?.codec_name || '').toLowerCase()));
+      if (!streams.length) return null;
+
+      const wantEn = /^en/i.test(String(language || 'eng'));
+      streams.sort((a, b) => {
+        const rank = (s) => {
+          const lang = String(s?.tags?.language || '').toLowerCase();
+          const title = String(s?.tags?.title || '').toLowerCase();
+          let score = 0;
+          if (wantEn && /^(en|eng|english)/.test(lang)) score += 40;
+          else if (!wantEn && lang.startsWith(String(language).toLowerCase())) score += 40;
+          if (s?.disposition?.default) score += 6;
+          if (s?.disposition?.forced || /\bforced\b/.test(title)) score -= 25;
+          if (/\b(?:sdh|hi|commentary|signs|songs)\b/.test(title)) score -= 12;
+          return score;
+        };
+        return rank(b) - rank(a);
+      });
+      const chosen = streams[0];
+      return {
+        streamIndex: Number(chosen.index),
+        language: chosen?.tags?.language || language,
+        label: chosen?.tags?.title
+          ? `Embedded (${chosen.tags.title})`
+          : `Embedded ${String(chosen?.tags?.language || 'EN').toUpperCase()}`
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  async #extractEmbeddedSubtitle(streamUrl, headers, outPath, { language = 'eng' } = {}) {
+    const probedTrack = await this.#probeEmbeddedSubtitleStream(streamUrl, headers, { language });
+    // If ffprobe ran and found ONLY bitmap subtitle tracks (or none), skip blind extraction
+    if (probedTrack === null && this.runner === exec) {
+      return null;
+    }
     const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y'];
-    if (headers && typeof headers === 'object') {
+    const isHttp = /^https?:\/\//i.test(String(streamUrl));
+    if (isHttp) {
+      args.push('-rw_timeout', '5000000');
+    }
+    if (headers && typeof headers === 'object' && isHttp) {
       const hdrStr = Object.entries(headers)
         .filter(([k, v]) => k && v)
         .map(([k, v]) => `${k}: ${v}`)
         .join('\r\n');
       if (hdrStr) args.push('-headers', `${hdrStr}\r\n`);
     }
-    args.push('-i', streamUrl, '-map', '0:s:0', '-f', 'srt', outPath);
+    const mapSpec = probedTrack?.streamIndex != null ? `0:${probedTrack.streamIndex}` : '0:s:0';
+    args.push('-i', streamUrl, '-map', mapSpec, '-f', 'srt', outPath);
     await this.runner(this.ffmpeg, args, { timeout: 25_000, maxBuffer: 2 * 1024 * 1024 });
     if (!existsSync(outPath)) return null;
-    const cues = this.loadCues(outPath);
+    const cues = this.loadCues(outPath).filter((c) => !isPromoCueText(c.text));
     if (cues.length < 5) return null;
-    return { found: true, filePath: outPath, cues, language: 'eng', label: 'Embedded MKV', source: 'embedded' };
+    return {
+      found: true,
+      filePath: outPath,
+      cues,
+      language: probedTrack?.language || language,
+      label: probedTrack?.label || 'Embedded Track',
+      source: 'embedded'
+    };
   }
 }

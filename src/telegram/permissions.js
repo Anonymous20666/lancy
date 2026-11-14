@@ -6,6 +6,11 @@ const log = logger().child({ module: 'telegram-permissions' });
 const permissionsCache = new Map();
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
 
+// Scoped per-API-instance cache for verified channel admins (45s allow cache; fail-closed on errors)
+const channelAdminCache = new WeakMap();
+const CHANNEL_ADMIN_CACHE_TTL_MS = 45 * 1000;
+const SYSTEM_PSEUDO_SENDER_IDS = new Set([136817688, 1087968824, 777000]);
+
 // In-memory storage for pending deep-link downloads (token -> { url, createdAt })
 const pendingDownloads = new Map();
 const DL_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -294,4 +299,78 @@ export function formatMediaRestrictedNotice({
   ];
 
   return { text, reply_markup: { inline_keyboard: inlineKeyboard } };
+}
+
+/**
+ * Determine whether an update represents a genuine anonymous Telegram channel post
+ * authored by a channel admin (Telegram omits `from` and sets `sender_chat.id === chat.id`).
+ */
+export function isNativeChannelPost(source, { isChannelPost = false } = {}) {
+  if (!source || source.data !== undefined) return false; // Never for callback_query
+  const msg = source.message || source;
+  const chat = msg?.chat;
+  if (chat?.type !== 'channel') return false;
+  if (msg.from) return false;
+  if (msg.is_automatic_forward) return false;
+  if (!isChannelPost && !source.channel_post && !source.edited_channel_post && msg.sender_chat?.id == null) {
+    return false;
+  }
+  return Number(msg.sender_chat?.id) === Number(chat.id);
+}
+
+/**
+ * Strictly verify whether the actor in a Telegram channel event is a verified administrator/creator.
+ * Fail-closed on lookup failures, pseudo-bot sender IDs (@Channel_Bot / @GroupAnonymousBot), and non-admins.
+ */
+export async function verifyChannelAdmin({
+  chatId,
+  source = null,
+  fromUser = null,
+  api = null,
+  isOwner = null,
+  adminIds = null,
+  isChannelPost = false
+} = {}) {
+  const numChatId = Number(chatId);
+  if (!Number.isFinite(numChatId)) return false;
+
+  const isCallback = Boolean(source && (source.data !== undefined || (source.id && source.from && !source.chat)));
+  if (!isCallback && isNativeChannelPost(source, { isChannelPost })) {
+    return true;
+  }
+
+  const msg = isCallback ? null : (source?.message || source);
+  const actor = fromUser || source?.from || msg?.from || null;
+  const uid = Number(actor?.id);
+  if (!Number.isFinite(uid) || uid <= 0) return false;
+  if (SYSTEM_PSEUDO_SENDER_IDS.has(uid) || actor?.is_bot) return false;
+
+  if (typeof isOwner === 'function' && isOwner(uid)) return true;
+  if (adminIds && typeof adminIds.has === 'function' && adminIds.has(uid)) return true;
+
+  if (!api?.getChatMember) return false;
+
+  let perApi = channelAdminCache.get(api);
+  if (!perApi) {
+    perApi = new Map();
+    channelAdminCache.set(api, perApi);
+  }
+  const cacheKey = `${numChatId}:${uid}`;
+  const cached = perApi.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) {
+    return cached.ok;
+  }
+
+  try {
+    const member = await api.getChatMember(numChatId, uid);
+    const ok = Boolean(member && (member.status === 'creator' || member.status === 'administrator'));
+    perApi.set(cacheKey, {
+      ok,
+      expiresAt: Date.now() + (ok ? CHANNEL_ADMIN_CACHE_TTL_MS : 10_000)
+    });
+    return ok;
+  } catch (err) {
+    log.debug({ err: err?.message, chatId: numChatId, uid }, 'channel admin check failed (fail-closed)');
+    return false;
+  }
 }

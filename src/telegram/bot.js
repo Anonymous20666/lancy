@@ -16,7 +16,7 @@ import { getLyrics, getCachedLyrics, chunkLyrics, escapeHtml, formatBlockquoteLy
 import { getStreamPublicUrl } from '../media/streamingServer.js';
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
-import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from './permissions.js';
+import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError, verifyChannelAdmin, isNativeChannelPost } from './permissions.js';
 import { GameEngine } from '../games/engine.js';
 import {
   invalidateForceJoinCache,
@@ -250,11 +250,14 @@ export class TelegramController extends EventEmitter {
     const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
     if (adminIds.has(id)) return { ok: true, role: 'admin' };
 
-    // Cloned bots are public for their audience:
+    // Channels require live administrator verification via verifyChannelAdmin().
+    if (isChannel) return { ok: false, role: 'channel_guest' };
+
+    // Cloned bots are public for their group/DM audience:
     if (this.botContext?.isClone) return { ok: true, role: 'allowed' };
 
-    // In group chats and channels, any member or channel administrator can use public commands & buttons:
-    if (isGroup || isChannel) return { ok: true, role: 'member' };
+    // In group chats, members can use public commands & buttons:
+    if (isGroup) return { ok: true, role: 'member' };
 
     // Public platform access if enabled:
     const pub = this.settings.get('security.publicAccess');
@@ -461,12 +464,26 @@ export class TelegramController extends EventEmitter {
     if (update.chat_member) return this.#handleChatMemberUpdated(update.chat_member);
     if (update.my_chat_member) return this.#handleMyChatMemberUpdated(update.my_chat_member);
     if (update.chat_join_request) return this.#handleChatJoinRequest(update.chat_join_request);
+    if (update.poll) return this.app?.music?.handlePollUpdate?.(update.poll);
     if (update.poll_answer) return this.app?.music?.handlePollAnswer?.(update.poll_answer);
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
-    if (update.channel_post) return this.#handleMessage(update.channel_post);
-    if (update.edited_channel_post) return this.#handleMessage(update.edited_channel_post, { edited: true });
+    if (update.channel_post) return this.#handleMessage(update.channel_post, { isChannelPost: true });
+    if (update.edited_channel_post) return this.#handleMessage(update.edited_channel_post, { edited: true, isChannelPost: true });
+  }
+
+  async #verifyChannelAccess(chatId, source, { fromUser = null, isChannelPost = false } = {}) {
+    const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
+    return await verifyChannelAdmin({
+      chatId,
+      source,
+      fromUser,
+      api: this.api,
+      isOwner: (id) => this.isOwner(id),
+      adminIds,
+      isChannelPost
+    });
   }
 
   #handleChatMemberUpdated(chatMember) {
@@ -506,16 +523,17 @@ export class TelegramController extends EventEmitter {
 
     if (isChannel) {
       if (['administrator', 'creator'].includes(newStatus)) {
-        this.log.info?.({ channelId: chatId, title: chat.title, status: newStatus }, 'bot added or updated as admin in channel');
+        const canPost = newStatus === 'creator' || myChatMember.new_chat_member?.can_post_messages !== false;
+        this.log.info?.({ channelId: chatId, title: chat.title, status: newStatus, canPost }, 'bot added or updated as admin in channel');
         this.db.recordTelegramChannel({
           channel_id: chatId,
           title: chat.title || 'Untitled Channel',
           username: chat.username || null,
-          can_post: 1,
+          can_post: canPost ? 1 : 0,
           added_by: myChatMember.from?.id || null
         });
-      } else if (newStatus === 'kicked' || newStatus === 'left') {
-        this.log.info?.({ channelId: chatId, status: newStatus }, 'bot removed from channel');
+      } else if (['kicked', 'left', 'restricted', 'member'].includes(newStatus)) {
+        this.log.info?.({ channelId: chatId, status: newStatus }, 'bot removed or demoted in channel');
         this.db.removeTelegramChannel(chatId);
       }
     }
@@ -523,6 +541,19 @@ export class TelegramController extends EventEmitter {
     if (myChatMember.from && !myChatMember.from.is_bot) {
       this.db.recordGroupMember(chatId, myChatMember.from);
     }
+  }
+
+  async #sendDmOnlyNotice(chatId, message, htmlText, isChannel = false) {
+    if (isChannel && message?.message_id) {
+      await this.api?.deleteMessage?.(chatId, message.message_id).catch(() => {});
+    }
+    const notice = await this.api.sendMessage(chatId, htmlText, { parse_mode: 'HTML' });
+    if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
+      setTimeout(() => {
+        this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
+      }, isChannel ? 6000 : 10000)?.unref?.();
+    }
+    return notice;
   }
 
   #handleChatJoinRequest(joinRequest) {
@@ -3518,7 +3549,18 @@ export class TelegramController extends EventEmitter {
     if (isGroup && query.message?.chat?.id && query.from && !query.from.is_bot) {
       this.db.recordGroupMember(query.message.chat.id, query.from);
     }
-    const guard = this.isAllowed(query.from.id, { isGroup, isChannel });
+    let channelAdminVerified = false;
+    if (isChannel) {
+      channelAdminVerified = await this.#verifyChannelAccess(query.message?.chat?.id, query, { fromUser: query.from });
+      if (!channelAdminVerified) {
+        await this.api.answerCallbackQuery(query.id, {
+          text: '🔒 Only channel admins can use bot controls in this channel.',
+          showAlert: true
+        }).catch(() => {});
+        return;
+      }
+    }
+    const guard = channelAdminVerified ? { ok: true, role: 'channel_admin' } : this.isAllowed(query.from.id, { isGroup, isChannel });
     if (!guard.ok && !isGroup && this.app?.music) {
       const screen=this.screens.get('music'),ctx=this.#ctx(String(query.from.id),query);
       if(screen?.privateChannelRequest?.(ctx,query)){
@@ -3585,7 +3627,12 @@ export class TelegramController extends EventEmitter {
         (query.message && this.isMediaDeliveryMessage(query.message)) ||
         (query.message?.message_id && this.isMediaDeliveryMessageId(query.message.message_id))
       );
-      const ctx = this.#ctx(tgId, query, { forceNew: isFromMedia, fromMedia: isFromMedia, isPagination });
+      const ctx = this.#ctx(tgId, query, {
+        forceNew: isFromMedia,
+        fromMedia: isFromMedia,
+        isPagination,
+        channelAdminVerified
+      });
 
       // State-agnostic global actions.
       if (this.globalCallbacks.has(action)) {
@@ -3608,7 +3655,7 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  async #handleMessage(message, { edited = false } = {}) {
+  async #handleMessage(message, { edited = false, isChannelPost = false } = {}) {
     if (!message) return;
     if (message.is_automatic_forward || message.from?.id === 777000) return;
     const user = message.from ? this.#upsertUser(message.from) : null;
@@ -3617,6 +3664,17 @@ export class TelegramController extends EventEmitter {
     const isChannel = Boolean(chatType === 'channel');
     const tgId = String(message.from?.id ?? message.sender_chat?.id ?? message.chat?.id);
     const chatId = message.chat.id;
+
+    let channelAdminVerified = false;
+    if (isChannel) {
+      channelAdminVerified = await this.#verifyChannelAccess(chatId, message, {
+        fromUser: message.from,
+        isChannelPost
+      });
+      if (!channelAdminVerified) return; // Fail-closed silently in channels for non-admins
+      message._channelAdminVerified = true;
+      message._isNativeChannelPost = isNativeChannelPost(message, { isChannelPost });
+    }
 
     // In group chats, passively keep group roster up-to-date for /hidetag
     if (isGroup && chatId) {
@@ -3661,7 +3719,9 @@ export class TelegramController extends EventEmitter {
       }
     }
 
-    const guard = this.isAllowed(message.from?.id ?? message.sender_chat?.id ?? message.chat?.id, { isGroup, isChannel });
+    const guard = channelAdminVerified
+      ? { ok: true, role: 'channel_admin' }
+      : this.isAllowed(message.from?.id ?? message.sender_chat?.id ?? message.chat?.id, { isGroup, isChannel });
     if (!guard.ok && !isGroup && this.app?.music) {
       const screen=this.screens.get('music'),ctx=this.#ctx(tgId,{message});
       if(screen?.privateChannelRequest?.(ctx,message)){
@@ -3793,17 +3853,13 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/forcejoin' || command === '/fsub' || command === '/forcesub') {
-        if (isGroup) {
-          const notice = await this.api.sendMessage(
+        if (isGroup || isChannel) {
+          await this.#sendDmOnlyNotice(
             chatId,
+            message,
             `<blockquote>🌸 The <b>FORCEJOIN</b> feature is only available in private DM with the bot ♡</blockquote>`,
-            { parse_mode: 'HTML' }
+            isChannel
           );
-          if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
-            setTimeout(() => {
-              this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
-            }, 10000)?.unref?.();
-          }
           return;
         }
         await this.handleForceJoinCommand(message, rest);
@@ -3816,6 +3872,15 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/postchannel' || command === '/posttochannel' || command === '/drop') {
+        if (isChannel) {
+          await this.#sendDmOnlyNotice(
+            chatId,
+            message,
+            `<blockquote>📢 Channel posting is configured in private DM with the bot (<code>/postchannel</code>) ♡</blockquote>`,
+            true
+          );
+          return;
+        }
         const channelPostScreen = this.screens.get('channel_post');
         if (channelPostScreen) {
           const sent = await channelPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
@@ -3829,6 +3894,15 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/autopost' || command === '/autoposting' || command === '/schedulepost') {
+        if (isChannel) {
+          await this.#sendDmOnlyNotice(
+            chatId,
+            message,
+            `<blockquote>📅 Auto-posting is configured in private DM with the bot (<code>/autopost</code>) ♡</blockquote>`,
+            true
+          );
+          return;
+        }
         const autoPostScreen = this.screens.get('autopost');
         if (autoPostScreen) {
           const sent = await autoPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
@@ -3991,32 +4065,24 @@ export class TelegramController extends EventEmitter {
         }
       };
 
-      if (isGroup && (command === '/whatsapp' || command === '/ai' || command === '/admins' || command === '/settings' || command === '/addadmin' || command === '/deladmin' || command === '/forcejoin' || command === '/fsub' || command === '/forcesub')) {
-        const notice = await this.api.sendMessage(
+      if (((isGroup || isChannel) && (command === '/whatsapp' || command === '/admins' || command === '/settings' || command === '/addadmin' || command === '/deladmin' || command === '/forcejoin' || command === '/fsub' || command === '/forcesub')) || ((isGroup || (isChannel && rest.length === 0)) && command === '/ai')) {
+        await this.#sendDmOnlyNotice(
           chatId,
+          message,
           `<blockquote>🌸 The <b>${command.slice(1).toUpperCase()}</b> feature is only available in private DM with the bot ♡</blockquote>`,
-          { parse_mode: 'HTML' }
+          isChannel
         );
-        if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
-          setTimeout(() => {
-            this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
-          }, 10000)?.unref?.();
-        }
         return;
       }
 
       if (command === '/clone') {
-        if (isGroup) {
-          const notice = await this.api.sendMessage(
+        if (isGroup || isChannel) {
+          await this.#sendDmOnlyNotice(
             chatId,
+            message,
             `<blockquote>🤖 To clone your own bot, please open a private DM with the bot and type <code>/clone</code>! ♡</blockquote>`,
-            { parse_mode: 'HTML' }
+            isChannel
           );
-          if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
-            setTimeout(() => {
-              this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
-            }, 10000)?.unref?.();
-          }
           return;
         }
         await this.sm.reset(tgId, { reason: 'command' });
@@ -4027,17 +4093,13 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/rmbot' || command === '/rm_bot' || command === '/deletebot' || command === '/removebot' || command === '/delbot') {
-        if (isGroup) {
-          const notice = await this.api.sendMessage(
+        if (isGroup || isChannel) {
+          await this.#sendDmOnlyNotice(
             chatId,
+            message,
             `<blockquote>🤖 To manage or remove your cloned bots, please open a private DM with the bot! ♡</blockquote>`,
-            { parse_mode: 'HTML' }
+            isChannel
           );
-          if (notice?.message_id && typeof this.api.deleteMessage === 'function') {
-            setTimeout(() => {
-              this.api.deleteMessage(chatId, notice.message_id).catch(() => {});
-            }, 10000)?.unref?.();
-          }
           return;
         }
 
@@ -4108,6 +4170,12 @@ export class TelegramController extends EventEmitter {
       }
 
       if (command === '/start' || command === '/menu') {
+        if (isChannel) {
+          if (message?.message_id) await this.api?.deleteMessage?.(chatId, message.message_id).catch(() => {});
+          const musicScreen = this.screens.get('music');
+          await musicScreen?.handleCommand?.(this.#ctx(tgId, { message }, { forceNew: true }), '/music', rest);
+          return;
+        }
         const startPayload = rest[0]?.trim();
         if (startPayload && /^play_/i.test(startPayload)) {
           const rawQuery = startPayload.replace(/^play_/i, '').replace(/_/g, ' ').trim();
@@ -4390,9 +4458,9 @@ export class TelegramController extends EventEmitter {
         return;
       }
       if (command === '/cancel') {
-        const stateOwnerId = this.sm.get?.(tgId)
-          ? tgId
-          : (isChannel && this.sm.get?.(String(chatId)) ? String(chatId) : tgId);
+        const stateOwnerId = (isChannel && this.sm.get?.(String(chatId)))
+          ? String(chatId)
+          : (this.sm.get?.(tgId) ? tgId : (isChannel ? String(chatId) : tgId));
         const state = this.sm.state(stateOwnerId);
         if (state !== States.IDLE) {
           await this.sm.cancel(stateOwnerId);
@@ -4557,9 +4625,9 @@ export class TelegramController extends EventEmitter {
         (botUsername && new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text))
       );
 
-      const stateOwnerId = this.sm.get?.(tgId)
-        ? tgId
-        : (isChannelMsg && this.sm.get?.(String(chatId)) ? String(chatId) : tgId);
+      const stateOwnerId = (isChannelMsg && this.sm.get?.(String(chatId)))
+        ? String(chatId)
+        : (this.sm.get?.(tgId) ? tgId : (isChannelMsg ? String(chatId) : tgId));
 
       // Check if user uploaded/sent a video, audio file, or voice note for music recognition:
       const recMedia = extractMediaForMusicRecognition(message);
@@ -4789,6 +4857,13 @@ export class TelegramController extends EventEmitter {
     const chatType = queryMessage?.chat?.type ?? directMessage?.chat?.type ?? message?.chat?.type ?? 'private';
     const isChannel = chatType === 'channel';
     const isGroup = !isChannel && (chatType === 'group' || chatType === 'supergroup' || Number(chatId) < 0);
+    const channelAdminVerified = Boolean(
+      opts.channelAdminVerified || source?.channelAdminVerified || directMessage?._channelAdminVerified || message?._channelAdminVerified
+    );
+    const nativeChanPost = Boolean(
+      opts.isNativeChannelPost || source?.isNativeChannelPost || directMessage?._isNativeChannelPost ||
+      (!query && isChannel && isNativeChannelPost(directMessage || message, { isChannelPost: Boolean(opts.isChannelPost) }))
+    );
 
     let userLang = 'en';
     try {
@@ -4801,6 +4876,8 @@ export class TelegramController extends EventEmitter {
       forceNew,
       fromMedia,
       isPagination,
+      channelAdminVerified,
+      isNativeChannelPost: nativeChanPost,
       user: this.db.get('SELECT * FROM users WHERE tg_id = ?', Number(tgId)),
       chatId,
       chatType,
@@ -5752,16 +5829,22 @@ export class TelegramController extends EventEmitter {
     const chatId = message.chat?.id;
     if (!chatId) return;
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
+    const isChannel = Boolean(message.chat?.type === 'channel');
+    if (isChannel && !(await this.#verifyChannelAccess(chatId, message, { fromUser: message.from, isChannelPost: true }))) {
+      return;
+    }
+    const isPrivateChat = !isGroup && !isChannel;
     const tgId = message.from?.id;
     const currentChatPrefix = this.db?.getChatPrefix ? this.db.getChatPrefix(chatId) : (this.settings?.get('telegram.prefix') || '/');
-    const currentUserPrefix = this.db?.getUserPrefix ? this.db.getUserPrefix(tgId) : '/';
+    const currentUserPrefix = (isPrivateChat && tgId && this.db?.getUserPrefix) ? this.db.getUserPrefix(tgId) : '/';
 
     if (!args.length) {
-      if (isGroup) {
+      if (isGroup || isChannel) {
+        const scopeWord = isChannel ? 'Channel' : 'Group';
         await this.api.sendMessage(
           chatId,
-          `<blockquote>🌸 <b>Group Command Prefix:</b> <code>${currentChatPrefix}</code>\n\n` +
-          `Everyone in this group uses: <code>${currentChatPrefix}&lt;command&gt;</code>\n\n` +
+          `<blockquote>🌸 <b>${scopeWord} Command Prefix:</b> <code>${currentChatPrefix}</code>\n\n` +
+          `Everyone in this ${scopeWord.toLowerCase()} uses: <code>${currentChatPrefix}&lt;command&gt;</code>\n\n` +
           `🎀 <b>To change prefix (Admins):</b>\n` +
           `Send: <code>${currentChatPrefix}setprefix &lt;symbol or emoji&gt;</code>\n\n` +
           `✨ Examples: <code>${currentChatPrefix}setprefix !</code>, <code>${currentChatPrefix}setprefix 🎀</code>, <code>${currentChatPrefix}setprefix ✨</code> ♡</blockquote>`,
@@ -5807,20 +5890,22 @@ export class TelegramController extends EventEmitter {
       return;
     }
 
-    // Determine target: personal vs group
-    const isSettingPersonal = isPersonalExplicit || !isGroup;
+    // Determine target: personal vs group/channel
+    const isSettingPersonal = isPrivateChat || (isPersonalExplicit && !isChannel);
 
     if (!isSettingPersonal) {
-      // Trying to set group-wide prefix
-      const isOwner = this.isOwner(tgId);
-      let isAdmin = isOwner;
-      if (!isAdmin) {
+      // Trying to set group-wide or channel-wide prefix
+      let isAdmin = isChannel
+        ? await this.#verifyChannelAccess(chatId, message, { fromUser: message.from, isChannelPost: true })
+        : this.isOwner(tgId);
+      if (!isAdmin && !isChannel) {
         try {
           const member = await this.api.getChatMember(chatId, tgId);
           isAdmin = member.status === 'administrator' || member.status === 'creator';
         } catch {}
       }
       if (!isAdmin) {
+        if (isChannel) return;
         await this.api.sendMessage(
           chatId,
           `<blockquote>✕ Only group administrators or the bot owner can change the group prefix.\n\n` +
@@ -5839,10 +5924,11 @@ export class TelegramController extends EventEmitter {
 
       await this.updateCommandsForChat(chatId, newPrefix);
 
+      const chatWord = isChannel ? 'Channel' : 'Group';
       await this.api.sendMessage(
         chatId,
-        `<blockquote>✨ <b>Group command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
-        `Everyone in this group must now use: <code>${newPrefix}</code>\n` +
+        `<blockquote>✨ <b>${chatWord} command prefix changed to:</b> <code>${newPrefix}</code>\n\n` +
+        `Everyone in this ${chatWord.toLowerCase()} must now use: <code>${newPrefix}</code>\n` +
         `• <code>${newPrefix}game</code>\n` +
         `• <code>${newPrefix}play &lt;song&gt;</code>\n` +
         `• <code>${newPrefix}grab &lt;link&gt;</code>\n` +
@@ -5855,10 +5941,10 @@ export class TelegramController extends EventEmitter {
     }
 
     // Setting personal prefix
-    if (this.db?.setUserPrefix) {
+    if (this.db?.setUserPrefix && tgId) {
       this.db.setUserPrefix(tgId, newPrefix);
     }
-    if (!isGroup && this.db?.setChatPrefix) {
+    if (isPrivateChat && this.db?.setChatPrefix) {
       this.db.setChatPrefix(chatId, newPrefix);
     }
 
@@ -5886,9 +5972,15 @@ export class TelegramController extends EventEmitter {
     const chatId = message.chat?.id;
     if (!chatId) return;
     const isGroup = Boolean(message.chat?.type === 'group' || message.chat?.type === 'supergroup');
-    const membership=isGroup?await this.api.getChatMember?.(chatId,message.from?.id).catch(()=>null):null;
-    const musicAdmin=!isGroup||['creator','administrator'].includes(membership?.status);
-    const scopeLabel = isGroup ? 'Group' : 'Personal';
+    const isChannel = Boolean(message.chat?.type === 'channel');
+    if (isChannel && !(await this.#verifyChannelAccess(chatId, message, { fromUser: message.from, isChannelPost: true }))) {
+      return;
+    }
+    const membership = isGroup ? await this.api.getChatMember?.(chatId, message.from?.id).catch(() => null) : null;
+    const musicAdmin = (!isGroup && !isChannel)
+      || isChannel
+      || ['creator', 'administrator'].includes(membership?.status);
+    const scopeLabel = isChannel ? 'Channel' : (isGroup ? 'Group' : 'Personal');
 
     const b = new RichMessageBuilder();
     b.heading(`𓆩♡𓆪 COMMAND SUGGESTIONS (${prefix}) 𓆩♡𓆪`, 1);
@@ -5905,7 +5997,7 @@ export class TelegramController extends EventEmitter {
       [`🎧 ${prefix}music`, 'Listen/download and music options'],
       [`📝 ${prefix}lyrics <song>`, 'Reliably matched recording lyrics'],
       ...(musicAdmin?[[`${prefix}addq <song>`, 'Admin: select and queue VC audio'],[`${prefix}vplay <song>`, 'Admin: queue genuine video + audio'],[`${prefix}player`, 'Admin: persistent playback controls'],[`${prefix}volume / ${prefix}queue`, 'Admin: volume and queue editing']]:[]),
-      ...(!isGroup?[[`${prefix}channel @name`, 'Channel admin: pinned private control panel']]:[]),
+      ...(!isGroup?[[`${prefix}movie <title>`, 'Search & download full movies & series']]:[]),
       [`📥 ${prefix}grab <link>`, 'Download HD videos/music (TT/IG/YT/X)'],
       [`👥 ${prefix}pfp <theme>`, 'Matching PFP albums (duo/couple)'],
       [`🔍 ${prefix}pint <search>`, 'Aesthetic Pinterest HD gallery'],

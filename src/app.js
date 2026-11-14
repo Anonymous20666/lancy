@@ -51,6 +51,7 @@ import { SearchSessions } from './music/search.js';
 import { MatchedLyrics } from './music/lyrics.js';
 import { AccountStore } from './music/accounts.js';
 import { MusicService } from './music/service.js';
+import { CinemaVcAnnouncer } from './music/cinemaAnnouncer.js';
 import { MovieApiClient } from './media/movieApi.js';
 import { SubtitleService } from './media/subtitles.js';
 import { MovieStreamResolver } from './media/movieResolver.js';
@@ -186,6 +187,7 @@ export class LancyApp {
     this.movieDownloader = new MovieDownloader({ app: this, log: this.log });
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
+    this.cinemaAnnouncer = new CinemaVcAnnouncer({ app: this, db: this.db, queueManager: this.musicQueueManager, log: this.log });
 
     // ── Screens ──
     this.screens = new Map();
@@ -309,8 +311,11 @@ export class LancyApp {
     await this.multiBotManager.startAll();
     this.#setupTestTriggerWatcher();
     this.log.info('✦ Lancy Bot is ready ♡');
-    // Restore encrypted playback accounts/managed idle cleanup without blocking unrelated features.
-    void this.musicAccounts.sync().catch(() => this.log.warn('Playback account warmup unavailable; use /accounts health in the owner DM.'));
+    // Restore encrypted playback accounts and active VC playback sessions without blocking unrelated features.
+    void this.musicAccounts
+      .sync()
+      .then(() => this.musicQueueManager?.restoreActiveSessions?.({ api: this.telegram?.api }))
+      .catch(() => this.log.warn('Playback account warmup unavailable; use /accounts health in the owner DM.'));
   }
 
   #setupTestTriggerWatcher() {

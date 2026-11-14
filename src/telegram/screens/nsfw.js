@@ -178,6 +178,7 @@ export function createNsfwScreen({ app }) {
       title: item.title || (mode === 'xvideos' ? '18+ Stream' : '18+ Feature Film'),
       artist: mode === 'xvideos' ? '18+ Stream' : '18+ Cinema',
       durationSec: Number(item.durationSec) || 0,
+      durationSeconds: Number(item.durationSec) || 0,
       durationLabel: item.duration || '',
       provider: 'movie',
       mediaType: 'video',
@@ -186,9 +187,11 @@ export function createNsfwScreen({ app }) {
       videoUrl: streamUrl,
       streamHeaders: item.streamHeaders || item.headers || {},
       fallbackUrls: item.fallbackUrls || [],
+      artwork: item.thumbUrl || item.poster || null,
       thumbnailUrl: item.thumbUrl || null,
       pageUrl: item.pageUrl || null,
-      resolution: item.quality || 'HD'
+      resolution: item.quality || 'HD',
+      capabilities: { seek: true, video: true }
     };
   }
 

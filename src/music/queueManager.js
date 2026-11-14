@@ -19,7 +19,7 @@ export class QueueManager extends EventEmitter {
   }
   async watchEvents(){
     while(!this.closed){
-      try{const result=await this.voice.waitEvent(this.eventAbort.signal);if(this.closed)return;for(const event of result.events||[]){if(event.status!=='ended'||this.eventJobs.size>=16)continue;const job=this.handleStreamEnded(event.chat_id,event.playback_id).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}}
+      try{const result=await this.voice.waitEvent(this.eventAbort.signal);if(this.closed)return;for(const event of result.events||[]){if(this.eventJobs.size>=16)continue;if(event.status==='ended'){const job=this.handleStreamEnded(event.chat_id,event.playback_id).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.status==='call_ended'){const job=this.handleCallEnded(event.chat_id,event.playback_id,event.position_seconds).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}}}
       catch{if(this.closed)return;await new Promise(resolve=>{const timer=setTimeout(resolve,3000);timer.unref?.();});}
     }
   }
@@ -32,18 +32,25 @@ export class QueueManager extends EventEmitter {
       const savedBass = this.db?.getSetting?.(`music.bass.${id}`, null);
       const savedEq = this.db?.getSetting?.(`music.eq.${id}`, null);
       const savedSubMode = this.db?.getSetting?.(`music.submode.${id}`, null);
+      const savedSubOffset = Number(this.db?.getSetting?.(`music.suboffset.${id}`, 0) || 0);
       const defaultBass = savedBass !== null && savedBass !== undefined ? Boolean(savedBass) : true;
       const defaultEq = savedEq || (defaultBass ? 'bass' : 'off');
       this.sessions.set(id, {
         chatId: id, status: 'idle', currentTrack: null, upcoming: [], history: [], movieUpcoming: [], movieHistory: [], activeDeck: 'music', loopMode: 'off', volume: 100, isChannel: false,
-        screenMessageId: null, playerChatId: id, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null,
+        screenMessageId: null, playerChatId: id, pinned: false, pinnedMessageId: null, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null, lastKnownPositionSeconds: 0, callEnded: false,
         connected: false, accountAlias: null, preferredAccount: null, lastError: null, view: 'player', page: 0, bass: defaultBass, eqPreset: defaultEq,
         subtitleMode: ['screen', 'live', 'off'].includes(savedSubMode) ? savedSubMode : 'screen',
+        subtitleSyncOffset: Number.isFinite(savedSubOffset) ? Math.max(-15, Math.min(15, savedSubOffset)) : 0,
+        subtitleTrackIndex: 0,
         liveSubCue: '',
         skipVotes: [],
         vcUrl: null,
+        callInviteLink: null,
+        dlqTarget: null,
+        groupInviteLink: null,
         destinationUsername: null,
         botUsername: null,
+        botId: 0,
         activePoll: null,
         aiDj: savedAiDj && typeof savedAiDj === 'object'
           ? { enabled: Boolean(savedAiDj.enabled), vibe: savedAiDj.vibe || 'Late Night Studio Mix', introNote: '', seenIds: [], cursor: 0, chatHistory: [] }
@@ -63,6 +70,7 @@ export class QueueManager extends EventEmitter {
     this.#cancelIdle(s); const entry = queueEntry(track); top ? s.upcoming.unshift(entry) : s.upcoming.push(entry);
     if (s.status === 'playing' && s.activeDeck !== 'movie') this.prefetch(s);
     else for (const u of s.upcoming.slice(0, 3)) this.#warmTrack(s, u);
+    this.#savePlaybackSnapshot(s);
     this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.upcoming.length, total: s.upcoming.length, track: entry };
   }
   enqueueMovie(id, track, { top = false } = {}) {
@@ -70,6 +78,7 @@ export class QueueManager extends EventEmitter {
     const s = this.getSession(id); if (s.movieUpcoming.length >= 100) throw new MusicError('QUEUE_FULL', 'Cinema queue has reached its 100-item limit.');
     this.#cancelIdle(s); const entry = queueEntry({ ...track, provider: 'movie', mediaType: 'video' });
     top ? s.movieUpcoming.unshift(entry) : s.movieUpcoming.push(entry);
+    this.#savePlaybackSnapshot(s);
     this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.movieUpcoming.length, total: s.movieUpcoming.length, track: entry };
   }
   #trackAcquireOptions(s, entry) {
@@ -304,27 +313,33 @@ export class QueueManager extends EventEmitter {
         let source=rawSource;
         let remoteProxy=false;
         if(!track.filePath && track.streamUrl && /^https?:\/\//i.test(track.streamUrl) && typeof this.app?.videoServer?.registerRemoteStream==='function'){
-          const isHls = Boolean(track.isHls || track.format === 'hls' || /\.m3u8(\?|$)/i.test(track.streamUrl));
+          const isDash = Boolean(track.isDash || track.format === 'dash' || /\.mpd(\?|$)/i.test(track.streamUrl));
+          const isHls = !isDash && Boolean(track.isHls || track.format === 'hls' || /\.m3u8(\?|$)/i.test(track.streamUrl));
           const proxied=this.app.videoServer.registerRemoteStream({
             url:track.streamUrl,
             headers:track.streamHeaders||{},
             isHls,
-            contentType: isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'
+            isDash,
+            contentType: isDash ? 'application/dash+xml' : isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'
           });
           if(proxied){source=proxied;remoteProxy=true;}
         }
         const subMode=s.subtitleMode||'screen';
         const subtitlePath=subMode==='screen' && track.subtitlePath && existsSync(track.subtitlePath)?track.subtitlePath:null;
+        const subtitleOffset=Number(s.subtitleSyncOffset||0)||0;
         const playbackId=randomUUID();calledNative=true;
         const eq=s.eqPreset||(s.bass?'bass':'off');
         const isVideo=track.mediaType==='video';
-        const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath};
+        const startSeconds=Math.max(0, Number(entry.startOffsetSeconds ?? entry.resumePositionSeconds ?? 0) || 0);
+        const vcTitle=String(track.title||'').trim().slice(0, 64) || undefined;
+        const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset};
         let r;
         try {
           r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
         } catch(playErr) {
           if(['NO_ACTIVE_CALL','CALL_FAILED'].includes(playErr?.code)&&typeof this.voice?.setup==='function'){
-            await this.voice.setup(s.chatId,'start',{create:true,account_alias:s.preferredAccount||s.accountAlias||undefined}).catch(()=>null);
+            const setupRes=await this.voice.setup(s.chatId,'start',{create:true,account_alias:s.preferredAccount||s.accountAlias||undefined,vc_title:vcTitle}).catch(()=>null);
+            if(setupRes?.call_invite_link){s.callInviteLink=setupRes.call_invite_link;s.vcUrl=setupRes.call_invite_link;}
             r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
           } else if(playErr?.code==='RATE_LIMITED'&&this.app?.musicProviders?.adapters){
             await new Promise(res=>setTimeout(res,2000));
@@ -333,17 +348,25 @@ export class QueueManager extends EventEmitter {
             throw playErr;
           }
         }
-        if(previous&&sameDeckPrevious&&!s.suppressHistoryOnce){hist.push(previous);if(hist.length>25)hist.shift();}
+        if(r?.call_invite_link){
+          s.callInviteLink=r.call_invite_link;
+          s.vcUrl=r.call_invite_link;
+        } else if(!s.vcUrl && typeof this.app?.music?.syncSessionIdentity==='function'){
+          await this.app.music.syncSessionIdentity(s,null,null).catch(()=>{});
+        }
+        if(previous&&sameDeckPrevious&&!s.suppressHistoryOnce){const {startOffsetSeconds:_so,resumePositionSeconds:_rp,...histItem}=previous;hist.push(histItem);if(hist.length>25)hist.shift();}
         if(previous&&sameDeckPrevious&&preservePreviousToEnd&&previous.entryId!==entry.entryId&&!q.some(t=>t.entryId===previous.entryId)){
           q.push({...previous,resumePositionSeconds:Number.isFinite(s.positionSeconds)?s.positionSeconds:(previous.resumePositionSeconds||0)});
         }
         s.suppressHistoryOnce=false;
-        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=null;s.failures=0;s.skipVotes=[];
+        const trackIdx=Array.isArray(track.subtitleTracks)&&track.subtitlePath?track.subtitleTracks.findIndex(t=>t?.filePath===track.subtitlePath):-1;
+        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=startSeconds>0?startSeconds:0;s.lastKnownPositionSeconds=s.positionSeconds;s.failures=0;s.skipVotes=[];
         this.prefetch(s);
         if(!previous||!s.volumeConfirmed||s.appliedVolume!==s.volume){
           try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;s.appliedVolume=s.volume;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}
         }
         this.emit('track_start',{chatId:s.chatId,track:s.currentTrack,session:s});
+        this.#savePlaybackSnapshot(s);
         if(targetDeck==='music')this.app?.music?.requestCardLyrics?.(s);
         if(aiDjActive&&aiDj?.generateIntroNote){
           void aiDj.generateIntroNote(s,s.currentTrack,previous).then(()=>this.updatePlayerCard(s.chatId)).catch(()=>{});
@@ -354,7 +377,7 @@ export class QueueManager extends EventEmitter {
         media?.release();s.lastError=error instanceof MusicError?error.message:'The call or media source failed. Check account membership and call permissions.';
         this.log.warn({chatId:s.chatId,code:error.code||'PLAY_FAILED',backendKind:/^[A-Za-z0-9_]{1,80}$/.test(error.backendKind||'')?error.backendKind:undefined},'Music track could not start');this.emit('track_error',{chatId:s.chatId,track:entry,code:error.code||'PLAY_FAILED'});s.lastNotice=`Could not start ${entry.title}.`;
         if(['POOL_EXHAUSTED','SESSION_NOT_READY','ACCOUNT_UNAVAILABLE','NO_ACTIVE_CALL','PERMISSION_DENIED','BRIDGE_UNAVAILABLE','BRIDGE_INCOMPATIBLE','PUBLISHER_UNVERIFIED','CALL_FAILED','RATE_LIMITED'].includes(error.code)){
-          s.lastNotice+=' Your selection is retained in the queue.';q.unshift(entry);if(previous&&sameDeckPrevious&&calledNative&&!q.some(t=>t.entryId===previous.entryId))q.unshift(previous);
+          s.lastNotice+=' Your selection is retained in the queue.';q.unshift(entry);if(previous&&sameDeckPrevious&&calledNative&&!q.some(t=>t.entryId===previous.entryId)){const prevSaved=this.#resolveSavedPosition(s,null,previous);q.unshift(prevSaved>0?{...previous,resumePositionSeconds:prevSaved,startOffsetSeconds:prevSaved}:previous);}
           if(calledNative){this.#release(s);s.currentTrack=null;s.playbackId=null;s.connected=false;s.status='error';}
           else if(!previous)s.status='error';
           await this.updatePlayerCard(s.chatId);return null;
@@ -372,20 +395,114 @@ export class QueueManager extends EventEmitter {
       try{this.#assert(await this.voice.idle(s.chatId));}
       catch(error){if(error.code!=='NO_ACTIVE_CALL')throw error;s.connected=false;s.accountAlias=null;s.lastError='The voice chat has ended. Use /vc to prepare it again.';}
     }
-    if(previous&&sameDeckPrevious){hist.push(previous);if(hist.length>25)hist.shift();}
-    this.dropPrefetch(s);this.#release(s);s.currentTrack=null;s.playbackId=null;s.positionSeconds=null;s.status='idle';
+    if(previous&&sameDeckPrevious){const {startOffsetSeconds:_so,resumePositionSeconds:_rp,...histItem}=previous;hist.push(histItem);if(hist.length>25)hist.shift();}
+    this.dropPrefetch(s);this.#release(s);s.currentTrack=null;s.playbackId=null;s.positionSeconds=null;s.lastKnownPositionSeconds=0;s.callEnded=false;s.status='idle';
     if(s.connected||s.prepared)this.#idle(s);
+    this.#clearPlaybackSnapshot(s.chatId);
     this.emit('queue_empty',{chatId:s.chatId});await this.updatePlayerCard(s.chatId);return null;
   }
   #assert(r) { if (!r?.ok) throw new MusicError(r?.error || 'BRIDGE_FAILURE', r?.message || 'The playback engine did not confirm this operation.'); return r; }
-  async pause(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); if (s.status !== 'playing') return false; this.#assert(await this.voice.pause(id)); s.status = 'paused'; await this.updatePlayerCard(id); return true; }); }
+  async pause(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); if (s.status !== 'playing') return false; this.#assert(await this.voice.pause(id)); s.status = 'paused'; this.#savePlaybackSnapshot(s); await this.updatePlayerCard(id, { forceEdit: true }); return true; }); }
+  #resolveSavedPosition(s, reportedPos = null, track = null) {
+    const candidates = [
+      reportedPos,
+      s?.positionSeconds,
+      s?.lastKnownPositionSeconds,
+      track?.resumePositionSeconds,
+      track?.startOffsetSeconds,
+      s?.currentTrack?.resumePositionSeconds,
+      s?.currentTrack?.startOffsetSeconds,
+    ];
+    for (const raw of candidates) {
+      const num = Number(raw);
+      if (Number.isFinite(num) && num > 0) return num;
+    }
+    return 0;
+  }
+  #formatSavedClock(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hrs = Math.floor(total / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    const secs = String(total % 60).padStart(2, '0');
+    return hrs > 0 ? `${hrs}:${String(mins).padStart(2, '0')}:${secs}` : `${mins}:${secs}`;
+  }
+  #requeueCurrentForResume(s, reportedPos = null) {
+    const savedPos = this.#resolveSavedPosition(s, reportedPos, s.currentTrack);
+    const cur = s.currentTrack;
+    const deck = cur ? (cur.provider === 'movie' ? 'movie' : 'music') : (s.activeDeck === 'movie' ? 'movie' : 'music');
+    s.activeDeck = deck;
+    const curQ = this.#deckQueue(s, deck);
+    if (cur) {
+      const restored = { ...cur, resumePositionSeconds: savedPos, startOffsetSeconds: savedPos };
+      const filtered = curQ.filter(t => t.entryId !== restored.entryId);
+      filtered.unshift(restored);
+      if (deck === 'movie') s.movieUpcoming = filtered;
+      else s.upcoming = filtered;
+      this.#release(s);
+      s.currentTrack = null;
+    } else if (curQ[0] && savedPos > 0 && !(Number(curQ[0].resumePositionSeconds || curQ[0].startOffsetSeconds || 0) > 0)) {
+      curQ[0] = { ...curQ[0], resumePositionSeconds: savedPos, startOffsetSeconds: savedPos };
+    }
+    return savedPos;
+  }
+  #handleCallEndedSession(s, reportedPos = null) {
+    const wasActive = Boolean(s.connected || s.currentTrack || ['playing', 'paused', 'buffering'].includes(s.status));
+    if (!wasActive && !reportedPos) return false;
+    const savedPos = this.#requeueCurrentForResume(s, reportedPos);
+    s.connected = false;
+    s.playbackId = null;
+    s.lastKnownPositionSeconds = savedPos;
+    s.positionSeconds = savedPos > 0 ? savedPos : null;
+    s.status = 'idle';
+    s.liveSubCue = '';
+    s.callEnded = true;
+    s.lastNotice = savedPos > 0
+      ? `Voice chat ended (saved at ${this.#formatSavedClock(savedPos)}). Tap ▶ Resume or send a song to start playback.`
+      : 'Voice chat ended. Tap ▶ Resume or send a song to start playback.';
+    s.lastError = null;
+    s.nextCardEdit = 0;
+    this.#savePlaybackSnapshot(s);
+    return true;
+  }
+  async handleCallEnded(id, playbackId = null, reportedPos = null) {
+    const changed = await this.locks.run(Number(id), async () => {
+      const s = this.sessions.get(Number(id));
+      if (!s) return false;
+      if (playbackId && s.playbackId && playbackId !== s.playbackId) return false;
+      return this.#handleCallEndedSession(s, reportedPos);
+    });
+    if (changed) await this.updatePlayerCard(id, { forceEdit: true }).catch(() => {});
+    return changed;
+  }
   async resume(id) {
     return this.locks.run(Number(id), async () => {
       const s = this.getSession(id);
+      if (s.status === 'playing' && typeof this.voice?.getStatus === 'function') {
+        const st = await this.voice.getStatus(id).catch(() => null);
+        if (st && st.active === false) {
+          this.#handleCallEndedSession(s, st.last_position_seconds);
+        }
+      }
       if (s.status !== 'paused') {
-        const deckQ = this.#deckQueue(s, s.activeDeck || 'music');
+        let deck = s.currentTrack?.provider === 'movie' ? 'movie' : (s.activeDeck || 'music');
+        let deckQ = this.#deckQueue(s, deck);
+        if (!s.currentTrack && !deckQ.length) {
+          const altDeck = deck === 'movie' ? 'music' : 'movie';
+          if (this.#deckQueue(s, altDeck).length) {
+            deck = altDeck;
+            deckQ = this.#deckQueue(s, deck);
+            s.activeDeck = deck;
+          }
+        }
         if ((s.status === 'idle' || s.status === 'error') && (s.currentTrack || deckQ.length)) {
-          return this.#next(s, { manual: true, deck: s.activeDeck || 'music' });
+          const resumingMidTrack = Boolean(s.callEnded || s.currentTrack || Number(deckQ[0]?.resumePositionSeconds || deckQ[0]?.startOffsetSeconds || 0) > 0);
+          if (s.currentTrack) this.#requeueCurrentForResume(s);
+          if (resumingMidTrack) s._suppressCinemaAnnounce = true;
+          try {
+            return await this.#next(s, { manual: true, deck });
+          } finally {
+            s._suppressCinemaAnnounce = false;
+          }
         }
         return false;
       }
@@ -393,11 +510,22 @@ export class QueueManager extends EventEmitter {
         this.#assert(await this.voice.resume(id));
         this.#cancelIdle(s);
         s.status = 'playing';
-        await this.updatePlayerCard(id);
+        s.callEnded = false;
+        this.#savePlaybackSnapshot(s);
+        await this.updatePlayerCard(id, { forceEdit: true });
         return true;
       } catch (err) {
         if (['NO_ACTIVE_CALL', 'CALL_FAILED', 'RATE_LIMITED'].includes(err?.code)) {
-          return this.#next(s, { manual: true });
+          this.#requeueCurrentForResume(s);
+          s.connected = false;
+          s.playbackId = null;
+          s.status = 'idle';
+          s._suppressCinemaAnnounce = true;
+          try {
+            return await this.#next(s, { manual: true, deck: s.activeDeck || 'music' });
+          } finally {
+            s._suppressCinemaAnnounce = false;
+          }
         }
         throw err;
       }
@@ -423,6 +551,7 @@ export class QueueManager extends EventEmitter {
         s.upcoming.unshift(track);
       }
       if (s.prefetched?.entryId !== track.entryId) this.dropPrefetch(s);
+      s.suppressHistoryOnce = true;
       return this.#next(s, { manual: true, deck });
     });
   }
@@ -436,6 +565,7 @@ export class QueueManager extends EventEmitter {
     this.requestStop(id);
     return this.locks.run(Number(id), async () => {
       const s=this.getSession(id);this.#cancelIdle(s);
+      this.#clearPlaybackSnapshot(id);
       this.dropPrefetch(s);
       if (s.activeDeck === 'movie') {
         for(const t of s.movieUpcoming)t.queuedMedia?.release?.();
@@ -445,7 +575,7 @@ export class QueueManager extends EventEmitter {
         for(const t of s.upcoming)t.queuedMedia?.release?.();
         s.upcoming=[];
       }
-      s.currentTrack=null;s.positionSeconds=null;s.status='idle';s.lastNotice=null;s.liveSubCue='';s.stopPending=true;
+      s.currentTrack=null;s.positionSeconds=null;s.lastKnownPositionSeconds=0;s.callEnded=false;s.status='idle';s.lastNotice=null;s.liveSubCue='';s.stopPending=true;
       try { await this.#finishStop(s); }
       catch(error) {s.status='error';s.lastError='Queue cleared, but immediate call/group departure was not confirmed. Cleanup will retry.';s.stopRetryAfter=Date.now()+30000;throw error;}
       finally {await this.updatePlayerCard(id);}
@@ -461,9 +591,9 @@ export class QueueManager extends EventEmitter {
     try{return await Promise.race([work,cancelled]);}
     finally{controller.signal.removeEventListener('abort',onAbort);if(s.prepareAbort===controller)s.prepareAbort=null;}
   }
-  async setVolume(id, value, { skipCardUpdate = false } = {}) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const volume = Number(value); if (!Number.isFinite(volume) || volume < 0 || volume > 200) throw new MusicError('INVALID_VOLUME', 'Use a volume between 0 and 200. Levels above 100 may clip.'); if (s.connected) this.#assert(await this.voice.setVolume(id, volume)); s.volume = volume; s.volumeConfirmed=true; s.appliedVolume=volume; if (!skipCardUpdate) await this.updatePlayerCard(id); return volume; }); }
-  async seek(id, seconds) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const value = Number(seconds); if (!s.currentTrack?.capabilities?.seek || !Number.isFinite(value) || value < 0 || value >= s.currentTrack.durationSeconds || !['playing','paused'].includes(s.status)) throw new MusicError('CANNOT_SEEK', 'Choose a position inside the current seekable track.'); const r = this.#assert(await this.voice.seek(id, value)); s.positionSeconds = r.position_seconds ?? null; await this.updatePlayerCard(id); return true; }); }
-  toggleLoopMode(id) { const s = this.getSession(id); const modes = ['off','track','queue']; s.loopMode = modes[(modes.indexOf(s.loopMode) + 1) % 3]; return s.loopMode; }
+  async setVolume(id, value, { skipCardUpdate = false } = {}) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const volume = Number(value); if (!Number.isFinite(volume) || volume < 0 || volume > 200) throw new MusicError('INVALID_VOLUME', 'Use a volume between 0 and 200. Levels above 100 may clip.'); if (s.connected) this.#assert(await this.voice.setVolume(id, volume)); s.volume = volume; s.volumeConfirmed=true; s.appliedVolume=volume; this.#savePlaybackSnapshot(s); if (!skipCardUpdate) await this.updatePlayerCard(id); return volume; }); }
+  async seek(id, seconds) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const value = Number(seconds); const dur = Number(s.currentTrack?.durationSeconds || 0); const seekable = Boolean(s.currentTrack?.capabilities?.seek || s.currentTrack?.provider === 'movie'); if (!seekable || !Number.isFinite(value) || value < 0 || (dur > 0 && value >= dur) || !['playing','paused'].includes(s.status)) throw new MusicError('CANNOT_SEEK', 'Choose a position inside the current seekable track.'); const r = this.#assert(await this.voice.seek(id, value)); const nextPos = Number.isFinite(Number(r.position_seconds)) ? Number(r.position_seconds) : value; s.positionSeconds = nextPos; s.lastKnownPositionSeconds = nextPos; this.#savePlaybackSnapshot(s); await this.updatePlayerCard(id, { forceEdit: true }); return true; }); }
+  toggleLoopMode(id) { const s = this.getSession(id); const modes = ['off','track','queue']; s.loopMode = modes[(modes.indexOf(s.loopMode) + 1) % 3]; this.#savePlaybackSnapshot(s); return s.loopMode; }
   shuffle(id) { const q = this.getSession(id).upcoming; for (let i=q.length-1; i>0; i--) { const j=Math.floor(Math.random()*(i+1)); [q[i],q[j]]=[q[j],q[i]]; } this.dropPrefetch(this.getSession(id));this.prefetch(this.getSession(id));return q.length; }
   clearQueue(id) { const s = this.getSession(id); const count = s.upcoming.length;for(const t of s.upcoming)t.queuedMedia?.release?.();this.dropPrefetch(s);s.upcoming = [];if(s.radio)s.radio.enabled=false; if (!s.currentTrack && (s.connected||s.prepared)) this.#idle(s); return count; }
   clearMovieQueue(id) { const s = this.getSession(id); const count = s.movieUpcoming.length; for (const t of s.movieUpcoming) t.queuedMedia?.release?.(); s.movieUpcoming = []; if (!s.currentTrack && (s.connected || s.prepared)) this.#idle(s); return count; }
@@ -492,6 +622,17 @@ export class QueueManager extends EventEmitter {
     const [entry] = s.movieUpcoming.splice(index, 1);
     entry.votes = [];
     s.movieUpcoming.unshift(entry);
+    this.emit('queue_updated', { chatId: s.chatId, session: s });
+    return entry;
+  }
+
+  promoteTrack(id, entryId) {
+    const s = this.getSession(id);
+    const index = s.upcoming.findIndex(t => t.entryId === entryId);
+    if (index < 0) throw new MusicError('STALE_PLAYER', 'That queued track is no longer available.');
+    const [entry] = s.upcoming.splice(index, 1);
+    entry.votes = [];
+    s.upcoming.unshift(entry);
     this.emit('queue_updated', { chatId: s.chatId, session: s });
     return entry;
   }
@@ -557,10 +698,49 @@ export class QueueManager extends EventEmitter {
       this.db?.setSetting?.(`music.submode.${id}`, valid);
       if (s.connected && s.currentTrack?.subtitlePath && typeof this.voice?.setSubtitle === 'function') {
         const subArg = valid === 'screen' ? s.currentTrack.subtitlePath : null;
-        await this.voice.setSubtitle(id, subArg).catch(() => {});
+        await this.voice.setSubtitle(id, subArg, { subtitleOffset: Number(s.subtitleSyncOffset || 0) || 0 }).catch(() => {});
       }
       await this.updatePlayerCard(id);
       return valid;
+    });
+  }
+  async setSubtitleOffset(id, deltaOrValue = 0, { absolute = false } = {}) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const cur = Number(s.subtitleSyncOffset || 0) || 0;
+      const val = Number(deltaOrValue) || 0;
+      const nextRaw = absolute ? val : cur + val;
+      const next = Math.round(Math.max(-15, Math.min(15, nextRaw)) * 10) / 10;
+      s.subtitleSyncOffset = next;
+      this.db?.setSetting?.(`music.suboffset.${id}`, next);
+      if (s.connected && (s.subtitleMode || 'screen') === 'screen' && s.currentTrack?.subtitlePath && typeof this.voice?.setSubtitle === 'function') {
+        await this.voice.setSubtitle(id, s.currentTrack.subtitlePath, { subtitleOffset: next }).catch(() => {});
+      }
+      await this.updatePlayerCard(id, { forceEdit: true });
+      return next;
+    });
+  }
+  async cycleSubtitleTrack(id, targetIndex = null) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const tracks = Array.isArray(s.currentTrack?.subtitleTracks)
+        ? s.currentTrack.subtitleTracks.filter(t => t?.filePath && existsSync(t.filePath))
+        : [];
+      if (!tracks.length) return null;
+      const curIdx = Math.max(0, Number(s.subtitleTrackIndex || 0));
+      const nextIdx = Number.isInteger(targetIndex) && targetIndex >= 0 && targetIndex < tracks.length
+        ? targetIndex
+        : (curIdx + 1) % tracks.length;
+      const chosen = tracks[nextIdx];
+      s.subtitleTrackIndex = nextIdx;
+      s.currentTrack.subtitlePath = chosen.filePath;
+      s.currentTrack.subtitleFormat = chosen.format || 'srt';
+      s.liveSubCue = '';
+      if (s.connected && (s.subtitleMode || 'screen') === 'screen' && typeof this.voice?.setSubtitle === 'function') {
+        await this.voice.setSubtitle(id, chosen.filePath, { subtitleOffset: Number(s.subtitleSyncOffset || 0) || 0 }).catch(() => {});
+      }
+      await this.updatePlayerCard(id, { forceEdit: true });
+      return { index: nextIdx, track: chosen };
     });
   }
   async handleStreamEnded(id, playbackId) {
@@ -588,24 +768,20 @@ export class QueueManager extends EventEmitter {
       try {
         const r = this.#assert(await this.voice.getStatus(s.chatId));
         if (!r.active) {
-          s.connected = false;
-          this.#release(s);
-          if (s.currentTrack) {
-            const curQ = s.currentTrack.provider === 'movie' ? s.movieUpcoming : s.upcoming;
-            curQ.unshift(s.currentTrack);
-            s.currentTrack = null;
-          }
-          s.playbackId = null;
-          s.status = 'idle';
-          s.lastNotice = 'Voice chat ended. Tap ▶ Resume or send a song to start playback.';
-          s.lastError = null;
+          this.#handleCallEndedSession(s, r.last_position_seconds);
         } else if (r.info?.playback_id === s.playbackId) {
-          s.positionSeconds = Number.isFinite(r.info.position_seconds) ? r.info.position_seconds : null;
+          if (Number.isFinite(r.info.position_seconds)) {
+            s.positionSeconds = r.info.position_seconds;
+            if (r.info.position_seconds > 0) s.lastKnownPositionSeconds = r.info.position_seconds;
+          } else {
+            s.positionSeconds = null;
+          }
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}
           if(r.info.status === 'recovering'){s.lastError='Reconnecting this stream; other destinations are unaffected.';s.positionSeconds=null;}
           if (s.subtitleMode === 'live' && s.currentTrack?.subtitlePath && Number.isFinite(s.positionSeconds)) {
             const cues = this.app?.subtitles?.loadCues?.(s.currentTrack.subtitlePath);
-            const cue = cues?.length ? getCueAt(cues, s.positionSeconds * 1000) : null;
+            const effectiveSec = Math.max(0, Number(s.positionSeconds) - (Number(s.subtitleSyncOffset || 0) || 0));
+            const cue = cues?.length ? getCueAt(cues, effectiveSec * 1000) : null;
             const nextCueText = cue?.text || '';
             if (nextCueText !== (s.liveSubCue || '')) {
               s.liveSubCue = nextCueText;
@@ -625,12 +801,216 @@ export class QueueManager extends EventEmitter {
           else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
         }
         s.failures = 0;
+        if (s.currentTrack && ['playing', 'paused'].includes(s.status) && Date.now() - (s._lastSnapshotAt || 0) >= 5000) {
+          this.#savePlaybackSnapshot(s);
+        }
         if(s.status==='playing'&&(!s.prefetched||((s.radio?.enabled||this.app?.music?.aiDj?.isEnabled?.(s))&&s.upcoming.length<3))){this.prefetch(s);}
       } catch { s.failures = (s.failures || 0) + 1; s.positionSeconds = null; s.lastError = 'Playback status unavailable; reconnecting to the engine.'; }
       if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+10000;if(!s.overlayView&&(s.view==='player'||s.view==='cinema'))await this.updatePlayerCard(s.chatId);}
     })));
   }
-  setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; }
+  setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; if (s.currentTrack && ['playing', 'paused', 'buffering'].includes(s.status)) this.#savePlaybackSnapshot(s); }
+  #serializeTrackSnapshot(track) {
+    if (!track || typeof track !== 'object') return null;
+    const { queuedMedia, media, release, ...rest } = track;
+    return rest;
+  }
+  #savePlaybackSnapshot(s) {
+    if (!this.db?.setSetting || s?._skipSnapshotSave) return;
+    const isActiveTrack = Boolean(s?.currentTrack && ['playing', 'paused', 'buffering'].includes(s.status));
+    const deck = s?.activeDeck === 'movie' || s?.currentTrack?.provider === 'movie' ? 'movie' : 'music';
+    const deckQ = deck === 'movie' ? (s?.movieUpcoming || []) : (s?.upcoming || []);
+    const isInterrupted = Boolean(!isActiveTrack && s?.callEnded && deckQ.length && Number(deckQ[0]?.resumePositionSeconds || deckQ[0]?.startOffsetSeconds || s?.lastKnownPositionSeconds || 0) > 0);
+    if (!isActiveTrack && !isInterrupted) return;
+    try {
+      const all = { ...(this.db.getSetting('music.activePlaybackSnapshots', {}) || {}) };
+      all[String(s.chatId)] = {
+        chatId: s.chatId,
+        isChannel: Boolean(s.isChannel),
+        activeDeck: deck,
+        status: isInterrupted ? 'idle' : (s.status === 'paused' ? 'paused' : 'playing'),
+        paused: s.status === 'paused' || isInterrupted,
+        callEnded: isInterrupted,
+        positionSeconds: this.#resolveSavedPosition(s, null, isActiveTrack ? s.currentTrack : deckQ[0]),
+        currentTrack: isActiveTrack ? this.#serializeTrackSnapshot(s.currentTrack) : null,
+        upcoming: (s.upcoming || []).slice(0, 100).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
+        history: (s.history || []).slice(-25).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
+        movieUpcoming: (s.movieUpcoming || []).slice(0, 100).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
+        movieHistory: (s.movieHistory || []).slice(-25).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
+        volume: Number.isFinite(Number(s.volume)) ? Number(s.volume) : 100,
+        loopMode: s.loopMode || 'off',
+        bass: Boolean(s.bass),
+        eqPreset: s.eqPreset || (s.bass ? 'bass' : 'off'),
+        subtitleMode: s.subtitleMode || 'screen',
+        subtitleSyncOffset: Number(s.subtitleSyncOffset || 0) || 0,
+        preferredAccount: s.preferredAccount || s.accountAlias || null,
+        screenMessageId: s.screenMessageId || null,
+        playerChatId: s.playerChatId || s.chatId,
+        pinned: Boolean(s.pinned),
+        destinationTitle: s.destinationTitle || null,
+        destinationUsername: s.destinationUsername || null,
+        botUsername: s.botUsername || null,
+        botId: Number(s.botId || 0),
+        vcUrl: s.vcUrl || null,
+        callInviteLink: s.callInviteLink || null,
+        groupInviteLink: s.groupInviteLink || null,
+        view: s.view || (s.activeDeck === 'movie' ? 'cinema' : 'player'),
+        savedAt: Date.now()
+      };
+      this.db.setSetting('music.activePlaybackSnapshots', all);
+      s._lastSnapshotAt = Date.now();
+    } catch {}
+  }
+  #clearPlaybackSnapshot(id) {
+    if (!this.db?.setSetting || this.closed) return;
+    try {
+      const all = { ...(this.db.getSetting('music.activePlaybackSnapshots', {}) || {}) };
+      if (Object.hasOwn(all, String(Number(id)))) {
+        delete all[String(Number(id))];
+        this.db.setSetting('music.activePlaybackSnapshots', all);
+      }
+    } catch {}
+  }
+  async autoPinPlayerCard(id, msgId = null, targetChatId = null, api = null) {
+    const s = this.getSession(id);
+    const messageId = Number(msgId || s.screenMessageId);
+    const chatId = Number(targetChatId || s.playerChatId || id);
+    const useApi = api || s.api || this.app?.telegram?.api;
+    const isActive = Boolean(s.currentTrack) || ['playing', 'paused', 'buffering'].includes(s.status);
+    if (!messageId || !useApi || !(chatId < 0) || !isActive || s.pinnedMessageId === messageId) return false;
+    if (typeof useApi.pinChatMessage !== 'function') return false;
+    try {
+      await useApi.pinChatMessage(chatId, messageId, { disable_notification: true });
+      s.pinned = true;
+      s.pinnedMessageId = messageId;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  async restoreActiveSessions({ api = null } = {}) {
+    if (this.closed || !this.db?.getSetting) return [];
+    const saved = this.db.getSetting('music.activePlaybackSnapshots', {}) || {};
+    const entries = Object.values(saved).filter(snap => (snap?.currentTrack || (snap?.callEnded && (snap?.movieUpcoming?.length || snap?.upcoming?.length))) && snap?.chatId);
+    if (!entries.length) return [];
+    const restored = [];
+    const maxAgeMs = Number(process.env.MUSIC_RESUME_MAX_AGE_MS || 24 * 60 * 60 * 1000);
+    for (const snap of entries) {
+      if (this.closed) break;
+      const age = Date.now() - Number(snap.savedAt || 0);
+      if (Number.isFinite(maxAgeMs) && maxAgeMs > 0 && snap.savedAt && age > maxAgeMs) {
+        this.#clearPlaybackSnapshot(snap.chatId);
+        continue;
+      }
+      try {
+        const started = await this.locks.run(Number(snap.chatId), async () => {
+          const s = this.getSession(snap.chatId);
+          if (this.hasActiveSession(s.chatId)) return false;
+          const trackCopy = snap.currentTrack ? { ...snap.currentTrack } : null;
+          if (trackCopy?.filePath && !existsSync(trackCopy.filePath)) delete trackCopy.filePath;
+          if (trackCopy?.subtitlePath && !existsSync(trackCopy.subtitlePath)) delete trackCopy.subtitlePath;
+          if (trackCopy?.streamUrl && /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/)/i.test(trackCopy.streamUrl)) delete trackCopy.streamUrl;
+          const resumeSec = Math.max(0, Number(snap.positionSeconds || 0) || 0);
+          const deck = snap.activeDeck === 'movie' || trackCopy?.provider === 'movie' ? 'movie' : 'music';
+          const hydrateEntry = raw => {
+            const copy = { ...raw };
+            if (copy.filePath && !existsSync(copy.filePath)) delete copy.filePath;
+            if (copy.subtitlePath && !existsSync(copy.subtitlePath)) delete copy.subtitlePath;
+            if (copy.streamUrl && /^https?:\/\/(127\.0\.0\.1|localhost)(:|\/)/i.test(copy.streamUrl)) delete copy.streamUrl;
+            return queueEntry(copy);
+          };
+          s.isChannel = Boolean(snap.isChannel);
+          s.activeDeck = deck;
+          s.volume = Number.isFinite(Number(snap.volume)) ? Number(snap.volume) : s.volume;
+          s.loopMode = snap.loopMode || s.loopMode;
+          s.bass = Boolean(snap.bass);
+          s.eqPreset = snap.eqPreset || (s.bass ? 'bass' : 'off');
+          s.subtitleMode = snap.subtitleMode || s.subtitleMode;
+          s.subtitleSyncOffset = Number.isFinite(Number(snap.subtitleSyncOffset)) ? Number(snap.subtitleSyncOffset) : (s.subtitleSyncOffset || 0);
+          s.preferredAccount = snap.preferredAccount || s.preferredAccount;
+          s.destinationTitle = snap.destinationTitle || s.destinationTitle || null;
+          s.destinationUsername = snap.destinationUsername || s.destinationUsername || null;
+          s.botUsername = snap.botUsername || s.botUsername || null;
+          s.botId = Number(snap.botId ?? s.botId ?? 0) || 0;
+          s.vcUrl = snap.vcUrl || s.vcUrl || null;
+          s.callInviteLink = snap.callInviteLink || s.callInviteLink || null;
+          s.groupInviteLink = snap.groupInviteLink || s.groupInviteLink || null;
+          if (s.botId > 0 && !s.api && this.app?.multiBotManager?.getRunningBot) {
+            const cloneBot = this.app.multiBotManager.getRunningBot(s.botId);
+            if (cloneBot?.api) s.api = cloneBot.api;
+          }
+          s.view = snap.view || (deck === 'movie' ? 'cinema' : 'player');
+          s.screenMessageId = snap.screenMessageId || s.screenMessageId || null;
+          s.playerChatId = snap.playerChatId || s.playerChatId || s.chatId;
+          s.pinned = false;
+          s.pinnedMessageId = null;
+          if (!s.api && api) s.api = api;
+          s.upcoming = Array.isArray(snap.upcoming) ? snap.upcoming.map(hydrateEntry) : [];
+          s.history = Array.isArray(snap.history) ? snap.history.map(hydrateEntry) : [];
+          s.movieUpcoming = Array.isArray(snap.movieUpcoming) ? snap.movieUpcoming.map(hydrateEntry) : [];
+          s.movieHistory = Array.isArray(snap.movieHistory) ? snap.movieHistory.map(hydrateEntry) : [];
+          if (snap.callEnded && !trackCopy) {
+            const q = deck === 'movie' ? s.movieUpcoming : s.upcoming;
+            if (q[0] && resumeSec > 0 && !(Number(q[0].resumePositionSeconds || q[0].startOffsetSeconds || 0) > 0)) {
+              q[0] = { ...q[0], resumePositionSeconds: resumeSec, startOffsetSeconds: resumeSec };
+            }
+            s.callEnded = true;
+            s.status = 'idle';
+            s.connected = false;
+            s.lastKnownPositionSeconds = resumeSec;
+            s.positionSeconds = resumeSec > 0 ? resumeSec : null;
+            s.lastNotice = resumeSec > 0
+              ? `Voice chat ended (saved at ${this.#formatSavedClock(resumeSec)}). Tap ▶ Resume or send a song to start playback.`
+              : 'Voice chat ended. Tap ▶ Resume or send a song to start playback.';
+            return true;
+          }
+          const resumeEntry = queueEntry({ ...trackCopy, startOffsetSeconds: resumeSec });
+          if (deck === 'movie') s.movieUpcoming.unshift(resumeEntry);
+          else s.upcoming.unshift(resumeEntry);
+          s._skipSnapshotSave = true;
+          s._suppressCinemaAnnounce = true;
+          let activeTrack = null;
+          try {
+            activeTrack = await this.#next(s, { manual: true, deck });
+            if (activeTrack && snap.paused) {
+              await this.voice.pause(s.chatId).catch(() => null);
+              s.status = 'paused';
+            }
+          } finally {
+            s._skipSnapshotSave = false;
+            s._suppressCinemaAnnounce = false;
+          }
+          if (activeTrack) {
+            this.#savePlaybackSnapshot(s);
+            const useApi = s.api || api || this.app?.telegram?.api;
+            const targetChatId = Number(s.playerChatId || s.chatId);
+            if (!s.screenMessageId && targetChatId < 0 && useApi && typeof useApi.sendRichMessage === 'function') {
+              const screen = this.app?.screens?.get('music');
+              const isCinema = s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie';
+              const rich = screen ? (isCinema && screen.renderCinemaPlayer ? screen.renderCinemaPlayer(s) : screen.renderPlayer(s)) : null;
+              if (rich) {
+                const sent = await useApi.sendRichMessage(targetChatId, rich).catch(() => null);
+                if (sent?.message_id) {
+                  this.setPlayerMessage(s.chatId, sent.message_id, targetChatId, useApi);
+                  s.lastRender = JSON.stringify(rich);
+                  s.editAfter = 0;
+                  await this.autoPinPlayerCard(s.chatId, sent.message_id, targetChatId, useApi);
+                  return true;
+                }
+              }
+            }
+            await this.updatePlayerCard(s.chatId, { forceEdit: true });
+            return true;
+          }
+          return false;
+        });
+        if (started) restored.push(Number(snap.chatId));
+      } catch (err) {
+        this.log.warn({ chatId: snap.chatId, code: err?.code, err: err?.message }, 'Could not auto-resume playback after restart');
+      }
+    }
+    return restored;
+  }
   async updatePlayerCard(id, options = {}) {
     const s=this.getSession(id);
     let updated = false;
@@ -671,6 +1051,8 @@ export class QueueManager extends EventEmitter {
         : effectiveView === 'accounts' ? screen.renderAccounts(display)
         : effectiveView === 'options' ? screen.renderOptions(display)
         : effectiveView === 'voteset' ? (screen.renderVoteSettings ? screen.renderVoteSettings(display) : screen.renderOptions(display))
+        : effectiveView === 'subsync' ? (screen.renderSubSyncPicker ? screen.renderSubSyncPicker(display) : screen.renderOptions(display))
+        : effectiveView === 'dlq' ? (screen.renderCinemaDownloadQuality ? screen.renderCinemaDownloadQuality(display) : screen.renderCinemaPlayer(display))
         : screen.renderPlayer(display);
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
@@ -680,6 +1062,7 @@ export class QueueManager extends EventEmitter {
         if (preview && (!previews.current(s, preview.request) || s.view !== 'player')) return false;
         const sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, rich, { dropOnFloodWait: true }, files);
         s.lastRender = content;
+        await this.autoPinPlayerCard(s.chatId, s.screenMessageId, s.playerChatId, api);
         if (preview) {
           const fileId = audioFileId(sent);
           if (!fileId) throw new MusicError('PREVIEW_REFERENCE_UNAVAILABLE', 'Telegram did not return a reusable audio reference. Full preview is unavailable; VC playback is unaffected.');
@@ -696,12 +1079,13 @@ export class QueueManager extends EventEmitter {
         const desc = String(e?.description || e?.message || '');
         if (/message is not modified/i.test(desc)) {
           s.lastRender = content;
+          await this.autoPinPlayerCard(s.chatId, s.screenMessageId, s.playerChatId, api);
           return true;
         }
-        if (/message to edit not found|message_id_invalid|message can't be edited|there is no text in the message to edit/i.test(desc)) {
+        if (/message to edit not found|message_id_invalid|message can't be edited|message edit time expired|message_edit_time_expired|edit_time_expired|edit time expired|there is no text in the message to edit/i.test(desc)) {
           const oldMsgId = s.screenMessageId;
           const now = Date.now();
-          if (oldMsgId && now - (s._lastCardReplaceAt || 0) >= 8000 && typeof api.sendRichMessage === 'function') {
+          if (oldMsgId && (forceEdit || now - (s._lastCardReplaceAt || 0) >= 8000) && typeof api.sendRichMessage === 'function') {
             s._lastCardReplaceAt = now;
             try {
               const replacement = await api.sendRichMessage(s.playerChatId, rich);
@@ -716,6 +1100,7 @@ export class QueueManager extends EventEmitter {
                 }
                 s.lastRender = content;
                 s.editAfter = 0;
+                await this.autoPinPlayerCard(s.chatId, replacement.message_id, s.playerChatId, api);
                 return true;
               }
             } catch {}
@@ -737,6 +1122,7 @@ export class QueueManager extends EventEmitter {
     });
   }
   async shutdown() {
+    for (const s of this.sessions.values()) this.#savePlaybackSnapshot(s);
     this.closed = true;this.eventAbort.abort(); clearInterval(this.poller);for(const s of this.sessions.values())s.prepareAbort?.abort();
     await Promise.allSettled([...this.sessions.values()].map(s => this.locks.run(s.chatId, async () => {
       this.#cancelIdle(s);this.dropPrefetch(s);for(const t of s.upcoming)t.queuedMedia?.release?.();for(const t of (s.movieUpcoming||[]))t.queuedMedia?.release?.();let confirmed=!s.connected&&!s.prepared;

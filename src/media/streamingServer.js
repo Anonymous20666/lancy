@@ -121,9 +121,15 @@ export class VideoStreamingServer {
     }
 
     // 1.5 Loopback progressive movie/episode relay (/movie-proxy/:token[.ext]) for PyTgCalls
-    const proxyMatch = pathname.match(/^\/movie-proxy\/([a-f0-9]{16,64})(?:\.(?:m3u8|ts|mp4|mkv|m4s|aac|key))?$/i);
+    const proxyMatch = pathname.match(/^\/movie-proxy\/([a-f0-9]{16,64})(?:\.(?:m3u8|mpd|ts|mp4|mkv|m4s|aac|key))?$/i);
     if (proxyMatch) {
       await this.#handleMovieProxy(req, res, proxyMatch[1]);
+      return;
+    }
+
+    const proxyBaseMatch = pathname.match(/^\/movie-proxy-base\/([a-f0-9]{16,64})\/(.+)$/i);
+    if (proxyBaseMatch) {
+      await this.#handleMovieProxyBase(req, res, proxyBaseMatch[1], proxyBaseMatch[2] + (parsedUrl.search || ''));
       return;
     }
 
@@ -394,7 +400,7 @@ export class VideoStreamingServer {
     return downloadPromise;
   }
 
-  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, ttlMs = 8 * 3600 * 1000 } = {}) {
+  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000 } = {}) {
     if (!url || !/^https?:\/\//i.test(String(url))) return null;
     const now = Date.now();
     for (const [k, v] of this.remoteStreams) {
@@ -402,22 +408,25 @@ export class VideoStreamingServer {
     }
     const token = randomBytes(16).toString('hex');
     const urlStr = String(url);
-    const detectedHls = Boolean(isHls || /mpegurl/i.test(String(contentType || '')) || /\.m3u8(\?|$)/i.test(urlStr));
+    const detectedDash = Boolean(isDash || /dash\+xml/i.test(String(contentType || '')) || /\.mpd(\?|$)/i.test(urlStr));
+    const detectedHls = !detectedDash && Boolean(isHls || /mpegurl/i.test(String(contentType || '')) || /\.m3u8(\?|$)/i.test(urlStr));
     this.remoteStreams.set(token, {
       url: urlStr,
       headers: headers && typeof headers === 'object' ? { ...headers } : {},
-      contentType: detectedHls ? 'application/vnd.apple.mpegurl' : contentType,
+      contentType: detectedDash ? 'application/dash+xml' : detectedHls ? 'application/vnd.apple.mpegurl' : contentType,
       isHls: detectedHls,
+      isDash: detectedDash,
       forceContentType: null,
       childTokens: new Map(),
       expiresAt: now + ttlMs
     });
-    return `http://127.0.0.1:${this.port}/movie-proxy/${token}`;
+    return `http://127.0.0.1:${this.port}/movie-proxy/${token}${detectedDash ? '.mpd' : ''}`;
   }
 
-  #registerChildProxyStream(parentEntry, targetUrl, { isHls = false, contentType = 'video/mp2t', forceContentType = null } = {}) {
+  #registerChildProxyStream(parentEntry, targetUrl, { isHls = false, isBasePrefix = false, contentType = 'video/mp2t', forceContentType = null } = {}) {
     const absUrl = String(targetUrl);
-    const existing = parentEntry.childTokens?.get(absUrl);
+    const cacheKey = isBasePrefix ? `base:${absUrl}` : absUrl;
+    const existing = parentEntry.childTokens?.get(cacheKey);
     const now = Date.now();
     if (existing) {
       const existingEntry = this.remoteStreams.get(existing);
@@ -425,15 +434,15 @@ export class VideoStreamingServer {
         return existing;
       }
     }
-    if (this.remoteStreams.size > 6000) {
+    if (this.remoteStreams.size > 120_000) {
       for (const [k, v] of this.remoteStreams) {
         if (now > v.expiresAt) this.remoteStreams.delete(k);
       }
-      if (this.remoteStreams.size > 6000) {
+      if (this.remoteStreams.size > 120_000) {
         for (const [k, v] of this.remoteStreams) {
-          if (v.isChildSegment) {
+          if (v.isChildSegment && (now - (v.createdAt || 0) > 600_000)) {
             this.remoteStreams.delete(k);
-            if (this.remoteStreams.size <= 4500) break;
+            if (this.remoteStreams.size <= 90_000) break;
           }
         }
       }
@@ -444,13 +453,64 @@ export class VideoStreamingServer {
       headers: parentEntry.headers ? { ...parentEntry.headers } : {},
       contentType,
       isHls: Boolean(isHls),
+      isBasePrefix: Boolean(isBasePrefix),
       forceContentType,
-      isChildSegment: !isHls,
+      isChildSegment: !isHls && !isBasePrefix,
+      createdAt: now,
       childTokens: new Map(),
       expiresAt: parentEntry.expiresAt
     });
-    parentEntry.childTokens?.set(absUrl, childToken);
+    parentEntry.childTokens?.set(cacheKey, childToken);
     return childToken;
+  }
+
+  #rewriteMpdManifest(xmlText, baseUrl, parentEntry) {
+    const raw = String(xmlText || '');
+    const decodeXml = (s) => String(s || '')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'");
+
+    const registerBasePrefix = (targetRaw) => {
+      try {
+        const abs = new URL(decodeXml(String(targetRaw || '').trim()), baseUrl).toString();
+        if (abs.endsWith('/')) {
+          const baseTok = this.#registerChildProxyStream(parentEntry, abs, {
+            isBasePrefix: true,
+            contentType: 'application/octet-stream'
+          });
+          return `http://127.0.0.1:${this.port}/movie-proxy-base/${baseTok}/`;
+        }
+        const singleTok = this.#registerChildProxyStream(parentEntry, abs, {
+          isHls: false,
+          contentType: 'video/mp4',
+          forceContentType: 'video/mp4'
+        });
+        return `http://127.0.0.1:${this.port}/movie-proxy/${singleTok}.mp4`;
+      } catch {
+        return targetRaw;
+      }
+    };
+
+    let sawBaseUrl = false;
+    let out = raw.replace(/<BaseURL>([\s\S]*?)<\/BaseURL>/gi, (_, inner) => {
+      sawBaseUrl = true;
+      return `<BaseURL>${registerBasePrefix(inner)}</BaseURL>`;
+    });
+    if (!sawBaseUrl) {
+      try {
+        const dirUrl = new URL('./', baseUrl).toString();
+        const dirTok = this.#registerChildProxyStream(parentEntry, dirUrl, {
+          isBasePrefix: true,
+          contentType: 'application/octet-stream'
+        });
+        const baseTag = `<BaseURL>http://127.0.0.1:${this.port}/movie-proxy-base/${dirTok}/</BaseURL>`;
+        out = out.replace(/(<MPD\b[^>]*>)/i, `$1${baseTag}`);
+      } catch {}
+    }
+    return out;
   }
 
   #rewriteHlsPlaylist(text, baseUrl, parentEntry) {
@@ -474,7 +534,13 @@ export class VideoStreamingServer {
       if (!trimmed) return line;
 
       if (trimmed.startsWith('#')) {
+        if (/^#EXT-X-MEDIA:\b/i.test(trimmed) && /\bTYPE=SUBTITLES\b/i.test(trimmed)) {
+          return null;
+        }
         expectVariantPlaylist = /^#EXT-X-STREAM-INF\b/i.test(trimmed);
+        if (expectVariantPlaylist) {
+          line = line.replace(/,?\s*\bSUBTITLES="[^"]*"/gi, '');
+        }
         if (/^#EXT-X-(?:KEY|MAP|MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed) && /\bURI="([^"]+)"/i.test(line)) {
           const isSubPlaylist = /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed);
           const isKey = /^#EXT-X-KEY\b/i.test(trimmed);
@@ -511,7 +577,7 @@ export class VideoStreamingServer {
       return rewriteUri(trimmed, isFmp4
         ? { isHls: false, contentType: 'video/mp4', forceContentType: 'video/mp4', ext: 'm4s' }
         : { isHls: false, contentType: 'video/mp2t', forceContentType: 'video/mp2t', ext: 'ts' });
-    }).join('\n');
+    }).filter((l) => l !== null).join('\n');
   }
 
   #getCachedSegment(token) {
@@ -692,16 +758,34 @@ export class VideoStreamingServer {
         || ctype.includes('text/plain')
         || /\.m3u8(\?|$)/i.test(upstream.url || entry.url));
 
-    if (maybePlaylist) {
+    const maybeDash = upstream.ok
+      && !entry.isChildSegment
+      && (entry.isDash
+        || ctype.includes('dash+xml')
+        || /\.mpd(\?|$)/i.test(upstream.url || entry.url));
+
+    if (maybePlaylist || maybeDash) {
       const lenHint = Number(upstream.headers.get('content-length') || 0);
-      if (!lenHint || lenHint <= 4 * 1024 * 1024) {
+      if (!lenHint || lenHint <= 8 * 1024 * 1024) {
         const rawBuf = Buffer.from(await upstream.arrayBuffer());
-        const headSample = rawBuf.subarray(0, 64).toString('utf8').trimStart();
+        const headSample = rawBuf.subarray(0, 512).toString('utf8').trimStart();
         if (headSample.startsWith('#EXTM3U')) {
           const rewritten = this.#rewriteHlsPlaylist(rawBuf.toString('utf8'), upstream.url || entry.url, entry);
           const outBuf = Buffer.from(rewritten, 'utf8');
           res.writeHead(200, {
             'Content-Type': 'application/vnd.apple.mpegurl',
+            'Content-Length': outBuf.length,
+            'Cache-Control': 'no-store',
+            'Access-Control-Allow-Origin': '*'
+          });
+          res.end(outBuf);
+          return;
+        }
+        if (maybeDash && /<MPD\b/i.test(headSample)) {
+          const rewritten = this.#rewriteMpdManifest(rawBuf.toString('utf8'), upstream.url || entry.url, entry);
+          const outBuf = Buffer.from(rewritten, 'utf8');
+          res.writeHead(200, {
+            'Content-Type': 'application/dash+xml',
             'Content-Length': outBuf.length,
             'Cache-Control': 'no-store',
             'Access-Control-Allow-Origin': '*'
@@ -720,6 +804,148 @@ export class VideoStreamingServer {
     nodeStream.on('error', () => { try { res.end(); } catch {} });
     res.on('close', () => { try { nodeStream.destroy(); } catch {} });
     nodeStream.pipe(res);
+  }
+
+  async #handleMovieProxyBase(req, res, baseToken, relPath) {
+    const baseEntry = this.remoteStreams.get(baseToken);
+    if (!baseEntry || !baseEntry.isBasePrefix || Date.now() > baseEntry.expiresAt) {
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Stream base expired or not found');
+      return;
+    }
+    const cleanRel = String(relPath || '').replace(/^\/+/, '');
+    if (!cleanRel || cleanRel.split('/').some((seg) => seg === '..')) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden path');
+      return;
+    }
+    let targetUrl;
+    try {
+      targetUrl = new URL(cleanRel, baseEntry.url).toString();
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Invalid segment path');
+      return;
+    }
+
+    const cacheKey = `dash:${baseToken}:${cleanRel}`;
+    const cacheableSegment = req.method === 'GET' && !req.headers.range;
+    if (cacheableSegment) {
+      const cached = this.#getCachedSegment(cacheKey);
+      if (cached) {
+        res.writeHead(200, {
+          'Content-Type': cached.contentType,
+          'Content-Length': cached.body.length,
+          'Cache-Control': 'no-store'
+        });
+        res.end(cached.body);
+        return;
+      }
+      if (this.inflightSegments.has(cacheKey)) {
+        const shared = await this.inflightSegments.get(cacheKey).catch(() => null);
+        if (shared?.body) {
+          res.writeHead(200, {
+            'Content-Type': shared.contentType,
+            'Content-Length': shared.body.length,
+            'Cache-Control': 'no-store'
+          });
+          res.end(shared.body);
+          return;
+        }
+      }
+    }
+
+    const upstreamHeaders = {
+      ...(baseEntry.headers || {}),
+      'User-Agent': baseEntry.headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+    };
+    if (req.headers.range) upstreamHeaders.Range = req.headers.range;
+    if (req.headers['if-range']) upstreamHeaders['If-Range'] = req.headers['if-range'];
+
+    if (cacheableSegment) {
+      const loader = (async () => {
+        const up = await fetch(targetUrl, {
+          method: 'GET',
+          headers: upstreamHeaders,
+          redirect: 'follow',
+          signal: AbortSignal.timeout(20_000)
+        });
+        if (!up.ok) return { status: up.status, body: null };
+        const cl = Number(up.headers.get('content-length') || 0);
+        if (cl > 12 * 1024 * 1024) return { status: up.status, streamThrough: up };
+        const buf = Buffer.from(await up.arrayBuffer());
+        const ctypeOut = up.headers.get('content-type') || 'video/mp4';
+        this.#putCachedSegment(cacheKey, buf, ctypeOut);
+        return { status: 200, contentType: ctypeOut, body: buf };
+      })().finally(() => {
+        this.inflightSegments.delete(cacheKey);
+      });
+      this.inflightSegments.set(cacheKey, loader);
+      try {
+        const fetched = await loader;
+        if (fetched?.body) {
+          res.writeHead(200, {
+            'Content-Type': fetched.contentType,
+            'Content-Length': fetched.body.length,
+            'Cache-Control': 'no-store'
+          });
+          res.end(fetched.body);
+          return;
+        }
+        if (fetched?.streamThrough) {
+          const pass = {};
+          for (const h of ['content-type', 'content-length']) {
+            const v = fetched.streamThrough.headers.get(h);
+            if (v) pass[h] = v;
+          }
+          res.writeHead(fetched.status, pass);
+          const nodeStream = Readable.fromWeb(fetched.streamThrough.body);
+          nodeStream.on('error', () => { try { res.end(); } catch {} });
+          res.on('close', () => { try { nodeStream.destroy(); } catch {} });
+          nodeStream.pipe(res);
+          return;
+        }
+        res.writeHead(fetched?.status || 502, { 'Content-Type': 'text/plain' });
+        res.end('Upstream DASH segment unavailable');
+        return;
+      } catch {
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' });
+          res.end('Upstream DASH segment unreachable');
+        }
+        return;
+      }
+    }
+
+    const controller = new AbortController();
+    req.on('close', () => controller.abort());
+    try {
+      const upstream = await fetch(targetUrl, {
+        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
+        headers: upstreamHeaders,
+        redirect: 'follow',
+        signal: controller.signal
+      });
+      const pass = {};
+      for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+        const val = upstream.headers.get(h);
+        if (val) pass[h] = val;
+      }
+      res.writeHead(upstream.status, pass);
+      if (req.method === 'HEAD' || !upstream.body) {
+        res.end();
+        return;
+      }
+      const nodeStream = Readable.fromWeb(upstream.body);
+      nodeStream.on('error', () => { try { res.end(); } catch {} });
+      res.on('close', () => { try { nodeStream.destroy(); } catch {} });
+      nodeStream.pipe(res);
+    } catch {
+      if (!res.headersSent) {
+        res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end('Upstream DASH segment unreachable');
+      }
+    }
   }
 
   #serveMediaFile(req, res, filePath, contentType = 'video/mp4', downloadFilename = null) {

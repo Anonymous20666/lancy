@@ -7,6 +7,7 @@ import { RichMessageBuilder, block, rt, richButton, encodeCallback, decodeCallba
 import { progressBar } from '../../utils/text.js';
 import { States } from '../../core/stateMachine.js';
 import { durationText, MusicError } from '../../music/model.js';
+import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, uploadLimitBytes } from '../../media/telegramLimits.js';
 import { createMovieUi } from './movieUi.js';
 
 const cut = (s, n = 65) => [...String(s || '')].slice(0, n).join('');
@@ -195,6 +196,16 @@ export function createMusicScreen({ app }) {
     return opts ? button(label, action, ...args, s.controlRevision || 0, opts) : button(label, action, ...args, s.controlRevision || 0);
   }
 
+  function joinCallButton(s) {
+    if (s?.vcUrl) {
+      return richButton.url(s.isChannel ? '📺 Join Livestream' : '🎙️ Join VC', s.vcUrl, { style: 'success' });
+    }
+    if (s?.groupInviteLink) {
+      return richButton.url(s.isChannel ? '📢 Open Channel' : '🍿 Open Group', s.groupInviteLink, { style: 'primary' });
+    }
+    return null;
+  }
+
   function defaultMediaMode(sOrPanel = null) {
     let ytEnabled = false;
     try { ytEnabled = Boolean(app.musicProviders?.get?.('youtube')?.enabled); } catch {}
@@ -227,13 +238,61 @@ export function createMusicScreen({ app }) {
     return genre.length > 18 ? 'custom' : cut(genre, 18);
   }
 
-  function renderHome() {
+  function renderDmChannelGuideCard() {
+    const b = card(
+      '📢 Lancy · Channel Features',
+      'Live VC & Polls Run In-Channel · Post Packs from DM'
+    );
+    b.blockquote(rt.text(
+      'Channel Play has moved inside Channels directly so your DM stays clean and clutter-free.\n\n' +
+      '• Live Channel VC & Polls: Add Lancy as an admin in your Channel and send /player, /vplay, /addq, /movie, or /aidj inside the Channel.\n' +
+      '• Post Media Packs to Channels: Tap 📢 Post to Channel or 📅 Auto Post below.\n' +
+      '• Download Movies & TV Series: Tap 🎬 Download Movies below!'
+    ));
+    b.buttons([
+      button('🎬 Download Movies', 'moviehub', { style: 'success' })
+    ]);
+    b.buttons([
+      richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' }),
+      richButton.callback('📅 Auto Post', encodeCallback('autopost', 'open'), { style: 'success' })
+    ]);
+    b.buttons([
+      richButton.callback('🏠 Dashboard', encodeCallback('dashboard', 'open'))
+    ]);
+    return finish(b);
+  }
+
+  function renderHome(ctx = null) {
+    const isDm = Boolean(ctx && Number(ctx.chatId) > 0 && !isChannelCtx(ctx));
+    if (isDm) {
+      const b = card('Lancy · movies & music', 'Download HD movies, TV series, music & talk to AI.');
+      b.blockquote(rt.text(
+        '/movie — search & download full movies or clean TV episode slides\n' +
+        '/play — search, listen or download full music tracks\n' +
+        '/ai — unified AI Movie & Song assistant\n' +
+        '/grab — download HD reels, shorts & audio from links\n\n' +
+        '📢 Live Voice Chat & Channel Polls run directly inside Groups/Channels where Lancy is an admin!'
+      ));
+      b.buttons([
+        button('🎬 Download Movies', 'moviehub', { style: 'success' }),
+        button('🤖 AI Movie & Song', 'aichat', { style: 'primary' })
+      ]);
+      b.buttons([
+        button('🎵 Play / Download Music', 'prompt', 'download', { style: 'primary' }),
+        richButton.callback('🏠 Dashboard', encodeCallback('dashboard', 'open'))
+      ]);
+      b.details('⌨ Quick Download Tips', [
+        block.paragraph(rt.text('Tap 🎬 Download Movies or use /movie <title> to get direct HD MP4 files and non-spammy paginated series slides (◀ Prev / Next ▶).')),
+        block.buttons([richButton.switchInlineCurrent('🔍 Inline Search', '')])
+      ], false);
+      return finish(b);
+    }
     const b = card('Lancy · music & movies', 'Stream studio music, HD videos & full movies.');
     b.blockquote(rt.text('/play — listen here or download\n/addq — search and queue studio audio\n/vplay — queue HD 720p video + audio\n/movie — search & stream full movies & TV seasons\n/ai — unified AI Movie & Song Agent\n/aidj — AI DJ live curation & liner notes\n/player — persistent live control deck'));
     b.buttons([button('Voice chat', 'prompt', 'queue', { style: 'success' }), button('Listen / download', 'prompt', 'download')]);
     b.buttons([button('🎬 Movie Stream', 'moviehub', { style: 'primary' }), button('🤖 AI Movie & Song', 'aichat', { style: 'primary' })]);
     b.buttons([button('Video / vidc', 'prompt', 'video'), button('Open player', 'openplayer', { style: 'success' })]);
-    b.buttons([button('Channel Play', 'channels'), button('Random / Infinite', 'openradio')]);
+    b.buttons([button('Random / Infinite', 'openradio')]);
     b.details('⌨ Commands & Search Tips', [
       block.paragraph(rt.text('Search “title artist” for studio audio or HD video. Movie Stream (/movie) supports multi-season series, episode checklists, and subtitles. Direct channel commands (/vplay, /movie, /addq, /aidj, /random, /player, /skip, /pause, /stop) work inside channels where Lancy is an administrator.')),
       block.paragraph(rt.text('/playlist list · /playlist save <name> · /playlist load <name>')),
@@ -246,16 +305,29 @@ export function createMusicScreen({ app }) {
     b.audio(audioInput(track, media), vc ? 'Full track · listen here, independently of the voice chat' : 'Full track · listen in Telegram or save from the audio menu');
   }
 
+  function attachSafeArtworkPhoto(b, artwork, caption = 'Recording artwork') {
+    if (!artwork) return false;
+    try {
+      const u = new URL(artwork);
+      if (u.protocol === 'https:' && !u.username && !u.password && u.hostname.includes('.') && !/^(?:127\.|10\.|192\.168\.|169\.254\.)/.test(u.hostname)) {
+        b.photo(u.href, cut(caption, 90) || 'Recording artwork');
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  function safeProgressRatio(pos, dur) {
+    const p = Math.max(0, Number(pos || 0));
+    const d = Number(dur || 0);
+    if (!(d > 0)) return 0;
+    const raw = Math.max(0, Math.min(1, p / d));
+    return p < d ? Math.min(0.99, raw) : raw;
+  }
+
   function recording(b, track, { media = null, lyrics = null, vc = false, positionSeconds = null } = {}) {
     if (media) trackAudio(b, track, media, vc);
-    if (track.artwork) {
-      try {
-        const u = new URL(track.artwork);
-        if (u.protocol === 'https:' && !u.username && !u.password && u.hostname.includes('.') && !/^(?:127\.|10\.|192\.168\.|169\.254\.)/.test(u.hostname)) {
-          b.photo(u.href, 'Recording artwork');
-        }
-      } catch {}
-    }
+    attachSafeArtworkPhoto(b, track.artwork || track.poster || track.backdrop || track.thumbnailUrl || track.thumb, 'Recording artwork');
     b.quote(rt.concat(rt.bold(cut(track.title, 160)), rt.text(`\n${cut(track.artist || 'Artist not supplied', 100)}${track.album ? ` · ${cut(track.album, 60)}` : ''}`)));
     b.table([
       ['Artist', track.artist || 'Not supplied'],
@@ -329,7 +401,7 @@ export function createMusicScreen({ app }) {
       const eqLabel = eqPreset !== 'off' ? ` · ${eqPreset === 'bass' ? 'Clean Bass' : `EQ ${eqPreset}`}` : '';
       b.paragraph(rt.text(`VC · ${durationText(s.positionSeconds)} / ${durationText(t.durationSeconds)} · ${t.mediaType === 'video' ? 'HD Video + audio' : 'Audio'}${eqLabel}`));
       if (Number.isFinite(s.positionSeconds) && t.durationSeconds) {
-        const ratio = Math.max(0, Math.min(1, s.positionSeconds / t.durationSeconds));
+        const ratio = safeProgressRatio(s.positionSeconds, t.durationSeconds);
         b.paragraph(rt.code(progressBar(ratio, { width: 12, filled: '█', empty: '░' })));
       }
       const volText = s.volumeConfirmed === false ? 'unconfirmed' : `${s.volume}%`;
@@ -369,7 +441,7 @@ export function createMusicScreen({ app }) {
         extraRow.push(controls(s, '−10 sec', 'seekby', -10), controls(s, '+10 sec', 'seekby', 10));
       }
       if (hasMovieOrVideo) {
-        extraRow.push(controls(s, `💬 Subs · ${subMode === 'screen' ? 'Screen' : subMode === 'live' ? 'Live' : 'Off'}`, 'submode'));
+        extraRow.push(controls(s, `💬 Subs · ${subMode === 'screen' ? 'Screen' : subMode === 'live' ? 'Live' : 'Off'}`, 'subsync'));
       }
       if (['playing', 'paused'].includes(s.status) && !s.isChannel) {
         extraRow.push(controls(s, s.skipVotes?.length ? `Vote skip (${s.skipVotes.length})` : 'Vote skip', 'voteskip'));
@@ -410,7 +482,13 @@ export function createMusicScreen({ app }) {
       s.panelToken ? controls(s, 'Listen / download', 'prompt', 'download') : button('Listen / download', 'prompt', 'download'),
       controls(s, 'More', 'options')
     ]);
-    if (s.panelToken) b.buttons([controls(s, 'My channels', 'channels')]);
+    const playerJoinBtn = joinCallButton(s);
+    if (playerJoinBtn || s.panelToken) {
+      const tailRow = [];
+      if (playerJoinBtn) tailRow.push(playerJoinBtn);
+      if (s.panelToken) tailRow.push(controls(s, 'My channels', 'channels'));
+      b.buttons(tailRow);
+    }
 
     const shortcutBlocks = [
       block.paragraph(rt.text(s.panelToken
@@ -444,7 +522,7 @@ export function createMusicScreen({ app }) {
       ['AI DJ', aiDjActive ? `ON · ${cut(s.aiDj?.vibe || 'Studio Mix', 28)}` : 'off'],
       ['Video Output', 'HD 720p + Studio Canvas']
     ], { striped: true, bordered: true, compact: true });
-    b.buttons([controls(s, `Repeat · ${s.loopMode}`, 'loop'), controls(s, 'Shuffle', 'shuffle'), controls(s, `💬 Subs · ${subMode}`, 'submode')]);
+    b.buttons([controls(s, `Repeat · ${s.loopMode}`, 'loop'), controls(s, 'Shuffle', 'shuffle'), controls(s, `💬 Subs · ${subMode}`, 'submode'), controls(s, '⏱ Sub Sync', 'subsync')]);
     b.buttons([
       controls(s, s.bass ? 'Bass · on' : 'Bass · off', 'bass', { style: s.bass ? 'success' : 'primary' }),
       controls(s, `EQ · ${eq}`, 'eq'),
@@ -480,6 +558,77 @@ export function createMusicScreen({ app }) {
       controls(s, '📊 Launch Telegram Poll', 'launchpoll', { style: 'success' }),
       controls(s, '◀ Back to Player', 'player')
     ]);
+    return finish(b);
+  }
+
+  function renderSubSyncPicker(s) {
+    const t = s.currentTrack;
+    const subMode = ['screen', 'live', 'off'].includes(s.subtitleMode) ? s.subtitleMode : 'screen';
+    const offset = Number(s.subtitleSyncOffset || 0) || 0;
+    const offsetLabel = `${offset > 0 ? `+${offset}` : offset}s`;
+    const tracks = Array.isArray(t?.subtitleTracks) ? t.subtitleTracks : [];
+    const curIdx = Math.max(0, Number(s.subtitleTrackIndex || 0));
+    const activeTrack = tracks[curIdx] || null;
+    const trackLabel = activeTrack?.label || (t?.subtitlePath ? 'Active English Track' : 'No subtitle loaded');
+    const b = card('💬 LANCY CINEMA · SUBTITLE & VOICE SYNC', cut(t?.title || s.destinationTitle || 'Voice Chat', 48));
+    b.table([
+      ['Mode', subMode === 'screen' ? 'Screen Burn (Video)' : subMode === 'live' ? 'Live Text Cues' : 'Off'],
+      ['Voice Offset', offset === 0 ? '0.0s (Default)' : `${offsetLabel} (${offset < 0 ? 'Earlier' : 'Later'})`],
+      ['Track', tracks.length ? `${curIdx + 1}/${tracks.length} · ${cut(trackLabel, 28)}` : cut(trackLabel, 32)]
+    ], { striped: true, bordered: true, compact: true });
+    b.paragraph(rt.italic('Voices ahead of subtitles? Tap −0.5s or −2s. Subtitles too early? Tap +0.5s or +2s.'));
+    b.buttons([
+      controls(s, `${subMode === 'screen' ? '✓ ' : ''}📺 Screen Burn`, 'submode', 'screen', subMode === 'screen' ? { style: 'success' } : { style: 'primary' }),
+      controls(s, `${subMode === 'live' ? '✓ ' : ''}💬 Live Text`, 'submode', 'live', subMode === 'live' ? { style: 'success' } : { style: 'primary' }),
+      controls(s, `${subMode === 'off' ? '✓ ' : ''}🔇 Off`, 'submode', 'off', subMode === 'off' ? { style: 'danger' } : null)
+    ]);
+    b.buttons([
+      controls(s, '−2s', 'subsync', -2),
+      controls(s, '−0.5s', 'subsync', -0.5, { style: 'primary' }),
+      controls(s, '0s', 'subsync', 'reset', offset === 0 ? { style: 'success' } : null),
+      controls(s, '+0.5s', 'subsync', 0.5, { style: 'primary' }),
+      controls(s, '+2s', 'subsync', 2)
+    ]);
+    const tail = [];
+    if (tracks.length > 1) {
+      tail.push(controls(s, `🌐 Next Track (${curIdx + 1}/${tracks.length})`, 'subtrack', { style: 'primary' }));
+    }
+    tail.push(controls(s, '◀ Back', 'subsync', 'back'));
+    b.buttons(tail);
+    return finish(b);
+  }
+
+  function renderCinemaDownloadQuality(s) {
+    const target = s.dlqTarget || {
+      action: 'downloadnow',
+      title: s.currentTrack?.title || 'Movie / Episode',
+      durationSeconds: s.currentTrack?.durationSeconds || 0,
+      item: s.currentTrack
+    };
+    const track = target.item || s.currentTrack || {};
+    const variants = Array.isArray(track.variants) ? track.variants : null;
+    const dur = Number(target.durationSeconds || track.durationSeconds || 5400);
+    const limitBytes = app.movieDownloader?.getLimitBytes?.() || uploadLimitBytes();
+    const b = card('📦 CHOOSE DOWNLOAD QUALITY', cut(target.title || 'Movie / Episode', 48));
+    const rows = ['360p', '480p', '720p'].map((q) => {
+      const prof = DOWNLOAD_QUALITY_PROFILES[q];
+      const variant = variants?.find((v) => Math.abs((v.height || 0) - prof.height) <= 80);
+      const est = estimateDownloadSizeMb({ durationSeconds: dur, quality: q, variantBytes: variant?.sizeBytes || null, limitBytes });
+      const cached = app.movieDownloader?.hasCachedVideo?.(track, q) ? '⚡ Instant' : est.text;
+      return [prof.label, q === '360p' ? 'Low data saver' : q === '480p' ? 'Balanced crisp' : 'Full HD', cached];
+    });
+    b.table(rows, { striped: true, bordered: true, compact: true });
+    b.paragraph(rt.italic('Choose 360p Saver to save data, 480p Balanced for sharp speed, or 720p HD for top clarity.'));
+    const dlButtons = ['360p', '480p', '720p'].map((q) => {
+      const prof = DOWNLOAD_QUALITY_PROFILES[q];
+      const variant = variants?.find((v) => Math.abs((v.height || 0) - prof.height) <= 80);
+      const est = estimateDownloadSizeMb({ durationSeconds: dur, quality: q, variantBytes: variant?.sizeBytes || null, limitBytes });
+      const cached = app.movieDownloader?.hasCachedVideo?.(track, q);
+      const icon = q === '360p' ? '📱' : q === '480p' ? '🎬' : '💎';
+      return controls(s, `${icon} ${q} · ${cached ? '⚡' : est.text}`, 'dlq', q, q === '480p' ? { style: 'success' } : { style: 'primary' });
+    });
+    b.buttons(dlButtons);
+    b.buttons([controls(s, '◀ Cancel', 'dlq', 'back')]);
     return finish(b);
   }
 
@@ -1235,6 +1384,38 @@ export function createMusicScreen({ app }) {
 
   async function handle(ctx, action, args = []) {
     try {
+      if (isChannelCtx(ctx) && Number(ctx.chatId) < 0 && !ctx.channelAdminVerified) {
+        await app.music.authorize(ctx, true, Number(ctx.chatId), { allowDj: false });
+        ctx = { ...ctx, channelAdminVerified: true };
+      }
+      if (action === 'calert') {
+        const enable = args[0] === 'on';
+        app.db?.setUserSetting?.(Number(ctx.tgId), 'cinema.vcNotifications', enable);
+        if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+          await ctx.api.answerCallbackQuery(ctx.query.id, {
+            text: enable ? '🔔 Cinema VC alerts enabled!' : '🔕 Cinema VC alerts muted.',
+            show_alert: false
+          }).catch(() => {});
+        }
+        if (ctx.messageId && ctx.api?.editMessageRich) {
+          const prefCard = card(
+            enable ? '🔔 CINEMA ALERTS ENABLED' : '🔕 CINEMA ALERTS MUTED',
+            enable ? 'You will receive DM alerts when Cinema VCs start' : 'You will no longer receive Cinema VC DM alerts'
+          );
+          prefCard.paragraph(rt.text(
+            enable
+              ? 'We will notify you whenever a Cinema Watch Party starts or switches movies in a group chat.'
+              : 'Cinema Watch Party DM notifications are turned off for your account. Tap below anytime to re-enable them.'
+          ));
+          prefCard.buttons([
+            enable
+              ? richButton.callback('🔕 Mute Cinema Alerts', encodeCallback('music', 'calert', 'off'))
+              : richButton.callback('🔔 Re-enable Cinema Alerts', encodeCallback('music', 'calert', 'on'), { style: 'success' })
+          ]);
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, finish(prefCard)).catch(() => {});
+        }
+        return true;
+      }
       if (action === 'mv') return await movieUi.handleCallback(ctx, args);
       if (action === 'moviehub' || action === 'movie') return await movieUi.openHub(ctx);
       if (action === 'aichat') return await movieUi.startAiChat(ctx, args.join(' '));
@@ -1248,8 +1429,25 @@ export function createMusicScreen({ app }) {
         }
         return true;
       }
-      if (action === 'channels') return await channels(ctx);
-      if (action === 'ch') return await app.music.channels.lock.run(args[0], async () => {
+      if (action === 'channels') {
+        if (Number(ctx.chatId) > 0 && !isChannelCtx(ctx)) {
+          await sendOrEditMenu(ctx, renderDmChannelGuideCard());
+          return true;
+        }
+        if (isChannelCtx(ctx)) {
+          const reuseId = reusableChannelSlotId(ctx);
+          const p = await app.music.player(reuseId ? { ...ctx, reuseMessageId: reuseId } : ctx, Number(ctx.chatId));
+          await adoptChannelPlayerResult(ctx, p);
+          return p;
+        }
+        return await channels(ctx);
+      }
+      if (action === 'ch') {
+        if (Number(ctx.chatId) > 0 && !isChannelCtx(ctx)) {
+          await sendOrEditMenu(ctx, renderDmChannelGuideCard());
+          return true;
+        }
+        return await app.music.channels.lock.run(args[0], async () => {
         const [token, revision, operation, index] = args;
         const state = app.music.channels.resolve(ctx, token, revision);
         if (operation === 'add') return prompt(ctx, 'channel');
@@ -1276,6 +1474,7 @@ export function createMusicScreen({ app }) {
           }
         }
       });
+      }
       if (action === 'listenq' || action === 'listennow' || action === 'listenadd') {
         const c = app.music.listenCard(ctx, args[0], { requireMessage: action === 'listenq' });
         if (!c.destination) return channels(ctx, c.token);
@@ -1375,7 +1574,14 @@ export function createMusicScreen({ app }) {
           app.music.channelPanels?.registerMessage?.(token, ctx.messageId);
         }
         if (command === 'channels') return await channels(ctx);
-        if (command === 'movie') return await movieUi.openHub({ ...ctx, musicPanel: panel });
+        if (command === 'movie') {
+          if (panel) {
+            panel.overlayView = 'movie';
+            panel.overlayAt = Date.now();
+            panel.lastRender = null;
+          }
+          return await movieUi.openHub({ ...ctx, musicPanel: panel });
+        }
         if (command === 'prompt') return await prompt({ ...ctx, musicPanel: panel }, controlArgs[0] || 'queue');
         if (command === 'catmenu') {
           let [mode, page = 0] = controlArgs;
@@ -1481,6 +1687,14 @@ export function createMusicScreen({ app }) {
       }
       if (action === 'prompt') return await prompt(ctx, args[0] || 'queue');
       if (action === 'openplayer') {
+        if (Number(ctx.chatId) > 0 && !isChannelCtx(ctx) && !ctx.musicPanel) {
+          let dmDest = null;
+          try { dmDest = app.music.destination(ctx); } catch {}
+          if (!dmDest) {
+            await sendOrEditMenu(ctx, renderDmChannelGuideCard());
+            return true;
+          }
+        }
         if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
           await ctx.api.answerCallbackQuery(ctx.query.id, { text: 'Opening player…' }).catch(() => {});
         }
@@ -1500,7 +1714,11 @@ export function createMusicScreen({ app }) {
           }
           return p;
         }
-        return await app.music.player({ ...ctx, forceNew: true });
+        const p = await app.music.player({ ...ctx, forceNew: true });
+        if (Number(ctx.chatId) < 0 && ctx.messageId && qmSession?.screenMessageId && ctx.messageId !== qmSession.screenMessageId) {
+          await ctx.api?.deleteMessage?.(ctx.chatId, ctx.messageId).catch(() => {});
+        }
+        return p;
       }
       if (['pick', 'spage', 'sclear', 'submit', 'playnow_s', 'qnow'].includes(action)) {
         const [token, revision, index] = args;
@@ -1621,6 +1839,14 @@ export function createMusicScreen({ app }) {
     ];
     if (!commands.includes(command)) return false;
     const isChan = isChannelCtx(ctx);
+    if (isChan && Number(ctx.chatId) < 0 && !ctx.channelAdminVerified) {
+      try {
+        await app.music.authorize(ctx, true, Number(ctx.chatId), { allowDj: false });
+        ctx = { ...ctx, channelAdminVerified: true };
+      } catch {
+        return true;
+      }
+    }
     const isExplicitNewPlayerCmd = ['/player', '/vc', '/channel', '/destination'].includes(command);
     ctx = { ...ctx, forceNew: isExplicitNewPlayerCmd };
     const triggerCleanup = isChan ? deleteTriggerMessage(ctx) : Promise.resolve(false);
@@ -1748,7 +1974,9 @@ export function createMusicScreen({ app }) {
           await app.music.control({ ...ctx, query: null, messageId: null, musicPanel: state.panelToken ? state : undefined }, 'radio', []);
         }
       } else if (['/play', '/song', '/addq', '/vplay', '/vcplay'].includes(command)) {
-        await app.sm?.reset(ctx.tgId);
+        const cmdStateKey = (isChan && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId;
+        await app.sm?.reset(cmdStateKey);
+        if (cmdStateKey !== ctx.tgId) await app.sm?.reset(ctx.tgId);
         if (['/play', '/song'].includes(command) && args.length && app.screens?.get('downloader')?.executeDownload) {
           await app.screens.get('downloader').executeDownload(ctx, args.join(' '), { forceMusicSearch: true, forceNew: true });
           return true;
@@ -1768,7 +1996,7 @@ export function createMusicScreen({ app }) {
           }
           await search(ctx, args.join(' '), 'download');
         } else {
-          await sendOrEditMenu(ctx, renderHome());
+          await sendOrEditMenu(ctx, renderHome(ctx));
         }
       } else if (command === '/accounts') {
         const accounts = await app.music.accountCommand(ctx, args);
@@ -1783,25 +2011,10 @@ export function createMusicScreen({ app }) {
           return true;
         }
         if (Number(ctx.chatId) < 0) {
-          if (args.length) {
-            const destId = await app.music.bind(ctx, args[0]);
-            await app.music.player(ctx, destId);
-          } else {
-            await ctx.api.sendMessage(ctx.chatId, `<blockquote>🌸 To manage channels, open a private chat with @${ctx.api?.me?.username || 'the bot'} and send <code>/channel</code> ♡\nTo play right inside a channel, make Lancy an admin there and send <code>/vplay</code>, <code>/addq</code>, <code>/aidj</code>, or <code>/player</code>.</blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
-          }
+          await ctx.api.sendMessage(ctx.chatId, `<blockquote>🌸 Channel playback runs directly inside the Channel itself ♡\nMake Lancy an admin in your Channel and send <code>/player</code>, <code>/vplay</code>, <code>/addq</code>, <code>/movie</code>, or <code>/aidj</code> there!</blockquote>`, { parse_mode: 'HTML' }).catch(() => {});
           return true;
         }
-        if (args[0] === 'close') {
-          const destId = app.music.destination(ctx);
-          await app.music.channelPanels.close(ctx, destId);
-        } else if (!args.length && !ctx.message?.forward_origin && !ctx.message?.forward_from_chat) {
-          await channels(ctx);
-        } else {
-          const destId = await app.music.bind(ctx, args[0]);
-          const session = app.musicQueueManager.getSession(destId);
-          if (session.status === 'stopped') { session.status = 'idle'; session.lastError = null; }
-          await app.music.player({ ...ctx, forceNew: true }, destId);
-        }
+        await sendOrEditMenu(ctx, renderDmChannelGuideCard());
         return true;
       } else if (command === '/playlist') {
         await playlist(ctx, args);
@@ -1984,13 +2197,13 @@ export function createMusicScreen({ app }) {
     if (!source.data && app.music.channelPanels?.replyPanel(ctx, source)) return true;
     if (source.data) {
       const d = decodeCallback(source.data);
-      return d?.screen === 'music' && (['pc', 'channels', 'ch', 'listenq', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose'].includes(d.action) || app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`));
+      return d?.screen === 'music' && (['pc', 'listenq', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose', 'calert'].includes(d.action) || app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`));
     }
     const pending = app.sm?.get?.(ctx.tgId);
-    if (pending?.state === States.MUSIC_QUEUE_INPUT && pending.context.mode === 'channel' && pending.context.botKey === app.music.botKey(ctx) && Number(pending.chatId) === Number(ctx.chatId)) return true;
+    if (pending?.state === States.MUSIC_QUEUE_INPUT && pending.context.panelToken && pending.context.botKey === app.music.botKey(ctx) && Number(pending.chatId) === Number(ctx.chatId)) return true;
     if (pending?.state === States.AI_MEDIA_CHAT && pending.context?.panelToken && pending.context.botKey === app.music.botKey(ctx) && Number(pending.chatId) === Number(ctx.chatId)) return true;
     const command = musicText(ctx, source.text).split(/\s+/)[0]?.split('@')[0]?.toLowerCase();
-    return command === '/channel' || command === '/destination' || (app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`) && (channelCommands.has(command) || [States.MUSIC_QUEUE_INPUT, States.AI_MEDIA_CHAT].includes(app.sm?.state(ctx.tgId))));
+    return Boolean(app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`) && (channelCommands.has(command) || [States.MUSIC_QUEUE_INPUT, States.AI_MEDIA_CHAT].includes(app.sm?.state(ctx.tgId))));
   }
 
   async function handlePrivateChannel(ctx, source) {
@@ -1998,7 +2211,7 @@ export function createMusicScreen({ app }) {
     if (!source.data && await handlePlayerReply(ctx, source)) return true;
     if (source.data) {
       const d = decodeCallback(source.data);
-      if (!['pc', 'channels', 'ch', 'listenq', 'listennow', 'listenadd', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose'].includes(d.action)) {
+      if (!['pc', 'channels', 'ch', 'listenq', 'listennow', 'listenadd', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose', 'calert'].includes(d.action)) {
         try {
           const session = ['pick', 'spage', 'sclear', 'submit', 'playnow_s', 'qnow'].includes(d.action) ? app.music.search.get(d.args[0], ctx) : null;
           await app.music.authorize(ctx, true, session && ['queue', 'video'].includes(session.mode) ? session.destination : null);
@@ -2047,9 +2260,9 @@ export function createMusicScreen({ app }) {
       },
       onMessage: async (ctx, message) => {
         const isChan = Boolean(ctx.isChannel || message.chat?.type === 'channel');
-        const record = sm.get(ctx.tgId) || (isChan && Number(ctx.chatId) < 0 ? sm.get(String(ctx.chatId)) : null);
+        const record = (isChan && Number(ctx.chatId) < 0 ? sm.get(String(ctx.chatId)) : null) || sm.get(ctx.tgId);
         if (!record?.context || Number(record.chatId) !== Number(ctx.chatId) || record.context.botKey !== app.music.botKey(ctx)) return false;
-        const stateKey = record.context.stateKey || (sm.get(ctx.tgId) ? ctx.tgId : String(ctx.chatId));
+        const stateKey = record.context.stateKey || ((isChan && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId);
         if (record.context.mode === 'channel') {
           try {
             const value = message.text || message.caption || '';
@@ -2115,9 +2328,17 @@ export function createMusicScreen({ app }) {
               }
             }
           } else if (mode === 'movie_search') {
+            if (panel) {
+              panel.overlayView = 'movie';
+              panel.overlayAt = Date.now();
+              panel.lastRender = null;
+            }
             if (isChan) record.context.reusedInChannel = true;
             await sm.reset(stateKey);
-            await movieUi.openMovieSearch(panel ? { ...ctx, musicPanel: panel } : ctx, message.text);
+            const searchTargetCtx = panel
+              ? { ...ctx, musicPanel: panel }
+              : (isChan && record.context?.promptMessageId ? { ...ctx, reuseMessageId: record.context.promptMessageId } : ctx);
+            await movieUi.openMovieSearch(searchTargetCtx, message.text);
           } else {
             if (isChan) record.context.reusedInChannel = true;
             await sm.reset(stateKey);
@@ -2139,9 +2360,9 @@ export function createMusicScreen({ app }) {
       },
       onMessage: async (ctx, message) => {
         const isChan = Boolean(ctx.isChannel || message.chat?.type === 'channel');
-        const record = sm.get(ctx.tgId) || (isChan && Number(ctx.chatId) < 0 ? sm.get(String(ctx.chatId)) : null);
+        const record = (isChan && Number(ctx.chatId) < 0 ? sm.get(String(ctx.chatId)) : null) || sm.get(ctx.tgId);
         if (!record?.context || Number(record.chatId) !== Number(ctx.chatId) || record.context.botKey !== app.music.botKey(ctx)) return false;
-        const stateKey = record.context.stateKey || (sm.get(ctx.tgId) ? ctx.tgId : String(ctx.chatId));
+        const stateKey = record.context.stateKey || ((isChan && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId);
         if (!message.text) return false;
         if (Number(ctx.chatId) < 0 && !isChan && record.context.promptMessageId && message.reply_to_message?.message_id !== record.context.promptMessageId) {
           // Allow tagged mentions too when handled via bot.js shouldHandleState, otherwise require reply to prompt/bot
@@ -2203,12 +2424,18 @@ export function createMusicScreen({ app }) {
     const skipNeed = app.music?.getSkipVoteThreshold?.(destId) ?? 2;
     const skipCount = Array.isArray(s.skipVotes) ? s.skipVotes.length : 0;
 
+    const resumeSec = !t ? Number(movieQ[0]?.resumePositionSeconds || movieQ[0]?.startOffsetSeconds || s.lastKnownPositionSeconds || 0) : 0;
+    const previewTrack = t || ((s.status === 'buffering' || resumeSec > 0) ? movieQ[0] : null);
+    const previewArt = previewTrack?.artwork || previewTrack?.poster || previewTrack?.backdrop || previewTrack?.thumbnailUrl || previewTrack?.thumb || null;
+    attachSafeArtworkPhoto(b, previewArt, previewTrack?.title || 'Cinema Artwork');
+
     if (t) {
       b.paragraph(rt.bold(cut(t.title || 'Streaming Movie', 80)));
-      const dur = Number(t.durationSeconds || 0);
+      const dur = Number(t.durationSeconds || t.durationSec || 0);
       const pos = Math.max(0, Number(s.positionSeconds || 0));
       if (dur > 0) {
-        b.paragraph(rt.text(`${progressBar(pos, dur)}  ${durationText(pos)} / ${durationText(dur)}`));
+        const ratio = safeProgressRatio(pos, dur);
+        b.paragraph(rt.text(`${progressBar(ratio, { width: 12, filled: '█', empty: '░' })}  ${durationText(pos)} / ${durationText(dur)}`));
       } else {
         b.paragraph(rt.text(`🔴 Live Cinema Stream${pos > 0 ? ` · ${durationText(pos)} elapsed` : ''}`));
       }
@@ -2216,12 +2443,15 @@ export function createMusicScreen({ app }) {
       const cleanArtistMeta = t.artist && !/thenkiri|downloadwella|holaflix|archive|dramafren|ok\.ru|yt-dlp|web cinema|source/i.test(t.artist)
         ? t.artist
         : fallbackFormat;
+      const vcDisplay = t?.title ? `${cut(t.title, 28)} · ${cut(destLabel, 20)}` : destLabel;
+      const subOffset = Number(s.subtitleSyncOffset || 0) || 0;
+      const offsetStr = subOffset ? ` (${subOffset > 0 ? `+${subOffset}` : subOffset}s)` : '';
       const metaRows = [
         ['🎬 Now Playing', cut(t.title || 'Movie Stream', 44)],
-        ['🎙️ Voice Chat', destLabel],
+        ['🎙️ Voice Chat', vcDisplay],
         ['🤖 Bot', `Lancy Music (@${botUsername})`],
         ['🎞 Quality', cut(cleanArtistMeta, 42)],
-        ['💬 Subtitles', `${subText}${t.subtitlePath ? ' · Synced' : ''}`],
+        ['💬 Subtitles', `${subText}${t.subtitlePath ? ' · Synced' : ''}${offsetStr}`],
         ['🎞 Cinema Queue', `${movieQ.length} upcoming · ⏭ Skip ${skipCount}/${skipNeed}`]
       ];
       if (t.requester) metaRows.push(['🙋 Requested by', cut(t.requester, 32)]);
@@ -2230,14 +2460,19 @@ export function createMusicScreen({ app }) {
         b.blockquote(rt.text(`💬 ${cut(s.liveSubCue, 260)}`));
       }
     } else {
+      const vcIdleDisplay = (resumeSec > 0 && movieQ[0]?.title)
+        ? `${cut(movieQ[0].title, 28)} · ${cut(destLabel, 20)}`
+        : destLabel;
       b.table([
-        ['🎙️ Voice Chat', destLabel],
+        ['🎙️ Voice Chat', vcIdleDisplay],
         ['🤖 Bot', `Lancy Music (@${botUsername})`],
         ['🎞 Cinema Queue', `${movieQ.length} up next`]
       ], { striped: true, bordered: true, compact: true });
       b.paragraph(rt.text(
         movieQ.length
-          ? `Cinema deck is ready (${movieQ.length} queued). Tap ▶ Resume to start streaming in Voice Chat.`
+          ? (resumeSec > 0
+              ? `Saved at ${durationText(resumeSec)} · ${cut(movieQ[0]?.title || 'Current item', 40)}. Tap ▶ Resume to continue where it stopped.`
+              : `Cinema deck is ready (${movieQ.length} queued). Tap ▶ Resume to start streaming in Voice Chat.`)
           : 'No movie or episode is currently playing in Cinema VC. Tap 🎬 Movies to search & stream.'
       ));
     }
@@ -2247,7 +2482,7 @@ export function createMusicScreen({ app }) {
 
     const row1 = [];
     if (t || movieQ.length) {
-      row1.push(controls(s, s.status === 'paused' ? '▶ Resume' : t ? '⏸ Pause' : '▶ Start Next', (s.status === 'paused' || !t) ? 'resume' : 'pause', { style: 'primary' }));
+      row1.push(controls(s, (s.status === 'paused' || (!t && resumeSec > 0)) ? '▶ Resume' : t ? '⏸ Pause' : '▶ Start Next', (s.status === 'paused' || !t) ? 'resume' : 'pause', { style: 'primary' }));
     }
     if (movieHist.length) row1.push(controls(s, '⏮ Prev', 'previous'));
     if (movieQ.length) row1.push(controls(s, '⏭ Next', 'skip'));
@@ -2271,6 +2506,7 @@ export function createMusicScreen({ app }) {
     }
     row3.push(controls(s, `🗳 Queue (${movieQ.length})`, 'mqueue', 0, { style: 'primary' }));
     row3.push(controls(s, '🎬 Movies', 'movie'));
+    if (t) row3.push(controls(s, '⏱ Sync', 'subsync'));
     b.buttons(row3);
 
     const row4 = [
@@ -2282,7 +2518,8 @@ export function createMusicScreen({ app }) {
     b.buttons(row4);
 
     const identityRow = [];
-    if (s.vcUrl) identityRow.push(richButton.url('🎙️ Join VC', s.vcUrl, { style: 'success' }));
+    const vcBtn = joinCallButton(s);
+    if (vcBtn) identityRow.push(vcBtn);
     identityRow.push(richButton.url('🤖 Lancy Music', `https://t.me/${botUsername}`, { style: 'primary' }));
     b.buttons(identityRow);
 
@@ -2352,6 +2589,8 @@ export function createMusicScreen({ app }) {
   function renderDeckPlayer(s) {
     if (s?.view === 'mqueue') return renderMovieQueue(s, s.page || 0);
     if (s?.view === 'voteset') return renderVoteSettings(s);
+    if (s?.view === 'subsync') return renderSubSyncPicker(s);
+    if (s?.view === 'dlq') return renderCinemaDownloadQuality(s);
     if (s?.activeDeck === 'movie' || s?.view === 'cinema' || (s?.currentTrack?.provider === 'movie' && s?.view !== 'queue')) {
       return renderCinemaPlayer(s);
     }
@@ -2364,6 +2603,8 @@ export function createMusicScreen({ app }) {
     renderListen,
     renderOptions,
     renderVoteSettings,
+    renderSubSyncPicker,
+    renderCinemaDownloadQuality,
     renderPlayer: renderDeckPlayer,
     renderMusicPlayer: renderPlayer,
     renderCinemaPlayer,
@@ -2406,7 +2647,7 @@ export function createMusicScreen({ app }) {
       await temporary.shutdown();
     },
     async open(ctx) {
-      return ctx.api.sendRichMessage(ctx.chatId, renderHome());
+      return ctx.api.sendRichMessage(ctx.chatId, renderHome(ctx));
     }
   };
 }

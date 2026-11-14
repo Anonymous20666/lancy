@@ -9,6 +9,9 @@ import { originalPlayDelivery } from './originalPlayCard.js';
 import { isMusicOwner } from './accounts.js';
 import { KeyedLock, MusicError } from './model.js';
 import { checkChatMediaPermissions } from '../telegram/permissions.js';
+import { ProgressTracker } from '../telegram/progress.js';
+import { RichMessageBuilder, rt } from '../telegram/rich.js';
+import { normalizeDownloadQuality } from '../media/telegramLimits.js';
 export const EQ_PRESETS = ['off','studio','bass','vocal','nightcore','vaporwave','8d'];
 export const EQ_CYCLE_PRESETS = ['off','studio','bass','vocal','8d'];
 export class MusicService {
@@ -27,20 +30,45 @@ export class MusicService {
     const mode=chatId!=null?this.app?.db?.getSetting?.(`music.queueVoteAction.${chatId}`,'playnow'):'playnow';
     return mode==='top'?'top':'playnow';
   }
-  async syncSessionIdentity(s,ctx,chat=null){
+  async syncSessionIdentity(s,ctx,chat=null,{bridgeInviteLink=null}={}){
     if(!s)return s;
     const botUser=ctx?.api?.botUsername||ctx?.api?.me?.username||this.app?.telegram?.botUsername||s.botUsername||'Lancy_easy_bot';
     s.botUsername=String(botUser).replace(/^@/,'');
+    const resolvedBotId=ctx?.botId??ctx?.controller?.botContext?.botId??s.botId??0;
+    s.botId=Number(resolvedBotId)||0;
+    if(ctx?.api)s.api=ctx.api;
+    if(bridgeInviteLink&&/^https:\/\/t\.me\//i.test(String(bridgeInviteLink))){
+      s.callInviteLink=String(bridgeInviteLink).trim();
+    }
     if(chat){
       s.isChannel=chat.type==='channel';
       s.destinationTitle=chat.title||(s.isChannel?'Channel':'Group');
       s.destinationUsername=chat.username||null;
-      if(chat.username)s.vcUrl=`https://t.me/${chat.username}?voicechat`;
-      else if(chat.invite_link)s.vcUrl=chat.invite_link;
+      if(chat.username){
+        const clean=String(chat.username).replace(/^@/,'');
+        s.groupInviteLink=`https://t.me/${clean}`;
+      } else if(chat.invite_link){
+        s.groupInviteLink=chat.invite_link;
+      }
+    }
+    if(s.callInviteLink&&/^https:\/\/t\.me\//i.test(s.callInviteLink)){
+      s.vcUrl=s.callInviteLink;
+    } else if(s.destinationUsername){
+      const clean=String(s.destinationUsername).replace(/^@/,'');
+      s.vcUrl=s.isChannel?`https://t.me/${clean}?livestream`:`https://t.me/${clean}?voicechat`;
+    } else {
+      s.vcUrl=null;
     }
     return s;
   }
   async prepare(ctx,id=this.destination(ctx)) {
+    const preSess = this.app.musicQueueManager?.getSession?.(id);
+    if (preSess && ctx) {
+      preSess.botId = Number(ctx?.botId ?? ctx?.controller?.botContext?.botId ?? preSess.botId ?? 0) || 0;
+      if (ctx.api) preSess.api = ctx.api;
+      const bUser = ctx.api?.botUsername || ctx.api?.me?.username || this.app?.telegram?.botUsername;
+      if (bUser) preSess.botUsername = String(bUser).replace(/^@/, '');
+    }
     // Older offline adapters remain supported. The real VoiceClient always has setup.
     if(typeof this.app.voiceClient?.setup==='function')return this.setup.prepare(ctx,id);
     await this.authorize(ctx,true,id);await this.accounts.sync();
@@ -275,25 +303,46 @@ export class MusicService {
         if(!bot||!['creator','administrator'].includes(bot.status))throw new MusicError('BOT_ADMIN_REQUIRED','Make this bot a channel administrator before opening its private dashboard.');
       }
     }else if(this.owner(ctx) || this.isVcSudo(ctx, id))return id;
-    if(!remote&&Number(ctx.chatId)<0&&(Number(ctx.tgId)===id||ctx.message?.sender_chat?.id===id))return id;
-    const isChannelChat = Boolean(ctx.isChannel || ctx.message?.chat?.type === 'channel' || this.app?.musicQueueManager?.getSession?.(id)?.isChannel);
+    const isChannelChat = Boolean(ctx.isChannel || ctx.chatType === 'channel' || ctx.message?.chat?.type === 'channel' || this.app?.musicQueueManager?.getSession?.(id)?.isChannel);
+    const nativeChannelPost = Boolean(
+      isChannelChat && !ctx.query && (
+        ctx.isNativeChannelPost ||
+        ctx.channelAdminVerified ||
+        (
+          !ctx.message?.from &&
+          !ctx.message?.is_automatic_forward &&
+          (ctx.message?.sender_chat?.id != null
+            ? Number(ctx.message.sender_chat.id) === id
+            : (Number(ctx.tgId) === id && Number(ctx.chatId) === id && ctx.message?.chat?.type === 'channel'))
+        )
+      )
+    );
+    if (!remote && nativeChannelPost) return id;
+    if (!remote && !isChannelChat && Number(ctx.chatId) < 0 && !ctx.query && Number(ctx.tgId) === id) return id;
     const vcSudoEnforced = !remote && Number(id) < 0 && !isChannelChat && this.isVcSudoEnforced(id);
     if (vcSudoEnforced && destructive) {
       if (allowDj && this.isDj(ctx, id)) return id;
       throw Object.assign(new MusicError('ADMIN_ONLY', 'Only authorized VC Sudo users can operate the player or change Voice Chat playback.'), { silent: true });
     }
-    const member=await ctx.api?.getChatMember?.(id,Number(ctx.tgId)).catch(()=>null);
+    const uid = Number(ctx.tgId);
+    if (isChannelChat && (!Number.isFinite(uid) || uid <= 0 || [136817688, 1087968824, 777000].includes(uid))) {
+      throw new MusicError('ADMIN_ONLY', 'Only verified channel administrators can use bot controls in this channel.');
+    }
+    const member=await ctx.api?.getChatMember?.(id,uid).catch(()=>null);
     if(!member || !['creator','administrator','member','restricted'].includes(member.status) || (member.status==='restricted'&&!member.is_member)) {
       throw Object.assign(new MusicError('PERMISSION_DENIED','Membership could not be verified.'), vcSudoEnforced ? { silent: true } : {});
     }
-    if((destructive||remote)&&!['creator','administrator'].includes(member.status)&&!(allowDj&&!remote&&this.isDj(ctx,id))) {
-      throw Object.assign(new MusicError('ADMIN_ONLY','Only verified chat administrators can operate the player or change playback, queue and settings.'), vcSudoEnforced ? { silent: true } : {});
+    const requireAdmin = destructive || remote || isChannelChat;
+    if(requireAdmin&&!['creator','administrator'].includes(member.status)&&!(!isChannelChat&&allowDj&&!remote&&this.isDj(ctx,id))) {
+      throw Object.assign(new MusicError('ADMIN_ONLY', isChannelChat ? 'Only verified channel administrators can use bot controls in this channel.' : 'Only verified chat administrators can operate the player or change playback, queue and settings.'), vcSudoEnforced ? { silent: true } : {});
     }
     return id;
   }
   async startSearch(ctx,query,mode='queue') {
-    this.rate(ctx); const destination=['download','lyrics'].includes(mode) ? Number(ctx.chatId) : await this.authorize(ctx,true,null,{allowDj:true});
-    let sessionChannel = Boolean(ctx.isChannel || ctx.message?.chat?.type === 'channel');
+    this.rate(ctx);
+    const isChannelChat = Boolean(ctx.isChannel || ctx.chatType === 'channel' || ctx.message?.chat?.type === 'channel' || this.app?.musicQueueManager?.getSession?.(Number(ctx.chatId))?.isChannel);
+    const destination=(['download','lyrics'].includes(mode) && !isChannelChat) ? Number(ctx.chatId) : await this.authorize(ctx,true,null,{allowDj:!isChannelChat});
+    let sessionChannel = isChannelChat;
     if (!['download','lyrics'].includes(mode)) { const state=this.app.musicQueueManager.getSession(destination); if (ctx.message?.chat?.id === destination) { state.isChannel = ctx.message.chat.type === 'channel'; if (ctx.message.chat.title) state.destinationTitle = ctx.message.chat.title; } this.syncEqSettings(state,destination); await this.prepare(ctx,destination); if (!state.destinationTitle || state.destinationTitle === String(destination)) { const chat=await ctx.api?.getChat?.(destination).catch(()=>null); if (chat) { state.isChannel=chat.type==='channel'; state.destinationTitle=chat.title||String(destination); } } sessionChannel=Boolean(state.isChannel||sessionChannel); }
     const s=this.search.create({ userId:ctx.tgId,chatId:ctx.chatId,botId:this.botKey(ctx),destination,query,mode,isChannel:sessionChannel && Number(ctx.chatId)===Number(destination) });
     s.queueDestination=ctx.musicPanel?.chatId||(Number(ctx.chatId)<0?Number(ctx.chatId):this.destinations.get(`${this.botKey(ctx)}:${ctx.tgId}`))||null;
@@ -410,7 +459,14 @@ export class MusicService {
   }
   async _player(ctx,id) {
     await this.authorize(ctx,true,id,{allowDj:true});
-    const qm=this.app.musicQueueManager,s=qm.getSession(id); const chat=await ctx.api.getChat(id); await this.syncSessionIdentity(s,ctx,chat); this.syncEqSettings(s,id);
+    const qm=this.app.musicQueueManager,s=qm.getSession(id);
+    const chat=await ctx.api.getChat(id).catch(()=>null);
+    let bridgeInviteLink = s.callInviteLink || null;
+    if (!bridgeInviteLink && (s.connected || s.prepared) && typeof this.app?.voiceClient?.getCallInviteLink === 'function') {
+      const linkRes = await this.app.voiceClient.getCallInviteLink(id).catch(() => null);
+      if (linkRes?.call_invite_link) bridgeInviteLink = linkRes.call_invite_link;
+    }
+    await this.syncSessionIdentity(s,ctx,chat,{bridgeInviteLink}); this.syncEqSettings(s,id);
     if(s.status==='stopped'){s.status='idle';s.lastError=null;}
     const isCinemaDeck = s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie';
     if(s.currentTrack && !isCinemaDeck)this.requestCardLyrics(s);
@@ -431,13 +487,19 @@ export class MusicService {
           sent=edited?.message_id ? edited : {message_id:ctx.reuseMessageId};
         }catch{}
       }
-      if(!sent)sent=await ctx.api.sendRichMessage(ctx.chatId,rich);
+      if(!sent){
+        sent=await ctx.api.sendRichMessage(ctx.chatId,rich);
+        if(sent?.message_id && ctx.reuseMessageId && sent.message_id!==ctx.reuseMessageId && typeof ctx.api.deleteMessage==='function'){
+          await ctx.api.deleteMessage(ctx.chatId,ctx.reuseMessageId).catch(()=>{});
+        }
+      }
       qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);
       s.lastRender=JSON.stringify(rich);
       s.editAfter=0;
       if(oldMessageId && oldMessageId !== sent.message_id && typeof ctx.api?.deleteMessage === 'function'){
         await ctx.api.deleteMessage(oldPlayerChatId, oldMessageId).catch(()=>{});
       }
+      await qm.autoPinPlayerCard?.(id, sent.message_id, Number(ctx.chatId), ctx.api);
     };
     let created=Boolean(!s.screenMessageId || ctx.forceNew || (s.isChannel && s.playerChatId !== Number(ctx.chatId)));
     if(created){
@@ -454,7 +516,7 @@ export class MusicService {
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','submode','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','bass','aidj'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','submode','subsync','subtrack','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
@@ -462,10 +524,68 @@ export class MusicService {
     if(['stop','leave'].includes(action))return this._control(ctx,action,[...args]);
     return this.controlLock.run(destination,()=>this._control(ctx,action,[...args]));
   }
+  async #startCinemaDownload(ctx, s, id, targetItem, qualityRaw = null) {
+    const downloader=this.app?.movieDownloader;
+    if(!downloader)throw new MusicError('UNAVAILABLE','Download service is currently unavailable.');
+    const uid=Number(ctx.tgId||0);
+    const fallbackQ=uid>0?this.app?.db?.getUserSetting?.(uid,'movie.downloadQuality','480p'):'480p';
+    const quality=normalizeDownloadQuality(qualityRaw||fallbackQ||'480p');
+    if(uid>0)this.app?.db?.setUserSetting?.(uid,'movie.downloadQuality',quality);
+    const userKey=String(ctx.tgId||ctx.chatId||'anon');
+    const activeUserDownloads=this.userDownloads.get(userKey)||0;
+    if(activeUserDownloads>=this.maxUserDownloads||this.downloads>=this.maxDownloads)throw new MusicError('DOWNLOAD_BUSY','Download queue is busy right now. Wait a few seconds and retry.');
+    if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`⬇️ Preparing ${quality} download: ${String(targetItem.title||'').slice(0,32)}…`}).catch(()=>{});
+    this.downloads++;
+    this.userDownloads.set(userKey,activeUserDownloads+1);
+    void (async()=>{
+      const dlCtx={...ctx,chatId:ctx.chatId||s.playerChatId||id};
+      const titleSafe=String(targetItem.title||'Movie');
+      const instantHit=Boolean(downloader.hasCachedVideo?.(targetItem,quality));
+      let tracker=null;
+      let statusMsg=null;
+      try{
+        if(!instantHit&&typeof dlCtx.api?.sendRichMessage==='function'){
+          tracker=new ProgressTracker({api:dlCtx.api,chatId:dlCtx.chatId,heartbeatMs:2000,action:'upload_video'});
+          await tracker.live((state,{elapsedMs})=>{
+            const sec=Math.max(0,Math.floor(elapsedMs/1000));
+            const pb=new RichMessageBuilder();
+            pb.bannerHeader([`⬇️ ${titleSafe.slice(0,44)}`,`${quality} MP4 Download`],{size:2});
+            pb.blockquote(rt.text(`${state.statusLine||'Preparing video for Telegram…'}\n⏱ Elapsed: ${sec}s`));
+            pb.validate();
+            return pb.toJSON();
+          },{statusLine:`⬇️ Preparing ${quality} · ${titleSafe.slice(0,34)}…`}).catch(()=>{});
+        }else if(!instantHit){
+          statusMsg=await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⬇️ Preparing <b>${titleSafe.replace(/[<>&]/g,'')}</b> (${quality}) for Telegram…`,{parse_mode:'HTML'}).catch(()=>null);
+        }
+        const res=await downloader.sendSingleVideo(dlCtx,targetItem,{
+          quality,
+          spoiler:Boolean(targetItem.isAdult&&Number(dlCtx.chatId)<0),
+          onProgress:(line)=>{
+            if(tracker)tracker.set({statusLine:String(line).slice(0,200)});
+            else if(statusMsg?.message_id&&dlCtx.api?.editMessageText){
+              void dlCtx.api.editMessageText(dlCtx.chatId,statusMsg.message_id,`⬇️ ${String(line).slice(0,200)}`).catch(()=>{});
+            }
+          }
+        });
+        if(!res?.ok){
+          await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⚠️ Download could not finish: ${res?.reason||'Stream unavailable'}`).catch(()=>{});
+        }
+      }catch(err){
+        await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⚠️ Download failed: ${err?.message||'Unknown error'}`).catch(()=>{});
+      }finally{
+        await tracker?.cleanup?.().catch(()=>{});
+        if(statusMsg?.message_id)await dlCtx.api?.deleteMessage?.(dlCtx.chatId,statusMsg.message_id).catch(()=>{});
+        this.downloads=Math.max(0,this.downloads-1);
+        const left=(this.userDownloads.get(userKey)||1)-1;
+        if(left<=0)this.userDownloads.delete(userKey);
+        else this.userDownloads.set(userKey,left);
+      }
+    })();
+  }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','submode','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','submode','subsync','subtrack','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isViewerVote=['voteskip','votequeue'].includes(action);
-    const isDownloadAct=['downloadnow','downloadq'].includes(action);
+    const isDownloadAct=['downloadnow','downloadq','dlq'].includes(action);
     const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh'].includes(action);
     const id=await this.authorize(ctx,!(isViewerVote||isDownloadAct),null,{allowDj});
     const qm=this.app.musicQueueManager;
@@ -473,7 +593,12 @@ export class MusicService {
     const s=panel?.state ? this.channelPanels.state(panel) : panel || qm.getSession(id);
     if(s.isChannel&&!s.panelToken&&Number(ctx.chatId)>0)throw new MusicError('CHANNEL_DM_REQUIRED','Open /channel @channelname in your private chat first.');
     if(ctx.query&&!s.screenMessageId)throw new MusicError('STALE_PLAYER','That player belongs to an earlier session. Open /player.');
-    if(ctx.query && args.pop() !== (s.panelToken?Number(s.controlRevision||0).toString(36):String(s.controlRevision||0)))throw new MusicError('STALE_PLAYER','Use the latest player controls.');
+    const strictRevisionActions=new Set(['remove','mremove','clear','mclear','playnow','mplaynow','selectaccount','stop','leave']);
+    if(ctx.query){
+      const revArg = args.pop();
+      const expectedRev = s.panelToken?Number(s.controlRevision||0).toString(36):String(s.controlRevision||0);
+      if(strictRevisionActions.has(action) && revArg !== expectedRev)throw new MusicError('STALE_PLAYER','Use the latest player controls.');
+    }
     if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');
     if(['pause','resume','skip','previous'].includes(action)){
       const rootSession=qm.getSession(id);
@@ -506,7 +631,18 @@ export class MusicService {
         await this.prepare(ctx,id);
         this.assertQueueGeneration(id,generation);
       }
-      await qm[action](id);
+      try{
+        await qm[action](id);
+      }catch(err){
+        if(action==='resume'&&['NO_ACTIVE_CALL','CALL_FAILED','PERMISSION_DENIED','ASSISTANT_MEMBERSHIP'].includes(err?.code)&&typeof this.app.voiceClient?.setup==='function'){
+          const generation=this.queueGeneration(id);
+          await this.prepare(ctx,id);
+          this.assertQueueGeneration(id,generation);
+          await qm.resume(id);
+        }else{
+          throw err;
+        }
+      }
       if(ackPromise)await ackPromise;
     }
     else if(action==='voteskip'){
@@ -592,10 +728,11 @@ export class MusicService {
     }
     else if(action==='launchpoll'){
       if(typeof ctx.api?.sendPoll!=='function')throw new MusicError('POLL_UNAVAILABLE','Telegram Poll API is unavailable.');
-      const deck=s.activeDeck==='movie'?'movie':'music';
       const rootSession=qm.getSession(id);
+      const deck=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie'||(!(rootSession.upcoming||[]).length&&(rootSession.movieUpcoming||[]).length>0))?'movie':'music';
       const q=deck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
       if(!q.length&&!s.currentTrack)throw new MusicError('NOTHING_QUEUED','Queue at least one movie or track before launching a poll.');
+      const icon=deck==='movie'?'🎬':'🎵';
       const optionTargets=[];
       const optionLabels=[];
       if(s.currentTrack){
@@ -604,19 +741,21 @@ export class MusicService {
       }
       for(const item of q.slice(0,9)){
         optionTargets.push({kind:'play',entryId:item.entryId,title:item.title});
-        optionLabels.push(`🎬 ${String(item.title||'Queued Item').slice(0,90)}`);
+        optionLabels.push(`${icon} ${String(item.title||'Queued Item').slice(0,90)}`);
       }
       if(optionLabels.length<2){
         optionTargets.push({kind:'keep',title:'Keep playing'});
         optionLabels.push('🔁 Keep Current Order');
       }
-      const targetChatId=s.playerChatId||id;
+      const targetChatId=Number(id)<0?Number(id):(s.playerChatId||id);
+      const isChanPoll=Boolean(rootSession?.isChannel||s.isChannel||ctx.isChannel);
       const needed=deck==='movie'?this.getQueueVoteThreshold(id):this.getSkipVoteThreshold(id);
-      const sentPoll=await ctx.api.sendPoll(targetChatId,`🗳 Lancy Viewer Poll (${needed} votes wins!)`,optionLabels,{is_anonymous:false,allows_multiple_answers:false});
+      const sentPoll=await ctx.api.sendPoll(targetChatId,`🗳 Lancy Viewer Poll (${needed} votes wins!)`,optionLabels,{is_anonymous:isChanPoll,allows_multiple_answers:false});
       const pollId=sentPoll?.poll?.id;
       if(pollId){
         const pollRec={pollId:String(pollId),chatId:targetChatId,destination:id,messageId:sentPoll.message_id,deck,optionTargets,needed,votesByUser:new Map(),api:ctx.api};
         this.activePolls.set(String(pollId),pollRec);
+        this.app?.db?.setSetting?.(`music.activePoll.${pollId}`,{pollId:String(pollId),chatId:targetChatId,destination:id,messageId:sentPoll.message_id,deck,optionTargets,needed});
         rootSession.activePoll={pollId:String(pollId),messageId:sentPoll.message_id,needed};
       }
       s.lastNotice=`📊 Live Viewer Poll posted! First option to hit ${needed} vote(s) wins automatically.`;
@@ -628,8 +767,10 @@ export class MusicService {
       const deck=s.activeDeck==='movie'?'movie':'music';
       const rootSession=qm.getSession(id);
       let targetItem=null;
+      let explicitQuality=null;
       if(action==='downloadnow'){
         targetItem=s.currentTrack;
+        explicitQuality=args[0]||null;
       }else{
         let entryId=args[0];
         const qList=deck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
@@ -638,54 +779,68 @@ export class MusicService {
           if(matches.length===1)entryId=matches[0].entryId;
         }
         targetItem=qList.find(t=>t.entryId===entryId)||null;
+        explicitQuality=args[1]||null;
       }
       if(!targetItem)throw new MusicError('NOTHING_PLAYING','Select an active movie or episode to download.');
-      const userKey=String(ctx.tgId||ctx.chatId||'anon');
-      const activeUserDownloads=this.userDownloads.get(userKey)||0;
-      if(activeUserDownloads>=this.maxUserDownloads||this.downloads>=this.maxDownloads)throw new MusicError('DOWNLOAD_BUSY','Download queue is busy right now. Wait a few seconds and retry.');
-      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`⬇️ Preparing download: ${String(targetItem.title||'').slice(0,36)}…`}).catch(()=>{});
-      this.downloads++;
-      this.userDownloads.set(userKey,activeUserDownloads+1);
-      void (async()=>{
-        const dlCtx={...ctx,chatId:ctx.chatId||s.playerChatId||id};
-        let statusMsg=null;
-        try{
-          statusMsg=await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⬇️ Preparing <b>${String(targetItem.title||'Movie').replace(/[<>&]/g,'')}</b> for Telegram…`,{parse_mode:'HTML'}).catch(()=>null);
-          const res=await downloader.sendSingleVideo(dlCtx,targetItem,{
-            spoiler:Boolean(targetItem.isAdult&&Number(dlCtx.chatId)<0),
-            onProgress:(line)=>{
-              if(statusMsg?.message_id&&dlCtx.api?.editMessageText){
-                void dlCtx.api.editMessageText(dlCtx.chatId,statusMsg.message_id,`⬇️ ${String(line).slice(0,200)}`).catch(()=>{});
-              }
-            }
-          });
-          if(!res?.ok){
-            await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⚠️ Download could not finish: ${res?.reason||'Stream unavailable'}`).catch(()=>{});
-          }
-        }catch(err){
-          await dlCtx.api?.sendMessage?.(dlCtx.chatId,`⚠️ Download failed: ${err?.message||'Unknown error'}`).catch(()=>{});
-        }finally{
-          if(statusMsg?.message_id)await dlCtx.api?.deleteMessage?.(dlCtx.chatId,statusMsg.message_id).catch(()=>{});
-          this.downloads=Math.max(0,this.downloads-1);
-          const left=(this.userDownloads.get(userKey)||1)-1;
-          if(left<=0)this.userDownloads.delete(userKey);
-          else this.userDownloads.set(userKey,left);
+      if(!explicitQuality){
+        s.dlqTarget={action,entryId:targetItem.entryId||null,title:targetItem.title,durationSeconds:targetItem.durationSeconds||0,item:targetItem};
+        s.view='dlq';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'📦 Choose download quality (360p / 480p / 720p)'}).catch(()=>{});
+      }else{
+        s.dlqTarget=null;
+        await this.#startCinemaDownload(ctx,s,id,targetItem,explicitQuality);
+        return s;
+      }
+    }
+    else if(action==='dlq'){
+      const req=String(args[0]||'').toLowerCase();
+      const rootSession=qm.getSession(id);
+      const targetMeta=s.dlqTarget;
+      const backView=targetMeta?.action==='downloadq'?'mqueue':((s.activeDeck==='movie'||s.currentTrack?.provider==='movie')?'cinema':'player');
+      if(!req||req==='back'){
+        s.dlqTarget=null;
+        s.view=backView;
+      }else{
+        let targetItem=null;
+        if(targetMeta?.action==='downloadq'){
+          const qList=rootSession.activeDeck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
+          targetItem=qList.find(t=>t.entryId===targetMeta.entryId)||targetMeta.item||null;
+        }else{
+          targetItem=s.currentTrack||targetMeta?.item||null;
         }
-      })();
-      return s;
+        if(!targetItem)throw new MusicError('NOTHING_PLAYING','Select an active movie or episode to download.');
+        s.dlqTarget=null;
+        s.view=backView;
+        await this.#startCinemaDownload(ctx,s,id,targetItem,req);
+      }
     }
     else if(action==='stop'||action==='leave'){
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏹ Stopping playback…'}).catch(()=>{});
       qm.requestStop?.(id);await this.setup.lock.run(Number(id),()=>qm.stop(id));
     }
-    else if(action==='retry'){s.lastNotice='Preparing your queued recording…';await qm.updatePlayerCard(id);const generation=this.queueGeneration(id);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);await qm.ensurePlaying(id);s.view='player';}
+    else if(action==='retry'){s.lastNotice='Preparing your queued recording…';await qm.updatePlayerCard(id);const generation=this.queueGeneration(id);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);await qm.ensurePlaying(id);s.view=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')?'cinema':'player';}
     else if(action==='setvol'){
       const targetVol=Number(args[0]);
       await qm.setVolume(id,targetVol,{skipCardUpdate:true});
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`🔊 Volume: ${targetVol}%`}).catch(()=>{});
     }
     else if(action==='seek')await qm.seek(id,Number(args[0]));
-    else if(action==='seekby'){ if(s.positionSeconds==null)throw new MusicError('CLOCK_UNAVAILABLE','The playback clock is unavailable.'); await qm.seek(id,Math.max(0,s.positionSeconds+Number(args[0]))); }
+    else if(action==='seekby'){
+      const rootSession=qm.getSession(id);
+      const basePos=Number.isFinite(Number(rootSession.positionSeconds))
+        ? Number(rootSession.positionSeconds)
+        : (Number.isFinite(Number(s.positionSeconds)) ? Number(s.positionSeconds) : 0);
+      const delta=Number(args[0])||0;
+      const dur=Number(rootSession.currentTrack?.durationSeconds||0);
+      let targetPos=Math.max(0,basePos+delta);
+      if(dur>2&&targetPos>=dur)targetPos=Math.max(0,dur-2);
+      await qm.seek(id,targetPos);
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery){
+        const mins=Math.floor(targetPos/60);
+        const secs=String(Math.floor(targetPos%60)).padStart(2,'0');
+        await ctx.api.answerCallbackQuery(ctx.query.id,{text:`${delta>=0?'⏩':'⏪'} ${mins}:${secs}`}).catch(()=>{});
+      }
+    }
     else if(action==='shuffle'){
       qm.shuffle(id);
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🔀 Queue shuffled'}).catch(()=>{});
@@ -721,7 +876,7 @@ export class MusicService {
       if(ackPromise)await ackPromise;
       s.view='player';
     }
-    else if(['radio','rpage','rpick','rstart','roff','retry'].includes(action)){
+    else if(['radio','rpage','rpick','rstart','roff'].includes(action)){
       s.view='radio';if(action==='rpage')s.radioPage=Math.max(0,Math.min(7,Number(args[0])||0));
       if(action==='rpick'){const index=Number(args[0]);if(!RADIO_CATEGORIES[index])throw new MusicError('RADIO_SELECTION','Choose a category from this menu.');const selected=[...(s.radioSelected||[])];const at=selected.indexOf(index);if(at>=0)selected.splice(at,1);else{if(selected.length+(s.radioCustom?1:0)>=5)throw new MusicError('RADIO_SELECTION','Choose up to five categories/custom searches.');selected.push(index);}s.radioSelected=selected;}
       if(action==='roff')this.radio.stop(qm.getSession(id));
@@ -837,6 +992,33 @@ export class MusicService {
       const label=nextMode==='screen'?'Burned on VC Screen':nextMode==='live'?'Live Chat/Card Cues':'Off';
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`💬 Subtitles: ${label}`}).catch(()=>{});
     }
+    else if(action==='subsync'){
+      const op=String(args[0]||'').toLowerCase();
+      if(!op||op==='open'){
+        s.view='subsync';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'💬 Subtitle Sync & Track Controls'}).catch(()=>{});
+      }else if(op==='back'){
+        s.view=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')?'cinema':'player';
+      }else if(op==='reset'||op==='0'){
+        await qm.setSubtitleOffset(id,0,{absolute:true});
+        s.view='subsync';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏱ Subtitle timing reset to 0.0s'}).catch(()=>{});
+      }else{
+        const delta=Number(args[0]);
+        if(Number.isFinite(delta)){
+          const nextOff=await qm.setSubtitleOffset(id,delta,{absolute:false});
+          s.view='subsync';
+          if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`⏱ Subtitle sync: ${nextOff>0?`+${nextOff}`:nextOff}s`}).catch(()=>{});
+        }
+      }
+    }
+    else if(action==='subtrack'){
+      const idxArg=args[0]!==undefined?Number(args[0]):null;
+      const picked=await qm.cycleSubtitleTrack(id,Number.isInteger(idxArg)?idxArg:null);
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery){
+        await ctx.api.answerCallbackQuery(ctx.query.id,{text:picked?`🌐 Subtitle: ${picked.track?.label||`Track ${picked.index+1}`}`:'No alternate subtitle tracks on this video'}).catch(()=>{});
+      }
+    }
     else if(action==='selectaccount'){
       if(s.connected||s.prepared)throw new MusicError('ACCOUNT_BUSY','Leave the current prepared session/call before changing its account.');
       const pool=await this.app.voiceClient.accounts(id);const account=pool.accounts.find(a=>a.alias===args[0]&&a.status==='available'&&a.enabled);
@@ -855,9 +1037,89 @@ export class MusicService {
     if(action==='player'&&s.status==='stopped'){s.status='idle';s.lastError=null;}
     s.controlRevision=(s.controlRevision||0)+1; await qm.updatePlayerCard(id,{forceEdit:Boolean(ctx.query)});return s;
   }
+  #resolveActivePoll(pollId){
+    const key=String(pollId||'');
+    if(!key)return null;
+    let poll=this.activePolls.get(key);
+    if(!poll){
+      const persisted=this.app?.db?.getSetting?.(`music.activePoll.${key}`,null);
+      if(persisted&&typeof persisted==='object'){
+        const session=this.app?.musicQueueManager?.sessions?.get?.(Number(persisted.destination))||null;
+        poll={
+          ...persisted,
+          pollId:key,
+          votesByUser:new Map(),
+          api:session?.api||this.app?.telegram?.api||null
+        };
+        this.activePolls.set(key,poll);
+      }
+    }
+    return poll||null;
+  }
+  async #completePollVote(poll,winnerIndex,votesCount){
+    const winner=poll.optionTargets?.[winnerIndex];
+    if(!winner)return false;
+    const pollId=String(poll.pollId||'');
+    this.activePolls.delete(pollId);
+    this.app?.db?.setSetting?.(`music.activePoll.${pollId}`,null);
+    const qm=this.app?.musicQueueManager;
+    const s=qm?.getSession?.(poll.destination);
+    if(s)s.activePoll=null;
+    const api=poll.api||s?.api||this.app?.telegram?.api;
+    if(poll.messageId&&typeof api?.stopPoll==='function'){
+      await api.stopPoll(poll.chatId,poll.messageId).catch(()=>{});
+    }
+    if(qm&&s){
+      if(winner.kind==='skip'){
+        s.lastNotice=`📊 Viewer Poll passed (${votesCount} votes): Skipping current item!`;
+        await qm.skip(poll.destination).catch(()=>{});
+      }else if(winner.kind==='play'&&winner.entryId){
+        const mode=this.getQueueVoteAction(poll.destination);
+        s.lastNotice=`📊 Viewer Poll winner (${votesCount} votes): ${winner.title}!`;
+        const inMovie=(s.movieUpcoming||[]).some(t=>t.entryId===winner.entryId);
+        if(mode==='playnow'){
+          if(inMovie)await qm.playQueuedMovieNow(poll.destination,winner.entryId).catch(()=>{});
+          else await qm.playNow(poll.destination,winner.entryId).catch(()=>{});
+        }else if(inMovie){
+          qm.promoteMovieTrack(poll.destination,winner.entryId);
+        }else{
+          qm.promoteTrack(poll.destination,winner.entryId);
+        }
+      }
+      await qm.updatePlayerCard(poll.destination,{forceEdit:true}).catch(()=>{});
+    }
+    return true;
+  }
+  async handlePollUpdate(pollObj){
+    const pollId=String(pollObj?.id||'');
+    const poll=this.#resolveActivePoll(pollId);
+    if(!poll)return false;
+    const options=Array.isArray(pollObj?.options)?pollObj.options:[];
+    let winnerIndex=null;
+    let bestCount=poll.needed-1;
+    for(let i=0;i<options.length;i++){
+      const target=poll.optionTargets?.[i];
+      if(!target||target.kind==='keep')continue;
+      const cnt=Number(options[i]?.voter_count||0);
+      if(cnt>=poll.needed&&cnt>bestCount){
+        bestCount=cnt;
+        winnerIndex=i;
+      }
+    }
+    if(winnerIndex!==null){
+      return await this.#completePollVote(poll,winnerIndex,bestCount);
+    }
+    if(pollObj?.is_closed){
+      this.activePolls.delete(pollId);
+      this.app?.db?.setSetting?.(`music.activePoll.${pollId}`,null);
+      const s=this.app?.musicQueueManager?.getSession?.(poll.destination);
+      if(s)s.activePoll=null;
+    }
+    return true;
+  }
   async handlePollAnswer(pollAnswer){
     const pollId=String(pollAnswer?.poll_id||'');
-    const poll=this.activePolls.get(pollId);
+    const poll=this.#resolveActivePoll(pollId);
     if(!poll)return false;
     const voterId=String(pollAnswer?.user?.id||pollAnswer?.voter_chat?.id||'');
     if(!voterId)return false;
@@ -877,33 +1139,7 @@ export class MusicService {
       }
     }
     if(winnerIndex===null)return true;
-
-    const winner=poll.optionTargets[winnerIndex];
-    this.activePolls.delete(pollId);
-    const qm=this.app?.musicQueueManager;
-    const s=qm?.getSession?.(poll.destination);
-    if(s)s.activePoll=null;
-    if(poll.messageId&&typeof poll.api?.stopPoll==='function'){
-      await poll.api.stopPoll(poll.chatId,poll.messageId).catch(()=>{});
-    }
-    if(qm&&s){
-      if(winner.kind==='skip'){
-        s.lastNotice=`📊 Viewer Poll passed (${tallies.get(winnerIndex)} votes): Skipping current item!`;
-        await qm.skip(poll.destination).catch(()=>{});
-      }else if(winner.kind==='play'&&winner.entryId){
-        const mode=this.getQueueVoteAction(poll.destination);
-        s.lastNotice=`📊 Viewer Poll winner (${tallies.get(winnerIndex)} votes): ${winner.title}!`;
-        const inMovie=(s.movieUpcoming||[]).some(t=>t.entryId===winner.entryId);
-        if(mode==='playnow'){
-          if(inMovie)await qm.playQueuedMovieNow(poll.destination,winner.entryId).catch(()=>{});
-          else await qm.playNow(poll.destination,winner.entryId).catch(()=>{});
-        }else if(inMovie){
-          qm.promoteMovieTrack(poll.destination,winner.entryId);
-        }
-      }
-      await qm.updatePlayerCard(poll.destination,{forceEdit:true}).catch(()=>{});
-    }
-    return true;
+    return await this.#completePollVote(poll,winnerIndex,tallies.get(winnerIndex));
   }
   async accountCommand(ctx,args) {
     if(!this.owner(ctx)||Number(ctx.chatId)<0||ctx.isClone)throw new MusicError('OWNER_ONLY','Account-pool management is restricted to the main owner in private chat.');

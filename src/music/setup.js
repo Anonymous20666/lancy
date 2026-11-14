@@ -84,8 +84,12 @@ export class CallSetup {
           }
           if(!['administrator','creator'].includes(member.status)||member.status!=='creator'&&!hasCallRights(member))throw new MusicError('PROMOTION_FAILED','The assistant’s call-management permission could not be verified.');
         }
-        current();const result=await checked(voice.setup(id,'start',{create:true}));
+        const preSession=this.app.musicQueueManager.getSession(id);
+        const queuedTitle=preSession.currentTrack?.title||(preSession.activeDeck==='movie'?preSession.movieUpcoming?.[0]?.title:preSession.upcoming?.[0]?.title)||(preSession.movieUpcoming?.[0]?.title||preSession.upcoming?.[0]?.title)||'';
+        const vcTitle=String(queuedTitle).trim().slice(0,64)||undefined;
+        current();const result=await checked(voice.setup(id,'start',{create:true,...(vcTitle?{vc_title:vcTitle}:{})}));
         const s=this.app.musicQueueManager.getSession(id);s.destinationTitle=chat.title||String(id);s.isChannel=chat.type==='channel';s.lastError=null;s.lastNotice=result.created?'Assistant ready · a new call/broadcast was created. Add a recording to start playback.':'Assistant ready · reusing the existing call. Add a recording or use the current player.';
+        await this.app?.music?.syncSessionIdentity?.(s,ctx,chat,{bridgeInviteLink:result?.call_invite_link||null});
         return {...result,destination:id};
       }catch(error){
         if(identity&&!managed)await voice.setup(id,'release').catch(()=>{});

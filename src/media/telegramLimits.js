@@ -21,6 +21,53 @@ export const PHOTO_LIMIT_BYTES = Math.floor(10 * MB * 0.95);
 export const MIN_VIDEO_KBPS = 220;
 const AUDIO_KBPS = 96;
 
+/** Data-aware downloader quality presets (Mobile Data Saver -> Balanced -> HD). */
+export const DOWNLOAD_QUALITY_PROFILES = {
+  '360p': { id: '360p', label: '360p · Saver', short: '360p', height: 360, videoKbps: 380, audioKbps: 64, crf: 27, maxrateKbps: 520 },
+  '480p': { id: '480p', label: '480p · Balanced', short: '480p', height: 480, videoKbps: 760, audioKbps: 96, crf: 24, maxrateKbps: 1050 },
+  '720p': { id: '720p', label: '720p · HD', short: '720p', height: 720, videoKbps: 1550, audioKbps: 128, crf: 23, maxrateKbps: 2200 }
+};
+
+export function normalizeDownloadQuality(raw, fallback = '480p') {
+  const s = String(raw || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (s === '360' || s === '360p' || s === 'low' || s === 'saver') return '360p';
+  if (s === '480' || s === '480p' || s === 'med' || s === 'balanced') return '480p';
+  if (s === '720' || s === '720p' || s === 'hd' || s === 'high') return '720p';
+  return fallback;
+}
+
+/** Estimate file size (MB) from upstream variant bytes or preset target bitrate * runtime. */
+export function estimateDownloadSizeMb({
+  durationSeconds = 0,
+  quality = '480p',
+  variantBytes = null,
+  limitBytes = uploadLimitBytes()
+} = {}) {
+  const q = normalizeDownloadQuality(quality);
+  const profile = DOWNLOAD_QUALITY_PROFILES[q];
+  let estBytes = 0;
+  if (Number.isFinite(Number(variantBytes)) && Number(variantBytes) > 0) {
+    estBytes = Number(variantBytes);
+  } else {
+    const dur = Math.max(60, Number(durationSeconds) || 5400);
+    estBytes = Math.round(((profile.videoKbps + profile.audioKbps) * 1000) / 8 * dur);
+  }
+  const limitMb = Math.max(1, Math.round(limitBytes / MB));
+  const exceedsLimit = estBytes > limitBytes;
+  const rawMb = Math.max(1, Math.round(estBytes / MB));
+  const displayMb = exceedsLimit ? limitMb : rawMb;
+  return {
+    quality: q,
+    profile,
+    estimatedBytes: estBytes,
+    estimatedMb: rawMb,
+    displayMb,
+    exceedsLimit,
+    limitMb,
+    text: exceedsLimit ? `≤${limitMb}MB fit` : `~${rawMb}MB`
+  };
+}
+
 async function probeDuration(path, runner) {
   try {
     const { stdout } = await runner('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path], { timeout: 15000 });

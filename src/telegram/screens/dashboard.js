@@ -188,15 +188,16 @@ ${stickerSection}
         richButton.callback('୨୧ Help & Guide', encodeCallback('help', 'open'))
       ]);
     } else {
-      // In private chat: Full dashboard with Game Arena & Clone Bot
-      b.buttons([richButton.callback('Channel Play', encodeCallback('music', 'channels'))]);
+      // In private chat: Download-first studio dashboard (Channel Play stays inside Channels directly)
+      b.buttons([
+        richButton.callback('🎬 Download Movies', encodeCallback('music', 'moviehub'), { style: 'success' })
+      ]);
       b.buttons([
         richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
         richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
       ]);
       b.buttons([
         richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
-        richButton.callback('Player', encodeCallback('music', 'openplayer')),
         richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'))
       ]);
       b.buttons([

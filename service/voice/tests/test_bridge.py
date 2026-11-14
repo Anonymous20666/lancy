@@ -539,3 +539,318 @@ class AvSyncAndSubtitleRegressionTests(unittest.IsolatedAsyncioTestCase):
                 mic_dur = out_pcm.stat().st_size / (48000 * 2 * 2)
                 cam_dur = (out_yuv.stat().st_size / (320 * 240 * 3 // 2)) / 30.0
                 self.assertLess(abs(mic_dur - cam_dur), 0.12, f'offset={seek_off}: mic={mic_dur:.3f}s cam={cam_dur:.3f}s')
+
+
+class RestartResumeTitleAndSeekTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.client = types.SimpleNamespace(
+            get_me=AsyncMock(return_value=types.SimpleNamespace(id=55, is_bot=False)),
+            stop=AsyncMock(),
+            join_chat=AsyncMock(return_value=types.SimpleNamespace(id=-1)),
+            leave_chat=AsyncMock(),
+            invoke=AsyncMock(),
+        )
+        self.engine = types.SimpleNamespace(
+            play=AsyncMock(),
+            pause=AsyncMock(),
+            resume=AsyncMock(),
+            leave_call=AsyncMock(),
+            time=AsyncMock(return_value=0),
+            unmute=AsyncMock(),
+        )
+        async def factory(alias, session):
+            return self.client, self.engine, 55
+        self.bridge = Bridge(self.temp.name, factory=factory)
+        self.bridge.resolve_destination = AsyncMock()
+        self.bridge.native_call = AsyncMock(return_value=(types.SimpleNamespace(), types.SimpleNamespace(id=77, access_hash=888)))
+        self.bridge.ensure_publisher = AsyncMock()
+        await self.bridge.register({'alias': 'one', 'session': 'offline', 'allowed': ['-1']})
+
+    async def asyncTearDown(self):
+        await self.bridge.shutdown()
+        self.temp.cleanup()
+
+    async def test_vc_title_passed_on_create_and_edit_group_call_title(self):
+        self.bridge.auto_create_call_in_tests = True
+        self.bridge.edit_call_title_in_tests = True
+        self.bridge.native_call = AsyncMock(side_effect=[
+            (types.SimpleNamespace(), None),
+            (types.SimpleNamespace(), types.SimpleNamespace(id=101, access_hash=202)),
+            (types.SimpleNamespace(), types.SimpleNamespace(id=101, access_hash=202)),
+        ])
+        self.bridge.stream = AsyncMock()
+        media = Path(self.temp.name) / 'movie.mp4'
+        media.write_bytes(b'video')
+
+        res = await self.bridge.play({
+            'chat_id': -1,
+            'stream_url': str(media),
+            'playback_id': 'mv-1',
+            'vc_title': 'Inception (2010)',
+            'video': True,
+        })
+        self.assertTrue(res['ok'])
+        create_req = self.client.invoke.await_args_list[0].args[0]
+        self.assertEqual(type(create_req).__name__, 'CreateGroupCall')
+        self.assertEqual(create_req.title, 'Inception (2010)')
+
+        # Next track in existing call updates title via EditGroupCallTitle
+        self.bridge.auto_create_call_in_tests = False
+        self.client.invoke.reset_mock()
+        res2 = await self.bridge.play({
+            'chat_id': -1,
+            'stream_url': str(media),
+            'playback_id': 'mv-2',
+            'vc_title': 'Interstellar (2014)',
+            'video': True,
+        })
+        self.assertTrue(res2['ok'])
+        edit_req = self.client.invoke.await_args.args[0]
+        self.assertEqual(type(edit_req).__name__, 'EditGroupCallTitle')
+        self.assertEqual(edit_req.title, 'Interstellar (2014)')
+
+    async def test_start_seconds_and_unknown_duration_seek_with_unprobed_fallback(self):
+        media = Path(self.temp.name) / 'sample.mp3'
+        media.write_bytes(b'audio')
+        captured_cmds = []
+        orig_probe = MODULE.probe_media_stream_info
+        MODULE.probe_media_stream_info = AsyncMock(return_value=None)
+        try:
+            async def fake_stream(a, chat, call):
+                mic = types.SimpleNamespace(path=f'ffmpeg -y -i {media} -f s16le -ac 2 -ar 48000 pipe:1')
+                cam = types.SimpleNamespace(path=f'ffmpeg -y -i {media} -f rawvideo -r 30 -pix_fmt yuv420p pipe:1', parameters=types.SimpleNamespace(frame_rate=30, width=1280, height=720))
+                info = await MODULE.probe_media_stream_info(str(media))
+                offset_val = float(call.get('offset') or 0.0)
+                sync_pre_seek = offset_val if (offset_val > 0.05 and not info) else None
+                mic.path = MODULE.rewrite_audio_ffmpeg_command(mic.path, pre_seek=sync_pre_seek, normalize_pts=bool(sync_pre_seek))
+                cam.path = MODULE.rewrite_video_ffmpeg_command(cam.path, 1280, 720, fps=30, pre_seek=sync_pre_seek, normalize_pts=True)
+                captured_cmds.append((mic.path, cam.path))
+
+            self.bridge.stream = fake_stream
+            res = await self.bridge.play({
+                'chat_id': -1,
+                'stream_url': str(media),
+                'playback_id': 'resume-1',
+                'duration_seconds': 0,
+                'start_seconds': 325.5,
+                'video': True,
+            })
+            self.assertEqual(res['position_seconds'], 325.5)
+            self.assertEqual(self.bridge.calls[-1]['offset'], 325.5)
+            self.assertEqual(self.bridge.calls[-1]['position_seconds'], 325.5)
+            self.assertIn('-ss 325.500', captured_cmds[-1][0])
+            self.assertIn('-ss 325.500', captured_cmds[-1][1])
+
+            # Unknown duration (0) seek must still succeed and keep numeric position_seconds
+            seek_res = await self.bridge.control('seek', {'chat_id': -1, 'seconds': 90})
+            self.assertEqual(seek_res['position_seconds'], 90.0)
+            self.assertEqual(self.bridge.calls[-1]['position_seconds'], 90.0)
+            self.assertIn('-ss 90.000', captured_cmds[-1][0])
+            self.assertIn('-ss 90.000', captured_cmds[-1][1])
+        finally:
+            MODULE.probe_media_stream_info = orig_probe
+
+    async def test_call_ended_preserves_last_position_on_chat_update_and_no_active_call(self):
+        self.bridge.stream = AsyncMock()
+        media = Path(self.temp.name) / 'movie_call_end.mp4'
+        media.write_bytes(b'video')
+
+        res = await self.bridge.play({
+            'chat_id': -1,
+            'stream_url': str(media),
+            'playback_id': 'ce-1',
+            'duration_seconds': 3600,
+            'start_seconds': 500,
+            'video': True,
+        })
+        self.assertEqual(res['position_seconds'], 500)
+
+        # Simulate elapsed playback and Pause sampling exact clock before call termination
+        self.engine.time = AsyncMock(return_value=145.5)
+        await self.bridge.control('pause', {'chat_id': -1})
+        self.assertAlmostEqual(self.bridge.calls[-1]['last_known_position'], 645.5, places=1)
+
+        # Simulate external call end (ChatUpdate LEFT_CALL)
+        self.engine.time = AsyncMock(side_effect=RuntimeError('No active call'))
+        closed_pos = await self.bridge.handle_chat_update(-1, 'CLOSED_VOICE_CHAT', expected_alias='one')
+        self.assertAlmostEqual(closed_pos, 645.5, places=1)
+        self.assertNotIn(-1, self.bridge.calls)
+
+        ev = self.bridge.events.get_nowait()
+        self.assertEqual(ev['status'], 'call_ended')
+        self.assertAlmostEqual(ev['position_seconds'], 645.5, places=1)
+
+        st = await self.bridge.status(-1)
+        self.assertFalse(st['active'])
+        self.assertAlmostEqual(st['last_position_seconds'], 645.5, places=1)
+
+        # Resuming via play() clears last_ended_positions and starts at start_seconds
+        await self.bridge.play({
+            'chat_id': -1,
+            'stream_url': str(media),
+            'playback_id': 'ce-2',
+            'duration_seconds': 3600,
+            'start_seconds': st['last_position_seconds'],
+            'video': True,
+        })
+        self.assertNotIn(-1, self.bridge.last_ended_positions)
+        self.assertAlmostEqual(self.bridge.calls[-1]['offset'], 645.5, places=1)
+
+    async def test_remote_proxy_accepts_dash_mpd_hls_and_mp4_extensions_and_rejects_untrusted_urls(self):
+        self.bridge.stream = AsyncMock()
+        token = '0123456789abcdef0123456789abcdef'
+        for ext in ('', '.mpd', '.m3u8', '.mp4'):
+            url = f'http://127.0.0.1:41234/movie-proxy/{token}{ext}'
+            res = await self.bridge.play({
+                'chat_id': -1,
+                'stream_url': url,
+                'remote_proxy': True,
+                'playback_id': f'proxy{ext or "-bare"}',
+                'duration_seconds': 3697,
+                'video': True,
+            })
+            self.assertTrue(res['ok'])
+            self.assertTrue(self.bridge.calls[-1]['remote_proxy'])
+            self.assertEqual(self.bridge.calls[-1]['path'], url)
+
+        for bad_url, rp in [
+            (f'http://127.0.0.1:41234/movie-proxy/{token}.mpd', False),
+            (f'http://127.0.0.1:41234/movie-proxy/{token}.exe', True),
+            (f'http://10.0.0.5:41234/movie-proxy/{token}.mpd', True),
+            (f'http://127.0.0.1:41234/other/{token}.mpd', True),
+        ]:
+            with self.assertRaises(MODULE.VoiceFailure) as ctx:
+                self.bridge.resolve_media_input({'stream_url': bad_url, 'remote_proxy': rp})
+            self.assertEqual(ctx.exception.code, 'MEDIA_INVALID')
+
+        NoVideoSourceFound = type('NoVideoSourceFound', (Exception,), {})
+        NoAudioSourceFound = type('NoAudioSourceFound', (Exception,), {})
+        self.assertEqual(MODULE.classify(NoVideoSourceFound('no video')), 'MEDIA_INVALID')
+        self.assertEqual(MODULE.classify(NoAudioSourceFound('no audio')), 'MEDIA_INVALID')
+
+
+class ChannelAuthSubSyncAndCallInviteTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.engine = FakeEngine()
+        self.invoked = []
+
+        class _InvokeClient(FakeClient):
+            def __init__(self, owner):
+                self.owner = owner
+
+            async def invoke(self, req, **_kwargs):
+                self.owner.invoked.append(req)
+                name = type(req).__name__
+                if name == 'GetGroupCall':
+                    link = self.owner.get_call_link
+                    return types.SimpleNamespace(call=types.SimpleNamespace(invite_link=link))
+                if name == 'ExportGroupCallInvite':
+                    return types.SimpleNamespace(link=self.owner.export_call_link)
+                return types.SimpleNamespace()
+
+        self.get_call_link = 'https://t.me/publicchan?livestream=live123'
+        self.export_call_link = 'https://t.me/+privinvite?voicechat=vc789'
+        self.client = _InvokeClient(self)
+
+        async def factory(_alias, _session):
+            return self.client, self.engine, 77
+
+        self.bridge = Bridge(self.root, factory=factory)
+        self.bridge.resolve_call_invite_in_tests = True
+        self.stream_calls = []
+
+        async def fake_stream(a, chat, call):
+            self.stream_calls.append((chat, call.get('subtitle_path'), call.get('subtitle_offset')))
+            await asyncio.sleep(0.002)
+
+        self.bridge.stream = fake_stream
+        self.media = self.root / 'movie.mp4'
+        self.media.write_bytes(b'video')
+        await self.bridge.register({'alias': 'one', 'session': 'fixture', 'allowed': ['-1001']})
+
+    async def asyncTearDown(self):
+        await self.bridge.shutdown()
+        self.temp.cleanup()
+
+    async def test_shift_subtitle_signed_offset_and_prune(self):
+        vtt = self.root / 'sample.vtt'
+        vtt.write_text(
+            'WEBVTT\n\n'
+            '00:00:10.000 --> 00:00:12.000\nLine A\n\n'
+            '00:00:25.000 --> 00:00:27.000\nLine B\n',
+            encoding='utf-8',
+        )
+        early_path = Path(self.bridge.shift_subtitle(str(vtt), 0.0, 'pb-early', subtitle_offset=-2.0))
+        early_txt = early_path.read_text(encoding='utf-8')
+        self.assertIn('00:00:08,000 --> 00:00:10,000', early_txt)
+
+        late_path = Path(self.bridge.shift_subtitle(str(vtt), 10.0, 'pb-late', subtitle_offset=2.0))
+        late_txt = late_path.read_text(encoding='utf-8')
+        self.assertIn('00:00:02,000 --> 00:00:04,000', late_txt)
+
+        srt = self.root / 'sub.srt'
+        srt.write_text('1\n00:00:05,000 --> 00:00:07,000\nSubtle\n', encoding='utf-8')
+        small_path = Path(self.bridge.shift_subtitle(str(srt), 0.0, 'pb-small', subtitle_offset=0.25))
+        self.assertNotEqual(str(small_path), str(srt))
+        self.assertIn('00:00:05,250 --> 00:00:07,250', small_path.read_text(encoding='utf-8'))
+
+        self.bridge.calls[-1001] = {'playback_id': 'pb-early'}
+        self.bridge.prune_shifted_subtitles(active_playback_id='pb-early')
+        self.bridge.calls.pop(-1001, None)
+        self.assertTrue(early_path.exists())
+        self.assertFalse(late_path.exists())
+
+    async def test_control_subtitle_offset_reloads_stream(self):
+        srt = self.root / 'sync.srt'
+        srt.write_text('1\n00:00:10,000 --> 00:00:12,000\nDialog\n', encoding='utf-8')
+        res = await self.bridge.play({
+            'chat_id': -1001,
+            'stream_url': str(self.media),
+            'playback_id': 'pb-sync',
+            'duration_seconds': 300,
+            'subtitle_path': str(srt),
+            'subtitle_offset': 0.0,
+        })
+        self.assertTrue(res['ok'])
+        prior_count = len(self.stream_calls)
+        await self.bridge.control('subtitle', {
+            'chat_id': -1001,
+            'subtitle_path': str(srt),
+            'subtitle_offset': -1.5,
+        })
+        self.assertEqual(len(self.stream_calls), prior_count + 1)
+        self.assertEqual(self.bridge.calls[-1001]['subtitle_offset'], -1.5)
+        st = await self.bridge.status(-1001)
+        self.assertEqual(st['info']['subtitle_offset'], -1.5)
+
+    async def test_resolve_call_invite_link_and_http_endpoint(self):
+        native_call = types.SimpleNamespace(id=555001, access_hash=999002)
+        acct = {'client': self.client, 'alias': 'one'}
+        link1 = await self.bridge.resolve_call_invite_link(acct, native_call)
+        self.assertEqual(link1, 'https://t.me/publicchan?livestream=live123')
+
+        self.get_call_link = None
+        link2 = await self.bridge.resolve_call_invite_link(acct, native_call)
+        self.assertEqual(link2, 'https://t.me/+privinvite?voicechat=vc789')
+
+        token = 'a' * 40
+        app = make_app(self.bridge, token)
+        self.bridge.calls[-1001] = {
+            'alias': 'one',
+            'status': 'playing',
+            'playback_id': 'pb-link',
+            'native_call': native_call,
+            'call_invite_link': None,
+        }
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.get(
+                '/call/invite-link?chat_id=-1001',
+                headers={'Authorization': f'Bearer {token}'},
+            )
+            self.assertEqual(resp.status, 200)
+            payload = await resp.json()
+            self.assertTrue(payload['ok'])
+            self.assertEqual(payload['call_invite_link'], 'https://t.me/+privinvite?voicechat=vc789')
