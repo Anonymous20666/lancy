@@ -87,6 +87,19 @@ export const DEFAULT_SETTINGS = {
     whatsappPhysicalPackSize: 60     // mirrors whatsapp.physicalStickerPackLimit
   },
 
+  customEmoji: {
+    defaultPackName: '',             // Owner-editable global default pack title (fallback: Lancy branding)
+    packNameTemplate: '{name}',      // Supports {name}, {bot}, {user}, {count}
+    autoEnhance: true,               // HD sharpening/edge clarity during 100x100 encoding
+    smartBorderTrim: true,           // Trim transparent borders to maximize 100x100 icon clarity
+    hdExportFormat: 'png_doc',       // png_doc | photo | mp4 | gif
+    hdExportSize: 1024,              // 512 | 720 | 1024
+    defaultEmoji: '✨',
+    autoSuggestInDm: true,           // Reply to pure standard-emoji messages in DM with custom emoji suggestions
+    createBatchSize: 25,             // Initial InputSticker batch size in createNewStickerSet (falls back to 1 safely)
+    addDelayMs: 40                   // Fast-safe pacing between remaining addStickerToSet calls
+  },
+
   captions: {
     defaultTemplate: 'aesthetic',
     creatorFooter: '†🤍🌷𝗟𝗔𝗡𝗖𝗬❀ 𝗔𝗦𝗧𝗛𝗘𝗧𝗜𝗖✿ 𝗦𝗧𝗜𝗖𝗞𝗘𝗥𝗦🌸†',

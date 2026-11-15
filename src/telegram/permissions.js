@@ -11,6 +11,110 @@ const channelAdminCache = new WeakMap();
 const CHANNEL_ADMIN_CACHE_TTL_MS = 45 * 1000;
 const SYSTEM_PSEUDO_SENDER_IDS = new Set([136817688, 1087968824, 777000]);
 
+/**
+ * Normalize an array or comma-separated string of Telegram user IDs into positive safe integers.
+ */
+export function parseIdList(raw) {
+  if (!raw) return [];
+  const items = Array.isArray(raw) ? raw : String(raw).split(',');
+  return items
+    .map((v) => Number(String(v).trim()))
+    .filter((n) => Number.isSafeInteger(n) && n > 0);
+}
+
+function resolveSettingsObj(settingsOrApp) {
+  if (!settingsOrApp) return null;
+  if (typeof settingsOrApp.get === 'function') return settingsOrApp;
+  if (typeof settingsOrApp.settings?.get === 'function') return settingsOrApp.settings;
+  return null;
+}
+
+/**
+ * Return the set of configured Bot Owner IDs (OWNER_IDS + general.ownerIds).
+ */
+export function getBotOwnerIds(settingsOrApp = null) {
+  const settings = resolveSettingsObj(settingsOrApp);
+  return new Set([
+    ...parseIdList(process.env.OWNER_IDS),
+    ...parseIdList(settings?.get?.('general.ownerIds'))
+  ]);
+}
+
+/**
+ * Return the set of configured Bot Super Admin IDs (telegram.adminIds, falling back to ADMIN_IDS env).
+ */
+export function getBotAdminIds(settingsOrApp = null) {
+  const settings = resolveSettingsObj(settingsOrApp);
+  const fromSettings = settings?.get?.('telegram.adminIds');
+  if (Array.isArray(fromSettings)) {
+    return new Set(parseIdList(fromSettings));
+  }
+  return new Set(parseIdList(process.env.ADMIN_IDS));
+}
+
+/**
+ * Return all Bot Super Admin IDs (Bot Owners + Bot Team Admins).
+ */
+export function getBotSuperAdminIds(settingsOrApp = null) {
+  return new Set([
+    ...getBotOwnerIds(settingsOrApp),
+    ...getBotAdminIds(settingsOrApp)
+  ]);
+}
+
+/**
+ * True if the user is a Bot Owner (including clone owner if controller provided) or Team Super Admin.
+ */
+export function isBotSuperAdmin(settingsOrApp, tgId, { controller = null } = {}) {
+  const uid = Number(tgId);
+  if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+  if (typeof controller?.isOwner === 'function' && controller.isOwner(uid)) return true;
+  if (typeof controller?.isMainOwner === 'function' && controller.isMainOwner(uid)) return true;
+  return getBotSuperAdminIds(settingsOrApp).has(uid);
+}
+
+/**
+ * True if a group chat member record represents a group creator or full-privilege Super Admin.
+ * Plain moderators (status === 'administrator' without can_promote_members) return false.
+ */
+export function isGroupSuperAdminMember(member) {
+  if (!member) return false;
+  if (member.status === 'creator') return true;
+  return member.status === 'administrator' && member.can_promote_members === true;
+}
+
+/**
+ * True if an incoming group/supergroup message was posted by an Anonymous Group Admin (@GroupAnonymousBot).
+ */
+export function isAnonymousGroupAdmin(source, chatId) {
+  if (!source || source.data !== undefined) return false;
+  const msg = source.message || source;
+  const type = msg?.chat?.type;
+  if (type !== 'group' && type !== 'supergroup') return false;
+  if (Number(msg?.from?.id) !== 1087968824) return false;
+  return Number(msg?.sender_chat?.id) === Number(chatId);
+}
+
+/**
+ * Invalidate cached positive channel admin lookups when roles change or bot/member updates arrive.
+ */
+export function invalidateChannelAdminCache(api, chatId = null, userId = null) {
+  const perApi = api ? channelAdminCache.get(api) : null;
+  if (!perApi) return;
+  if (chatId == null) {
+    perApi.clear();
+    return;
+  }
+  const prefix = `${Number(chatId)}:`;
+  if (userId != null) {
+    perApi.delete(`${prefix}${Number(userId)}`);
+    return;
+  }
+  for (const k of perApi.keys()) {
+    if (k.startsWith(prefix)) perApi.delete(k);
+  }
+}
+
 // In-memory storage for pending deep-link downloads (token -> { url, createdAt })
 const pendingDownloads = new Map();
 const DL_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -303,7 +407,8 @@ export function formatMediaRestrictedNotice({
 
 /**
  * Determine whether an update represents a genuine anonymous Telegram channel post
- * authored by a channel admin (Telegram omits `from` and sets `sender_chat.id === chat.id`).
+ * authored by a channel admin (Telegram omits `from` and sets `sender_chat.id === chat.id`,
+ * or omits `sender_chat` on raw `channel_post` updates).
  */
 export function isNativeChannelPost(source, { isChannelPost = false } = {}) {
   if (!source || source.data !== undefined) return false; // Never for callback_query
@@ -312,8 +417,12 @@ export function isNativeChannelPost(source, { isChannelPost = false } = {}) {
   if (chat?.type !== 'channel') return false;
   if (msg.from) return false;
   if (msg.is_automatic_forward) return false;
-  if (!isChannelPost && !source.channel_post && !source.edited_channel_post && msg.sender_chat?.id == null) {
+  const rawChannelUpdate = Boolean(isChannelPost || source.channel_post || source.edited_channel_post);
+  if (!rawChannelUpdate && msg.sender_chat?.id == null) {
     return false;
+  }
+  if (rawChannelUpdate && msg.sender_chat?.id == null) {
+    return true;
   }
   return Number(msg.sender_chat?.id) === Number(chat.id);
 }
@@ -364,13 +473,179 @@ export async function verifyChannelAdmin({
   try {
     const member = await api.getChatMember(numChatId, uid);
     const ok = Boolean(member && (member.status === 'creator' || member.status === 'administrator'));
-    perApi.set(cacheKey, {
-      ok,
-      expiresAt: Date.now() + (ok ? CHANNEL_ADMIN_CACHE_TTL_MS : 10_000)
-    });
+    if (ok) {
+      perApi.set(cacheKey, {
+        ok: true,
+        expiresAt: Date.now() + CHANNEL_ADMIN_CACHE_TTL_MS
+      });
+    } else {
+      // Never cache negative status so newly promoted channel admins gain access immediately.
+      perApi.delete(cacheKey);
+    }
     return ok;
   } catch (err) {
     log.debug({ err: err?.message, chatId: numChatId, uid }, 'channel admin check failed (fail-closed)');
     return false;
   }
+}
+
+/**
+ * Verify that the ACTIVE bot (main or clone) is an administrator/creator of a Telegram channel
+ * AND has permission to post messages (`can_post_messages !== false`).
+ * Also rejects non-channel chats (`chat.type !== 'channel'`).
+ */
+export async function verifyBotCanPostInChannel(api, chatOrInput) {
+  if (!api?.getChat || !api?.getMe || !api?.getChatMember) {
+    return { ok: false, reason: 'missing_api', canPost: false };
+  }
+  const chat = (chatOrInput && typeof chatOrInput === 'object' && chatOrInput.id)
+    ? chatOrInput
+    : await api.getChat(chatOrInput);
+  if (!chat?.id) {
+    return { ok: false, reason: 'chat_not_found', canPost: false };
+  }
+  if (chat.type !== 'channel') {
+    return { ok: false, reason: 'not_a_channel', chat, canPost: false };
+  }
+  const me = api.me || await api.getMe();
+  if (!me?.id) {
+    return { ok: false, reason: 'bot_identity_unavailable', chat, canPost: false };
+  }
+  const member = await api.getChatMember(chat.id, me.id);
+  const isCreator = member?.status === 'creator';
+  const isAdmin = member?.status === 'administrator';
+  const canPost = Boolean(isCreator || (isAdmin && member?.can_post_messages !== false));
+  if (!isCreator && !isAdmin) {
+    return {
+      ok: false,
+      reason: 'bot_not_admin',
+      botId: String(me.id),
+      botUsername: me.username || null,
+      chat,
+      isAdmin: false,
+      canPost: false
+    };
+  }
+  if (!canPost) {
+    return {
+      ok: false,
+      reason: 'missing_post_permission',
+      botId: String(me.id),
+      botUsername: me.username || null,
+      chat,
+      isAdmin: true,
+      canPost: false
+    };
+  }
+  return {
+    ok: true,
+    reason: 'ok',
+    botId: String(me.id),
+    botUsername: me.username || null,
+    chat,
+    isAdmin: true,
+    canPost: true
+  };
+}
+
+/**
+ * Return all known Telegram channels in `tg_channels` that `userId` is currently verified
+ * to administer (any creator/administrator or Bot Super Admin), regardless of who originally added the bot.
+ * Optionally attaches live/stored per-bot `botVerified` status when `db` + `api` are provided.
+ */
+export async function listVerifiedAdminChannels({
+  db = null,
+  api = null,
+  settings = null,
+  controller = null,
+  userId = null,
+  isSuperAdmin = null,
+  botId = null
+} = {}) {
+  const allChannels = db?.getTelegramChannels?.() || [];
+  if (!allChannels.length) return [];
+
+  let resolvedBotId = botId ? String(botId) : (api?.me?.id ? String(api.me.id) : null);
+  if (!resolvedBotId && api?.getMe) {
+    const me = await api.getMe().catch(() => null);
+    if (me?.id) {
+      resolvedBotId = String(me.id);
+      if (!api.me) api.me = me;
+    }
+  }
+  const botLedger = new Map(
+    (resolvedBotId && db?.getBotChannelVerifications ? db.getBotChannelVerifications(resolvedBotId) : [])
+      .map((row) => [Number(row.channel_id), row])
+  );
+  const attachBotStatus = (ch) => {
+    const entry = botLedger.get(Number(ch.channel_id));
+    if (!entry) return { ...ch, botVerified: resolvedBotId ? null : undefined };
+    return {
+      ...ch,
+      botVerified: Boolean(entry.is_admin && entry.can_post),
+      botCanPost: Boolean(entry.can_post),
+      botUsername: entry.bot_username || api?.me?.username || null
+    };
+  };
+
+  const uid = Number(userId);
+  const superAdmin = isSuperAdmin != null
+    ? Boolean(isSuperAdmin)
+    : isBotSuperAdmin(settings, uid, { controller });
+  if (superAdmin) return allChannels.map(attachBotStatus);
+
+  if (!Number.isSafeInteger(uid) || uid <= 0) return [];
+  if (!api?.getChatMember) {
+    // Offline fallback only when no Telegram API client exists
+    return (db?.getTelegramChannels?.(uid) || []).map(attachBotStatus);
+  }
+
+  const adminIds = getBotAdminIds(settings);
+  const isOwnerFn = controller ? (id) => controller.isOwner(id) : null;
+  const checks = await Promise.all(
+    allChannels.map(async (ch) => {
+      const ok = await verifyChannelAdmin({
+        chatId: ch.channel_id,
+        fromUser: { id: uid },
+        api,
+        isOwner: isOwnerFn,
+        adminIds
+      });
+      return ok ? attachBotStatus(ch) : null;
+    })
+  );
+  return checks.filter(Boolean);
+}
+
+/**
+ * Verify whether `userId` may select/toggle `channelId` inside channel-management menus.
+ * Mirrors `listVerifiedAdminChannels` offline fallback when `api.getChatMember` is unavailable.
+ */
+export async function canAccessChannelInMenu({
+  db = null,
+  api = null,
+  settings = null,
+  controller = null,
+  userId = null,
+  channelId = null,
+  fromUser = null
+} = {}) {
+  const uid = Number(userId);
+  const cid = Number(channelId);
+  if (!Number.isSafeInteger(cid)) return false;
+  if (isBotSuperAdmin(settings, uid, { controller })) return true;
+  if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+  if (!api?.getChatMember) {
+    const fallback = db?.getTelegramChannels?.(uid) || [];
+    return fallback.some((ch) => Number(ch.channel_id) === cid);
+  }
+  const adminIds = getBotAdminIds(settings);
+  const isOwnerFn = controller ? (id) => controller.isOwner(id) : null;
+  return await verifyChannelAdmin({
+    chatId: cid,
+    fromUser: fromUser || { id: uid },
+    api,
+    isOwner: isOwnerFn,
+    adminIds
+  });
 }

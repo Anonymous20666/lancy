@@ -45,7 +45,7 @@ function saveSpotifyCollection(key, data, db = null) {
       album: data.album || null,
       year: data.year || null,
       totalTracks: data.totalTracks || (data.tracks?.length || 0),
-      tracks: Array.isArray(data.tracks) ? data.tracks.slice(0, 100) : [],
+      tracks: Array.isArray(data.tracks) ? data.tracks : [],
       description: data.description || null,
       requestedBy: data.requestedBy || null
     };
@@ -127,7 +127,7 @@ function saveMediaImages(key, items) {
   }
   imageStickerCache.set(key, items);
   try {
-    const maxCount = Math.min(items.length, 100);
+    const maxCount = items.length;
     for (let i = 0; i < maxCount; i++) {
       writeFileSync(join(tmpdir(), `lancy_img_${key}_${i}.jpg`), items[i].buffer);
     }
@@ -174,7 +174,7 @@ function saveAlbum(key, data) {
     };
     writeFileSync(join(tmpdir(), `lancy_album_${key}_meta.json`), JSON.stringify(meta));
     if (Array.isArray(data.mediaItems)) {
-      const maxSave = Math.min(data.mediaItems.length, 100);
+      const maxSave = data.mediaItems.length;
       for (let i = 0; i < maxSave; i++) {
         const item = data.mediaItems[i];
         const ext = item.type === 'video' ? 'mp4' : 'jpg';

@@ -120,6 +120,18 @@ export class SettingsManager extends EventEmitter {
     return this.set(path, value);
   }
 
+  /** Clear a per-user override so the user falls back to the bot/owner global default. */
+  resetForUser(userId, path) {
+    if (userId != null) {
+      this.db.deleteUserSetting(Number(userId), path);
+      this.db.audit(Number(userId), 'settings.user_reset', { path });
+      const category = path.split('.')[0];
+      this.emit('change:user', { userId, path, value: this.get(path), category });
+      return { applied: true, hotReloaded: true, reset: true };
+    }
+    return { applied: false };
+  }
+
   /**
    * Set a value. Returns { applied, hotReloaded, restartRequired }.
    * Never pretends: restart-required paths are only marked, not applied

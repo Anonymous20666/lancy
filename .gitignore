@@ -4,6 +4,7 @@ node_modules/
 vendor/
 logs/
 *.log
+unknown_errors.txt
 .env
 *.db
 *.db-*

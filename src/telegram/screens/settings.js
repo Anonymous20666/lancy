@@ -16,6 +16,7 @@ const CATEGORIES = [
   ['whatsapp', '♡ WhatsApp'],
   ['pinterest', '✦ Pinterest'],
   ['stickers', '★ Stickers'],
+  ['customEmoji', '✨ Custom Emojis'],
   ['captions', '♡ Captions'],
   ['ai', '✦ AI'],
   ['media', '🖼 Media'],
@@ -65,6 +66,15 @@ const EDITABLE = {
     ['stickers.defaultStickerAmount', 'Default amount (e.g. 60)'],
     ['stickers.telegramFormat', 'Format (static/video)'],
     ['stickers.telegramStickersPerSet', 'TG stickers per set (max 120)']
+  ],
+  customEmoji: [
+    ['customEmoji.defaultPackName', 'Global default emoji pack name'],
+    ['customEmoji.packNameTemplate', 'Pack title template ({name}, {bot}, {user})'],
+    ['customEmoji.autoEnhance', 'Auto HD sharpen (true/false)'],
+    ['customEmoji.smartBorderTrim', 'Smart trim padding (true/false)'],
+    ['customEmoji.hdExportFormat', 'Reverse HD format (png_doc/photo/mp4/gif)'],
+    ['customEmoji.hdExportSize', 'Reverse HD resolution (512/720/1024)'],
+    ['customEmoji.defaultEmoji', 'Fallback emoji char']
   ],
   captions: [
     ['captions.defaultTemplate', 'Default template'],

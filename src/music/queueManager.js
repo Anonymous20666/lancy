@@ -1,15 +1,16 @@
 import { audioUpload, audioFileId } from './preview.js';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { basename } from 'node:path';
 import { logger } from '../core/logger.js';
-import { getCueAt } from '../media/subtitles.js';
+import { getCueAt, mapMediaSecToSubMs } from '../media/subtitles.js';
 import { KeyedLock, MusicError, queueEntry } from './model.js';
 
 /** Sole owner of ephemeral destination queues. The bridge exclusively owns account leases. */
 export class QueueManager extends EventEmitter {
   constructor({ app, voiceClient, db, log, idleTimeoutMs = Number(process.env.MUSIC_IDLE_SECONDS || 600) * 1000, pollMs = 1000 } = {}) {
-    super(); this.app = app; this.voice = voiceClient; this.db = db;
+    super(); this.app = app; this.voice = voiceClient; this.db = db || app?.db;
     this.log = log || logger().child({ module: 'music-queue' }); this.sessions = new Map(); this.locks = new KeyedLock(); this.cardLocks = new KeyedLock(); this.closed = false;
     if (!Number.isFinite(idleTimeoutMs) || idleTimeoutMs <= 0) throw new MusicError('INVALID_CONFIGURATION', 'Music idle timeout must be a positive duration.');
     this.idleTimeoutMs = idleTimeoutMs;this.prefetchJobs=0;this.prefetchWork=new Set();this.radioRefillInFlight=new Set();this.eventJobs=new Set();this.eventAbort=new AbortController();
@@ -19,9 +20,20 @@ export class QueueManager extends EventEmitter {
   }
   async watchEvents(){
     while(!this.closed){
-      try{const result=await this.voice.waitEvent(this.eventAbort.signal);if(this.closed)return;for(const event of result.events||[]){if(this.eventJobs.size>=16)continue;if(event.status==='ended'){const job=this.handleStreamEnded(event.chat_id,event.playback_id).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.status==='call_ended'){const job=this.handleCallEnded(event.chat_id,event.playback_id,event.position_seconds).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}}}
+      try{const result=await this.voice.waitEvent(this.eventAbort.signal);if(this.closed)return;for(const event of result.events||[]){if(this.eventJobs.size>=16)continue;if(event.status==='ended'){const job=this.handleStreamEnded(event.chat_id,event.playback_id).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.status==='call_ended'){const job=this.handleCallEnded(event.chat_id,event.playback_id,event.position_seconds).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_message'){const job=this.handleVcMessage(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}}}
       catch{if(this.closed)return;await new Promise(resolve=>{const timer=setTimeout(resolve,3000);timer.unref?.();});}
     }
+  }
+  getDeckStreamMode(id, deck = 'music') {
+    const d = deck === 'movie' ? 'movie' : 'music';
+    const deckVal = this.db?.getSetting?.(`music.streamMode.${d}.${id}`, null);
+    if (deckVal === 'rtmp' || deckVal === 'interactive') return deckVal;
+    if (d === 'music') {
+      const legacy = this.db?.getSetting?.(`music.streamMode.${id}`, null);
+      if (legacy === 'rtmp' || legacy === 'interactive') return legacy;
+      return 'interactive';
+    }
+    return 'rtmp';
   }
   getSession(chatId) {
     const id = Number(chatId);
@@ -32,15 +44,28 @@ export class QueueManager extends EventEmitter {
       const savedBass = this.db?.getSetting?.(`music.bass.${id}`, null);
       const savedEq = this.db?.getSetting?.(`music.eq.${id}`, null);
       const savedSubMode = this.db?.getSetting?.(`music.submode.${id}`, null);
-      const savedSubOffset = Number(this.db?.getSetting?.(`music.suboffset.${id}`, 0) || 0);
+      const musicStreamMode = this.getDeckStreamMode(id, 'music');
+      const movieStreamMode = this.getDeckStreamMode(id, 'movie');
+      const savedSeekStep = Number(this.db?.getSetting?.(`music.seekstep.${id}`, 0) || 0);
       const defaultBass = savedBass !== null && savedBass !== undefined ? Boolean(savedBass) : true;
       const defaultEq = savedEq || (defaultBass ? 'bass' : 'off');
       this.sessions.set(id, {
         chatId: id, status: 'idle', currentTrack: null, upcoming: [], history: [], movieUpcoming: [], movieHistory: [], activeDeck: 'music', loopMode: 'off', volume: 100, isChannel: false,
-        screenMessageId: null, playerChatId: id, pinned: false, pinnedMessageId: null, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null, lastKnownPositionSeconds: 0, callEnded: false,
+        screenMessageId: null, playerChatId: id, pinned: false, pinnedMessageId: null, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null, lastKnownPositionSeconds: 0, positionUpdatedAt: 0, callEnded: false,
         connected: false, accountAlias: null, preferredAccount: null, lastError: null, view: 'player', page: 0, bass: defaultBass, eqPreset: defaultEq,
-        subtitleMode: ['screen', 'live', 'off'].includes(savedSubMode) ? savedSubMode : 'screen',
-        subtitleSyncOffset: Number.isFinite(savedSubOffset) ? Math.max(-15, Math.min(15, savedSubOffset)) : 0,
+        streamMode: musicStreamMode,
+        userStreamMode: musicStreamMode,
+        musicStreamMode,
+        movieStreamMode,
+        seekStepSeconds: (Number.isFinite(savedSeekStep) && savedSeekStep >= 5 && savedSeekStep <= 600) ? Math.round(savedSeekStep) : null,
+        subtitleMode: ['screen', 'live', 'vc', 'off'].includes(savedSubMode) ? savedSubMode : 'screen',
+        _vcMsgRateBySender: new Map(), _lastVcMsgAt: 0, _lastVcSubText: '', _lastVcSubSentAt: 0,
+        subtitleSyncOffset: 0,
+        subtitleAutoOffset: null,
+        subtitleAutoVerified: false,
+        subtitleSyncStatus: null,
+        subtitleDriftRate: 0,
+        subtitleDriftAnchor: 0,
         subtitleTrackIndex: 0,
         liveSubCue: '',
         skipVotes: [],
@@ -63,23 +88,29 @@ export class QueueManager extends EventEmitter {
   #deckForTrack(track) { return track?.provider === 'movie' ? 'movie' : 'music'; }
   #deckQueue(s, deck) { return deck === 'movie' ? s.movieUpcoming : s.upcoming; }
   #deckHistory(s, deck) { return deck === 'movie' ? s.movieHistory : s.history; }
-  enqueue(id, track, { top = false } = {}) {
-    if (track?.provider === 'movie') return this.enqueueMovie(id, track, { top });
+  enqueue(id, track, { top = false, skipSnapshot = false } = {}) {
+    if (track?.provider === 'movie') return this.enqueueMovie(id, track, { top, skipSnapshot });
     if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
-    const s = this.getSession(id); if (s.upcoming.length >= 100) throw new MusicError('QUEUE_FULL', 'This destination has reached its 100-track queue limit.');
+    const s = this.getSession(id);
     this.#cancelIdle(s); const entry = queueEntry(track); top ? s.upcoming.unshift(entry) : s.upcoming.push(entry);
-    if (s.status === 'playing' && s.activeDeck !== 'movie') this.prefetch(s);
-    else for (const u of s.upcoming.slice(0, 3)) this.#warmTrack(s, u);
-    this.#savePlaybackSnapshot(s);
-    this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.upcoming.length, total: s.upcoming.length, track: entry };
+    if (!skipSnapshot) {
+      if (s.status === 'playing' && s.activeDeck !== 'movie') this.prefetch(s);
+      else for (const u of s.upcoming.slice(0, 3)) this.#warmTrack(s, u);
+      this.#savePlaybackSnapshot(s);
+      this.emit('queue_updated', { chatId: s.chatId, session: s });
+    }
+    return { position: top ? 1 : s.upcoming.length, total: s.upcoming.length, track: entry };
   }
-  enqueueMovie(id, track, { top = false } = {}) {
+  enqueueMovie(id, track, { top = false, skipSnapshot = false } = {}) {
     if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
-    const s = this.getSession(id); if (s.movieUpcoming.length >= 100) throw new MusicError('QUEUE_FULL', 'Cinema queue has reached its 100-item limit.');
+    const s = this.getSession(id);
     this.#cancelIdle(s); const entry = queueEntry({ ...track, provider: 'movie', mediaType: 'video' });
     top ? s.movieUpcoming.unshift(entry) : s.movieUpcoming.push(entry);
-    this.#savePlaybackSnapshot(s);
-    this.emit('queue_updated', { chatId: s.chatId, session: s }); return { position: top ? 1 : s.movieUpcoming.length, total: s.movieUpcoming.length, track: entry };
+    if (!skipSnapshot) {
+      this.#savePlaybackSnapshot(s);
+      this.emit('queue_updated', { chatId: s.chatId, session: s });
+    }
+    return { position: top ? 1 : s.movieUpcoming.length, total: s.movieUpcoming.length, track: entry };
   }
   #trackAcquireOptions(s, entry) {
     return {
@@ -113,8 +144,12 @@ export class QueueManager extends EventEmitter {
     }
     const generation=this.getSession(id).stopGeneration||0;
     return this.locks.run(Number(id), async () => {
-      const s = this.getSession(id);if((s.stopGeneration||0)!==generation)throw new MusicError('ACTION_CANCELLED','This queue request was cancelled by Stop.');if(s.stopPending)throw new MusicError('DEPARTURE_PENDING','Wait for call/group departure to be confirmed, then run /vc to start again.'); if (s.upcoming.length + tracks.length > 100) throw new MusicError('QUEUE_FULL', 'There is not enough room in the queue for this selection.');
-      const result = tracks.map(t => this.enqueue(id, t));
+      const s = this.getSession(id);if((s.stopGeneration||0)!==generation)throw new MusicError('ACTION_CANCELLED','This queue request was cancelled by Stop.');if(s.stopPending)throw new MusicError('DEPARTURE_PENDING','Wait for call/group departure to be confirmed, then run /vc to start again.');
+      const result = tracks.map(t => this.enqueue(id, t, { skipSnapshot: true }));
+      if (s.status === 'playing' && s.activeDeck !== 'movie') this.prefetch(s);
+      else for (const u of s.upcoming.slice(0, 3)) this.#warmTrack(s, u);
+      this.#savePlaybackSnapshot(s);
+      this.emit('queue_updated', { chatId: s.chatId, session: s });
       if (!['playing','paused','buffering'].includes(s.status)) {
         s.activeDeck = 'music';
         if (s.view === 'cinema' || s.view === 'mqueue') s.view = 'player';
@@ -132,20 +167,24 @@ export class QueueManager extends EventEmitter {
       const s = this.getSession(id);
       if ((s.stopGeneration || 0) !== generation) throw new MusicError('ACTION_CANCELLED', 'This Cinema request was cancelled by Stop.');
       if (s.stopPending) throw new MusicError('DEPARTURE_PENDING', 'Wait for call/group departure to be confirmed, then run /vc to start again.');
-      if (s.movieUpcoming.length + list.length > 100) throw new MusicError('QUEUE_FULL', 'Cinema queue has reached its 100-item limit.');
       let result;
       if (playNow) {
         result = [];
         for (let i = list.length - 1; i >= 0; i--) {
-          result.unshift(this.enqueueMovie(id, list[i], { top: true }));
+          result.unshift(this.enqueueMovie(id, list[i], { top: true, skipSnapshot: true }));
         }
       } else {
-        result = list.map(t => this.enqueueMovie(id, t));
+        result = list.map(t => this.enqueueMovie(id, t, { skipSnapshot: true }));
       }
+      this.#savePlaybackSnapshot(s);
+      this.emit('queue_updated', { chatId: s.chatId, session: s });
       const hadActive = ['playing', 'paused', 'buffering'].includes(s.status) && Boolean(s.currentTrack);
       if (playNow || !hadActive) {
         s.activeDeck = 'movie';
         s.view = 'cinema';
+        const movMode = this.getDeckStreamMode(id, 'movie');
+        s.streamMode = movMode;
+        s.movieStreamMode = movMode;
         this.dropPrefetch(s);
         await this.#next(s, {
           manual: true,
@@ -309,9 +348,33 @@ export class QueueManager extends EventEmitter {
         if(this.closed||(s.stopGeneration||0)!==cancel){media?.release();return null;}
         const track=media?{...media.track,entryId:entry.entryId,requester:entry.requester}:entry;
         if(wantsVideo&&track.capabilities)track.capabilities={...track.capabilities,video:true};
-        const rawSource=track.filePath||track.streamUrl||track.audioUrl;if(!rawSource)throw new MusicError('NO_SOURCE','This track has no playable media.');
+        const staleAdultStream = Boolean(
+          !track.filePath &&
+          track.isAdult &&
+          track.pageUrl &&
+          (!track.streamUrl || !track.streamResolvedAt || (Date.now() - Number(track.streamResolvedAt) > 90 * 60 * 1000))
+        );
+        if(staleAdultStream && typeof this.app?.adultCatalog?.resolveStream === 'function'){
+          const resolvedAdult = await this.app.adultCatalog.resolveStream(track).catch(() => null);
+          if(resolvedAdult?.streamUrl){
+            track.streamUrl = resolvedAdult.streamUrl;
+            track.videoUrl = resolvedAdult.streamUrl;
+            track.isHls = Boolean(resolvedAdult.isHls);
+            track.streamHeaders = { ...(track.streamHeaders || {}), ...(resolvedAdult.headers || {}) };
+            track.streamResolvedAt = Date.now();
+            if(resolvedAdult.durationSeconds && !track.durationSeconds) track.durationSeconds = resolvedAdult.durationSeconds;
+          }
+        }
+        const rawSource=track.filePath||track.streamUrl||track.videoUrl||track.audioUrl;if(!rawSource)throw new MusicError('NO_SOURCE','This track has no playable media.');
+        if(!track.streamUrl && track.videoUrl && /^https?:\/\//i.test(track.videoUrl)) track.streamUrl = track.videoUrl;
         let source=rawSource;
         let remoteProxy=false;
+        const isMovieTrack=targetDeck==='movie' || track?.provider==='movie';
+        const deckKey=isMovieTrack ? 'movie' : 'music';
+        const streamMode=this.getDeckStreamMode(s.chatId, deckKey);
+        s.streamMode=streamMode;
+        if(isMovieTrack)s.movieStreamMode=streamMode; else s.musicStreamMode=streamMode;
+        const videoQuality=(isMovieTrack || streamMode==='rtmp') ? 'FHD_1080p' : (process.env.VOICE_VIDEO_QUALITY || 'HD_720p');
         if(!track.filePath && track.streamUrl && /^https?:\/\//i.test(track.streamUrl) && typeof this.app?.videoServer?.registerRemoteStream==='function'){
           const isDash = Boolean(track.isDash || track.format === 'dash' || /\.mpd(\?|$)/i.test(track.streamUrl));
           const isHls = !isDash && Boolean(track.isHls || track.format === 'hls' || /\.m3u8(\?|$)/i.test(track.streamUrl));
@@ -320,25 +383,29 @@ export class QueueManager extends EventEmitter {
             headers:track.streamHeaders||{},
             isHls,
             isDash,
+            maxHeight:(isMovieTrack || streamMode==='rtmp') ? 1080 : 720,
+            preferredAudioLang: track.preferredAudioLang || null,
             contentType: isDash ? 'application/dash+xml' : isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'
           });
           if(proxied){source=proxied;remoteProxy=true;}
         }
         const subMode=s.subtitleMode||'screen';
-        const subtitlePath=subMode==='screen' && track.subtitlePath && existsSync(track.subtitlePath)?track.subtitlePath:null;
-        const subtitleOffset=Number(s.subtitleSyncOffset||0)||0;
+        const subtitlePath=['screen', 'vc'].includes(subMode) && track.subtitlePath && existsSync(track.subtitlePath)?track.subtitlePath:null;
+        const subtitleSameRoute=subtitlePath ? this.#isSameRouteSub(track, subtitlePath) : false;
+        const subtitleOffset=track.subtitlePath && existsSync(track.subtitlePath) ? this.#readTrackSubOffset(track, track.subtitlePath) : 0;
         const playbackId=randomUUID();calledNative=true;
         const eq=s.eqPreset||(s.bass?'bass':'off');
         const isVideo=track.mediaType==='video';
         const startSeconds=Math.max(0, Number(entry.startOffsetSeconds ?? entry.resumePositionSeconds ?? 0) || 0);
         const vcTitle=String(track.title||'').trim().slice(0, 64) || undefined;
-        const playOpts={isChannel:s.isChannel,video:isVideo,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset};
+        const volume=Number.isFinite(Number(s.volume)) ? Number(s.volume) : 100;
+        const playOpts={isChannel:s.isChannel,video:isVideo,videoQuality,volume,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset,subtitleSameRoute,streamMode,preferredAudioLang:track.preferredAudioLang||null,rejectDub:Boolean(track.preferredAudioLang)};
         let r;
         try {
           r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
         } catch(playErr) {
           if(['NO_ACTIVE_CALL','CALL_FAILED'].includes(playErr?.code)&&typeof this.voice?.setup==='function'){
-            const setupRes=await this.voice.setup(s.chatId,'start',{create:true,account_alias:s.preferredAccount||s.accountAlias||undefined,vc_title:vcTitle}).catch(()=>null);
+            const setupRes=await this.voice.setup(s.chatId,'start',{create:true,account_alias:s.preferredAccount||s.accountAlias||undefined,vc_title:vcTitle,stream_mode:streamMode}).catch(()=>null);
             if(setupRes?.call_invite_link){s.callInviteLink=setupRes.call_invite_link;s.vcUrl=setupRes.call_invite_link;}
             r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
           } else if(playErr?.code==='RATE_LIMITED'&&this.app?.musicProviders?.adapters){
@@ -360,7 +427,14 @@ export class QueueManager extends EventEmitter {
         }
         s.suppressHistoryOnce=false;
         const trackIdx=Array.isArray(track.subtitleTracks)&&track.subtitlePath?track.subtitleTracks.findIndex(t=>t?.filePath===track.subtitlePath):-1;
-        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=startSeconds>0?startSeconds:0;s.lastKnownPositionSeconds=s.positionSeconds;s.failures=0;s.skipVotes=[];
+        if (r?.audio_language) track.audioLanguage = r.audio_language;
+        if (r?.audio_is_dub !== undefined) {
+          track.audioIsDub = Boolean(r.audio_is_dub);
+          if (track.audioIsDub && track.preferredAudioLang && !track.dubOnlyWarning) {
+            track.dubOnlyWarning = '⚠️ Dub Only Available';
+          }
+        }
+        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=0;s.subtitleDriftAnchor=0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=startSeconds>0?startSeconds:0;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
         this.prefetch(s);
         if(!previous||!s.volumeConfirmed||s.appliedVolume!==s.volume){
           try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;s.appliedVolume=s.volume;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}
@@ -591,8 +665,35 @@ export class QueueManager extends EventEmitter {
     try{return await Promise.race([work,cancelled]);}
     finally{controller.signal.removeEventListener('abort',onAbort);if(s.prepareAbort===controller)s.prepareAbort=null;}
   }
+  getEstimatedPosition(id) {
+    const s = this.getSession(id);
+    if (typeof s.positionSeconds === 'number' && Number.isFinite(s.positionSeconds) && s.positionSeconds >= 0) {
+      return s.positionSeconds;
+    }
+    const lastKnown = (typeof s.lastKnownPositionSeconds === 'number' && Number.isFinite(s.lastKnownPositionSeconds) && s.lastKnownPositionSeconds > 0)
+      ? s.lastKnownPositionSeconds
+      : 0;
+    const resumeFallback = Number(s.currentTrack?.resumePositionSeconds || s.currentTrack?.startOffsetSeconds || 0) || 0;
+    let base = Math.max(lastKnown, resumeFallback);
+    if (base > 0 && s.status === 'playing' && s.positionUpdatedAt > 0) {
+      const elapsedSec = Math.floor((Date.now() - s.positionUpdatedAt) / 1000);
+      if (elapsedSec >= 1) {
+        base += Math.min(15, elapsedSec);
+      }
+    }
+    const dur = Number(s.currentTrack?.durationSeconds || 0);
+    if (dur > 0) base = Math.min(base, Math.max(0, dur - 1));
+    return Math.max(0, base);
+  }
+  setSeekStep(id, seconds) {
+    const s = this.getSession(id);
+    const clean = Math.max(5, Math.min(600, Math.round(Number(seconds) || 30)));
+    s.seekStepSeconds = clean;
+    this.db?.setSetting?.(`music.seekstep.${id}`, clean);
+    return clean;
+  }
   async setVolume(id, value, { skipCardUpdate = false } = {}) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const volume = Number(value); if (!Number.isFinite(volume) || volume < 0 || volume > 200) throw new MusicError('INVALID_VOLUME', 'Use a volume between 0 and 200. Levels above 100 may clip.'); if (s.connected) this.#assert(await this.voice.setVolume(id, volume)); s.volume = volume; s.volumeConfirmed=true; s.appliedVolume=volume; this.#savePlaybackSnapshot(s); if (!skipCardUpdate) await this.updatePlayerCard(id); return volume; }); }
-  async seek(id, seconds) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const value = Number(seconds); const dur = Number(s.currentTrack?.durationSeconds || 0); const seekable = Boolean(s.currentTrack?.capabilities?.seek || s.currentTrack?.provider === 'movie'); if (!seekable || !Number.isFinite(value) || value < 0 || (dur > 0 && value >= dur) || !['playing','paused'].includes(s.status)) throw new MusicError('CANNOT_SEEK', 'Choose a position inside the current seekable track.'); const r = this.#assert(await this.voice.seek(id, value)); const nextPos = Number.isFinite(Number(r.position_seconds)) ? Number(r.position_seconds) : value; s.positionSeconds = nextPos; s.lastKnownPositionSeconds = nextPos; this.#savePlaybackSnapshot(s); await this.updatePlayerCard(id, { forceEdit: true }); return true; }); }
+  async seek(id, seconds) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); const value = Number(seconds); const dur = Number(s.currentTrack?.durationSeconds || 0); const seekable = Boolean(s.currentTrack?.capabilities?.seek || s.currentTrack?.provider === 'movie'); if (!seekable || !Number.isFinite(value) || value < 0 || (dur > 0 && value >= dur) || !['playing','paused'].includes(s.status)) throw new MusicError('CANNOT_SEEK', 'Choose a position inside the current seekable track.'); const r = this.#assert(await this.voice.seek(id, value)); const nextPos = (r.position_seconds !== null && r.position_seconds !== undefined && Number.isFinite(Number(r.position_seconds))) ? Number(r.position_seconds) : value; s.positionSeconds = nextPos; s.lastKnownPositionSeconds = nextPos; s.positionUpdatedAt = Date.now(); this.#savePlaybackSnapshot(s); await this.updatePlayerCard(id, { forceEdit: true }); return true; }); }
   toggleLoopMode(id) { const s = this.getSession(id); const modes = ['off','track','queue']; s.loopMode = modes[(modes.indexOf(s.loopMode) + 1) % 3]; this.#savePlaybackSnapshot(s); return s.loopMode; }
   shuffle(id) { const q = this.getSession(id).upcoming; for (let i=q.length-1; i>0; i--) { const j=Math.floor(Math.random()*(i+1)); [q[i],q[j]]=[q[j],q[i]]; } this.dropPrefetch(this.getSession(id));this.prefetch(this.getSession(id));return q.length; }
   clearQueue(id) { const s = this.getSession(id); const count = s.upcoming.length;for(const t of s.upcoming)t.queuedMedia?.release?.();this.dropPrefetch(s);s.upcoming = [];if(s.radio)s.radio.enabled=false; if (!s.currentTrack && (s.connected||s.prepared)) this.#idle(s); return count; }
@@ -680,7 +781,22 @@ export class QueueManager extends EventEmitter {
       }
       s.activeDeck = target;
       s.view = target === 'movie' ? 'cinema' : 'player';
+      const prevMode = s.streamMode === 'rtmp' ? 'rtmp' : 'interactive';
+      const nextMode = this.getDeckStreamMode(id, target);
+      s.streamMode = nextMode;
       const targetQ = this.#deckQueue(s, target);
+      if (!s.currentTrack && (s.connected || s.prepared) && prevMode !== nextMode && typeof this.voice?.setup === 'function') {
+        const swRes = await this.voice.setup(id, 'start', {
+          create: true,
+          account_alias: s.preferredAccount || s.accountAlias || undefined,
+          stream_mode: nextMode,
+          force_switch: true,
+        }).catch(() => null);
+        if (swRes?.call_invite_link) {
+          s.callInviteLink = swRes.call_invite_link;
+          s.vcUrl = swRes.call_invite_link;
+        }
+      }
       if (!s.currentTrack && targetQ.length && (s.connected || s.prepared)) {
         await this.#next(s, { manual: true, deck: target });
       } else {
@@ -689,20 +805,207 @@ export class QueueManager extends EventEmitter {
       return s;
     });
   }
+  #subOffsetKey(track, filePath = null) {
+    const tid = String(track?.id || track?.url || '').trim();
+    if (!tid) return null;
+    const subFile = basename(String(filePath || track?.subtitlePath || ''));
+    const raw = subFile ? `${tid}:${subFile}` : tid;
+    return `music.suboffset.v2.${createHash('sha1').update(raw).digest('hex').slice(0, 16)}`;
+  }
+  #readTrackSubOffset(track, filePath = null) {
+    const k = this.#subOffsetKey(track, filePath);
+    if (!k) return 0;
+    const val = Number(this.db?.getSetting?.(k, 0) || 0);
+    return Number.isFinite(val) ? Math.max(-20, Math.min(20, val)) : 0;
+  }
+  #isSameRouteSub(track, filePath = null) {
+    const target = String(filePath || track?.subtitlePath || '');
+    const tracks = Array.isArray(track?.subtitleTracks) ? track.subtitleTracks : [];
+    const hit = target ? tracks.find(t => t?.filePath === target) : null;
+    if (hit) {
+      const baseSame = Boolean(hit.sameRoute || ['embedded', 'subtitle_hint'].includes(hit.source));
+      if (!baseSame) return false;
+      if (hit.source !== 'embedded' && track?.audioIsDub) return false;
+      return true;
+    }
+    return Boolean(track?.subtitleSameRoute && !track?.audioIsDub);
+  }
   async setSubtitleMode(id, mode) {
     return this.locks.run(Number(id), async () => {
       const s = this.getSession(id);
-      const valid = ['screen', 'live', 'off'].includes(mode) ? mode : 'screen';
+      const valid = ['screen', 'live', 'vc', 'off'].includes(mode) ? mode : 'screen';
       s.subtitleMode = valid;
       s.liveSubCue = '';
+      s._lastVcSubText = '';
       this.db?.setSetting?.(`music.submode.${id}`, valid);
       if (s.connected && s.currentTrack?.subtitlePath && typeof this.voice?.setSubtitle === 'function') {
-        const subArg = valid === 'screen' ? s.currentTrack.subtitlePath : null;
-        await this.voice.setSubtitle(id, subArg, { subtitleOffset: Number(s.subtitleSyncOffset || 0) || 0 }).catch(() => {});
+        const subArg = ['screen', 'vc'].includes(valid) ? s.currentTrack.subtitlePath : null;
+        const off = Number(s.subtitleSyncOffset || 0) || 0;
+        await this.voice.setSubtitle(id, subArg, {
+          subtitleOffset: off,
+          subtitleSameRoute: this.#isSameRouteSub(s.currentTrack),
+          manualOverride: Math.abs(off) >= 0.05
+        }).catch(() => {});
       }
       await this.updatePlayerCard(id);
       return valid;
     });
+  }
+  async setStreamMode(id, targetMode = null) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const prev = s.streamMode === 'rtmp' ? 'rtmp' : 'interactive';
+      const nextMode = ['rtmp', 'interactive'].includes(targetMode)
+        ? targetMode
+        : (prev === 'rtmp' ? 'interactive' : 'rtmp');
+      s.streamMode = nextMode;
+      const curIsMovie = (s.currentTrack?.provider === 'movie' || s.activeDeck === 'movie');
+      const deckKey = curIsMovie ? 'movie' : 'music';
+      if (curIsMovie) {
+        s.movieStreamMode = nextMode;
+      } else {
+        s.musicStreamMode = nextMode;
+        s.userStreamMode = nextMode;
+        this.db?.setSetting?.(`music.streamMode.${id}`, nextMode);
+      }
+      this.db?.setSetting?.(`music.streamMode.${deckKey}.${id}`, nextMode);
+      const wasActive = Boolean(s.connected || (s.currentTrack && ['playing', 'paused', 'buffering'].includes(s.status)));
+      if (nextMode !== prev && wasActive) {
+        const curTrack = s.currentTrack;
+        const deck = (curTrack?.provider === 'movie' || s.activeDeck === 'movie') ? 'movie' : 'music';
+        const deckQ = this.#deckQueue(s, deck);
+        const resumePos = curTrack ? this.#resolveSavedPosition(s, null, curTrack) : 0;
+        const wasPaused = s.status === 'paused';
+        const vcTitle = String(curTrack?.title || '').trim().slice(0, 64) || undefined;
+        if (curTrack) {
+          const requeued = resumePos > 1
+            ? { ...curTrack, resumePositionSeconds: resumePos, startOffsetSeconds: resumePos }
+            : { ...curTrack };
+          s.currentTrack = null;
+          s.playbackId = null;
+          deckQ.unshift(requeued);
+        }
+        if (typeof this.voice?.setup === 'function') {
+          const res = await this.voice.setup(s.chatId, 'start', {
+            create: true,
+            account_alias: s.preferredAccount || s.accountAlias || undefined,
+            stream_mode: nextMode,
+            force_switch: true,
+            ...(vcTitle ? { vc_title: vcTitle } : {})
+          }).catch(() => null);
+          if (res?.call_invite_link) {
+            s.callInviteLink = res.call_invite_link;
+            s.vcUrl = res.call_invite_link;
+          }
+        }
+        s.connected = false;
+        s.status = 'idle';
+        if (deckQ.length) {
+          s._suppressCinemaAnnounce = true;
+          try {
+            await this.#next(s, { manual: true, deck });
+            if (wasPaused && s.status === 'playing' && typeof this.voice?.pause === 'function') {
+              await this.voice.pause(s.chatId).catch(() => {});
+              s.status = 'paused';
+            }
+          } finally {
+            s._suppressCinemaAnnounce = false;
+          }
+        }
+      }
+      s.lastNotice = nextMode === 'rtmp'
+        ? '🔒 Switched to RTMP Live Stream (100% locked A/V broadcast).'
+        : '🎙 Switched to Interactive VC (WebRTC open-mic mode).';
+      this.#savePlaybackSnapshot(s);
+      await this.updatePlayerCard(id, { forceEdit: true });
+      return nextMode;
+    });
+  }
+  async sendVcChatMessage(id, text) {
+    const clean = String(text || '').trim().slice(0, 500);
+    if (!clean) return { ok: false, reason: 'empty' };
+    const s = this.getSession(id);
+    if (!s?.connected && !s?.currentTrack) return { ok: false, reason: 'not_connected' };
+    if (typeof this.voice?.sendCallMessage !== 'function') return { ok: false, reason: 'unsupported' };
+    const res = await this.voice.sendCallMessage(Number(id), clean).catch(() => ({ ok: false }));
+    if (res?.ok) {
+      s.lastNotice = `💬 Sent to VC chat: ${clean.slice(0, 80)}`;
+    }
+    return res || { ok: false };
+  }
+  async handleVcMessage(event) {
+    const chatId = Number(event?.chat_id);
+    if (!Number.isFinite(chatId) || chatId >= 0) return;
+    const s = this.sessions.get(chatId);
+    if (!s || (!s.connected && !s.currentTrack)) return;
+    const text = String(event?.text || '').trim();
+    if (!text) return;
+    this.emit('vc_message', event);
+    const now = Date.now();
+    const senderKey = event?.sender_id ? String(event.sender_id) : String(event?.sender_name || 'anon');
+    if (!(s._vcMsgRateBySender instanceof Map)) s._vcMsgRateBySender = new Map();
+    const lastFromSender = s._vcMsgRateBySender.get(senderKey) || 0;
+    const minSenderGap = event?.from_admin ? 1200 : 4000;
+    if (now - lastFromSender < minSenderGap || now - (s._lastVcMsgAt || 0) < 1000) return;
+    const reply = async msg => {
+      if (typeof this.voice?.sendCallMessage !== 'function') return;
+      s._vcMsgRateBySender.set(senderKey, Date.now());
+      if (s._vcMsgRateBySender.size > 128) s._vcMsgRateBySender.clear();
+      s._lastVcMsgAt = Date.now();
+      await this.voice.sendCallMessage(chatId, String(msg).slice(0, 420)).catch(() => {});
+    };
+    const parts = text.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const fmtSec = sec => {
+      const n = Math.max(0, Math.floor(Number(sec) || 0));
+      const h = Math.floor(n / 3600), m = Math.floor((n % 3600) / 60), s2 = n % 60;
+      return h ? `${h}:${String(m).padStart(2, '0')}:${String(s2).padStart(2, '0')}` : `${m}:${String(s2).padStart(2, '0')}`;
+    };
+    if (cmd === '!np' || cmd === '!now') {
+      const t = s.currentTrack;
+      if (!t) return reply('⚪ Nothing is currently playing in Voice Chat.');
+      const posStr = fmtSec(s.positionSeconds || 0);
+      const durStr = t.durationSeconds ? ` / ${fmtSec(t.durationSeconds)}` : '';
+      const eng = s.streamMode === 'rtmp' ? 'RTMP Live' : 'Interactive VC';
+      return reply(`▶ ${t.title} [${posStr}${durStr}] · ${eng}`);
+    }
+    if (cmd === '!queue' || cmd === '!q') {
+      const q = this.#deckQueue(s, s.activeDeck || 'music');
+      if (!q?.length) return reply('🗳 Queue is currently empty.');
+      const lines = q.slice(0, 3).map((item, idx) => `${idx + 1}. ${item.title}`);
+      return reply(`🗳 Up Next (${q.length}):\n${lines.join('\n')}`);
+    }
+    if (cmd === '!skip') {
+      if (!s.currentTrack) return;
+      const needed = this.app?.music?.getSkipVoteThreshold?.(chatId) ?? 2;
+      const voter = event?.sender_id ? Number(event.sender_id) : senderKey;
+      const votes = new Set(Array.isArray(s.skipVotes) ? s.skipVotes : []);
+      if (votes.has(voter)) return reply(`⏭ You already voted (${votes.size}/${needed}).`);
+      votes.add(voter);
+      s.skipVotes = [...votes];
+      if (s.skipVotes.length >= needed) {
+        s.skipVotes = [];
+        await reply(`⏭ Skip vote passed (${needed}/${needed}) — skipping!`);
+        await this.skip(chatId).catch(() => {});
+      } else {
+        await reply(`⏭ Skip vote: ${s.skipVotes.length}/${needed}`);
+      }
+      return;
+    }
+    if (event?.from_admin && cmd === '!pause' && s.status === 'playing') {
+      await this.pause(chatId).catch(() => {});
+      return reply('⏸ Paused playback.');
+    }
+    if (event?.from_admin && cmd === '!resume' && s.status === 'paused') {
+      await this.resume(chatId).catch(() => {});
+      return reply('▶ Resumed playback.');
+    }
+    if (cmd === '!vcmsg' && event?.from_admin && parts.length > 1) {
+      return reply(parts.slice(1).join(' '));
+    }
+    if (cmd === '!help') {
+      return reply('Commands: !np (now playing), !queue (up next), !skip (vote skip)');
+    }
   }
   async setSubtitleOffset(id, deltaOrValue = 0, { absolute = false } = {}) {
     return this.locks.run(Number(id), async () => {
@@ -710,11 +1013,25 @@ export class QueueManager extends EventEmitter {
       const cur = Number(s.subtitleSyncOffset || 0) || 0;
       const val = Number(deltaOrValue) || 0;
       const nextRaw = absolute ? val : cur + val;
-      const next = Math.round(Math.max(-15, Math.min(15, nextRaw)) * 10) / 10;
+      const next = Math.round(Math.max(-20, Math.min(20, nextRaw)) * 10) / 10;
       s.subtitleSyncOffset = next;
-      this.db?.setSetting?.(`music.suboffset.${id}`, next);
+      s.subtitleSyncStatus = {
+        ...(s.subtitleSyncStatus || {}),
+        status: 'manual',
+        applied_offset_sec: next,
+        residual_sec: 0,
+        manual_override: true,
+        message: `Manual offset locked (${next > 0 ? `+${next}` : next}s)`,
+        updated_at: Date.now() / 1000
+      };
+      const k = this.#subOffsetKey(s.currentTrack);
+      if (k) this.db?.setSetting?.(k, next);
       if (s.connected && (s.subtitleMode || 'screen') === 'screen' && s.currentTrack?.subtitlePath && typeof this.voice?.setSubtitle === 'function') {
-        await this.voice.setSubtitle(id, s.currentTrack.subtitlePath, { subtitleOffset: next }).catch(() => {});
+        await this.voice.setSubtitle(id, s.currentTrack.subtitlePath, {
+          subtitleOffset: next,
+          subtitleSameRoute: this.#isSameRouteSub(s.currentTrack),
+          manualOverride: true
+        }).catch(() => {});
       }
       await this.updatePlayerCard(id, { forceEdit: true });
       return next;
@@ -735,12 +1052,84 @@ export class QueueManager extends EventEmitter {
       s.subtitleTrackIndex = nextIdx;
       s.currentTrack.subtitlePath = chosen.filePath;
       s.currentTrack.subtitleFormat = chosen.format || 'srt';
+      const nextOffset = this.#readTrackSubOffset(s.currentTrack, chosen.filePath);
+      s.subtitleSyncOffset = nextOffset;
+      s.subtitleAutoOffset = null;
+      s.subtitleAutoVerified = false;
+      s.subtitleSyncStatus = null;
+      s.subtitleDriftRate = 0;
+      s.subtitleDriftAnchor = 0;
       s.liveSubCue = '';
       if (s.connected && (s.subtitleMode || 'screen') === 'screen' && typeof this.voice?.setSubtitle === 'function') {
-        await this.voice.setSubtitle(id, chosen.filePath, { subtitleOffset: Number(s.subtitleSyncOffset || 0) || 0 }).catch(() => {});
+        await this.voice.setSubtitle(id, chosen.filePath, {
+          subtitleOffset: nextOffset,
+          subtitleSameRoute: this.#isSameRouteSub(s.currentTrack, chosen.filePath),
+          manualOverride: Math.abs(nextOffset) >= 0.05
+        }).catch(() => {});
       }
       await this.updatePlayerCard(id, { forceEdit: true });
       return { index: nextIdx, track: chosen };
+    });
+  }
+  #syncSubtitleTelemetryFromInfo(s, info) {
+    if (!s || !info || typeof info !== 'object') return false;
+    let changed = false;
+    if (info.auto_subtitle_offset !== null && info.auto_subtitle_offset !== undefined && Number.isFinite(Number(info.auto_subtitle_offset))) {
+      const autoOff = Number(info.auto_subtitle_offset);
+      const normalizedAuto = autoOff || null;
+      if (s.subtitleAutoOffset !== normalizedAuto || !s.subtitleAutoVerified) changed = true;
+      s.subtitleAutoOffset = normalizedAuto;
+      s.subtitleAutoVerified = true;
+    }
+    if (info.subtitle_offset !== undefined && info.subtitle_offset !== null && Number.isFinite(Number(info.subtitle_offset))) {
+      const nextOff = Number(info.subtitle_offset);
+      if (Math.abs(nextOff - (Number(s.subtitleSyncOffset || 0) || 0)) >= 0.05) {
+        s.subtitleSyncOffset = nextOff;
+        changed = true;
+      }
+    }
+    if (info.sub_drift_sec_per_sec !== undefined && info.sub_drift_sec_per_sec !== null && Number.isFinite(Number(info.sub_drift_sec_per_sec))) {
+      const nextDrift = Number(info.sub_drift_sec_per_sec) || 0;
+      if (Math.abs(nextDrift - (Number(s.subtitleDriftRate || 0) || 0)) >= 0.0001) changed = true;
+      s.subtitleDriftRate = nextDrift;
+    }
+    if (info.sub_drift_anchor_sec !== undefined && info.sub_drift_anchor_sec !== null && Number.isFinite(Number(info.sub_drift_anchor_sec))) {
+      s.subtitleDriftAnchor = Number(info.sub_drift_anchor_sec) || 0;
+    }
+    if (info.subtitle_sync && typeof info.subtitle_sync === 'object') {
+      const prevStatus = s.subtitleSyncStatus?.status || null;
+      const nextStatus = info.subtitle_sync.status || null;
+      const prevOff = Number(s.subtitleSyncStatus?.applied_offset_sec ?? 0);
+      const nextOff = Number(info.subtitle_sync.applied_offset_sec ?? s.subtitleSyncOffset ?? 0);
+      if (prevStatus !== nextStatus || Math.abs(prevOff - nextOff) >= 0.05) {
+        changed = true;
+      }
+      s.subtitleSyncStatus = { ...info.subtitle_sync };
+    }
+    return changed;
+  }
+  async checkSubtitleSync(id, { autoFix = true } = {}) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      if (!s.connected || !s.currentTrack?.subtitlePath) {
+        return {
+          ok: false,
+          reason: 'NO_SUBTITLE',
+          sync: { status: 'none', message: 'No active subtitle stream to check' },
+          offset: Number(s.subtitleSyncOffset || 0) || 0
+        };
+      }
+      if (typeof this.voice?.checkSubtitleSync !== 'function') {
+        return { ok: false, reason: 'UNSUPPORTED', sync: s.subtitleSyncStatus, offset: Number(s.subtitleSyncOffset || 0) || 0 };
+      }
+      const res = await this.voice.checkSubtitleSync(id, { autoFix });
+      this.#syncSubtitleTelemetryFromInfo(s, res);
+      if (autoFix && res?.subtitle_sync?.auto_normalized && Number.isFinite(Number(s.subtitleSyncOffset))) {
+        const k = this.#subOffsetKey(s.currentTrack);
+        if (k) this.db?.setSetting?.(k, s.subtitleSyncOffset);
+      }
+      await this.updatePlayerCard(id, { forceEdit: true });
+      return { ...(res || { ok: true }), sync: s.subtitleSyncStatus, offset: Number(s.subtitleSyncOffset || 0) || 0 };
     });
   }
   async handleStreamEnded(id, playbackId) {
@@ -770,23 +1159,52 @@ export class QueueManager extends EventEmitter {
         if (!r.active) {
           this.#handleCallEndedSession(s, r.last_position_seconds);
         } else if (r.info?.playback_id === s.playbackId) {
-          if (Number.isFinite(r.info.position_seconds)) {
+          if (typeof r.info.position_seconds === 'number' && Number.isFinite(r.info.position_seconds)) {
             s.positionSeconds = r.info.position_seconds;
+            s.positionUpdatedAt = Date.now();
             if (r.info.position_seconds > 0) s.lastKnownPositionSeconds = r.info.position_seconds;
           } else {
             s.positionSeconds = null;
           }
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}
+          const prevSyncing = Boolean(s.avSync?.syncing);
+          s.avSync = r.info.av_sync || null;
+          if (Boolean(s.avSync?.syncing) !== prevSyncing) {
+            s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+          }
+          if (r.info.audio_language && s.currentTrack) s.currentTrack.audioLanguage = r.info.audio_language;
+          if (r.info.audio_is_dub !== undefined && s.currentTrack) {
+            s.currentTrack.audioIsDub = Boolean(r.info.audio_is_dub);
+            if (s.currentTrack.audioIsDub && s.currentTrack.preferredAudioLang && !s.currentTrack.dubOnlyWarning) {
+              s.currentTrack.dubOnlyWarning = '⚠️ Dub Only Available';
+            }
+          }
           if(r.info.status === 'recovering'){s.lastError='Reconnecting this stream; other destinations are unaffected.';s.positionSeconds=null;}
-          if (s.subtitleMode === 'live' && s.currentTrack?.subtitlePath && Number.isFinite(s.positionSeconds)) {
+          if (this.#syncSubtitleTelemetryFromInfo(s, r.info)) {
+            if (r.info.subtitle_sync?.auto_normalized && Number.isFinite(Number(s.subtitleSyncOffset))) {
+              const k = this.#subOffsetKey(s.currentTrack);
+              if (k) this.db?.setSetting?.(k, s.subtitleSyncOffset);
+            }
+            s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+          }
+          if (['live', 'vc'].includes(s.subtitleMode) && s.currentTrack?.subtitlePath && Number.isFinite(s.positionSeconds)) {
             const cues = this.app?.subtitles?.loadCues?.(s.currentTrack.subtitlePath);
-            const effectiveSec = Math.max(0, Number(s.positionSeconds) - (Number(s.subtitleSyncOffset || 0) || 0));
-            const cue = cues?.length ? getCueAt(cues, effectiveSec * 1000) : null;
+            const subPosMs = mapMediaSecToSubMs(s.positionSeconds, {
+              offsetSec: Number(s.subtitleSyncOffset || 0) || 0,
+              driftRate: Number(s.subtitleDriftRate || 0) || 0,
+              driftAnchorSec: Number(s.subtitleDriftAnchor || 0) || 0
+            });
+            const cue = cues?.length ? getCueAt(cues, subPosMs) : null;
             const nextCueText = cue?.text || '';
             if (nextCueText !== (s.liveSubCue || '')) {
               s.liveSubCue = nextCueText;
               if (nextCueText) {
                 this.emit('subtitle_cue', { chatId: s.chatId, cue: nextCueText, positionSeconds: s.positionSeconds, track: s.currentTrack });
+                if (s.subtitleMode === 'vc' && nextCueText !== (s._lastVcSubText || '') && Date.now() - (s._lastVcSubSentAt || 0) >= 1500 && typeof this.voice?.sendCallMessage === 'function') {
+                  s._lastVcSubText = nextCueText;
+                  s._lastVcSubSentAt = Date.now();
+                  void this.voice.sendCallMessage(s.chatId, `💬 ${nextCueText.slice(0, 240)}`).catch(() => {});
+                }
                 if (Date.now() - (s.lastSubEdit || 0) >= 3500) {
                   s.lastSubEdit = Date.now();
                   s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
@@ -801,7 +1219,9 @@ export class QueueManager extends EventEmitter {
           else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
         }
         s.failures = 0;
-        if (s.currentTrack && ['playing', 'paused'].includes(s.status) && Date.now() - (s._lastSnapshotAt || 0) >= 5000) {
+        const totalQueued = (s.upcoming?.length || 0) + (s.movieUpcoming?.length || 0);
+        const snapIntervalMs = totalQueued > 200 ? 15000 : 5000;
+        if (s.currentTrack && ['playing', 'paused'].includes(s.status) && Date.now() - (s._lastSnapshotAt || 0) >= snapIntervalMs) {
           this.#savePlaybackSnapshot(s);
         }
         if(s.status==='playing'&&(!s.prefetched||((s.radio?.enabled||this.app?.music?.aiDj?.isEnabled?.(s))&&s.upcoming.length<3))){this.prefetch(s);}
@@ -833,14 +1253,17 @@ export class QueueManager extends EventEmitter {
         callEnded: isInterrupted,
         positionSeconds: this.#resolveSavedPosition(s, null, isActiveTrack ? s.currentTrack : deckQ[0]),
         currentTrack: isActiveTrack ? this.#serializeTrackSnapshot(s.currentTrack) : null,
-        upcoming: (s.upcoming || []).slice(0, 100).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
+        upcoming: (s.upcoming || []).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
         history: (s.history || []).slice(-25).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
-        movieUpcoming: (s.movieUpcoming || []).slice(0, 100).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
+        movieUpcoming: (s.movieUpcoming || []).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
         movieHistory: (s.movieHistory || []).slice(-25).map(t => this.#serializeTrackSnapshot(t)).filter(Boolean),
         volume: Number.isFinite(Number(s.volume)) ? Number(s.volume) : 100,
         loopMode: s.loopMode || 'off',
         bass: Boolean(s.bass),
         eqPreset: s.eqPreset || (s.bass ? 'bass' : 'off'),
+        streamMode: s.streamMode === 'rtmp' ? 'rtmp' : 'interactive',
+        musicStreamMode: s.musicStreamMode || this.getDeckStreamMode(s.chatId, 'music'),
+        movieStreamMode: s.movieStreamMode || this.getDeckStreamMode(s.chatId, 'movie'),
         subtitleMode: s.subtitleMode || 'screen',
         subtitleSyncOffset: Number(s.subtitleSyncOffset || 0) || 0,
         preferredAccount: s.preferredAccount || s.accountAlias || null,
@@ -925,6 +1348,9 @@ export class QueueManager extends EventEmitter {
           s.loopMode = snap.loopMode || s.loopMode;
           s.bass = Boolean(snap.bass);
           s.eqPreset = snap.eqPreset || (s.bass ? 'bass' : 'off');
+          if (snap.musicStreamMode === 'rtmp' || snap.musicStreamMode === 'interactive') s.musicStreamMode = snap.musicStreamMode;
+          if (snap.movieStreamMode === 'rtmp' || snap.movieStreamMode === 'interactive') s.movieStreamMode = snap.movieStreamMode;
+          if (snap.streamMode === 'rtmp' || snap.streamMode === 'interactive') s.streamMode = snap.streamMode;
           s.subtitleMode = snap.subtitleMode || s.subtitleMode;
           s.subtitleSyncOffset = Number.isFinite(Number(snap.subtitleSyncOffset)) ? Number(snap.subtitleSyncOffset) : (s.subtitleSyncOffset || 0);
           s.preferredAccount = snap.preferredAccount || s.preferredAccount;
@@ -1052,6 +1478,7 @@ export class QueueManager extends EventEmitter {
         : effectiveView === 'options' ? screen.renderOptions(display)
         : effectiveView === 'voteset' ? (screen.renderVoteSettings ? screen.renderVoteSettings(display) : screen.renderOptions(display))
         : effectiveView === 'subsync' ? (screen.renderSubSyncPicker ? screen.renderSubSyncPicker(display) : screen.renderOptions(display))
+        : effectiveView === 'seekmenu' ? (screen.renderSeekPicker ? screen.renderSeekPicker(display) : screen.renderOptions(display))
         : effectiveView === 'dlq' ? (screen.renderCinemaDownloadQuality ? screen.renderCinemaDownloadQuality(display) : screen.renderCinemaPlayer(display))
         : screen.renderPlayer(display);
       if (!rich) return false;

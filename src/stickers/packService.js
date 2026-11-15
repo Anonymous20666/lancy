@@ -17,12 +17,13 @@ import { isVideoBuffer, toLoopingPreviewVideo } from '../media/convert.js';
  * "Add to Existing" work across restarts.
  */
 export class StickerPackService extends EventEmitter {
-  constructor({ db, settings, stickerService, media, log } = {}) {
+  constructor({ db, settings, stickerService, media, customEmojiRegistry = null, log } = {}) {
     super();
     this.db = db;
     this.settings = settings;
     this.stickerService = stickerService;
     this.media = media;
+    this.customEmojiRegistry = customEmojiRegistry;
     this.log = log ?? logger().child({ module: 'pack-service' });
   }
 
@@ -197,13 +198,17 @@ export class StickerPackService extends EventEmitter {
     };
   }
 
-  listAvailablePacks(userId, { limit = 10, offset = 0, stickerType = null } = {}) {
+  listAvailablePacks(userId, { limit = 10, offset = 0, stickerType = null, stickerKind = 'regular' } = {}) {
+    const kindClause = stickerKind && stickerKind !== 'all'
+      ? `AND (sticker_kind = '${stickerKind === 'custom_emoji' ? 'custom_emoji' : 'regular'}' OR (sticker_kind IS NULL AND '${stickerKind}' = 'regular'))`
+      : '';
     if (stickerType && stickerType !== 'all') {
-      const limits = resolveLimits(this.settings, stickerType);
+      const limits = resolveLimits(this.settings, stickerKind === 'custom_emoji' ? 'custom_emoji' : stickerType);
       const type = stickerType === 'video' ? 'video' : 'static';
       const rows = this.db.all(
         `SELECT * FROM sticker_packs
          WHERE user_id = ?
+           ${kindClause}
            AND (sticker_type = ? OR (sticker_type IS NULL AND ? = 'static'))
            AND count < ?
          ORDER BY modified_at DESC LIMIT ? OFFSET ?`,
@@ -212,6 +217,7 @@ export class StickerPackService extends EventEmitter {
       const total = this.db.get(
         `SELECT COUNT(*) AS c FROM sticker_packs
          WHERE user_id = ?
+           ${kindClause}
            AND (sticker_type = ? OR (sticker_type IS NULL AND ? = 'static'))
            AND count < ?`,
         userId, type, type, limits.perSet
@@ -219,11 +225,12 @@ export class StickerPackService extends EventEmitter {
       return { packs: rows.map((r) => this.#decorate(r)), total };
     }
 
-    const staticLimit = resolveLimits(this.settings, 'static').perSet;
-    const videoLimit = resolveLimits(this.settings, 'video').perSet;
+    const staticLimit = resolveLimits(this.settings, stickerKind === 'custom_emoji' ? 'custom_emoji' : 'static').perSet;
+    const videoLimit = resolveLimits(this.settings, stickerKind === 'custom_emoji' ? 'custom_emoji' : 'video').perSet;
     const rows = this.db.all(
       `SELECT * FROM sticker_packs
        WHERE user_id = ?
+         ${kindClause}
          AND (
            ((sticker_type = 'video') AND count < ?)
            OR
@@ -235,6 +242,7 @@ export class StickerPackService extends EventEmitter {
     const total = this.db.get(
       `SELECT COUNT(*) AS c FROM sticker_packs
        WHERE user_id = ?
+         ${kindClause}
          AND (
            ((sticker_type = 'video') AND count < ?)
            OR
@@ -246,24 +254,27 @@ export class StickerPackService extends EventEmitter {
   }
 
   /** The user's packs, newest first, with pagination. */
-  listPacks(userId, { limit = 5, offset = 0, query = '' } = {}) {
+  listPacks(userId, { limit = 5, offset = 0, query = '', stickerKind = 'regular' } = {}) {
+    const kindClause = stickerKind && stickerKind !== 'all'
+      ? `AND (sticker_kind = '${stickerKind === 'custom_emoji' ? 'custom_emoji' : 'regular'}' OR (sticker_kind IS NULL AND '${stickerKind}' = 'regular'))`
+      : '';
     const trimmed = (query ?? '').trim();
     if (trimmed) {
       const rows = this.db.all(
-        `SELECT * FROM sticker_packs WHERE user_id = ? AND (tg_title LIKE ? OR query LIKE ?) ORDER BY modified_at DESC LIMIT ? OFFSET ?`,
+        `SELECT * FROM sticker_packs WHERE user_id = ? ${kindClause} AND (tg_title LIKE ? OR query LIKE ?) ORDER BY modified_at DESC LIMIT ? OFFSET ?`,
         userId, `%${trimmed}%`, `%${trimmed}%`, limit, offset
       );
       const total = this.db.get(
-        'SELECT COUNT(*) AS c FROM sticker_packs WHERE user_id = ? AND (tg_title LIKE ? OR query LIKE ?)',
+        `SELECT COUNT(*) AS c FROM sticker_packs WHERE user_id = ? ${kindClause} AND (tg_title LIKE ? OR query LIKE ?)`,
         userId, `%${trimmed}%`, `%${trimmed}%`
       )?.c ?? 0;
       return { packs: rows.map((r) => this.#decorate(r)), total };
     }
     const rows = this.db.all(
-      `SELECT * FROM sticker_packs WHERE user_id = ? ORDER BY modified_at DESC LIMIT ? OFFSET ?`,
+      `SELECT * FROM sticker_packs WHERE user_id = ? ${kindClause} ORDER BY modified_at DESC LIMIT ? OFFSET ?`,
       userId, limit, offset
     );
-    const total = this.db.get('SELECT COUNT(*) AS c FROM sticker_packs WHERE user_id = ?', userId)?.c ?? 0;
+    const total = this.db.get(`SELECT COUNT(*) AS c FROM sticker_packs WHERE user_id = ? ${kindClause}`, userId)?.c ?? 0;
     return { packs: rows.map((r) => this.#decorate(r)), total };
   }
 
@@ -279,20 +290,35 @@ export class StickerPackService extends EventEmitter {
     try {
       const set = await this.stickerService.api.getStickerSet(sName);
       if (set?.stickers?.length) {
+        const isCustomEmojiSet = set.sticker_type === 'custom_emoji';
         const rows = this.db.all('SELECT id, position FROM sticker_items WHERE pack_id = ? ORDER BY position ASC', pack.id);
-        const updateStmt = this.db.prepare('UPDATE sticker_items SET file_id = ?, type = ? WHERE id = ?');
+        const updateStmt = this.db.prepare(
+          'UPDATE sticker_items SET file_id = ?, type = ?, custom_emoji_id = COALESCE(?, custom_emoji_id), item_format = ? WHERE id = ?'
+        );
         for (let i = 0; i < set.stickers.length; i++) {
           const st = set.stickers[i];
-          const fileId = st.is_animated && (st.thumbnail || st.thumb) ? (st.thumbnail || st.thumb).file_id : st.file_id;
-          const stType = (st.is_video || set.sticker_type === 'video') ? 'video' : 'static';
+          const itemFormat = st.is_animated ? 'animated' : (st.is_video ? 'video' : 'static');
+          const fileId = !isCustomEmojiSet && st.is_animated && (st.thumbnail || st.thumb)
+            ? (st.thumbnail || st.thumb).file_id
+            : st.file_id;
+          const stType = itemFormat === 'video' ? 'video' : (itemFormat === 'animated' ? 'animated' : 'static');
           if (rows[i]) {
-            updateStmt.run(fileId, stType, rows[i].id);
+            updateStmt.run(fileId, stType, st.custom_emoji_id ?? null, itemFormat, rows[i].id);
           } else {
             this.db.run(
-              'INSERT INTO sticker_items (pack_id, position, file_id, emoji, type) VALUES (?, ?, ?, ?, ?)',
-              pack.id, i, fileId, st.emoji ?? '🤍', stType
+              'INSERT INTO sticker_items (pack_id, position, file_id, emoji, type, custom_emoji_id, item_format) VALUES (?, ?, ?, ?, ?, ?, ?)',
+              pack.id, i, fileId, st.emoji ?? '🤍', stType, st.custom_emoji_id ?? null, itemFormat
             );
           }
+        }
+        this.db.run(
+          "UPDATE sticker_packs SET count = ?, sticker_kind = ?, modified_at = datetime('now') WHERE id = ?",
+          set.stickers.length,
+          isCustomEmojiSet ? 'custom_emoji' : (pack.stickerKind || 'regular'),
+          pack.id
+        );
+        if (isCustomEmojiSet) {
+          this.customEmojiRegistry?.registerPackSet?.(set, { userId: pack?.userId ?? null, source: 'pack' });
         }
       }
     } catch (err) {
@@ -460,21 +486,32 @@ export class StickerPackService extends EventEmitter {
     return part > 1 ? `${title} ${String(part).padStart(2, '0')}` : title;
   }
 
-  #persistPack({ userId, query, title, shortName, count, link, stickerType, items }) {
+  #persistPack({ userId, query, title, shortName, count, link, stickerType, stickerKind = 'regular', source = 'pinterest', items }) {
     const row = this.db.run(
       `INSERT INTO sticker_packs
-         (user_id, tg_short_name, tg_title, query, count, source, sticker_type, link, meta_json)
-       VALUES (?, ?, ?, ?, ?, 'pinterest', ?, ?, ?)`,
-      userId, shortName, title, query ?? null, count, stickerType, link,
+         (user_id, tg_short_name, tg_title, query, count, source, sticker_type, sticker_kind, link, meta_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      userId, shortName, title, query ?? null, count, source, stickerType, stickerKind, link,
       JSON.stringify({ createdVia: 'lancy-bot' })
     );
     const packId = Number(row.lastInsertRowid);
     const stmt = this.db.prepare(
-      'INSERT INTO sticker_items (pack_id, position, emoji, sha256, phash, type) VALUES (?, ?, ?, ?, ?, ?)'
+      'INSERT INTO sticker_items (pack_id, position, emoji, sha256, phash, type, custom_emoji_id, item_format, source_sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
     );
     items.forEach((item, i) => {
-      const itType = (item.isVideo || item.sourceType === 'video' || item.type === 'video') ? 'video' : 'static';
-      stmt.run(packId, i, item.emoji?.join(' ') ?? null, item.sha256 ?? null, item.phash ?? null, itType);
+      const itemFormat = item.format || ((item.isVideo || item.sourceType === 'video' || item.type === 'video') ? 'video' : (item.type === 'animated' ? 'animated' : 'static'));
+      const itType = itemFormat;
+      stmt.run(
+        packId,
+        i,
+        Array.isArray(item.emoji) ? item.emoji.join(' ') : (item.emoji ?? null),
+        item.sha256 ?? null,
+        item.phash ?? null,
+        itType,
+        item.customEmojiId ?? item.custom_emoji_id ?? null,
+        itemFormat,
+        item.sourceSha256 ?? null
+      );
     });
     return packId;
   }
@@ -489,6 +526,7 @@ export class StickerPackService extends EventEmitter {
       count: row.count,
       source: row.source,
       stickerType: row.sticker_type,
+      stickerKind: row.sticker_kind || 'regular',
       link: row.link,
       thumbFileId: row.thumb_file_id,
       createdAt: row.created_at,

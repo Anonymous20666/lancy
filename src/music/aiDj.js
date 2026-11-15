@@ -697,7 +697,7 @@ export class AiDjEngine {
             )
           );
           for (const pg of pages) {
-            if (picked.length >= count || session.upcoming.length >= 100) break;
+            if (picked.length >= count) break;
             const filtered = (pg?.items || []).filter(filterCandidate);
             const strict = filtered.filter(matchesPlanArtist);
             const ranked = rankTracksTrendingToOld(strict.length ? strict : filtered, { isVideo });
@@ -726,7 +726,7 @@ export class AiDjEngine {
           const strict = filtered.filter(matchesPlanArtist);
           const ranked = rankTracksTrendingToOld(strict.length ? strict : filtered, { isVideo });
           for (const chosen of ranked) {
-            if (picked.length >= count || session.upcoming.length >= 100) break;
+            if (picked.length >= count) break;
             excludedIds.add(chosen.id);
             const tk = normTrackTitleKey(chosen.artist, chosen.title);
             if (tk) { excludedTitles.add(tk); dj.seenTitles.push(tk); }
@@ -784,7 +784,7 @@ export class AiDjEngine {
           });
           const pool = distinctArtist.length ? distinctArtist : fresh;
           for (const item of pool) {
-            if (picked.length >= count || session.upcoming.length >= 100) break;
+            if (picked.length >= count) break;
             excludedIds.add(item.id);
             const a = normArtist(item.artist);
             if (a) recentArtists.add(a);

@@ -2,6 +2,7 @@ import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
 import { navButtons, banner, ACCENT, SPARK } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { logger } from '../../core/logger.js';
+import { listVerifiedAdminChannels, canAccessChannelInMenu } from '../permissions.js';
 
 /**
  * Helper to format "HH:MM" (24h) into clean 12-hour AM/PM string.
@@ -158,7 +159,13 @@ export function createAutoPostScreen({ app }) {
     // 1. Telegram Channels
     if (sel.platform === 'telegram' || sel.platform === 'both') {
       b.heading('📢 TELEGRAM CHANNELS', 3);
-      const tgChs = app.db.getTelegramChannels(userId);
+      const tgChs = await listVerifiedAdminChannels({
+        db: app.db,
+        api: ctx.api || app.telegram?.api,
+        settings: app.settings,
+        controller: ctx.controller,
+        userId
+      });
 
       if (!tgChs.length) {
         b.paragraph(rt.text('No Telegram channels connected yet! Add the bot as an Administrator in your channel, or tap "➕ Add TG Channel" below.'));
@@ -614,9 +621,10 @@ export function createAutoPostScreen({ app }) {
   }
 
   // ── State Machine Handlers ─────────────────────────────────────────────
-  if (app.sm) {
+  function registerStateHandlers(sm) {
+    if (!sm) return;
     // Custom days number input handler
-    app.sm.register(States.AUTOPOST_CUSTOM_DAYS, {
+    sm.register(States.AUTOPOST_CUSTOM_DAYS, {
       onMessage: async (sctx, message) => {
         const api = sctx?.api || app.telegram?.api;
         const targetChatId = message.chat?.id || sctx.chatId || sctx.tgId;
@@ -628,14 +636,14 @@ export function createAutoPostScreen({ app }) {
         }
         const sel = getSelection(sctx.tgId);
         sel.days = num;
-        await app.sm.reset(sctx.tgId, { reason: 'custom-days-set' });
+        await sm.reset(sctx.tgId, { reason: 'custom-days-set' });
         await renderDaysPicker({ ...sctx, tgId: sctx.tgId, api, chatId: targetChatId });
         return true;
       }
     });
 
     // AI Chat Theme input handler
-    app.sm.register(States.AUTOPOST_AI_CHAT, {
+    sm.register(States.AUTOPOST_AI_CHAT, {
       onMessage: async (sctx, message) => {
         const api = sctx?.api || app.telegram?.api;
         const targetChatId = message.chat?.id || sctx.chatId || sctx.tgId;
@@ -644,7 +652,7 @@ export function createAutoPostScreen({ app }) {
         const sel = getSelection(sctx.tgId);
         sel.aiTopic = text;
         sel.aiPrompt = text;
-        await app.sm.reset(sctx.tgId, { reason: 'ai-theme-set' });
+        await sm.reset(sctx.tgId, { reason: 'ai-theme-set' });
 
         await api.sendMessage(
           targetChatId,
@@ -657,9 +665,14 @@ export function createAutoPostScreen({ app }) {
     });
   }
 
+  if (app.sm) {
+    registerStateHandlers(app.sm);
+  }
+
   // ── Screen Interface ───────────────────────────────────────────────────
   return {
     id,
+    registerStateHandlers,
     async open(ctx) {
       await renderPlatformPicker(ctx);
     },
@@ -684,6 +697,25 @@ export function createAutoPostScreen({ app }) {
           if (sel.tgChannels.includes(chId)) {
             sel.tgChannels = sel.tgChannels.filter((c) => c !== chId);
           } else {
+            const api = ctx.api || app.telegram?.api;
+            const callerOk = await canAccessChannelInMenu({
+              db: app.db,
+              api,
+              settings: app.settings,
+              controller: ctx.controller,
+              userId: Number(tgId),
+              channelId: chId,
+              fromUser: ctx.query?.from || ctx.message?.from || { id: Number(tgId) }
+            });
+            if (!callerOk) {
+              if (ctx.query?.id) {
+                await api?.answerCallbackQuery?.(ctx.query.id, {
+                  text: '🔒 Only channel administrators or Bot Super Admins can select this channel.',
+                  showAlert: true
+                })?.catch?.(() => {});
+              }
+              return renderChannelPicker(ctx);
+            }
             sel.tgChannels.push(chId);
           }
           return renderChannelPicker(ctx);

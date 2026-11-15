@@ -16,6 +16,9 @@ import { FixtureProvider, makeFixturePins } from './pinterest/fixtures.js';
 import { ProviderRegistry } from './pinterest/provider.js';
 import { TelegramStickerService } from './stickers/telegram.js';
 import { StickerPackService } from './stickers/packService.js';
+import { CustomEmojiPackService } from './stickers/customEmojiPackService.js';
+import { CustomEmojiRegistry } from './stickers/customEmojiRegistry.js';
+import { createCustomEmojiStudioScreen } from './telegram/screens/customEmojiStudio.js';
 import { WhatsAppManager } from './whatsapp/manager.js';
 import { ChannelService } from './whatsapp/channels.js';
 import { WhatsAppPublisher } from './whatsapp/publisher.js';
@@ -57,6 +60,8 @@ import { SubtitleService } from './media/subtitles.js';
 import { MovieStreamResolver } from './media/movieResolver.js';
 import { MovieSessions } from './media/movieSessions.js';
 import { MovieDownloader } from './media/movieDownloader.js';
+import { defaultAdultCatalog } from './media/adultCatalog.js';
+import { CommandJobProcessor } from './core/commandProcessor.js';
 import { MediaAiAgent } from './ai/mediaAgent.js';
 
 /**
@@ -167,7 +172,7 @@ export class LancyApp {
     this.mediaWorkerPool = getSharedMediaWorkerPool({
       maxWorkers: this.settings.get('performance.workerConcurrency') ?? 8,
       maxConcurrentJobs: Math.max(8, (this.settings.get('performance.workerConcurrency') ?? 8) * 2),
-      perUserMaxConcurrent: 3
+      perUserMaxConcurrent: 6
     });
     this.mediaDownloader = new MediaDownloader({ log: this.log, workerPool: this.mediaWorkerPool });
     this.videoServer = new VideoStreamingServer({ app: this, port: 3055, log: this.log });
@@ -184,6 +189,8 @@ export class LancyApp {
     this.subtitles = new SubtitleService({ cacheDir: join(this.root, 'cache', 'music', 'subs'), log: this.log });
     this.movieResolver = new MovieStreamResolver({ movieApi: this.movieApi, subtitles: this.subtitles, log: this.log });
     this.movieSessions = new MovieSessions({ db: this.db });
+    this.adultCatalog = defaultAdultCatalog;
+    this.commandProcessor = new CommandJobProcessor({ log: this.log });
     this.movieDownloader = new MovieDownloader({ app: this, log: this.log });
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
@@ -213,6 +220,12 @@ export class LancyApp {
     this.telegram.isMediaDeliveryMessage = (msg) => this.telegram.controller?.isMediaDeliveryMessage(msg);
     this.telegram.isMediaDeliveryMessageId = (id) => this.telegram.controller?.isMediaDeliveryMessageId(id);
 
+    this.customEmojiRegistry = new CustomEmojiRegistry({
+      db: this.db,
+      log: this.log
+    });
+    this.customEmojiRegistry.seedBuiltinCatalog();
+
     this.stickerService = new TelegramStickerService({
       api: this.telegram.api,
       db: this.db,
@@ -222,7 +235,19 @@ export class LancyApp {
       db: this.db,
       settings: this.settings,
       stickerService: this.stickerService,
-      media: this.media
+      media: this.media,
+      customEmojiRegistry: this.customEmojiRegistry
+    });
+    this.customEmojiPacks = new CustomEmojiPackService({
+      api: this.telegram.api,
+      db: this.db,
+      settings: this.settings,
+      stickerService: this.stickerService,
+      packService: this.packs,
+      media: this.media,
+      mediaWorkerPool: this.mediaWorkerPool,
+      customEmojiRegistry: this.customEmojiRegistry,
+      log: this.log
     });
 
     this.multiBotManager = new MultiBotManager({
@@ -234,7 +259,7 @@ export class LancyApp {
     // Register screens.
     const factories = [
       createDashboardScreen, createPinterestScreen, createStickersScreen,
-      createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
+      createCustomEmojiStudioScreen, createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
       createDownloaderScreen, createCloneScreen, createChannelPostScreen,
       createAutoPostScreen, createNsfwScreen, createMusicScreen
     ];
@@ -315,7 +340,7 @@ export class LancyApp {
     void this.musicAccounts
       .sync()
       .then(() => this.musicQueueManager?.restoreActiveSessions?.({ api: this.telegram?.api }))
-      .catch(() => this.log.warn('Playback account warmup unavailable; use /accounts health in the owner DM.'));
+      .catch((err) => this.log.warn({ code: err?.code, err: err?.message }, 'Playback account warmup unavailable; use /accounts health in the owner DM.'));
   }
 
   #setupTestTriggerWatcher() {
@@ -384,14 +409,14 @@ export class LancyApp {
     clearInterval(this.cleanupTimer);
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
+    await this.telegram.controller?.stop();
+    await this.multiBotManager?.stopAll();
     await this.musicQueueManager?.shutdown();
     await this.music?.previews?.shutdown();
     await this.screens.get('music')?.cleanup?.();
     await this.musicLibrary?.shutdown();
     await this.voiceClient?.stopDaemon();
     await this.videoServer?.stop().catch(() => {});
-    await this.multiBotManager?.stopAll();
-    await this.telegram.controller?.stop();
     await this.whatsapp.stopAll();
     await this.ai.stop();
     await this.queues.shutdown();

@@ -3,9 +3,15 @@ import { mkdirSync, readFileSync, writeFileSync, statSync, unlinkSync, lstatSync
 import { join } from 'node:path';
 import { MusicError, KeyedLock } from './model.js';
 
+import { isBotSuperAdmin, getBotOwnerIds } from '../telegram/permissions.js';
+
 export function isMusicOwner(app, id) {
-  const owners = [...String(process.env.OWNER_IDS || '').split(','), ...(app.settings?.get('general.ownerIds') || [])].map(Number).filter(n => Number.isSafeInteger(n) && n > 0);
-  return owners.includes(Number(id));
+  const uid = Number(id);
+  return Number.isSafeInteger(uid) && uid > 0 && getBotOwnerIds(app).has(uid);
+}
+
+export function isMusicSuperAdmin(app, id) {
+  return isBotSuperAdmin(app, id);
 }
 export class AccountStore {
   constructor({ db, root, voice, allowExistingMemberGroups=false }) { this.allowExistingMemberGroups=Boolean(allowExistingMemberGroups);this.db = db; this.root = root; this.voice = voice; this.lock = new KeyedLock(); this.initialized = false; }

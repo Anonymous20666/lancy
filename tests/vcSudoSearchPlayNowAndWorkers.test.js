@@ -519,3 +519,101 @@ test('7. Volume button (VC volume & setvol) works without rate-limit/double-edit
   assert.equal(ranked[0].title, 'Burna Boy - Last Last [Official Music Video]');
   assert.equal(ranked.at(-1).title, 'Breaking News Live Report');
 });
+
+test('6. /rmsudo revokes VC Sudo by ID, @username, reply (matching username too), multi-target, --global, and clear cleanly', async (t) => {
+  const db = new Database(':memory:');
+  t.after(() => db.close());
+
+  const app = {
+    db,
+    sm: new StateMachine(),
+    settings: { get: (k) => (k === 'general.ownerIds' ? [10] : []) }
+  };
+  const qm = new QueueManager({
+    app,
+    db,
+    pollMs: 0,
+    voiceClient: {
+      play: async () => ({ ok: true, account_alias: 'one' }),
+      stop: async () => ({ ok: true }),
+      pause: async () => ({ ok: true }),
+      resume: async () => ({ ok: true }),
+      setVolume: async () => ({ ok: true })
+    }
+  });
+  app.musicQueueManager = qm;
+  const service = new MusicService({ app, search: new SearchSessions({ providers: {} }), lyrics: {}, accounts: { sync: async () => {} } });
+  app.music = service;
+  const screen = createMusicScreen({ app });
+  app.screens = new Map([['music', screen]]);
+  t.after(async () => {
+    await qm.shutdown();
+    await screen.cleanup();
+  });
+
+  const sent = [];
+  const api = {
+    me: { id: 99 },
+    getChat: async () => ({ id: -100777, type: 'supergroup', title: 'Test GC' }),
+    getChatMember: async (_c, uid) => ({
+      status: Number(uid) === 10 ? 'creator' : Number(uid) === 200 ? 'administrator' : 'member'
+    }),
+    sendMessage: async (_c, text) => { sent.push(text); return { message_id: sent.length }; }
+  };
+
+  const ownerCtx = { tgId: 10, chatId: -100777, api };
+  const adminCtx = { tgId: 200, chatId: -100777, api };
+  const outsiderCtx = { tgId: 999, chatId: -100777, api };
+
+  // Seed users in chat vcsudo (by ID and @username) + global vcsudo
+  await service.vcsudoCommand(ownerCtx, ['add', '777', '@alice', '888']);
+  await service.vcsudoCommand(ownerCtx, ['add', '555', '--global']);
+  assert.deepEqual(service.getVcSudoList(-100777).chat, ['777', 'alice', '888']);
+  assert.deepEqual(service.getVcSudoList(-100777).global, ['555']);
+
+  // 1) Remove by ID via screen.handleCommand('/rmsudo', ...)
+  const handled = await screen.handleCommand(ownerCtx, '/rmsudo', ['777']);
+  assert.equal(handled, true);
+  assert.match(sent.at(-1), /Removed <code>777<\/code> from Chat VC Sudo/);
+  assert.deepEqual(service.getVcSudoList(-100777).chat, ['alice', '888']);
+
+  // 2) Reply /rmsudo to @alice's message (even though stored entry was username 'alice' and reply carries id + username)
+  const replyMsg = await service.rmsudoCommand({
+    ...ownerCtx,
+    replyTo: { from: { id: 444, username: 'Alice' } }
+  }, []);
+  assert.match(replyMsg, /Removed <code>alice<\/code>/);
+  assert.deepEqual(service.getVcSudoList(-100777).chat, ['888']);
+
+  // 3) Attempting /rmsudo on a user not in chat list (including hint when in global list)
+  const notListed = await service.rmsudoCommand(ownerCtx, ['555']);
+  assert.match(notListed, /not listed in Chat VC Sudo/);
+  assert.match(notListed, /Global VC Sudo/);
+
+  // 4) Non-global chat admin cannot touch Global VC Sudo via --global
+  await assert.rejects(
+    () => service.rmsudoCommand(adminCtx, ['--global', '555']),
+    (err) => err?.code === 'ADMIN_ONLY' && err?.silent === true
+  );
+  assert.deepEqual(service.getVcSudoList(-100777).global, ['555']);
+
+  // 5) Owner removes from global with --global before target
+  const globalRm = await service.rmsudoCommand(ownerCtx, ['--global', '555']);
+  assert.match(globalRm, /Removed <code>555<\/code> from Global VC Sudo/);
+  assert.deepEqual(service.getVcSudoList(-100777).global, []);
+
+  // 6) Unauthorized user stays silently blocked
+  const beforeLen = sent.length;
+  await screen.handleCommand(outsiderCtx, '/rmsudo', ['888']);
+  assert.equal(sent.length, beforeLen);
+  assert.deepEqual(service.getVcSudoList(-100777).chat, ['888']);
+
+  // 7) /rmsudo clear wipes remaining chat entries; /rmsudo without target throws INVALID_VCSUDO
+  const clrMsg = await service.rmsudoCommand(ownerCtx, ['clear']);
+  assert.match(clrMsg, /Cleared all entries in Chat VC Sudo/);
+  assert.deepEqual(service.getVcSudoList(-100777).chat, []);
+  await assert.rejects(
+    () => service.rmsudoCommand(ownerCtx, []),
+    (err) => err?.code === 'INVALID_VCSUDO'
+  );
+});

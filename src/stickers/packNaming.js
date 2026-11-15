@@ -82,7 +82,7 @@ export function toWhatsAppPackTitle(formattedOrName, template = DEFAULT_PACK_NAM
  */
 export function extractTelegramPackName(input) {
   const trimmed = String(input || '').trim();
-  const linkMatch = trimmed.match(/(?:t\.me\/addstickers\/|telegram\.me\/addstickers\/|addstickers\/)([a-zA-Z0-9_]+)/i);
+  const linkMatch = trimmed.match(/(?:t\.me\/(?:addstickers|addemoji)\/|telegram\.me\/(?:addstickers|addemoji)\/|(?:addstickers|addemoji)\/)([a-zA-Z0-9_]+)/i);
   if (linkMatch) return linkMatch[1];
   const nameMatch = trimmed.match(/^[a-zA-Z0-9_]{3,64}$/);
   if (nameMatch) return nameMatch[0];

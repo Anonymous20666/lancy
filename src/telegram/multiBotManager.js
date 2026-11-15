@@ -5,10 +5,12 @@ import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 import { TelegramStickerService } from '../stickers/telegram.js';
 import { StickerPackService } from '../stickers/packService.js';
+import { CustomEmojiPackService } from '../stickers/customEmojiPackService.js';
 
 import { createDashboardScreen } from './screens/dashboard.js';
 import { createPinterestScreen } from './screens/pinterest.js';
 import { createStickersScreen } from './screens/stickers.js';
+import { createCustomEmojiStudioScreen } from './screens/customEmojiStudio.js';
 import { createWhatsAppScreen } from './screens/whatsapp.js';
 import { createAIScreen } from './screens/ai.js';
 import { createSettingsScreen } from './screens/settings.js';
@@ -23,6 +25,7 @@ const SCREEN_FACTORIES = [
   createDashboardScreen,
   createPinterestScreen,
   createStickersScreen,
+  createCustomEmojiStudioScreen,
   createWhatsAppScreen,
   createAIScreen,
   createSettingsScreen,
@@ -158,6 +161,8 @@ export class MultiBotManager {
     // Create a clone-scoped application proxy so all screens reference this clone's API and controller
     let controller = null;
     const cloneApp = Object.create(this.app);
+    cloneApp.sm = sm;
+    cloneApp.customEmojiRegistry = this.app.customEmojiRegistry || null;
     cloneApp.telegram = {
       api,
       controller: null,
@@ -176,10 +181,23 @@ export class MultiBotManager {
       db: this.db,
       settings: this.settings,
       stickerService: cloneStickerService,
-      media: this.app.media
+      media: this.app.media,
+      customEmojiRegistry: cloneApp.customEmojiRegistry
+    });
+    const cloneCustomEmojiPacks = new CustomEmojiPackService({
+      api,
+      db: this.db,
+      settings: this.settings,
+      stickerService: cloneStickerService,
+      packService: clonePacks,
+      media: this.app.media,
+      mediaWorkerPool: this.app.mediaWorkerPool,
+      customEmojiRegistry: cloneApp.customEmojiRegistry,
+      log: this.log
     });
     cloneApp.stickerService = cloneStickerService;
     cloneApp.packs = clonePacks;
+    cloneApp.customEmojiPacks = cloneCustomEmojiPacks;
     if (this.app.publisher) {
       cloneApp.publisher = Object.create(this.app.publisher);
       cloneApp.publisher.telegramApi = api;

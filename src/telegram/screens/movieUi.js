@@ -4,6 +4,8 @@ import { States } from '../../core/stateMachine.js';
 import { durationText, MusicError } from '../../music/model.js';
 import { PANEL_ACTIONS } from '../../music/channelPanels.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, normalizeDownloadQuality, uploadLimitBytes } from '../../media/telegramLimits.js';
+import { isBotSuperAdmin, isAnonymousGroupAdmin } from '../permissions.js';
+import { defaultAdultCatalog, isBlockedAdultText, formatDurationLabel } from '../../media/adultCatalog.js';
 
 const cut = (s, n = 60) => [...String(s || '')].slice(0, n).join('');
 
@@ -20,6 +22,13 @@ function appendLiveLog(b, ms) {
   if (Array.isArray(ms?.logLines) && ms.logLines.length) {
     b.blockquote(rt.text(`📡 Live Cinema Log\n${ms.logLines.slice(-8).join('\n')}`));
   }
+}
+
+function appendNoticeIfDistinct(b, ms) {
+  if (!ms?.notice) return;
+  const lastLog = Array.isArray(ms.logLines) && ms.logLines.length ? ms.logLines[ms.logLines.length - 1] : '';
+  if (lastLog && lastLog === ms.notice) return;
+  b.paragraph(rt.italic(cut(ms.notice, 260)));
 }
 
 /**
@@ -59,10 +68,80 @@ export function createMovieUi({
     return getMusicButton('◀ Back to Player', 'openplayer');
   }
 
-  function isGroupAdultAllowed(ctx) {
-    const cid = Number(ctx?.chatId);
+  function effectiveAdultChatId(ctx, ms = null) {
+    return Number(ms?.destination ?? ctx?.musicPanel?.destination ?? ctx?.chatId);
+  }
+
+  function isGroupAdultAllowed(ctx, ms = null) {
+    const cid = effectiveAdultChatId(ctx, ms);
     if (!Number.isFinite(cid) || cid > 0) return true;
     return Boolean(app.db?.getSetting?.(`nsfw.groupEnabled.${cid}`, false));
+  }
+
+  function isAgeGateRequired(ctx) {
+    return app.settings?.get?.('nsfw.requireAgeGate') === true && !app.db?.getSetting?.(`nsfw.ageVerified.${ctx?.tgId}`, false);
+  }
+
+  function getCatalog() {
+    return app.adultCatalog || defaultAdultCatalog;
+  }
+
+  function getXvQuality(ms) {
+    return ['360p', '480p', '720p'].includes(ms?.xvQuality) ? ms.xvQuality : '480p';
+  }
+
+  function xvQualityHeight(q) {
+    return q === '720p' ? 720 : q === '360p' ? 360 : 480;
+  }
+
+  function buildXvTrack(item, resolved = null, quality = '480p') {
+    const variants = Array.isArray(resolved?.variants) && resolved.variants.length
+      ? resolved.variants
+      : (Array.isArray(item?.variants) ? item.variants : []);
+    const targetH = xvQualityHeight(quality);
+    let chosenUrl = resolved?.streamUrl || item?.streamUrl || item?.videoUrl || item?.fallbackUrls?.[0] || null;
+    let chosenIsHls = Boolean(resolved?.isHls || item?.isHls);
+    if (variants.length) {
+      const sorted = [...variants]
+        .filter((v) => v?.url)
+        .sort((a, b) => {
+          const ha = Number(a.height || parseInt(String(a.quality || '480').replace(/[^\d]/g, ''), 10) || 480);
+          const hb = Number(b.height || parseInt(String(b.quality || '480').replace(/[^\d]/g, ''), 10) || 480);
+          return (Math.abs(ha - targetH) + (a.isHls ? 50 : 0)) - (Math.abs(hb - targetH) + (b.isHls ? 50 : 0));
+        });
+      if (sorted[0]?.url) {
+        chosenUrl = sorted[0].url;
+        chosenIsHls = Boolean(sorted[0].isHls);
+      }
+    }
+    const rawId = String(item?.id || `xv_${Date.now()}`).replace(/^(xv|ad):/i, '');
+    const durSec = Number(resolved?.durationSeconds || item?.durationSeconds || item?.durationSec || 0) || 0;
+    return {
+      id: `xv:${rawId}`,
+      type: 'xvideos',
+      title: resolved?.fullTitle || resolved?.title || item?.title || 'XVideos Stream',
+      artist: resolved?.artist || resolved?.uploader || item?.artist || 'XVideos',
+      durationSec: durSec,
+      durationSeconds: durSec,
+      durationLabel: item?.duration || (durSec ? formatDurationLabel(durSec) : 'HD'),
+      provider: 'movie',
+      mediaType: 'video',
+      isAdult: true,
+      sourceKey: 'xvideos',
+      streamUrl: chosenUrl,
+      videoUrl: chosenUrl,
+      isHls: chosenIsHls,
+      variants,
+      streamHeaders: resolved?.headers || item?.streamHeaders || item?.headers || { Referer: 'https://www.xvideos.com/' },
+      fallbackUrls: [...new Set([...(resolved?.fallbackUrls || []), ...(item?.fallbackUrls || [])].filter(Boolean))],
+      artwork: resolved?.thumbUrl || item?.thumbUrl || item?.poster || null,
+      thumbnailUrl: resolved?.thumbUrl || item?.thumbUrl || item?.poster || null,
+      pageUrl: item?.pageUrl || item?.url || null,
+      categories: resolved?.categories || item?.categories || [],
+      streamResolvedAt: Date.now(),
+      resolution: quality,
+      capabilities: { seek: true, video: true }
+    };
   }
 
   function isDmDownloadMode(ctx, ms = null) {
@@ -130,8 +209,295 @@ export function createMovieUi({
     return finish(b);
   }
 
-  function renderHub(ctx, ms) {
+  function getMovieDeckStreamMode(ctx, ms) {
+    let dest = ms?.destination || ctx?.musicPanel?.destination || null;
+    if (!dest && Number(ctx?.chatId) < 0) dest = Number(ctx.chatId);
+    if (!dest) {
+      try { dest = app.music?.destination?.(ctx) || null; } catch { return 'rtmp'; }
+    }
+    if (!dest) return 'rtmp';
+    return app.musicQueueManager?.getDeckStreamMode?.(dest, 'movie') || 'rtmp';
+  }
+
+  function renderAdultGroupLocked(ctx, ms) {
+    const b = card('🔒 18+ XVideos Mode Locked in This Group', 'Admin Opt-In Required');
+    b.blockquote(rt.text('18+ XVideos streaming is disabled by default in group chats. A group administrator can unlock it below, or members can use /movie inside private DM.'));
+    b.buttons([
+      mvBtn(ms, '🔓 Unlock XVideos (Admin)', 'xgt', '', { style: 'primary' }),
+      mvBtn(ms, '🎬 Movies & TV', 'xm', 'movie')
+    ]);
+    return finish(b);
+  }
+
+  function renderAdultAgeGate(ms) {
+    const b = card('🔞 Age Verification Required (18+)', 'Confirm age before accessing XVideos inside Movie Dash');
+    b.blockquote(rt.text('This section includes explicit 18+ adult videos. Tap Confirm below to unlock 18+ browsing, streaming, and downloads for your account.'));
+    b.buttons([
+      mvBtn(ms, '🔞 I am 18+ · Unlock', 'xag', '', { style: 'success' }),
+      mvBtn(ms, '🎬 Back to Movies & TV', 'xm', 'movie')
+    ]);
+    return finish(b);
+  }
+
+  function renderAdultBlockedQuery(ms) {
+    const b = card('⛔ Search Blocked by Safety Filter', 'Zero-Tolerance Moderation');
+    b.blockquote(rt.text('Your query matched restricted terms and cannot be searched.'));
+    b.buttons([
+      mvBtn(ms, '🔍 New XVideos Search', 'xs', '', { style: 'primary' }),
+      mvBtn(ms, '🏠 XVideos Hub', 'hb', '')
+    ]);
+    return finish(b);
+  }
+
+  function renderXvHub(ctx, ms) {
+    if (!isGroupAdultAllowed(ctx, ms)) return renderAdultGroupLocked(ctx, ms);
+    if (isAgeGateRequired(ctx)) return renderAdultAgeGate(ms);
     const dmOnly = isDmDownloadMode(ctx, ms);
+    const streamMode = getMovieDeckStreamMode(ctx, ms);
+    const cid = effectiveAdultChatId(ctx, ms);
+    const b = dmOnly
+      ? card('🔥 Lancy Cinema · XVideos Studio', 'Search · 36 Categories · 24+ Stars · HD MP4 & Album Slides')
+      : card('🔥 Lancy Cinema · XVideos Stream Studio', `${streamMode === 'rtmp' ? '🔒 RTMP Locked A/V' : '🎙 Interactive VC'} · Queue · HD Downloads`);
+    b.blockquote(rt.text(
+      dmOnly
+        ? 'Search XVideos, browse Trending, 36 Categories, or Featured Artists, pick multiple videos via checkboxes, choose 360p/480p/720p, and download MP4 or paginated album slides.'
+        : 'Browse XVideos Trending, Categories, or Stars and stream straight into Voice Chat (RTMP Live or Interactive VC) or queue multiple videos at once.'
+    ));
+    b.buttons([
+      mvBtn(ms, '🔍 Search XVideos', 'xs', '', { style: 'success' }),
+      mvBtn(ms, '🔥 Trending Now', 'xt', '0', { style: 'primary' })
+    ]);
+    b.buttons([
+      mvBtn(ms, '📂 Categories (36)', 'xc', '0', { style: 'primary' }),
+      mvBtn(ms, '⭐ Artists & Stars', 'xa', '0', { style: 'primary' })
+    ]);
+    if (!dmOnly) {
+      b.buttons([
+        mvBtn(ms, streamMode === 'rtmp' ? '🔄 Mode · 🔒 RTMP Live' : '🔄 Mode · 🎙 Interactive VC', 'xpm', '', {
+          style: streamMode === 'rtmp' ? 'success' : 'primary'
+        }),
+        mvBtn(ms, '🎞 Cinema Queue', 'mq', ''),
+        backToPlayerButton(ms)
+      ]);
+    }
+    if (Number.isFinite(cid) && cid < 0) {
+      b.buttons([mvBtn(ms, '🔒 Lock XVideos in Group (Admin)', 'xgt', '')]);
+    }
+    const footer = [mvBtn(ms, '🎬 Movies & TV', 'xm', 'movie')];
+    if (dmOnly) footer.push(richButton.callback('🏠 Dashboard', encodeCallback('dashboard', 'open')));
+    b.buttons(footer);
+    appendLiveLog(b, ms);
+    appendNoticeIfDistinct(b, ms);
+    return finish(b);
+  }
+
+  function renderXvResults(ctx, ms) {
+    if (!isGroupAdultAllowed(ctx, ms)) return renderAdultGroupLocked(ctx, ms);
+    if (isAgeGateRequired(ctx)) return renderAdultAgeGate(ms);
+    const dmOnly = isDmDownloadMode(ctx, ms);
+    const results = Array.isArray(ms.xvResults) ? ms.xvResults : [];
+    const perPage = 5;
+    const localPagesCount = Math.max(1, Math.ceil(results.length / perPage));
+    const localPage = Math.max(0, Math.min(Number(ms.xvResPage || 0) % 3, localPagesCount - 1));
+    const startIdx = localPage * perPage;
+    const slice = results.slice(startIdx, startIdx + perPage);
+    const sel = ms.xvSelected instanceof Set ? ms.xvSelected : new Set();
+
+    const modeTitle = ms.xvMode === 'category'
+      ? `📂 ${ms.xvCat || 'Category'}`
+      : ms.xvMode === 'artist'
+        ? `⭐ ${ms.xvArtist || 'Artist'}`
+        : ms.xvMode === 'search' && ms.xvQuery
+          ? `🔍 "${cut(ms.xvQuery, 28)}"`
+          : '🔥 Trending Now';
+    const b = card(
+      `🔥 XVideos · ${modeTitle}`,
+      `Page ${(ms.xvResPage || 0) + 1} · Sort: ${ms.xvSort || 'relevance'} · Dur: ${ms.xvDur || 'all'} · ${sel.size} checked`
+    );
+
+    if (!slice.length) {
+      b.paragraph(rt.italic('No matching XVideos results on this page. Try another filter or search term.'));
+    } else {
+      b.table(
+        slice.map((item, idx) => {
+          const gIdx = startIdx + idx;
+          const checked = sel.has(gIdx) ? '☑' : '☐';
+          return [
+            `${checked} ${gIdx + 1}`,
+            cut(item.title || 'Untitled', 34),
+            item.duration || formatDurationLabel(item.durationSeconds || 0, 'HD'),
+            cut(item.artist || item.quality || 'XVideos', 16)
+          ];
+        }),
+        { striped: true, bordered: true, compact: true }
+      );
+      b.buttons(slice.map((_, idx) => {
+        const gIdx = startIdx + idx;
+        return mvBtn(ms, `${sel.has(gIdx) ? '☑' : '☐'} #${gIdx + 1}`, 'xk', String(gIdx), sel.has(gIdx) ? { style: 'success' } : null);
+      }));
+      b.buttons(slice.map((_, idx) => {
+        const gIdx = startIdx + idx;
+        return mvBtn(ms, `🔎 ${gIdx + 1}`, 'xo', String(gIdx), { style: 'primary' });
+      }));
+    }
+
+    const sorts = [
+      ['relevance', 'Relevance'],
+      ['views', 'Views'],
+      ['rating', 'Rating']
+    ];
+    b.buttons(sorts.map(([k, lbl]) => mvBtn(ms, `${(ms.xvSort || 'relevance') === k ? '• ' : ''}${lbl}`, 'xso', k)));
+
+    const durs = [
+      ['all', 'All'],
+      ['short', '1-3m'],
+      ['medium', '3-10m'],
+      ['long', '10-20m'],
+      ['full', '20m+']
+    ];
+    b.buttons(durs.map(([k, lbl]) => mvBtn(ms, `${(ms.xvDur || 'all') === k ? '• ' : ''}${lbl}`, 'xd', k)));
+
+    const pageIndices = slice.map((_, idx) => startIdx + idx);
+    const pageAllSelected = pageIndices.length > 0 && pageIndices.every((idx) => sel.has(idx));
+    const bulkRow = [mvBtn(ms, pageAllSelected ? '☐ Uncheck Page' : '☑ Check Page', 'xqa', '')];
+    if (sel.size > 0) {
+      if (!dmOnly) {
+        bulkRow.push(mvBtn(ms, `⚡ Play (${sel.size})`, 'xpl', 'now', { style: 'success' }));
+        bulkRow.push(mvBtn(ms, `➕ Queue (${sel.size})`, 'xpl', 'q', { style: 'primary' }));
+      }
+      bulkRow.push(mvBtn(ms, `⬇ Slides (${sel.size})`, 'xdl', 'sl', { style: 'success' }));
+    }
+    b.buttons(bulkRow);
+
+    const hasNextLocal = localPage < localPagesCount - 1;
+    const hasNextApi = results.length >= 15 && (Number(ms.xvApiPage || 0) + 1) < Math.max(1, Number(ms.xvTotalPages || 1));
+    const navRow = [];
+    if ((Number(ms.xvResPage) || 0) > 0) navRow.push(mvBtn(ms, '◀ Prev', 'xp', String(Number(ms.xvResPage) - 1)));
+    navRow.push(mvBtn(ms, '🔍 Search', 'xs', ''));
+    if (hasNextLocal || hasNextApi) navRow.push(mvBtn(ms, 'Next ▶', 'xp', String((Number(ms.xvResPage) || 0) + 1)));
+    b.buttons(navRow);
+
+    b.buttons([
+      mvBtn(ms, '📂 Cats', 'xc', '0'),
+      mvBtn(ms, '⭐ Artists', 'xa', '0'),
+      mvBtn(ms, '🏠 Hub', 'hb', '')
+    ]);
+    appendLiveLog(b, ms);
+    appendNoticeIfDistinct(b, ms);
+    return finish(b);
+  }
+
+  function renderXvDetail(ctx, ms) {
+    if (!isGroupAdultAllowed(ctx, ms)) return renderAdultGroupLocked(ctx, ms);
+    if (isAgeGateRequired(ctx)) return renderAdultAgeGate(ms);
+    const dmOnly = isDmDownloadMode(ctx, ms);
+    const cid = effectiveAdultChatId(ctx, ms);
+    const item = (ms.xvResults || [])[Number(ms.xvCurrentIdx || 0)] || ms.mediaItem || {};
+    const resolved = ms.xvResolved || null;
+    const q = getXvQuality(ms);
+    const variants = Array.isArray(resolved?.variants) ? resolved.variants : (Array.isArray(item.variants) ? item.variants : []);
+    const durSec = Number(resolved?.durationSeconds || item.durationSeconds || 0);
+    const streamMode = getMovieDeckStreamMode(ctx, ms);
+
+    const b = card(
+      `🔥 ${cut(resolved?.fullTitle || item.title || 'XVideos Stream', 48)}`,
+      `${cut(resolved?.artist || item.artist || 'XVideos', 24)} · ${formatDurationLabel(durSec, item.duration || 'HD')} · ${q}`
+    );
+    // Group safety: attach photo preview in private DMs only; never expose unblurred adult artwork in groups/channels
+    const thumb = resolved?.thumbUrl || item.thumbUrl || item.poster || null;
+    if (Number.isFinite(cid) && cid > 0 && isSafeHttpsUrl(thumb)) {
+      b.photo(thumb, cut(item.title || 'XVideos Preview', 90));
+    }
+
+    const sizeForHeight = (h) => {
+      const match = variants.find((v) => Number(v.height) === h && Number(v.sizeBytes) > 0);
+      return match?.sizeBytes ? ` (${Math.max(1, Math.round(match.sizeBytes / (1024 * 1024)))}MB)` : '';
+    };
+    const meta = [
+      ['Source', 'XVideos'],
+      ['Creator', cut(resolved?.artist || item.artist || 'Creator', 36)],
+      ['Duration', formatDurationLabel(durSec, item.duration || 'HD')],
+      ['Quality', `${q}${sizeForHeight(xvQualityHeight(q))}`]
+    ];
+    if (!dmOnly) {
+      meta.push(['VC Engine', streamMode === 'rtmp' ? '🔒 RTMP Live (Locked A/V)' : '🎙 Interactive VC (WebRTC)']);
+    }
+    b.table(meta, { striped: true, bordered: true, compact: true });
+
+    b.buttons(['360p', '480p', '720p'].map((tier) => {
+      const sz = sizeForHeight(xvQualityHeight(tier));
+      const active = q === tier;
+      return mvBtn(ms, `${active ? '✓ ' : ''}${tier}${sz}`, 'xq', tier, active ? { style: 'success' } : null);
+    }));
+
+    if (dmOnly) {
+      b.buttons([
+        mvBtn(ms, `⬇ Download ${q} MP4`, 'xdl', 'cur', { style: 'success' })
+      ]);
+    } else {
+      b.buttons([
+        mvBtn(ms, '⚡ Play in VC', 'xpl', 'cur', { style: 'success' }),
+        mvBtn(ms, '➕ Add to Queue', 'xpl', 'curq', { style: 'primary' })
+      ]);
+      b.buttons([
+        mvBtn(ms, streamMode === 'rtmp' ? '🔄 Mode · 🔒 RTMP Live' : '🔄 Mode · 🎙 Interactive VC', 'xpm', ''),
+        mvBtn(ms, `⬇ Download ${q} MP4`, 'xdl', 'cur', { style: 'primary' })
+      ]);
+    }
+
+    const tail = [];
+    if (Array.isArray(ms.xvResults) && ms.xvResults.length) tail.push(mvBtn(ms, '◀ Results', 'xrv', ''));
+    if (!dmOnly) tail.push(mvBtn(ms, '🎞 Queue', 'mq', ''));
+    tail.push(mvBtn(ms, '🏠 Hub', 'hb', ''));
+    b.buttons(tail);
+    appendLiveLog(b, ms);
+    appendNoticeIfDistinct(b, ms);
+    return finish(b);
+  }
+
+  function renderXvCats(ctx, ms) {
+    const catPage = getCatalog().getCategories({ page: Number(ms.xvCatPage || 0), perPage: 12 });
+    ms.xvCatPage = catPage.page;
+    const b = card('📂 XVideos Categories', `Page ${catPage.page + 1}/${catPage.totalPages} · ${catPage.total} categories`);
+    b.paragraph(rt.italic('Tap any category to browse XVideos HD streams & downloads.'));
+    for (let i = 0; i < catPage.items.length; i += 3) {
+      b.buttons(catPage.items.slice(i, i + 3).map((c) => mvBtn(ms, c.label || c.id, 'xcc', c.id, { style: 'primary' })));
+    }
+    const nav = [];
+    if (catPage.page > 0) nav.push(mvBtn(ms, '◀ Prev', 'xcp', String(catPage.page - 1)));
+    nav.push(mvBtn(ms, '🔍 Search', 'xs', ''));
+    if (catPage.page < catPage.totalPages - 1) nav.push(mvBtn(ms, 'Next ▶', 'xcp', String(catPage.page + 1)));
+    b.buttons(nav);
+    b.buttons([mvBtn(ms, '⭐ Artists', 'xa', '0'), mvBtn(ms, '🏠 Hub', 'hb', '')]);
+    return finish(b);
+  }
+
+  function renderXvArtists(ctx, ms) {
+    const list = Array.isArray(ms.xvArtists) ? ms.xvArtists : [];
+    const totalPages = Math.max(1, Number(ms.xvArtistsTotalPages || 1));
+    const page = Math.max(0, Math.min(Number(ms.xvArtistPage || 0), totalPages - 1));
+    ms.xvArtistPage = page;
+    const b = card('⭐ XVideos Featured Artists & Stars', `Page ${page + 1}/${totalPages} · Tap any artist to view videos`);
+    if (!list.length) {
+      b.paragraph(rt.italic('No artists loaded. Use Search XVideos to find any creator by name.'));
+    } else {
+      for (let i = 0; i < list.length; i += 3) {
+        b.buttons(list.slice(i, i + 3).map((a, subIdx) => mvBtn(ms, `⭐ ${cut(a.name, 18)}`, 'xac', String(i + subIdx), { style: 'primary' })));
+      }
+    }
+    const nav = [];
+    if (page > 0) nav.push(mvBtn(ms, '◀ Prev', 'xap', String(page - 1)));
+    nav.push(mvBtn(ms, '🔍 Search', 'xs', ''));
+    if (page < totalPages - 1) nav.push(mvBtn(ms, 'Next ▶', 'xap', String(page + 1)));
+    b.buttons(nav);
+    b.buttons([mvBtn(ms, '📂 Categories', 'xc', '0'), mvBtn(ms, '🏠 Hub', 'hb', '')]);
+    return finish(b);
+  }
+
+  function renderHub(ctx, ms) {
+    if (ms?.sourceMode === 'xvideos') return renderXvHub(ctx, ms);
+    const dmOnly = isDmDownloadMode(ctx, ms);
+    const cid = effectiveAdultChatId(ctx, ms);
     const b = dmOnly
       ? card('🎬 Lancy Cinema · Movie & Series Downloads', 'Direct HD MP4 & Clean Paginated Slides · Zero Chat Clutter')
       : card('🎬 Lancy Music · Movie & Series Stream', 'HD VC Playback · Synced Subtitles · High-Capacity Downloads');
@@ -155,8 +521,10 @@ export function createMovieUi({
         mvBtn(ms, '🎞 Cinema Queue', 'mq', ''),
         backToPlayerButton(ms)
       ];
-    if (isGroupAdultAllowed(ctx)) {
-      utilRow.push(richButton.callback('🔞 18+ Cinema', encodeCallback('nsfw', 'sub', 'real_videos')));
+    if (isGroupAdultAllowed(ctx, ms)) {
+      utilRow.push(mvBtn(ms, '🔥 XVideos Mode', 'xm', 'xvideos', { style: 'primary' }));
+    } else if (Number.isFinite(cid) && cid < 0) {
+      utilRow.push(mvBtn(ms, '🔓 Unlock XVideos (Admin)', 'xgt', ''));
     }
     b.buttons(utilRow);
     b.details('💡 How Multi-Season TV & Album Slides Work', [
@@ -258,7 +626,7 @@ export function createMovieUi({
       b.expandableBlockquote(`Synopsis · ${cut(item.title, 48)}\n\n${cut(item.overview, 600)}`);
     }
     appendLiveLog(b, ms);
-    if (ms.notice) b.paragraph(rt.italic(cut(ms.notice, 260)));
+    appendNoticeIfDistinct(b, ms);
 
     if (dmOnly) {
       b.buttons(buildQualitySelectorRow(ms, dlQuality, { durationSeconds: estDur, itemCount: 1, variants }));
@@ -388,7 +756,7 @@ export function createMovieUi({
     ]);
 
     appendLiveLog(b, ms);
-    if (ms.notice) b.paragraph(rt.italic(cut(ms.notice, 260)));
+    appendNoticeIfDistinct(b, ms);
 
     const tail = [];
     if (ms.results?.length) tail.push(mvBtn(ms, '◀ Results', 'rs', ''));
@@ -484,6 +852,10 @@ export function createMovieUi({
   }
 
   function renderCurrentView(ctx, ms) {
+    if (ms.view === 'xv_results') return renderXvResults(ctx, ms);
+    if (ms.view === 'xv_detail') return renderXvDetail(ctx, ms);
+    if (ms.view === 'xv_cats') return renderXvCats(ctx, ms);
+    if (ms.view === 'xv_artists') return renderXvArtists(ctx, ms);
     if (ms.view === 'results') return renderResults(ctx, ms);
     if (ms.view === 'movie') return renderMovieDetail(ctx, ms);
     if (ms.view === 'season') return renderTvSeason(ctx, ms);
@@ -647,10 +1019,13 @@ export function createMovieUi({
     });
   }
 
-  async function openHub(ctx) {
+  async function openHub(ctx, { sourceMode = 'movie' } = {}) {
     await ensureMovieAuth(ctx, null, null);
     const prev = app.movieSessions.getLatestForChat(ctx.chatId);
-    const ms = await createSessionForCtx(ctx, { view: 'hub' });
+    const ms = await createSessionForCtx(ctx, {
+      view: 'hub',
+      sourceMode: sourceMode === 'xvideos' ? 'xvideos' : 'movie'
+    });
     await upsertCard(ctx, ms, renderHub(ctx, ms));
     if (prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
       await cleanupSupersededCards(ctx, prev, ms.messageId);
@@ -658,30 +1033,180 @@ export function createMovieUi({
     return ms;
   }
 
-  async function openMovieSearch(ctx, query, { random = false } = {}) {
+  async function executeXvSearch(ctx, ms, { rawUrl = null, apiPage = null, resPage = 0, preserveSelection = false } = {}) {
+    if (!isGroupAdultAllowed(ctx, ms)) {
+      ms.view = 'hub';
+      await upsertCard(ctx, ms, renderAdultGroupLocked(ctx, ms));
+      return ms;
+    }
+    if (isAgeGateRequired(ctx)) {
+      ms.view = 'hub';
+      await upsertCard(ctx, ms, renderAdultAgeGate(ms));
+      return ms;
+    }
+    if (isBlockedAdultText(ms.xvQuery)) {
+      await upsertCard(ctx, ms, renderAdultBlockedQuery(ms));
+      return ms;
+    }
+    ms.sourceMode = 'xvideos';
+    if (rawUrl) {
+      const q = getXvQuality(ms);
+      const resolved = await getCatalog().resolveStream(rawUrl, { preferredHeight: xvQualityHeight(q), probeSize: true }).catch(() => null);
+      if (!resolved?.streamUrl) throw new MusicError('MOVIE_NOT_FOUND', 'Could not extract an XVideos stream from that URL.');
+      const urlId = (String(rawUrl).match(/\/video\.?([a-z0-9]+)/i) || [])[1] || String(Date.now());
+      const item = {
+        id: urlId,
+        title: resolved.fullTitle || resolved.title || 'XVideos Stream',
+        artist: resolved.artist || resolved.uploader || 'XVideos',
+        durationSeconds: resolved.durationSeconds || 0,
+        duration: resolved.durationSeconds ? formatDurationLabel(resolved.durationSeconds) : 'HD',
+        thumbUrl: resolved.thumbUrl || null,
+        pageUrl: rawUrl,
+        sourceKey: 'xvideos',
+        variants: resolved.variants || [],
+        streamUrl: resolved.streamUrl,
+        videoUrl: resolved.streamUrl,
+        headers: resolved.headers || { Referer: 'https://www.xvideos.com/' }
+      };
+      ms.xvResults = [item];
+      ms.xvCurrentIdx = 0;
+      ms.xvResolved = resolved;
+      ms.xvSelected = new Set();
+      ms.view = 'xv_detail';
+      await upsertCard(ctx, ms, renderXvDetail(ctx, ms));
+      return ms;
+    }
+    const targetApiPage = apiPage != null ? Math.max(0, Number(apiPage) || 0) : Number(ms.xvApiPage || 0);
+    const res = await getCatalog().searchXvideos({
+      query: ms.xvMode === 'trending' ? '' : (ms.xvQuery || ''),
+      page: targetApiPage,
+      limit: 15,
+      sort: ms.xvSort || 'relevance',
+      durationFilter: ms.xvDur || 'all',
+      category: ms.xvMode === 'category' ? (ms.xvCat || null) : null,
+      artist: ms.xvMode === 'artist' ? (ms.xvArtist || null) : null,
+      lazy: true
+    });
+    ms.xvApiPage = targetApiPage;
+    ms.xvResults = Array.isArray(res?.results) ? res.results : [];
+    ms.xvTotalPages = Math.max(1, Number(res?.totalPages || 1));
+    const maxLocalPages = Math.max(1, Math.ceil(ms.xvResults.length / 5));
+    const safeLocal = Math.min(Number(resPage || 0) % 3, maxLocalPages - 1);
+    ms.xvResPage = Math.max(0, targetApiPage * 3 + Math.max(0, safeLocal));
+    if (!preserveSelection) ms.xvSelected = new Set();
+    ms.view = 'xv_results';
+    ms.notice = null;
+    ms.logLines = null;
+    await upsertCard(ctx, ms, renderXvResults(ctx, ms));
+    return ms;
+  }
+
+  async function loadXvDetailIntoSession(ms, idx) {
+    const item = ms.xvResults?.[idx];
+    if (!item) throw new MusicError('STALE_PLAYER', 'That XVideos title is no longer in the result list.');
+    ms.xvCurrentIdx = idx;
+    ms.xvResolved = null;
+    ms.notice = null;
+    ms.logLines = null;
+    const q = getXvQuality(ms);
+    const resolved = await getCatalog().resolveStream(item, {
+      preferredHeight: xvQualityHeight(q),
+      probeSize: true
+    }).catch(() => null);
+    if (resolved) ms.xvResolved = resolved;
+    ms.view = 'xv_detail';
+    return item;
+  }
+
+  async function promptSearchInput(resolvedCtx, ms, isXv = false) {
+    const isChan = isChannelCtx(resolvedCtx);
+    const group = Number(resolvedCtx.chatId) < 0 && !isChan;
+    const stateKey = (isChan && Number(resolvedCtx.chatId) < 0) ? String(resolvedCtx.chatId) : resolvedCtx.tgId;
+    if (resolvedCtx.query?.id && resolvedCtx.api?.answerCallbackQuery) {
+      await resolvedCtx.api.answerCallbackQuery(resolvedCtx.query.id, {
+        text: isXv ? '🔍 Send an XVideos query, star, or URL.' : '🔍 Send the movie or TV show title.'
+      }).catch(() => {});
+    }
+    const promptText = isXv
+      ? `${group ? 'Reply to this message with' : 'Send'} an XVideos search query, artist/star name, or xvideos.com URL. /cancel closes search.`
+      : `${group ? 'Reply to this message with' : 'Send'} a movie or TV series title (e.g. "Breaking Bad", "John Wick 4", "Inception"). /cancel closes search.`;
+    let sent = null;
+    if (isChan && typeof resolvedCtx.api?.sendRichMessage === 'function') {
+      const promptCard = card(isXv ? '🔍 XVideos · Search' : '🔍 Lancy Cinema · Search', isXv ? 'Post an XVideos query or link in this channel' : 'Post the movie or TV series title in this channel')
+        .paragraph(rt.text(promptText))
+        .buttons([[richButton.callback('✕ Cancel Search', encodeCallback('nav', 'cancelprompt'), { style: 'danger' })]]);
+      sent = await sendOrEditMenu(resolvedCtx, finish(promptCard), { ttlMs: 120000 }).catch(() => null);
+    } else {
+      sent = await resolvedCtx.api.sendMessage(resolvedCtx.chatId, promptText, {
+        ...(group || Number(resolvedCtx.chatId) > 0 ? { reply_markup: { force_reply: true, selective: true } } : {}),
+        ...(resolvedCtx.messageId && group ? { reply_to_message_id: resolvedCtx.messageId } : {})
+      });
+    }
+    const temporaryToken = temporary.remember(resolvedCtx, sent, { ttlMs: 120000 });
+    await app.sm.transition(stateKey, States.MUSIC_QUEUE_INPUT, {
+      chatId: resolvedCtx.chatId,
+      timeoutMs: 120000,
+      context: {
+        stateKey,
+        mode: 'movie_search',
+        sourceMode: isXv ? 'xvideos' : 'movie',
+        movieSid: ms.id,
+        botKey: app.music.botKey(resolvedCtx),
+        promptMessageId: sent?.message_id || null,
+        temporaryToken,
+        panelToken: ms.panelToken || null,
+        isChannelPrompt: isChan
+      }
+    });
+    return true;
+  }
+
+  async function openMovieSearch(ctx, query, { random = false, movieSid = null, sourceMode = null } = {}) {
     await ensureMovieAuth(ctx, null, null);
     const prev = app.movieSessions.getLatestForChat(ctx.chatId);
-    const ms = await createSessionForCtx(ctx);
+    const existing = movieSid ? app.movieSessions.get(movieSid) : null;
+    const reuseExisting = Boolean(existing && Number(existing.chatId) === Number(ctx.chatId));
+    const q = String(query || '').trim();
+    const isXvUrl = /^https?:\/\/(?:www\.)?xvideos\./i.test(q);
+    const effSource = sourceMode || (reuseExisting ? existing.sourceMode : null) || (isXvUrl ? 'xvideos' : 'movie');
+    const ms = reuseExisting
+      ? existing
+      : await createSessionForCtx(ctx, { sourceMode: effSource === 'xvideos' ? 'xvideos' : 'movie' });
+    if (effSource === 'xvideos') ms.sourceMode = 'xvideos';
+
     if (random) {
       const pick = await app.movieApi.pickRandom({});
       if (!pick) throw new MusicError('MOVIE_NOT_FOUND', 'No random movie was available right now. Try searching by title.');
       ms.results = [pick];
       await loadItemIntoSession(ms, pick);
       await upsertCard(ctx, ms, renderCurrentView(ctx, ms));
-      if (prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
+      if (!reuseExisting && prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
         await cleanupSupersededCards(ctx, prev, ms.messageId);
       }
       return ms;
     }
-    const q = String(query || '').trim();
-    if (!q) return openHub(ctx);
+    if (!q) return reuseExisting ? (ms.view = 'hub', await upsertCard(ctx, ms, renderHub(ctx, ms)), ms) : openHub(ctx, { sourceMode: effSource });
+
+    if (effSource === 'xvideos') {
+      ms.xvQuery = isXvUrl ? '' : q;
+      ms.xvMode = 'search';
+      ms.xvCat = '';
+      ms.xvArtist = '';
+      ms.xvApiPage = 0;
+      await executeXvSearch(ctx, ms, { rawUrl: isXvUrl ? q : null, resPage: 0 });
+      if (!reuseExisting && prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
+        await cleanupSupersededCards(ctx, prev, ms.messageId);
+      }
+      return ms;
+    }
+
     const res = await app.movieApi.search(q, { limit: 20 });
     ms.query = q;
     ms.results = res?.results || [];
     ms.resultPage = 0;
     ms.view = 'results';
     await upsertCard(ctx, ms, renderResults(ctx, ms));
-    if (prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
+    if (!reuseExisting && prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
       await cleanupSupersededCards(ctx, prev, ms.messageId);
     }
     return ms;
@@ -835,27 +1360,35 @@ export function createMovieUi({
     ms.logLines = [];
     let lastLogFlush = 0;
     let pendingLogTimer = null;
-    let flushingLog = false;
+    let activeFlushPromise = null;
+    let flushQueued = false;
     const labelItem = first.episode
       ? `S${String(first.season).padStart(2, '0')}E${String(first.episode).padStart(2, '0')}`
       : cut(first.title, 36);
     const flushLog = async () => {
-      if (flushingLog) return;
-      flushingLog = true;
-      try {
-        ms.notice = ms.logLines[ms.logLines.length - 1] || `⏳ Loading ${labelItem}…`;
-        await upsertCard(targetCtx, ms, renderCurrentView(targetCtx, ms)).catch(() => {});
-        lastLogFlush = Date.now();
-      } finally {
-        flushingLog = false;
-      }
+      flushQueued = true;
+      if (activeFlushPromise) return activeFlushPromise;
+      activeFlushPromise = (async () => {
+        try {
+          while (flushQueued) {
+            flushQueued = false;
+            ms.notice = ms.logLines[ms.logLines.length - 1] || `⏳ Loading ${labelItem}…`;
+            await upsertCard(targetCtx, ms, renderCurrentView(targetCtx, ms)).catch(() => {});
+            lastLogFlush = Date.now();
+          }
+        } finally {
+          activeFlushPromise = null;
+        }
+      })();
+      return activeFlushPromise;
     };
     const pushLog = (msg, { force = false } = {}) => {
       const clean = String(msg || '').trim();
       if (!clean) return Promise.resolve();
       const stamp = new Date().toISOString().slice(11, 19);
       const entry = `[${stamp}] ${clean}`;
-      if (ms.logLines[ms.logLines.length - 1] !== entry) {
+      const prevBody = String(ms.logLines[ms.logLines.length - 1] || '').replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '');
+      if (prevBody !== clean) {
         ms.logLines.push(entry);
         if (ms.logLines.length > 10) ms.logLines.shift();
       }
@@ -881,12 +1414,21 @@ export function createMovieUi({
         onProgress: (line) => { void pushLog(line); }
       });
       if (!resolvedFirst?.ok || !resolvedFirst.track) {
-        await pushLog(`❌ ${resolvedFirst?.reason || 'No playable full-length web stream found.'}`, { force: true });
+        if (pendingLogTimer) { clearTimeout(pendingLogTimer); pendingLogTimer = null; }
+        const lastEntry = String(ms.logLines[ms.logLines.length - 1] || '');
+        if (/\]\s*❌\s/.test(lastEntry)) {
+          await flushLog();
+        } else {
+          await pushLog(`❌ ${resolvedFirst?.reason || 'No playable full-length web stream found.'}`, { force: true });
+        }
         return;
       }
 
       const subTag = (resolvedFirst.subtitles?.filePath || resolvedFirst.subtitles?.found) ? ' · 💬 Subtitles ready' : '';
-      await pushLog(`✅ Stream ready (${cut(resolvedFirst.track.artist || 'HD Feature', 36)})${subTag}`, { force: true });
+      const audioTag = resolvedFirst.track?.dubOnlyWarning
+        ? ' · ⚠️ Dub only available'
+        : (resolvedFirst.track?.audioLanguage ? ` · 🔊 ${String(resolvedFirst.track.audioLanguage).toUpperCase()} Original` : '');
+      await pushLog(`✅ Stream ready (${cut(resolvedFirst.track.artist || 'HD Feature', 36)})${audioTag}${subTag}`, { force: true });
       await pushLog('🎙️ Preparing Voice Chat Cinema deck…', { force: true });
 
       const requesterName = targetCtx.user?.first_name || targetCtx.user?.username || 'Member';
@@ -897,9 +1439,20 @@ export function createMovieUi({
         rating: tr.rating ?? desc?.rating ?? null,
         genres: tr.genres ?? desc?.genres ?? null,
         overview: tr.overview ?? desc?.overview ?? null,
+        originalLanguage: tr.originalLanguage ?? desc?.originalLanguage ?? null,
+        preferredAudioLang: tr.preferredAudioLang ?? desc?.originalLanguage ?? null,
+        audioLanguage: tr.audioLanguage || null,
+        audioIsDub: Boolean(tr.audioIsDub),
+        dubOnlyWarning: Boolean(tr.dubOnlyWarning),
+        subtitlesLabel: tr.subtitlesLabel || null,
         ...(desc?.type === 'tv' ? { seriesId: desc.id, seasonNumber: desc.season } : {})
       });
 
+      const preSess = qm.getSession(dest);
+      if (playNow || !['playing', 'paused', 'buffering'].includes(preSess.status)) {
+        preSess.activeDeck = 'movie';
+        preSess.streamMode = qm.getDeckStreamMode?.(dest, 'movie') || 'rtmp';
+      }
       await app.music.prepare(targetCtx, dest);
       if ((qm.getSession(dest).stopGeneration || 0) !== generation) {
         throw new MusicError('ACTION_CANCELLED', 'Playback stopped before stream started.');
@@ -917,22 +1470,15 @@ export function createMovieUi({
           panel.overlayAt = 0;
           panel.lastRender = null;
         }
-        await pushLog(
-          `🎬 Streaming ${cut(resolvedFirst.track.title, 40)}${subTag}${remaining.length ? ` · Queuing ${remaining.length} more…` : ''}`,
-          { force: true }
-        );
-        const searchCardId = ms.messageId;
-        const canMorphSearchCard = Boolean(searchCardId && !updatedSession.screenMessageId && !panel?.screenMessageId && Number(targetCtx.chatId) === Number(ms.chatId));
-        const p = await app.music.player({
-          ...targetCtx,
-          ...(canMorphSearchCard ? { reuseMessageId: searchCardId } : {}),
-          forceNew: !canMorphSearchCard && !updatedSession.screenMessageId && !panel?.screenMessageId
-        }, dest).catch(() => null);
-        if (isChannelCtx(targetCtx)) await adoptChannelPlayerResult(targetCtx, p);
-        const activePlayerMsgId = updatedSession.screenMessageId || panel?.screenMessageId || p?.screenMessageId;
-        if (searchCardId && activePlayerMsgId && searchCardId !== activePlayerMsgId) {
-          await cleanupSupersededCards(targetCtx, ms, activePlayerMsgId);
-        }
+        await presentQueuedCinema(targetCtx, ms, {
+          dest,
+          panel,
+          qm,
+          firstTitle: resolvedFirst.track.title,
+          subTag,
+          remainingCount: remaining.length,
+          pushLog
+        });
       } else {
         await pushLog(
           `🎞 Added ${cut(resolvedFirst.track.title, 40)} to Cinema Queue (${updatedSession.movieUpcoming?.length || 1} queued) · Music stays live.`,
@@ -965,13 +1511,128 @@ export function createMovieUi({
     }
   }
 
+  async function presentQueuedCinema(targetCtx, ms, { dest, panel, qm, firstTitle, subTag = '', remainingCount = 0, pushLog = null }) {
+    const updatedSession = qm.getSession(dest);
+    if (panel) {
+      panel.overlayView = null;
+      panel.overlayAt = 0;
+      panel.lastRender = null;
+    }
+    if (pushLog) {
+      await pushLog(
+        `🎬 Streaming ${cut(firstTitle, 40)}${subTag}${remainingCount ? ` · Queuing ${remainingCount} more…` : ''}`,
+        { force: true }
+      );
+    }
+    const searchCardId = ms.messageId;
+    const canMorphSearchCard = Boolean(searchCardId && !updatedSession.screenMessageId && !panel?.screenMessageId && Number(targetCtx.chatId) === Number(ms.chatId));
+    const p = await app.music.player({
+      ...targetCtx,
+      ...(canMorphSearchCard ? { reuseMessageId: searchCardId } : {}),
+      forceNew: !canMorphSearchCard && !updatedSession.screenMessageId && !panel?.screenMessageId
+    }, dest).catch(() => null);
+    if (isChannelCtx(targetCtx)) await adoptChannelPlayerResult(targetCtx, p);
+    const activePlayerMsgId = updatedSession.screenMessageId || panel?.screenMessageId || p?.screenMessageId;
+    if (searchCardId && activePlayerMsgId && searchCardId !== activePlayerMsgId) {
+      await cleanupSupersededCards(targetCtx, ms, activePlayerMsgId);
+    }
+  }
+
+  async function streamXvItems(ctx, ms, rawItems, { playNow = true } = {}) {
+    if (!isGroupAdultAllowed(ctx, ms)) {
+      ms.view = 'hub';
+      await upsertCard(ctx, ms, renderAdultGroupLocked(ctx, ms));
+      return;
+    }
+    if (isAgeGateRequired(ctx)) {
+      ms.view = 'hub';
+      await upsertCard(ctx, ms, renderAdultAgeGate(ms));
+      return;
+    }
+    if (!Array.isArray(rawItems) || !rawItems.length) {
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: 'Check at least one video first.' }).catch(() => {});
+      return;
+    }
+    const dest = ms.destination || app.music.destination(ctx);
+    const panel = ms.panelToken ? await app.music.channelPanels?.resolve?.(ctx, ms.panelToken, { requireMessage: false }).catch(() => null) : ctx.musicPanel;
+    const targetCtx = panel ? { ...ctx, musicPanel: panel } : ctx;
+    await app.music.authorize(targetCtx, true, dest, { allowDj: !isChannelCtx(targetCtx) });
+    const qm = app.musicQueueManager;
+    const session = qm.getSession(dest);
+    const generation = session.stopGeneration || 0;
+    const q = getXvQuality(ms);
+    const requesterName = targetCtx.user?.first_name || targetCtx.user?.username || 'Member';
+
+    const first = rawItems[0];
+    if (ctx.query?.id) {
+      await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `⏳ Resolving XVideos (${q}) for ${cut(first.title, 26)}…` }).catch(() => {});
+    }
+    ms.logLines = [`🔎 Resolving XVideos stream (${q}) for ${cut(first.title, 34)}…`];
+    ms.notice = ms.logLines[0];
+    await upsertCard(targetCtx, ms, renderCurrentView(targetCtx, ms)).catch(() => {});
+
+    const curDetailItem = (ms.xvResults || [])[Number(ms.xvCurrentIdx || 0)];
+    const resolvedFirst = await getCatalog().resolveStream(first, { preferredHeight: xvQualityHeight(q), probeSize: false }).catch(() => null);
+    const firstTrack = buildXvTrack(first, resolvedFirst || (curDetailItem === first ? ms.xvResolved : null), q);
+    firstTrack.requester = requesterName;
+    if (!firstTrack.streamUrl && !firstTrack.pageUrl) {
+      throw new MusicError('NO_SOURCE', 'Could not extract a playable XVideos stream URL.');
+    }
+
+    const preSess = qm.getSession(dest);
+    if (playNow || !['playing', 'paused', 'buffering'].includes(preSess.status)) {
+      preSess.activeDeck = 'movie';
+      preSess.streamMode = qm.getDeckStreamMode?.(dest, 'movie') || 'rtmp';
+    }
+    await app.music.prepare(targetCtx, dest);
+    if ((qm.getSession(dest).stopGeneration || 0) !== generation) {
+      throw new MusicError('ACTION_CANCELLED', 'Playback stopped before stream started.');
+    }
+
+    await qm.addMovies(dest, [firstTrack], { playNow });
+    const remaining = rawItems.slice(1);
+    const updatedSession = qm.getSession(dest);
+    if (updatedSession.activeDeck === 'movie') {
+      await presentQueuedCinema(targetCtx, ms, {
+        dest,
+        panel,
+        qm,
+        firstTitle: firstTrack.title,
+        remainingCount: remaining.length
+      });
+    } else {
+      ms.notice = `🎞 Added ${cut(firstTrack.title, 36)} to Cinema Queue (${updatedSession.movieUpcoming?.length || 1} queued) · Music stays live.`;
+      await upsertCard(targetCtx, ms, renderCurrentView(targetCtx, ms)).catch(() => {});
+    }
+
+    if (remaining.length) {
+      void (async () => {
+        for (const it of remaining) {
+          if ((qm.getSession(dest).stopGeneration || 0) !== generation) break;
+          const r = await getCatalog().resolveStream(it, { preferredHeight: xvQualityHeight(q), probeSize: false }).catch(() => null);
+          if ((qm.getSession(dest).stopGeneration || 0) !== generation) break;
+          const tr = buildXvTrack(it, r, q);
+          tr.requester = requesterName;
+          if (tr.streamUrl || tr.pageUrl) {
+            try {
+              qm.enqueueMovie(dest, tr);
+            } catch {
+              break;
+            }
+          }
+        }
+        await qm.updatePlayerCard(dest).catch(() => {});
+      })();
+    }
+  }
+
   async function handleCallback(ctx, args = []) {
     const [sidRaw, op, arg = ''] = args;
     if (isChannelCtx(ctx) && Number(ctx.chatId) < 0 && !ctx.channelAdminVerified) {
       await ensureMovieAuth(ctx, Number(ctx.chatId), null);
     }
     if (sidRaw === 'new') {
-      return await openHub(ctx);
+      return await openHub(ctx, { sourceMode: op === 'xv' ? 'xvideos' : 'movie' });
     }
     let ms = app.movieSessions.get(sidRaw)
       || (ctx.messageId ? app.movieSessions.getByMessage(ctx.chatId, ctx.messageId) : null)
@@ -999,42 +1660,22 @@ export function createMovieUi({
       return true;
     }
 
-    if (op === 'ps') {
-      const isChan = isChannelCtx(resolvedCtx);
-      const group = Number(resolvedCtx.chatId) < 0 && !isChan;
-      const stateKey = (isChan && Number(resolvedCtx.chatId) < 0) ? String(resolvedCtx.chatId) : resolvedCtx.tgId;
-      if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
-        await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🔍 Send the movie or TV show title.' }).catch(() => {});
-      }
-      const promptText = `${group ? 'Reply to this message with' : 'Send'} a movie or TV series title (e.g. "Breaking Bad", "John Wick 4", "Inception"). /cancel closes search.`;
-      let sent = null;
-      if (isChan && typeof resolvedCtx.api?.sendRichMessage === 'function') {
-        const promptCard = card('🔍 Lancy Cinema · Search', 'Post the movie or TV series title in this channel')
-          .paragraph(rt.text(promptText))
-          .buttons([[richButton.callback('✕ Cancel Search', encodeCallback('nav', 'cancelprompt'), { style: 'danger' })]]);
-        sent = await sendOrEditMenu(resolvedCtx, finish(promptCard), { ttlMs: 120000 }).catch(() => null);
-      } else {
-        sent = await resolvedCtx.api.sendMessage(resolvedCtx.chatId, promptText, {
-          ...(group || Number(resolvedCtx.chatId) > 0 ? { reply_markup: { force_reply: true, selective: true } } : {}),
-          ...(ctx.messageId && group ? { reply_to_message_id: ctx.messageId } : {})
-        });
-      }
-      const temporaryToken = temporary.remember(resolvedCtx, sent, { ttlMs: 120000 });
-      await app.sm.transition(stateKey, States.MUSIC_QUEUE_INPUT, {
-        chatId: resolvedCtx.chatId,
-        timeoutMs: 120000,
-        context: {
-          stateKey,
-          mode: 'movie_search',
-          movieSid: ms.id,
-          botKey: app.music.botKey(resolvedCtx),
-          promptMessageId: sent?.message_id || null,
-          temporaryToken,
-          panelToken: ms.panelToken || null,
-          isChannelPrompt: isChan
+    if (op === 'ps' || op === 'xs') {
+      const isXv = op === 'xs' || ms.sourceMode === 'xvideos';
+      if (isXv) {
+        if (!isGroupAdultAllowed(resolvedCtx, ms)) {
+          ms.view = 'hub';
+          await upsertCard(resolvedCtx, ms, renderAdultGroupLocked(resolvedCtx, ms));
+          return true;
         }
-      });
-      return true;
+        if (isAgeGateRequired(resolvedCtx)) {
+          ms.view = 'hub';
+          await upsertCard(resolvedCtx, ms, renderAdultAgeGate(ms));
+          return true;
+        }
+        ms.sourceMode = 'xvideos';
+      }
+      return await promptSearchInput(resolvedCtx, ms, isXv);
     }
 
     if (op === 'ai') {
@@ -1250,6 +1891,8 @@ export function createMovieUi({
         type: 'movie',
         id: item.id,
         title: item.title,
+        originalTitle: item.originalTitle || null,
+        originalLanguage: item.originalLanguage || item.language || ms.playback?.originalLanguage || null,
         year: item.year,
         releaseDate: item.releaseDate || null,
         runtime: item.runtimeMinutes || item.runtime,
@@ -1259,7 +1902,8 @@ export function createMovieUi({
         rating: item.rating || null,
         genres: Array.isArray(item.genres) ? item.genres : null,
         overview: item.overview || null,
-        webappUrl: ms.playback?.webappPlayerUrl || item.playUrl
+        webappUrl: ms.playback?.webappPlayerUrl || item.playUrl,
+        playback: ms.playback || null
       }];
       await streamResolvedItems(resolvedCtx, ms, desc, { playNow: op === 'pm' });
       return true;
@@ -1347,6 +1991,8 @@ export function createMovieUi({
         type: 'tv',
         id: item.id,
         title: item.title,
+        originalTitle: item.originalTitle || null,
+        originalLanguage: item.originalLanguage || item.language || ms.playback?.originalLanguage || null,
         year: item.year,
         season: sNum,
         episode: eNum,
@@ -1357,7 +2003,8 @@ export function createMovieUi({
         rating: item.rating || null,
         genres: Array.isArray(item.genres) ? item.genres : null,
         overview: ep.overview || item.overview || null,
-        webappUrl: ms.playback?.webappPlayerUrl || item.playUrl
+        webappUrl: ms.playback?.webappPlayerUrl || item.playUrl,
+        playback: ms.playback || null
       };
       if (op === 'de') {
         if (!app.movieDownloader) throw new MusicError('UNAVAILABLE', 'Movie downloader is unavailable.');
@@ -1500,6 +2147,8 @@ export function createMovieUi({
         type: 'tv',
         id: item.id,
         title: item.title,
+        originalTitle: item.originalTitle || null,
+        originalLanguage: item.originalLanguage || item.language || ms.playback?.originalLanguage || null,
         year: item.year,
         season: ep.seasonNumber,
         episode: ep.episodeNumber,
@@ -1510,9 +2159,363 @@ export function createMovieUi({
         rating: item.rating || null,
         genres: Array.isArray(item.genres) ? item.genres : null,
         overview: ep.overview || item.overview || null,
-        webappUrl: ms.playback?.webappPlayerUrl || item.playUrl
+        webappUrl: ms.playback?.webappPlayerUrl || item.playUrl,
+        playback: ms.playback || null
       }));
       await streamResolvedItems(resolvedCtx, ms, descriptors, { playNow: op === 'px' });
+      return true;
+    }
+
+    if (op === 'xm') {
+      ms.sourceMode = arg === 'xvideos' ? 'xvideos' : 'movie';
+      ms.view = 'hub';
+      ms.notice = null;
+      ms.logLines = null;
+      await upsertCard(resolvedCtx, ms, renderHub(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xag') {
+      app.db?.setSetting?.(`nsfw.ageVerified.${resolvedCtx.tgId}`, true);
+      ms.sourceMode = 'xvideos';
+      ms.view = 'hub';
+      ms.notice = '🔞 18+ mode unlocked.';
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: '🔞 18+ verified.' }).catch(() => {});
+      await upsertCard(resolvedCtx, ms, renderHub(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xgt') {
+      const cid = effectiveAdultChatId(resolvedCtx, ms);
+      if (!Number.isFinite(cid) || cid > 0) {
+        if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: 'Group 18+ lock applies to groups/channels only.' }).catch(() => {});
+        return true;
+      }
+      let isAdmin = Boolean(
+        (isChannelCtx(resolvedCtx) && resolvedCtx.channelAdminVerified) ||
+        isAnonymousGroupAdmin(ctx.message || ctx.query?.message, cid) ||
+        isBotSuperAdmin(app, resolvedCtx.tgId, { controller: resolvedCtx.controller })
+      );
+      if (!isAdmin && Number(resolvedCtx.tgId) > 0) {
+        const m = await resolvedCtx.api?.getChatMember?.(cid, Number(resolvedCtx.tgId)).catch(() => null);
+        isAdmin = ['creator', 'administrator'].includes(m?.status);
+      }
+      if (!isAdmin) {
+        if (ctx.query?.id) {
+          await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+            text: '🔒 Only group administrators can change 18+ XVideos access in this group.',
+            show_alert: true
+          }).catch(() => {});
+        }
+        return true;
+      }
+      const next = !isGroupAdultAllowed(resolvedCtx, ms);
+      app.db?.setSetting?.(`nsfw.groupEnabled.${cid}`, next);
+      if (!next && ms.sourceMode === 'xvideos') {
+        ms.sourceMode = 'movie';
+        ms.view = 'hub';
+      }
+      ms.notice = next ? '🔓 XVideos Mode enabled in this group.' : '🔒 XVideos Mode locked in this group.';
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: ms.notice }).catch(() => {});
+      await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xt') {
+      ms.sourceMode = 'xvideos';
+      ms.xvMode = 'trending';
+      ms.xvQuery = '';
+      ms.xvCat = '';
+      ms.xvArtist = '';
+      ms.xvApiPage = 0;
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: '🔥 Loading Trending XVideos…' }).catch(() => {});
+      await executeXvSearch(resolvedCtx, ms, { apiPage: 0, resPage: Math.max(0, Number(arg) || 0) });
+      return true;
+    }
+
+    if (op === 'xc' || op === 'xcp') {
+      if (!isGroupAdultAllowed(resolvedCtx, ms)) {
+        await upsertCard(resolvedCtx, ms, renderAdultGroupLocked(resolvedCtx, ms));
+        return true;
+      }
+      if (isAgeGateRequired(resolvedCtx)) {
+        await upsertCard(resolvedCtx, ms, renderAdultAgeGate(ms));
+        return true;
+      }
+      ms.sourceMode = 'xvideos';
+      ms.xvCatPage = Math.max(0, Number(arg) || 0);
+      ms.view = 'xv_cats';
+      await upsertCard(resolvedCtx, ms, renderXvCats(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xcc') {
+      const cats = getCatalog().getCategories({ page: 0, perPage: 100 }).items || [];
+      const catObj = cats.find((c) => c.id === arg) || { id: arg, label: arg };
+      ms.sourceMode = 'xvideos';
+      ms.xvMode = 'category';
+      ms.xvCat = catObj.id;
+      ms.xvQuery = '';
+      ms.xvArtist = '';
+      ms.xvApiPage = 0;
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `📂 Loading ${catObj.label || catObj.id}…` }).catch(() => {});
+      await executeXvSearch(resolvedCtx, ms, { apiPage: 0, resPage: 0 });
+      return true;
+    }
+
+    if (op === 'xa' || op === 'xap') {
+      if (!isGroupAdultAllowed(resolvedCtx, ms)) {
+        await upsertCard(resolvedCtx, ms, renderAdultGroupLocked(resolvedCtx, ms));
+        return true;
+      }
+      if (isAgeGateRequired(resolvedCtx)) {
+        await upsertCard(resolvedCtx, ms, renderAdultAgeGate(ms));
+        return true;
+      }
+      const reqPage = Math.max(0, Number(arg) || 0);
+      const artRes = await getCatalog().getArtists({ page: reqPage, perPage: 12 });
+      ms.sourceMode = 'xvideos';
+      ms.xvArtists = Array.isArray(artRes?.items) ? artRes.items : [];
+      ms.xvArtistPage = artRes?.page ?? reqPage;
+      ms.xvArtistsTotalPages = artRes?.totalPages || 1;
+      ms.view = 'xv_artists';
+      await upsertCard(resolvedCtx, ms, renderXvArtists(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xac') {
+      const idx = Number(arg);
+      const artistObj = Array.isArray(ms.xvArtists) ? ms.xvArtists[idx] : null;
+      const artistTarget = artistObj ? (artistObj.xvType && artistObj.xvSlug ? `${artistObj.xvType}/${artistObj.xvSlug}` : artistObj.name) : String(arg || '');
+      ms.sourceMode = 'xvideos';
+      ms.xvMode = 'artist';
+      ms.xvArtist = artistTarget;
+      ms.xvQuery = '';
+      ms.xvCat = '';
+      ms.xvApiPage = 0;
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `⭐ Loading ${artistObj?.name || artistTarget}…` }).catch(() => {});
+      await executeXvSearch(resolvedCtx, ms, { apiPage: 0, resPage: 0 });
+      return true;
+    }
+
+    if (op === 'xso' || op === 'xd') {
+      if (op === 'xso') {
+        ms.xvSort = ['relevance', 'views', 'rating'].includes(arg) ? arg : 'relevance';
+      } else {
+        ms.xvDur = ['all', 'short', 'medium', 'long', 'full'].includes(arg) ? arg : 'all';
+      }
+      ms.xvApiPage = 0;
+      if (ctx.query?.id) {
+        await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: op === 'xso' ? `Sort: ${ms.xvSort}` : `Duration: ${ms.xvDur}` }).catch(() => {});
+      }
+      await executeXvSearch(resolvedCtx, ms, { apiPage: 0, resPage: 0 });
+      return true;
+    }
+
+    if (op === 'xp') {
+      const targetUiPage = Math.max(0, Number(arg) || 0);
+      const targetApiPage = Math.floor(targetUiPage / 3);
+      if (targetApiPage !== Number(ms.xvApiPage || 0)) {
+        await executeXvSearch(resolvedCtx, ms, { apiPage: targetApiPage, resPage: targetUiPage, preserveSelection: false });
+      } else {
+        ms.xvResPage = targetUiPage;
+        ms.view = 'xv_results';
+        await upsertCard(resolvedCtx, ms, renderXvResults(resolvedCtx, ms));
+      }
+      return true;
+    }
+
+    if (op === 'xk') {
+      const idx = Number(arg);
+      if (!(ms.xvSelected instanceof Set)) ms.xvSelected = new Set();
+      if (ms.xvSelected.has(idx)) ms.xvSelected.delete(idx);
+      else ms.xvSelected.add(idx);
+      if (ctx.query?.id) {
+        await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+          text: `${ms.xvSelected.has(idx) ? '☑ Checked' : '☐ Unchecked'} #${idx + 1} (${ms.xvSelected.size} selected)`
+        }).catch(() => {});
+      }
+      await upsertCard(resolvedCtx, ms, renderXvResults(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xqa') {
+      if (!(ms.xvSelected instanceof Set)) ms.xvSelected = new Set();
+      const results = Array.isArray(ms.xvResults) ? ms.xvResults : [];
+      const localPagesCount = Math.max(1, Math.ceil(results.length / 5));
+      const localPage = Math.max(0, Math.min(Number(ms.xvResPage || 0) % 3, localPagesCount - 1));
+      const start = localPage * 5;
+      const pageIndices = results.slice(start, start + 5).map((_, i) => start + i);
+      const allSelected = pageIndices.length > 0 && pageIndices.every((idx) => ms.xvSelected.has(idx));
+      if (allSelected) pageIndices.forEach((idx) => ms.xvSelected.delete(idx));
+      else pageIndices.forEach((idx) => ms.xvSelected.add(idx));
+      if (ctx.query?.id) {
+        await ctx.api?.answerCallbackQuery?.(ctx.query.id, {
+          text: allSelected ? '☐ Page unchecked' : `☑ Page selected (${ms.xvSelected.size} total)`
+        }).catch(() => {});
+      }
+      await upsertCard(resolvedCtx, ms, renderXvResults(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xo') {
+      const idx = Number(arg);
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: '🔎 Loading XVideos details & sizes…' }).catch(() => {});
+      await loadXvDetailIntoSession(ms, idx);
+      await upsertCard(resolvedCtx, ms, renderXvDetail(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xrv') {
+      ms.view = 'xv_results';
+      ms.notice = null;
+      await upsertCard(resolvedCtx, ms, renderXvResults(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xq') {
+      const q = ['360p', '480p', '720p'].includes(arg) ? arg : '480p';
+      ms.xvQuality = q;
+      if (Array.isArray(ms.xvResolved?.variants) && ms.xvResolved.variants.length) {
+        const targetH = xvQualityHeight(q);
+        const best = [...ms.xvResolved.variants].sort((a, b) => {
+          const ha = Number(a.height || parseInt(String(a.quality || '480').replace(/[^\d]/g, ''), 10) || 480);
+          const hb = Number(b.height || parseInt(String(b.quality || '480').replace(/[^\d]/g, ''), 10) || 480);
+          return (Math.abs(ha - targetH) + (a.isHls ? 50 : 0)) - (Math.abs(hb - targetH) + (b.isHls ? 50 : 0));
+        })[0];
+        if (best?.url) {
+          ms.xvResolved.streamUrl = best.url;
+          ms.xvResolved.isHls = Boolean(best.isHls);
+        }
+      }
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `Quality: ${q}` }).catch(() => {});
+      await upsertCard(resolvedCtx, ms, renderXvDetail(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xpm') {
+      const dest = ms.destination || app.music?.destination?.(resolvedCtx);
+      const qm = app.musicQueueManager;
+      const cur = qm?.getDeckStreamMode?.(dest, 'movie') || 'rtmp';
+      const nextMode = cur === 'rtmp' ? 'interactive' : 'rtmp';
+      app.db?.setSetting?.(`music.streamMode.movie.${dest}`, nextMode);
+      if (qm) {
+        const qSess = qm.getSession?.(dest);
+        if (qSess) {
+          qSess.movieStreamMode = nextMode;
+          const movieActive = qSess.activeDeck === 'movie' || qSess.currentTrack?.provider === 'movie';
+          if (movieActive && typeof qm.setStreamMode === 'function') {
+            await qm.setStreamMode(dest, nextMode).catch(() => {});
+          } else if (!['playing', 'paused', 'buffering'].includes(qSess.status)) {
+            qSess.streamMode = nextMode;
+            qSess.activeDeck = 'movie';
+          }
+        }
+      }
+      const modeLabel = nextMode === 'rtmp' ? '🔒 RTMP Live (Locked A/V)' : '🎙 Interactive VC (WebRTC)';
+      ms.notice = `🔄 Cinema VC Engine set to ${modeLabel}`;
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: ms.notice }).catch(() => {});
+      await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
+      return true;
+    }
+
+    if (op === 'xpl') {
+      if (arg === 'cur' || arg === 'curq') {
+        const item = (ms.xvResults || [])[Number(ms.xvCurrentIdx || 0)];
+        if (!item) throw new MusicError('STALE_PLAYER', 'Choose an XVideos title first.');
+        await streamXvItems(resolvedCtx, ms, [item], { playNow: arg === 'cur' });
+      } else {
+        const indices = [...(ms.xvSelected instanceof Set ? ms.xvSelected : [])].sort((a, b) => a - b);
+        const items = indices.map((i) => ms.xvResults?.[i]).filter(Boolean);
+        await streamXvItems(resolvedCtx, ms, items, { playNow: arg !== 'q' });
+      }
+      return true;
+    }
+
+    if (op === 'xdl') {
+      if (!isGroupAdultAllowed(resolvedCtx, ms)) {
+        await upsertCard(resolvedCtx, ms, renderAdultGroupLocked(resolvedCtx, ms));
+        return true;
+      }
+      if (isAgeGateRequired(resolvedCtx)) {
+        await upsertCard(resolvedCtx, ms, renderAdultAgeGate(ms));
+        return true;
+      }
+      if (!app.movieDownloader) throw new MusicError('UNAVAILABLE', 'Movie downloader is unavailable.');
+      const q = getXvQuality(ms);
+      const spoiler = effectiveAdultChatId(resolvedCtx, ms) < 0;
+
+      if (arg === 'cur') {
+        const item = (ms.xvResults || [])[Number(ms.xvCurrentIdx || 0)];
+        if (!item) throw new MusicError('STALE_PLAYER', 'Choose an XVideos title first.');
+        if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `⬇️ Preparing ${q} MP4 download…` }).catch(() => {});
+        const resolved = await getCatalog().resolveStream(item, { preferredHeight: xvQualityHeight(q), probeSize: false }).catch(() => null);
+        const track = buildXvTrack(item, resolved || ms.xvResolved, q);
+        if (!track.streamUrl) throw new MusicError('NO_SOURCE', 'Could not resolve downloadable MP4 stream.');
+        const useTracker = !app.movieDownloader.hasCachedVideo?.(track, q) && typeof resolvedCtx.api?.sendRichMessage === 'function';
+        const tracker = useTracker
+          ? new ProgressTracker({ api: resolvedCtx.api, chatId: resolvedCtx.chatId, heartbeatMs: 2000, action: 'upload_video' })
+          : null;
+        if (tracker) {
+          await tracker.live(
+            (state, { elapsedMs }) => buildDownloadProgressCard(`⬇️ ${cut(track.title, 44)}`, `XVideos · ${q} MP4`, state, elapsedMs),
+            { statusLine: `⬇️ Preparing ${q} MP4 for Telegram…` }
+          ).catch(() => {});
+        }
+        let res;
+        try {
+          res = await app.movieDownloader.sendSingleVideo(resolvedCtx, track, {
+            quality: q,
+            spoiler,
+            onProgress: (line) => {
+              ms.logLines = [...(ms.logLines || []).slice(-7), line];
+              ms.notice = line;
+              tracker?.set({ statusLine: line });
+            }
+          });
+        } finally {
+          await tracker?.cleanup?.().catch(() => {});
+        }
+        ms.notice = res?.ok ? `✅ Sent "${cut(track.title, 34)}" (${q}) to chat!` : `⚠️ ${res?.reason || 'Download unavailable'}`;
+        await upsertCard(resolvedCtx, ms, renderXvDetail(resolvedCtx, ms));
+        return true;
+      }
+
+      const slidePage = arg.startsWith('p:') ? Math.max(0, Number(arg.slice(2)) || 0) : 0;
+      if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `📦 Preparing XVideos Slide ${slidePage + 1}…` }).catch(() => {});
+      if (arg === 'sl' || !ms.dlManifest?.items?.length) {
+        const results = Array.isArray(ms.xvResults) ? ms.xvResults : [];
+        const selIndices = ms.xvSelected instanceof Set && ms.xvSelected.size
+          ? [...ms.xvSelected].sort((a, b) => a - b)
+          : results.slice((Number(ms.xvResPage || 0) % 3) * 5, (Number(ms.xvResPage || 0) % 3) * 5 + 5).map((_, i) => (Number(ms.xvResPage || 0) % 3) * 5 + i);
+        const tracks = [];
+        for (const idx of selIndices) {
+          const it = results[idx];
+          if (!it) continue;
+          const r = await getCatalog().resolveStream(it, { preferredHeight: xvQualityHeight(q), probeSize: false }).catch(() => null);
+          const tr = buildXvTrack(it, r, q);
+          if (tr.streamUrl) tracks.push(tr);
+        }
+        if (!tracks.length) throw new MusicError('NO_SOURCE', 'Could not resolve any XVideos MP4 streams for slides.');
+        ms.dlManifest = {
+          title: `🔥 XVideos · ${cut(ms.xvQuery || ms.xvCat || ms.xvArtist || 'Trending', 32)}`,
+          pageSize: 4,
+          items: tracks
+        };
+      }
+      const res = await app.movieDownloader.deliverAlbumSlidePage(resolvedCtx, ms, slidePage, {
+        quality: q,
+        spoiler,
+        buildNavCallback: (pNum) => encodeCallback('music', 'mv', ms.id, 'xdl', `p:${pNum}`),
+        keepCallback: (pNum) => encodeCallback('music', 'mv', ms.id, 'dk', String(pNum)),
+        isKept: Boolean(ms.dlKeptPages?.includes?.(slidePage)),
+        backCallback: () => encodeCallback('music', 'mv', ms.id, 'xrv'),
+        onProgress: (line) => { ms.notice = line; }
+      });
+      if (!res?.ok) {
+        ms.notice = `⚠️ ${res?.reason || 'Slide album failed'}`;
+        await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
+      }
       return true;
     }
 
@@ -1522,10 +2525,16 @@ export function createMovieUi({
   return {
     openHub,
     openMovieSearch,
+    executeXvSearch,
     startAiChat,
     handleAiTurn,
     handleCallback,
     renderHub,
+    renderXvHub,
+    renderXvResults,
+    renderXvDetail,
+    renderXvCats,
+    renderXvArtists,
     renderResults,
     renderMovieDetail,
     renderTvSeason,

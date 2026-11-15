@@ -31,14 +31,21 @@ export class StickerLimitError extends Error {
 
 /** Resolve the effective limits for a sticker type from settings + defaults. */
 export function resolveLimits(settings, type = 'static') {
-  const base = TELEGRAM_STICKER_LIMITS[type] ?? TELEGRAM_STICKER_LIMITS.static;
+  const normalized = type === 'custom_emoji' ? 'emoji' : type;
+  const base = TELEGRAM_STICKER_LIMITS[normalized] ?? TELEGRAM_STICKER_LIMITS.static;
+  const key = normalized[0].toUpperCase() + normalized.slice(1);
   return {
-    perSet: Number(settings?.get(`stickers.telegram${type[0].toUpperCase()}${type.slice(1)}StickersPerSet`))
-      || (type === 'static' ? Number(settings?.get('stickers.telegramStickersPerSet')) : 0)
+    perSet: Number(settings?.get(`stickers.telegram${key}StickersPerSet`))
+      || (normalized === 'static' ? Number(settings?.get('stickers.telegramStickersPerSet')) : 0)
       || base.perSet,
-    maxBytes: Number(type === 'video'
+    maxBytes: Number(normalized === 'video'
       ? settings?.get('stickers.telegramVideoMaxBytes')
-      : settings?.get('stickers.telegramStaticMaxBytes')) || base.maxBytes,
+      : (normalized === 'animated' ? base.maxBytes : settings?.get('stickers.telegramStaticMaxBytes'))) || base.maxBytes,
+    formatMaxBytes: {
+      static: Number(settings?.get('stickers.telegramStaticMaxBytes')) || TELEGRAM_STICKER_LIMITS.static.maxBytes,
+      video: Number(settings?.get('stickers.telegramVideoMaxBytes')) || TELEGRAM_STICKER_LIMITS.video.maxBytes,
+      animated: TELEGRAM_STICKER_LIMITS.animated.maxBytes
+    },
     createInitialLimit: Math.max(1, Number(settings?.get('stickers.telegramCreateInitialLimit')) || 1),
     format: base.format
   };

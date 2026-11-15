@@ -854,3 +854,547 @@ class ChannelAuthSubSyncAndCallInviteTests(unittest.IsolatedAsyncioTestCase):
             payload = await resp.json()
             self.assertTrue(payload['ok'])
             self.assertEqual(payload['call_invite_link'], 'https://t.me/+privinvite?voicechat=vc789')
+
+    async def test_hls_proxy_seek_appends_start_query_without_broken_input_ss_or_copyts(self):
+        class Flags:
+            REQUIRED = 'required'
+            IGNORE = 'ignore'
+
+        class FakeMediaStream:
+            def __init__(self, path, **kw):
+                self.path = path
+                self.kw = kw
+                self.microphone = types.SimpleNamespace(
+                    path=f'ffmpeg -reconnect 1 -i {path} -f s16le -ac 2 -ar 48000 -af aresample=48000:async=1:first_pts=0 pipe:1'
+                )
+                self.camera = types.SimpleNamespace(
+                    path=f'ffmpeg -reconnect 1 -i {path} -f rawvideo -r 30 -pix_fmt yuv420p pipe:1',
+                    parameters=types.SimpleNamespace(frame_rate=30, width=1280, height=720),
+                )
+
+            async def check_stream(self):
+                return True
+
+        FakeMediaStream.Flags = Flags
+
+        class FakeRawStream:
+            def __init__(self, **kw):
+                self.microphone = kw.get('microphone')
+                self.camera = kw.get('camera')
+
+        class FakeConfig:
+            def __init__(self, **kw):
+                self.kw = kw
+
+        fake_types = types.ModuleType('pytgcalls.types')
+        fake_types.MediaStream = FakeMediaStream
+        fake_types.AudioQuality = types.SimpleNamespace(HIGH='48k-stereo')
+        fake_types.VideoQuality = types.SimpleNamespace(HD_720p='720p', SD_360p='360p')
+        fake_types.GroupCallConfig = FakeConfig
+        fake_raw = types.ModuleType('pytgcalls.types.raw')
+        fake_raw.Stream = FakeRawStream
+        fake_raw.VideoParameters = None
+
+        bridge = Bridge('/tmp')
+        engine = FakeEngine()
+        bridge.ensure_publisher = AsyncMock()
+        call = {
+            'path': 'http://127.0.0.1:41234/movie-proxy/0123456789abcdef0123456789abcdef.m3u8',
+            'remote_proxy': True,
+            'offset': 60.0,
+            'video': True,
+            '_probe_info': {
+                'width': 1920,
+                'height': 1080,
+                'stream_index': 0,
+                'video_count': 1,
+                'is_image': False,
+                'video_start_time': 0.08,
+                'fps': 24.0,
+                'duration': 2566.0,
+                'format_name': 'hls',
+                'audio_stream_index': 1,
+                'audio_count': 1,
+                'audio_start_time': 0.0,
+            },
+        }
+        with patch.dict(
+            sys.modules,
+            {
+                'pytgcalls': types.ModuleType('pytgcalls'),
+                'pytgcalls.types': fake_types,
+                'pytgcalls.types.raw': fake_raw,
+            },
+        ):
+            await bridge.stream({'engine': engine}, -1001, call)
+            played = engine.streams[-1][1]
+            self.assertIn('?start=60.000', played.microphone.path)
+            self.assertIn('?start=60.000', played.camera.path)
+            self.assertNotIn('-ss ', played.microphone.path)
+            self.assertNotIn('-ss ', played.camera.path)
+            self.assertNotIn('-copyts', played.camera.path)
+            self.assertNotIn('trim=start=', played.camera.path)
+            self.assertEqual(call.get('duration'), 2566.0)
+
+    def test_rewrite_video_adds_an_sn_dn_and_wrap_av_sync_pair(self):
+        orig = 'ffmpeg -reconnect 1 -i http://127.0.0.1:3055/movie-proxy/abc -f rawvideo -r 30 -pix_fmt yuv420p pipe:1'
+        rw = MODULE.rewrite_video_ffmpeg_command(orig, 1280, 720, fps=30)
+        import shlex as _shlex
+        parts = _shlex.split(rw)
+        self.assertIn('-an', parts)
+        self.assertIn('-sn', parts)
+        self.assertIn('-dn', parts)
+
+        wa, wv = MODULE.wrap_av_sync_pair(
+            'ffmpeg -i http://127.0.0.1:3055/movie-proxy/abc.m3u8?start=60.000 -f s16le pipe:1',
+            'ffmpeg -i http://127.0.0.1:3055/movie-proxy/abc.m3u8?start=60.000 -f rawvideo pipe:1',
+            frame_bytes=1280 * 720 * 3 // 2,
+            fps=30,
+            sync_id='test-pair-1',
+        )
+        self.assertIn('av_sync.py', wa)
+        self.assertIn('--role audio', wa)
+        self.assertIn('?start=60.000', wa)
+        self.assertIn('--role video', wv)
+        self.assertIn('--frame-bytes 1382400', wv)
+        self.assertNotIn('-copyts', wv)
+
+    async def test_hls_seek_probe_aligns_audio_trim_without_touching_camera(self):
+        class Flags:
+            REQUIRED = 'required'
+            IGNORE = 'ignore'
+
+        class FakeMediaStream:
+            def __init__(self, path, **_kw):
+                self.path = path
+                self.microphone = types.SimpleNamespace(
+                    path=f'ffmpeg -reconnect 1 -i {path} -f s16le -ac 2 -ar 48000 -af aresample=48000:async=1:first_pts=0 pipe:1'
+                )
+                self.camera = types.SimpleNamespace(
+                    path=f'ffmpeg -reconnect 1 -i {path} -f rawvideo -r 30 -pix_fmt yuv420p pipe:1',
+                    parameters=types.SimpleNamespace(frame_rate=30, width=1280, height=720),
+                )
+
+            async def check_stream(self):
+                return True
+
+        FakeMediaStream.Flags = Flags
+
+        class FakeRawStream:
+            def __init__(self, **kw):
+                self.microphone = kw.get('microphone')
+                self.camera = kw.get('camera')
+
+        class FakeConfig:
+            def __init__(self, **kw):
+                self.kw = kw
+
+        fake_types = types.ModuleType('pytgcalls.types')
+        fake_types.MediaStream = FakeMediaStream
+        fake_types.AudioQuality = types.SimpleNamespace(HIGH='48k-stereo')
+        fake_types.VideoQuality = types.SimpleNamespace(HD_720p='720p', SD_360p='360p')
+        fake_types.GroupCallConfig = FakeConfig
+        fake_raw = types.ModuleType('pytgcalls.types.raw')
+        fake_raw.Stream = FakeRawStream
+        fake_raw.VideoParameters = None
+
+        bridge = Bridge('/tmp')
+        engine = FakeEngine()
+        bridge.ensure_publisher = AsyncMock()
+        call = {
+            'path': 'http://127.0.0.1:41234/movie-proxy/0123456789abcdef0123456789abcdef.m3u8',
+            'remote_proxy': True,
+            'offset': 120.0,
+            'video': True,
+            '_probe_info': {
+                'width': 1280,
+                'height': 720,
+                'stream_index': 1,
+                'video_count': 1,
+                'is_image': False,
+                'video_start_time': 0.0,
+                'fps': 30.0,
+                'duration': 1500.0,
+                'format_name': 'hls',
+                'audio_stream_index': 0,
+                'audio_count': 1,
+                'audio_start_time': 0.0,
+            },
+        }
+        probed_seek = {
+            **call['_probe_info'],
+            'audio_start_time': 114.083,
+            'video_start_time': 116.991,
+        }
+        with patch.object(MODULE, 'probe_media_stream_info', AsyncMock(return_value=probed_seek)), patch.dict(
+            sys.modules,
+            {
+                'pytgcalls': types.ModuleType('pytgcalls'),
+                'pytgcalls.types': fake_types,
+                'pytgcalls.types.raw': fake_raw,
+            },
+        ):
+            await bridge.stream({'engine': engine}, -1002, call)
+            played = engine.streams[-1][1]
+            self.assertIn('atrim=start=2.908,asetpts=PTS-STARTPTS', played.microphone.path)
+            self.assertNotIn('-copyts', played.camera.path)
+            self.assertNotIn('trim=start=', played.camera.path)
+
+    def test_av_sync_barrier_and_cleanup_end_to_end(self):
+        import os
+        import shlex as _shlex
+        import subprocess
+        import threading
+        import time
+        av_sync = str(Path(MODULE.__file__).resolve().with_name('av_sync.py'))
+        sid = f'ut-{os.getpid()}'
+        fb = 320 * 240 * 3 // 2
+        py = _shlex.quote(sys.executable)
+        cmd_a = f"{py} {_shlex.quote(av_sync)} --role audio --sync-id {sid} --sample-rate 48000 --channels 2 --fps 30 -- {py} -c \"import sys; sys.stdout.buffer.write(b'\\x01\\x00'*48000)\""
+        cmd_v = f"{py} {_shlex.quote(av_sync)} --role video --sync-id {sid} --frame-bytes {fb} --fps 30 -- {py} -c \"import time, sys; time.sleep(0.4); sys.stdout.buffer.write(b'\\x80'*{fb}*15)\""
+        pa = subprocess.Popen(cmd_a, shell=True, stdout=subprocess.PIPE)
+        pv = subprocess.Popen(cmd_v, shell=True, stdout=subprocess.PIPE)
+        res = {'a': None, 'v': None, 'ab': 0, 'vb': 0}
+
+        def ra():
+            while True:
+                c = pa.stdout.read(1920)
+                if not c:
+                    break
+                if res['a'] is None:
+                    res['a'] = time.monotonic()
+                res['ab'] += len(c)
+                time.sleep(0.01)
+
+        def rv():
+            while True:
+                b = bytearray()
+                while len(b) < fb:
+                    c = pv.stdout.read(fb - len(b))
+                    if not c:
+                        break
+                    b.extend(c)
+                if len(b) < fb:
+                    break
+                if res['v'] is None:
+                    res['v'] = time.monotonic()
+                res['vb'] += len(b)
+                time.sleep(1.0 / 30.0)
+
+        ta = threading.Thread(target=ra)
+        tv = threading.Thread(target=rv)
+        ta.start()
+        tv.start()
+        ta.join(timeout=5)
+        tv.join(timeout=5)
+        pa.wait(timeout=3)
+        pv.wait(timeout=3)
+        pa.stdout.close()
+        pv.stdout.close()
+        self.assertIsNotNone(res['a'])
+        self.assertIsNotNone(res['v'])
+        self.assertLess(abs(res['a'] - res['v']), 0.05)
+        self.assertEqual(res['ab'], 96000)
+        self.assertEqual(res['vb'] // fb, 15)
+
+    def test_av_sync_hot_subtitle_reload_without_restart(self):
+        import json as _json
+        import os
+        import shlex as _shlex
+        import subprocess
+        import tempfile
+        import threading
+        import time
+        voice_dir = Path(MODULE.__file__).resolve().parent
+        av_sync_mod = MODULE.av_sync
+        av_sync_script = str(voice_dir / 'av_sync.py')
+        sid = f'ut-hot-{os.getpid()}'
+        w, h = 640, 360
+        fb = w * h * 3 // 2
+        y_len = w * h
+        py = _shlex.quote(sys.executable)
+
+        with tempfile.TemporaryDirectory() as td:
+            td_p = Path(td)
+            sub1 = td_p / 't1.srt'
+            sub2 = td_p / 't2.srt'
+            sub1.write_text('1\n00:00:00,000 --> 00:00:30,000\nHOT RELOAD TRACK ONE\n', encoding='utf-8')
+            sub2.write_text('1\n00:00:00,000 --> 00:00:30,000\nSECOND TRACK OVERLAY\n', encoding='utf-8')
+            cfg_path = av_sync_mod.sub_config_path_for(sid)
+            shm_path = av_sync_mod.shm_path_for(sid)
+            cfg_path.write_text(_json.dumps({
+                'enabled': False,
+                'subtitle_path': '',
+                'base_sec': 0.0,
+                'subtitle_offset': 0.0,
+            }), encoding='utf-8')
+
+            total_frames = 55
+            prod_v = (
+                "import sys, time; "
+                f"f = (b'\\x10'*{y_len}) + (b'\\x80'*{fb - y_len}); "
+                "w = sys.stdout.buffer.write; fl = sys.stdout.buffer.flush; "
+                f"[(w(f), fl(), time.sleep(0.03)) for _ in range({total_frames})]"
+            )
+            prod_a = (
+                "import sys, time; "
+                "c = b'\\x01\\x00' * 3200; "  # 1/30s @ 48kHz stereo
+                "w = sys.stdout.buffer.write; fl = sys.stdout.buffer.flush; "
+                f"[(w(c), fl(), time.sleep(0.025)) for _ in range({total_frames + 10})]"
+            )
+            cmd_a = f"{py} {_shlex.quote(av_sync_script)} --role audio --sync-id {sid} --sample-rate 48000 --channels 2 --fps 30 -- {py} -c {_shlex.quote(prod_a)}"
+            cmd_v = f"{py} {_shlex.quote(av_sync_script)} --role video --sync-id {sid} --frame-bytes {fb} --fps 30 --width {w} --height {h} --sub-config {_shlex.quote(str(cfg_path))} -- {py} -c {_shlex.quote(prod_v)}"
+
+            pa = subprocess.Popen(cmd_a, shell=True, stdout=subprocess.PIPE)
+            pv = subprocess.Popen(cmd_v, shell=True, stdout=subprocess.PIPE)
+
+            def drain_a():
+                while pa.stdout.read(3840):
+                    pass
+
+            ta = threading.Thread(target=drain_a, daemon=True)
+            ta.start()
+
+            def read_frame():
+                buf = bytearray()
+                while len(buf) < fb:
+                    chunk = pv.stdout.read(fb - len(buf))
+                    if not chunk:
+                        return None
+                    buf.extend(chunk)
+                return bytes(buf[:y_len])
+
+            phases = {}
+            try:
+                y_slices = []
+                # Phase 0: initial Off frames
+                for _ in range(5):
+                    y = read_frame()
+                    self.assertIsNotNone(y)
+                    y_slices.append(y)
+                phases['off_initial_max'] = max(y_slices[-1])
+
+                # Phase 1: Hot enable track1
+                MODULE._write_sub_config(sid, enabled=True, subtitle_path=str(sub1), base_sec=0.0, subtitle_offset=0.0)
+                MODULE._bump_sub_gen(sid)
+                t1_y = []
+                for _ in range(12):
+                    y = read_frame()
+                    self.assertIsNotNone(y)
+                    t1_y.append(y)
+                phases['track1_max'] = max(t1_y[-1])
+                phases['track1_y'] = t1_y[-1]
+
+                # Phase 2: Hot offset +15s hides active cue without restart
+                MODULE._write_sub_config(sid, enabled=True, subtitle_path=str(sub1), base_sec=0.0, subtitle_offset=15.0)
+                MODULE._bump_sub_gen(sid)
+                shifted_y = []
+                for _ in range(10):
+                    y = read_frame()
+                    self.assertIsNotNone(y)
+                    shifted_y.append(y)
+                phases['shifted_away_max'] = max(shifted_y[-1])
+
+                # Phase 3: Hot swap to track2 with 0s offset
+                MODULE._write_sub_config(sid, enabled=True, subtitle_path=str(sub2), base_sec=0.0, subtitle_offset=0.0)
+                MODULE._bump_sub_gen(sid)
+                t2_y = []
+                for _ in range(10):
+                    y = read_frame()
+                    self.assertIsNotNone(y)
+                    t2_y.append(y)
+                phases['track2_max'] = max(t2_y[-1])
+                phases['track2_y'] = t2_y[-1]
+
+                # Phase 4: Hot disable -> clean frame
+                MODULE._write_sub_config(sid, enabled=False, subtitle_path='', base_sec=0.0, subtitle_offset=0.0)
+                MODULE._bump_sub_gen(sid)
+                tail_y = []
+                while True:
+                    y = read_frame()
+                    if y is None:
+                        break
+                    tail_y.append(y)
+                phases['off_final_max'] = max(tail_y[-1]) if tail_y else 0
+            finally:
+                ta.join(timeout=5)
+                pa.wait(timeout=5)
+                pv.wait(timeout=5)
+                pa.stdout.close()
+                pv.stdout.close()
+
+            self.assertEqual(phases['off_initial_max'], 16)
+            self.assertGreaterEqual(phases['track1_max'], 180)
+            self.assertEqual(phases['shifted_away_max'], 16)
+            self.assertGreaterEqual(phases['track2_max'], 180)
+            self.assertNotEqual(phases['track1_y'], phases['track2_y'])
+            self.assertEqual(phases['off_final_max'], 16)
+            self.assertFalse(cfg_path.exists())
+            self.assertFalse(shm_path.exists())
+
+    async def test_bridge_subtitle_control_hot_reloads_with_zero_stream_restart(self):
+        import json as _json
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            sub1 = Path(td) / 'sub1.srt'
+            sub2 = Path(td) / 'sub2.srt'
+            sub1.write_text('1\n00:00:01,000 --> 00:00:05,000\nLine one\n', encoding='utf-8')
+            sub2.write_text('1\n00:00:01,000 --> 00:00:05,000\nLine two\n', encoding='utf-8')
+
+            class Flags:
+                REQUIRED = 1
+                IGNORE = 0
+
+            class FakeEngine:
+                def __init__(self):
+                    self.streams = []
+                    self.left = []
+                async def play(self, chat, stream, config=None):
+                    self.streams.append((chat, stream))
+                async def leave_call(self, chat):
+                    self.left.append(chat)
+                async def time(self, chat):
+                    return 42.0
+
+            class FakeMediaStream:
+                def __init__(self, path, **_kw):
+                    self.microphone = types.SimpleNamespace(
+                        path=f'ffmpeg -reconnect 1 -i {path} -f s16le -ac 2 -ar 48000 -af aresample=48000:async=1:first_pts=0 pipe:1'
+                    )
+                    self.camera = types.SimpleNamespace(
+                        path=f'ffmpeg -reconnect 1 -i {path} -f rawvideo -r 30 -pix_fmt yuv420p pipe:1',
+                        parameters=types.SimpleNamespace(frame_rate=30, width=1280, height=720),
+                    )
+                async def check_stream(self):
+                    return True
+
+            FakeMediaStream.Flags = Flags
+            fake_types = types.ModuleType('pytgcalls.types')
+            fake_types.MediaStream = FakeMediaStream
+            fake_types.AudioQuality = types.SimpleNamespace(HIGH='48k-stereo')
+            fake_types.VideoQuality = types.SimpleNamespace(HD_720p='720p', SD_360p='360p')
+            fake_types.GroupCallConfig = lambda **kw: kw
+            fake_raw = types.ModuleType('pytgcalls.types.raw')
+            fake_raw.Stream = lambda **kw: types.SimpleNamespace(**kw)
+            fake_raw.VideoParameters = None
+
+            bridge = Bridge(td)
+            engine = FakeEngine()
+            bridge.ensure_publisher = AsyncMock()
+            bridge.accounts['main'] = {
+                'alias': 'main',
+                'engine': engine,
+                'client': types.SimpleNamespace(),
+                'destinations': {-1003},
+                'leases': {-1003},
+                'managed': set(),
+                'group_grants': set(),
+            }
+            call = {
+                'alias': 'main',
+                'path': 'http://127.0.0.1:41234/movie-proxy/fedcba9876543210fedcba9876543210.m3u8',
+                'remote_proxy': True,
+                'offset': 0.0,
+                'playback_id': 'pb-hot-1',
+                'status': 'playing',
+                'subtitle_path': str(sub1),
+                'subtitle_offset': 0.0,
+                'video': True,
+                '_probe_info': {
+                    'width': 1280,
+                    'height': 720,
+                    'stream_index': 1,
+                    'video_count': 1,
+                    'is_image': False,
+                    'video_start_time': 0.0,
+                    'fps': 30.0,
+                    'duration': 1500.0,
+                    'format_name': 'hls',
+                    'audio_stream_index': 0,
+                    'audio_count': 1,
+                    'audio_start_time': 0.0,
+                },
+            }
+            bridge.calls[-1003] = call
+
+            with patch.dict(
+                sys.modules,
+                {
+                    'pytgcalls': types.ModuleType('pytgcalls'),
+                    'pytgcalls.types': fake_types,
+                    'pytgcalls.types.raw': fake_raw,
+                },
+            ):
+                await bridge.stream(bridge.accounts['main'], -1003, call)
+                played = engine.streams[-1][1]
+                self.assertIn('--sub-config', played.camera.path)
+                self.assertNotIn('subtitles=', played.camera.path)
+                cfg_p = Path(call['sub_config_path'])
+                self.assertTrue(cfg_p.is_file())
+                shm_p = MODULE.av_sync.shm_path_for(call['av_sync_id'])
+                fd, mm, st = MODULE.av_sync._open_sync_state(shm_p)
+                try:
+                    self.assertEqual(int(st.sub_gen), 0)
+                    res = await bridge.control('subtitle', {
+                        'chat_id': -1003,
+                        'subtitle_path': str(sub2),
+                        'subtitle_offset': 2.5,
+                        'subtitle_manual_override': True,
+                    })
+                    self.assertTrue(res.get('hot_reloaded'))
+                    self.assertEqual(len(engine.streams), 1)
+                    self.assertEqual(int(st.sub_gen), 1)
+                    cfg_data = _json.loads(cfg_p.read_text(encoding='utf-8'))
+                    self.assertEqual(cfg_data['subtitle_path'], str(sub2))
+                    self.assertAlmostEqual(cfg_data['subtitle_offset'], 2.5, places=2)
+
+                    # Hot disable (Off) also zero-restart
+                    res_off = await bridge.control('subtitle', {'chat_id': -1003, 'subtitle_path': None})
+                    self.assertTrue(res_off.get('hot_reloaded'))
+                    self.assertEqual(len(engine.streams), 1)
+                    self.assertEqual(int(st.sub_gen), 2)
+                    cfg_off = _json.loads(cfg_p.read_text(encoding='utf-8'))
+                    self.assertFalse(cfg_off['enabled'])
+                finally:
+                    st = None
+                    mm.close()
+                    os.close(fd)
+                    shm_p.unlink(missing_ok=True)
+                await bridge.control('stop', {'chat_id': -1003})
+                self.assertFalse(cfg_p.exists())
+
+    def test_sub_align_recovers_shifted_cues_without_false_positive(self):
+        import math
+        from array import array
+        sa = MODULE.sub_align
+        cues = []
+        gaps = [1.8, 3.4, 2.1, 4.9, 1.5, 5.6, 2.7, 3.8]
+        t = 8.0
+        for idx in range(28):
+            dur_c = 1.6 + (idx % 4) * 0.45
+            cues.append((int(t * 1000), int((t + dur_c) * 1000), f'Dialogue {idx}'))
+            t += dur_c + gaps[idx % len(gaps)] * 0.55
+
+        sr = 8000
+        total_sec = int(t) + 25
+        for true_shift in (0.0, 5.0, -4.5):
+            samples = array('h', [int(420 * math.sin(2 * math.pi * 110 * (i / sr))) for i in range(total_sec * sr)])
+            for s_ms, e_ms, _ in cues:
+                s_t = s_ms / 1000.0 + true_shift
+                e_t = e_ms / 1000.0 + true_shift
+                i0 = max(0, int(s_t * sr))
+                i1 = min(total_sec * sr, int(e_t * sr))
+                for i in range(i0, i1):
+                    tt = i / sr
+                    mod = 0.5 + 0.5 * math.sin(2 * math.pi * 5.0 * (tt - s_t))
+                    sp = 9000 * mod * (0.6 * math.sin(2 * math.pi * 240 * tt) + 0.4 * math.sin(2 * math.pi * 700 * tt))
+                    samples[i] = max(-32000, min(32000, int(samples[i] + sp)))
+            res = sa.correlate_speech_and_cues(samples.tobytes(), cues, probe_start_sec=0.0, max_shift_sec=16.0)
+            self.assertTrue(res['ok'])
+            if true_shift == 0.0:
+                self.assertEqual(res['offset'], 0.0)
+                self.assertFalse(res['confident'])
+            else:
+                self.assertTrue(res['confident'], f'Expected confident match for shift={true_shift}: {res}')
+                self.assertLessEqual(abs(res['offset'] - true_shift), 0.3)

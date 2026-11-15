@@ -10,7 +10,9 @@ import { StateMachine } from '../src/core/stateMachine.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { verifyChannelAdmin, isNativeChannelPost } from '../src/telegram/permissions.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb } from '../src/media/telegramLimits.js';
-import { SubtitleService } from '../src/media/subtitles.js';
+import { SubtitleService, parseSrt, parseTtml, parseAss, parseAnySubtitleText, getCueAt, mapMediaSecToSubMs } from '../src/media/subtitles.js';
+import { extractDashSubtitleHints } from '../src/media/movieResolver.js';
+import { VideoStreamingServer } from '../src/media/streamingServer.js';
 import { MovieDownloader } from '../src/media/movieDownloader.js';
 import { MovieSessions } from '../src/media/movieSessions.js';
 import { CinemaVcAnnouncer } from '../src/music/cinemaAnnouncer.js';
@@ -501,4 +503,436 @@ test('Pillar 4: Data-aware quality selector estimates MB, isolates 360p/480p/720
   assert.ok(dlqBtns.some((b) => b.callback_data.includes('dlq:360p')));
   assert.ok(dlqBtns.some((b) => b.callback_data.includes('dlq:720p')));
   assert.ok(existsSync(srcVideo));
+});
+
+test('Pillar 2b: DASH text AdaptationSet, >500 HLS VTT, X-TIMESTAMP-MAP, X-Lancy-Skipped-Sec & per-track offset isolation', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'lancy_p2b_'));
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  // 1. DASH MPD text AdaptationSet extraction produces same_route subtitle hint
+  const mpdXml = `<?xml version="1.0"?>
+  <MPD mediaPresentationDuration="PT1H30M">
+    <Period>
+      <AdaptationSet contentType="video" mimeType="video/mp4">
+        <Representation id="v1" height="720"><BaseURL>v/init.mp4</BaseURL></Representation>
+      </AdaptationSet>
+      <AdaptationSet contentType="text" lang="en" label="English CC">
+        <Representation id="s1" mimeType="text/vtt"><BaseURL>subs/eng.vtt</BaseURL></Representation>
+      </AdaptationSet>
+    </Period>
+  </MPD>`;
+  const dashHints = extractDashSubtitleHints(mpdXml, 'https://cdn.example/stream/manifest.mpd', { Referer: 'https://cdn.example/' });
+  assert.equal(dashHints.length, 1);
+  assert.equal(dashHints[0].url, 'https://cdn.example/stream/subs/eng.vtt');
+  assert.equal(dashHints[0].tier, 'same_route');
+
+  // 2. SubtitleService: >500 HLS VTT segments, X-TIMESTAMP-MAP normalization, promo filtering, sameRoute metadata
+  const segCount = 520;
+  const hlsPlaylist = [
+    '#EXTM3U',
+    '#EXT-X-TARGETDURATION:4',
+    ...Array.from({ length: segCount }, (_, i) => `#EXTINF:4.000,\nseg_${i}.vtt`),
+    '#EXT-X-ENDLIST'
+  ].join('\n');
+
+  const extSrtWithPromo = [
+    '1\n00:00:01,000 --> 00:00:03,000\nWatch free on getray.app',
+    ...Array.from({ length: 6 }, (_, k) => `${k + 2}\n00:00:${String(4 + k * 4).padStart(2, '0')},000 --> 00:00:${String(6 + k * 4).padStart(2, '0')},000\nReal movie dialogue line ${k + 1}`)
+  ].join('\n\n');
+
+  const fetchMock = async (url) => {
+    const s = String(url);
+    if (s.endsWith('/subs_520.m3u8')) {
+      return { ok: true, status: 200, text: async () => hlsPlaylist };
+    }
+    const m = s.match(/seg_(\d+)\.vtt$/);
+    if (m) {
+      const i = Number(m[1]);
+      // Segment 519 uses X-TIMESTAMP-MAP=MPEGTS:0,LOCAL:01:00:00.000 while cue timestamp is shifted accordingly
+      const vttBody = i === 519
+        ? 'WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:0,LOCAL:01:00:00.000\n\n01:34:36.000 --> 01:34:39.000\nSegment 519 normalized cue\n'
+        : `WEBVTT\n\n00:${String(Math.floor((i * 4) / 60)).padStart(2, '0')}:${String((i * 4) % 60).padStart(2, '0')}.000 --> 00:${String(Math.floor((i * 4 + 2) / 60)).padStart(2, '0')}:${String((i * 4 + 2) % 60).padStart(2, '0')}.000\nLine ${i}\n`;
+      return { ok: true, status: 200, text: async () => vttBody };
+    }
+    if (s.includes('ext_promo.srt')) {
+      return { ok: true, status: 200, text: async () => extSrtWithPromo };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+
+  const subs = new SubtitleService({ cacheDir: dir, fetchImpl: fetchMock });
+  const hlsBig = await subs.resolveForMedia({
+    title: 'Long VTT Series',
+    year: 2024,
+    streamUrl: 'https://cdn.example/s520/master.m3u8',
+    subtitleHints: [{ url: 'https://cdn.example/s520/subs_520.m3u8', language: 'eng', format: 'vtt', tier: 'same_route' }]
+  });
+  assert.ok(hlsBig?.found);
+  assert.equal(hlsBig.sameRoute, true);
+  assert.equal(hlsBig.cues.length, 520);
+  const lastCue = hlsBig.cues[hlsBig.cues.length - 1];
+  assert.ok(lastCue.text.includes('Segment 519 normalized cue'));
+  // Normalized by -3600s from 01:34:36 -> ~34m36s (2076s)
+  assert.ok(Math.abs(lastCue.startMs - 2076000) <= 500, `Expected normalized ~2076000ms, got ${lastCue.startMs}`);
+
+  const extRes = await subs.resolveForMedia({
+    title: 'External Promo Filter Film',
+    year: 2024,
+    streamUrl: 'https://cdn.example/ext/video.mp4',
+    subtitleHints: [{ url: 'https://cdn.example/ext_promo.srt', language: 'eng', format: 'srt', tier: 'meta_match' }]
+  });
+  assert.ok(extRes?.found);
+  assert.equal(extRes.sameRoute, false);
+  assert.ok(!extRes.cues.some((c) => /getray\.app/i.test(c.text)));
+
+  // 3. Per-track subtitleSyncOffset isolation across tracks and subtitle files
+  const db = new Database(join(dir, 'subiso.db'));
+  db.migrate();
+  t.after(() => db.close());
+  const voiceCalls = [];
+  const fakeVoice = {
+    async play(chatId, url, opts = {}) {
+      voiceCalls.push({ op: 'play', chatId, opts });
+      return { ok: true, account_alias: 'a1' };
+    },
+    async setSubtitle(chatId, path, opts = {}) {
+      voiceCalls.push({ op: 'subtitle', chatId, path, opts });
+      return { ok: true };
+    },
+    async setVolume() { return { ok: true }; }
+  };
+  const qm = new QueueManager({ app: { db, subtitles: subs }, voiceClient: fakeVoice, db, pollMs: 0 });
+  t.after(() => { qm.closed = true; });
+  const s = qm.getSession(-10077);
+  s.connected = true;
+  s.subtitleMode = 'screen';
+  s.currentTrack = {
+    id: 'movie:A',
+    provider: 'movie',
+    mediaType: 'video',
+    title: 'Film A',
+    subtitlePath: hlsBig.filePath,
+    subtitleTracks: [
+      { filePath: hlsBig.filePath, label: 'Same Route', source: 'subtitle_hint', sameRoute: true },
+      { filePath: extRes.filePath, label: 'External', source: 'opensubtitles', sameRoute: false }
+    ]
+  };
+  await qm.setSubtitleOffset(-10077, 3.5);
+  assert.equal(s.subtitleSyncOffset, 3.5);
+  assert.equal(db.getSetting('music.suboffset.-10077', null), null);
+  // Cycling to track 1 resets offset to track 1's own saved offset (0) instead of leaking 3.5
+  await qm.cycleSubtitleTrack(-10077);
+  assert.equal(s.subtitleSyncOffset, 0);
+  // Cycling back to track 0 restores track 0's saved 3.5
+  await qm.cycleSubtitleTrack(-10077);
+  assert.equal(s.subtitleSyncOffset, 3.5);
+
+  // 4. StreamingServer emits X-Lancy-Skipped-Sec header on ?start= HLS seek
+  const srv = new VideoStreamingServer({ port: 0, cacheDir: dir, audioCacheDir: dir });
+  await srv.start();
+  t.after(async () => { await srv.stop(); });
+  const mediaPlaylist = [
+    '#EXTM3U',
+    '#EXT-X-TARGETDURATION:6',
+    '#EXTINF:6.000,\nseg0.ts',
+    '#EXTINF:6.000,\nseg1.ts',
+    '#EXTINF:6.000,\nseg2.ts',
+    '#EXT-X-ENDLIST'
+  ].join('\n');
+  const http = await import('node:http');
+  const upstream = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+    res.end(mediaPlaylist);
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => upstream.close(r)));
+  const uPort = upstream.address().port;
+  const proxyUrl = srv.registerRemoteStream({ url: `http://127.0.0.1:${uPort}/index.m3u8`, isHls: true });
+  const seekRes = await fetch(`${proxyUrl}?start=10`);
+  assert.equal(seekRes.status, 200);
+  assert.equal(Number(seekRes.headers.get('x-lancy-skipped-sec')), 6);
+});
+
+test('Pillar 2c: Overlapping/long cues in getCueAt, split-audio HLS X-Lancy-Audio-Skipped-Sec, cached headers & MPEGTS VTT sync', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'lancy_p2c_'));
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  // 1. Overlapping cues where a long background cue spans past >0 dialogue cues
+  const cues = parseSrt([
+    '1',
+    '00:00:10,000 --> 00:00:40,000',
+    '[Tense music]',
+    '',
+    '2',
+    '00:00:12,000 --> 00:00:14,000',
+    'First speaker',
+    '',
+    '3',
+    '00:00:20,000 --> 00:00:22,000',
+    'Second speaker'
+  ].join('\n'));
+  const at17 = getCueAt(cues, 17000);
+  assert.ok(at17 && at17.text.includes('[Tense music]'), 'Long cue must still match between short cues');
+  const at13 = getCueAt(cues, 13000);
+  assert.ok(at13 && at13.text.includes('[Tense music]') && at13.text.includes('First speaker'), 'Overlapping cues must merge text');
+
+  // 2. Split-audio HLS proxy (6s video segs vs 5s audio segs): master emits both skipped headers and cached child preserves X-Lancy-Skipped-Sec
+  const http = await import('node:http');
+  const upstream = http.createServer((req, res) => {
+    if (req.url === '/master.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a1",NAME="English",DEFAULT=YES,URI="audio.m3u8"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=1500000,RESOLUTION=1280x720,AUDIO="a1"',
+        'video.m3u8'
+      ].join('\n'));
+      return;
+    }
+    if (req.url === '/video.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end('#EXTM3U\n#EXT-X-TARGETDURATION:6\n#EXTINF:6,\nv0.ts\n#EXTINF:6,\nv1.ts\n#EXTINF:6,\nv2.ts\n#EXTINF:6,\nv3.ts\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (req.url === '/audio.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end('#EXTM3U\n#EXT-X-TARGETDURATION:5\n#EXTINF:5,\na0.ts\n#EXTINF:5,\na1.ts\n#EXTINF:5,\na2.ts\n#EXTINF:5,\na3.ts\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (req.url === '/subs_mts.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end('#EXTM3U\n#EXTINF:10,\ns0.vtt\n#EXTINF:10,\ns1.vtt\n#EXTINF:10,\ns2.vtt\n#EXTINF:10,\ns3.vtt\n#EXTINF:10,\ns4.vtt\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    const sm = req.url.match(/^\/s(\d+)\.vtt$/);
+    if (sm) {
+      const idx = Number(sm[1]);
+      res.writeHead(200, { 'Content-Type': 'text/vtt' });
+      res.end(`WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:${900000 * (idx + 1)},LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nSeg ${idx} line\n`);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => upstream.close(r)));
+  const uPort = upstream.address().port;
+
+  const srv = new VideoStreamingServer({ port: 0, host: '127.0.0.1', cacheDir: dir, audioCacheDir: dir });
+  await srv.start();
+  t.after(async () => { await srv.stop(); });
+  const masterProxy = srv.registerRemoteStream({ url: `http://127.0.0.1:${uPort}/master.m3u8`, isHls: true });
+  const masterRes = await fetch(`${masterProxy}?start=14.000`);
+  assert.equal(masterRes.status, 200);
+  assert.equal(Number(masterRes.headers.get('x-lancy-skipped-sec')), 12);
+  assert.equal(Number(masterRes.headers.get('x-lancy-audio-skipped-sec')), 10);
+  const masterBody = await masterRes.text();
+  const vidUrl = masterBody.split('\n').find((l) => !l.startsWith('#') && l.includes('.m3u8'));
+  assert.ok(vidUrl);
+  const v1 = await fetch(vidUrl);
+  assert.equal(Number(v1.headers.get('x-lancy-skipped-sec')), 12);
+  await v1.text();
+  const v2 = await fetch(vidUrl);
+  assert.equal(Number(v2.headers.get('x-lancy-skipped-sec')), 12, 'Cached child playlist must keep X-Lancy-Skipped-Sec');
+
+  // 3. HLS VTT incremental MPEGTS offset tracking across 5 segments
+  const subs = new SubtitleService({ cacheDir: dir, fetchImpl: fetch });
+  const vttRes = await subs.resolveForMedia({
+    title: 'Split HLS MTS Film',
+    streamUrl: `http://127.0.0.1:${uPort}/master.m3u8`,
+    subtitleHints: [{ url: `http://127.0.0.1:${uPort}/subs_mts.m3u8`, language: 'eng', format: 'vtt', tier: 'same_route' }]
+  });
+  assert.ok(vttRes?.found);
+  assert.equal(vttRes.cues.length, 5);
+  assert.equal(vttRes.cues[0].startMs, 1000);
+  assert.equal(vttRes.cues[4].startMs, 41000);
+});
+
+test('Subtitle Verifier parses TTML/ASS/single-newline VTT, recovers HLS origin when seg0 is empty, and harvests all source tracks', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'lancy-sub-verifier-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+
+  // 1. TTML (including tickRate & dur), ASS, and single-newline VTT parsers
+  const ttmlCues = parseTtml(`<?xml version="1.0"?><tt ttp:tickRate="10000000"><body><div>
+    <p begin="10000000t" end="35000000t">Tick cue<br/>line two</p>
+    <p begin="00:00:05.000" dur="2.5s">Dur &amp; entity</p>
+  </div></body></tt>`);
+  assert.equal(ttmlCues.length, 2);
+  assert.equal(ttmlCues[0].startMs, 1000);
+  assert.equal(ttmlCues[0].text, 'Tick cue\nline two');
+  assert.equal(ttmlCues[1].endMs, 7500);
+
+  const assCues = parseAss(`[Script Info]\nTitle: Anime\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:02.00,0:00:04.50,Default,,0,0,0,,{\\an8\\pos(640,50)}Clean\\Nline!\nDialogue: 0,0:00:05.00,0:00:06.00,Signs,,0,0,0,,{\\p1}m 0 0 l 10 10\n`);
+  assert.equal(assCues.length, 1);
+  assert.equal(assCues[0].text, 'Clean\nline!');
+
+  const compactVtt = parseSrt('WEBVTT\n00:00:01.000 --> 00:00:03.000\nLine one\n00:00:04.000 --> 00:00:06.000\nLine two\n');
+  assert.equal(compactVtt.length, 2);
+  assert.equal(compactVtt[1].startMs, 4000);
+
+  // 2. DASH Period + multiple Representation + TTML + Forced + SDH hint extraction
+  const dashXml = `<?xml version="1.0"?>
+  <MPD><Period><BaseURL>https://cdn.example/base/</BaseURL>
+    <AdaptationSet contentType="text" lang="en" mimeType="application/ttml+xml">
+      <Representation id="en_clean"><BaseURL>subs/en_dialogue.ttml</BaseURL></Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="text" lang="en" label="English [SDH]">
+      <Role value="caption"/>
+      <Representation id="en_sdh" mimeType="text/vtt"><SegmentTemplate media="$RepresentationID$.vtt"/></Representation>
+    </AdaptationSet>
+    <AdaptationSet contentType="text" lang="ja" label="Japanese">
+      <Representation id="ja_clean"><BaseURL>subs/ja.srt</BaseURL></Representation>
+    </AdaptationSet>
+  </Period></MPD>`;
+  const dashSubs = extractDashSubtitleHints(dashXml, 'https://cdn.example/manifest.mpd', {});
+  assert.equal(dashSubs.length, 3);
+  assert.equal(dashSubs[0].type, 'ttml');
+  assert.equal(dashSubs[1].url, 'https://cdn.example/base/en_sdh.vtt');
+  assert.match(dashSubs[1].label, /SDH/);
+
+  // 3. HLS VTT where segment 0 has X-TIMESTAMP-MAP but 0 cues, plus ALL source tracks harvested without OpenSubtitles call
+  let openSubsCalls = 0;
+  const fetchMock = async (url) => {
+    const u = String(url);
+    if (u.includes('opensubtitles')) {
+      openSubsCalls++;
+      return new Response('[]', { status: 200 });
+    }
+    if (u === 'https://src.example/subs.m3u8') {
+      return new Response('#EXTM3U\n#EXTINF:10,\nseg0.vtt\n#EXTINF:10,\nseg1.vtt\n#EXTINF:10,\nseg2.vtt\n#EXT-X-ENDLIST\n', { status: 200 });
+    }
+    if (u === 'https://src.example/seg0.vtt') {
+      return new Response('WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:900000,LOCAL:00:00:00.000\n\n', { status: 200 });
+    }
+    if (u === 'https://src.example/seg1.vtt') {
+      return new Response('WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:1800000,LOCAL:00:00:00.000\n\n00:00:02.000 --> 00:00:04.000\nSeg1 A\n00:00:05.000 --> 00:00:07.000\nSeg1 B\n00:00:08.000 --> 00:00:09.000\nSeg1 C\n', { status: 200 });
+    }
+    if (u === 'https://src.example/seg2.vtt') {
+      return new Response('WEBVTT\nX-TIMESTAMP-MAP=MPEGTS:2700000,LOCAL:00:00:00.000\n\n00:00:01.000 --> 00:00:03.000\nSeg2 D\n00:00:04.000 --> 00:00:06.000\nSeg2 E\n', { status: 200 });
+    }
+    if (u === 'https://src.example/en_sdh.ttml') {
+      const body = `<?xml version="1.0"?><tt><body><div>${Array.from({ length: 6 }, (_, i) => `<p begin="00:00:0${i + 1}.000" end="00:00:0${i + 1}.800">[door opens] ${i}</p>`).join('')}</div></body></tt>`;
+      return new Response(body, { status: 200 });
+    }
+    if (u === 'https://src.example/ja.ass') {
+      const ev = Array.from({ length: 6 }, (_, i) => `Dialogue: 0,0:00:0${i + 1}.00,0:00:0${i + 1}.80,Default,,0,0,0,,Line ${i}`).join('\n');
+      return new Response(`[Script Info]\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n${ev}\n`, { status: 200 });
+    }
+    return new Response('', { status: 404 });
+  };
+
+  const verifierSubs = new SubtitleService({ cacheDir: dir, fetchImpl: fetchMock });
+  const multiRes = await verifierSubs.resolveForMedia({
+    title: 'Demon Slayer Test',
+    streamUrl: 'https://src.example/master.m3u8',
+    subtitleHints: [
+      { url: 'https://src.example/en_sdh.ttml', language: 'English', label: 'English (SDH)', type: 'ttml', tier: 'same_route' },
+      { url: 'https://src.example/subs.m3u8', language: 'English', label: 'English Subtitles', type: 'hls_vtt', tier: 'same_route' },
+      { url: 'https://src.example/ja.ass', language: 'Japanese', label: 'Japanese Subtitles', type: 'ass', tier: 'same_route' }
+    ]
+  });
+  assert.ok(multiRes?.found);
+  assert.equal(openSubsCalls, 0, 'Must not query OpenSubtitles when verified clean same-route dialogue exists');
+  assert.equal(multiRes.label, 'English Subtitles', 'Clean English dialogue must beat English (SDH)');
+  assert.equal(multiRes.tracks.length, 3, 'Must harvest ALL 3 source subtitle tracks into tracks[]');
+  assert.equal(multiRes.cues[0].startMs, 12000, 'Seg1 cue after empty seg0 must land at exact 12000ms (10s seg1 + 2s local)');
+  assert.equal(multiRes.cues[3].startMs, 21000, 'Seg2 cue must land at exact 21000ms');
+});
+
+test('Live Subtitle Sync Checker + Normalizer: drift mapping, subcheck action & UI badges', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'lancy_subchk_'));
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+  const db = new Database(join(dir, 'subchk.db'));
+  db.migrate();
+  t.after(() => db.close());
+
+  // 1. Exact shared transform: media=120s, offset=+2s, drift=0.001s/s from anchor=20s => sub = 117.9s
+  assert.equal(mapMediaSecToSubMs(120, { offsetSec: 2.0, driftRate: 0.001, driftAnchorSec: 20.0 }), 117900);
+
+  const srtPath = join(dir, 'movie.srt');
+  await writeFile(srtPath, '1\n00:00:05,000 --> 00:00:08,000\nLine one\n\n2\n00:00:10,000 --> 00:00:13,000\nLine two\n', 'utf8');
+
+  let checkCalls = 0;
+  const mockVoice = {
+    async checkSubtitleSync(chatId, opts) {
+      checkCalls++;
+      assert.equal(chatId, -100777);
+      assert.equal(opts.autoFix, true);
+      return {
+        ok: true,
+        subtitle_offset: 2.2,
+        auto_subtitle_offset: 2.2,
+        sub_drift_sec_per_sec: 0.0015,
+        sub_drift_anchor_sec: 45.0,
+        subtitle_sync: {
+          status: 'auto_normalized',
+          applied_offset_sec: 2.2,
+          residual_sec: 0,
+          drift_ms_per_min: 90,
+          auto_normalized: true,
+          message: 'Auto-normalized subtitles (+2.2s, +90ms/min)'
+        }
+      };
+    }
+  };
+
+  const apiRec = makeFakeApi();
+  const adminApi = { ...apiRec.api, async getChatMember() { return { status: 'administrator', user: { id: 10 } }; } };
+  const app = {
+    db,
+    settings: new SettingsManager(db, { env: {} }),
+    subtitles: new SubtitleService({ cacheDir: dir }),
+    voiceClient: mockVoice
+  };
+  app.musicQueueManager = new QueueManager({ app, voiceClient: mockVoice, db, pollMs: 0 });
+  app.music = new MusicService({ app, accounts: { sync: async () => {} } });
+  const screen = createMusicScreen({ app });
+  t.after(async () => {
+    await screen.cleanup();
+    await app.music.previews.shutdown();
+    await app.musicQueueManager.shutdown();
+  });
+
+  const s = app.musicQueueManager.getSession(-100777);
+  s.connected = true;
+  s.status = 'playing';
+  s.activeDeck = 'movie';
+  s.view = 'subsync';
+  s.screenMessageId = 601;
+  s.playerChatId = -100777;
+  s.api = adminApi;
+  s.currentTrack = {
+    id: 'tmdb-subchk',
+    provider: 'movie',
+    mediaType: 'video',
+    title: 'Sync Checker Movie',
+    subtitlePath: srtPath,
+    subtitleTracks: [{ label: 'English', filePath: srtPath, format: 'srt' }]
+  };
+
+  const beforeCard = JSON.stringify(screen.renderSubSyncPicker(s));
+  assert.match(beforeCard, /Check & Auto-Fix Sync/);
+
+  const ctx = {
+    tgId: '10',
+    chatId: -100777,
+    messageId: 601,
+    isGroup: true,
+    api: adminApi,
+    query: { id: 'qsubchk' }
+  };
+  await app.music.control(ctx, 'subcheck', [String(s.controlRevision || 0)]);
+
+  assert.equal(checkCalls, 1);
+  assert.equal(s.subtitleSyncOffset, 2.2);
+  assert.equal(s.subtitleDriftRate, 0.0015);
+  assert.equal(s.subtitleSyncStatus?.status, 'auto_normalized');
+
+  const afterPickerText = JSON.stringify(screen.renderSubSyncPicker(s));
+  assert.match(afterPickerText, /Auto-Normalized/);
+  assert.match(afterPickerText, /drift \+90ms\/m/);
+
+  s.view = 'cinema';
+  const cinemaText = JSON.stringify(screen.renderCinemaPlayer(s));
+  assert.match(cinemaText, /Auto-Normalized/);
 });

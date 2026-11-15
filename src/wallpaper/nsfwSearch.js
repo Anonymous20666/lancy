@@ -1,5 +1,8 @@
 import * as cheerio from 'cheerio';
 import { logger } from '../core/logger.js';
+import { defaultAdultCatalog, ADULT_CATEGORIES, FEATURED_ARTISTS } from '../media/adultCatalog.js';
+
+export { defaultAdultCatalog as adultCatalog, ADULT_CATEGORIES, FEATURED_ARTISTS };
 
 const log = logger().child({ module: 'nsfw-search' });
 
@@ -23,6 +26,7 @@ export const NSFW_CATEGORIES = {
   REAL_FULL_VIDEOS: 'real_videos',
   ADULT_MOVIES: 'adult_movies',
   XVIDEOS_VIDEO: 'xvideos',
+  PORNHUB_VIDEO: 'pornhub',
   // Backward compatibility aliases
   VIDEOS: 'real_videos',
   ANIMATED: 'hentai_clips'
@@ -38,6 +42,7 @@ export const CATEGORY_SUGGESTIONS = {
   [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['Asian', 'Latina', 'Brunette', 'Blonde', 'Baddie', 'Glamour'],
   [NSFW_CATEGORIES.ADULT_MOVIES]: ['Full Movie', 'Passionate', 'Couples', 'Romantic 18+', 'Brunette', 'Asian'],
   [NSFW_CATEGORIES.XVIDEOS_VIDEO]: ['Trending', 'Asian', 'Latina', 'Brunette', 'Blonde', 'Amateur'],
+  [NSFW_CATEGORIES.PORNHUB_VIDEO]: ['Trending', 'Asian', 'Latina', 'MILF', 'Lesbian', 'POV', '4K HD'],
   all: ['Tifa', 'Asian Model', 'Makima', 'Latina', 'Genshin', 'Glamour']
 };
 
@@ -1333,15 +1338,20 @@ export async function searchXvideos({
   page = 0,
   limit = 15,
   sort = 'relevance',
+  durationFilter = 'all',
+  category = '',
+  artist = '',
+  lazy = false,
   signal = null
 } = {}) {
-  const cleanQuery = String(query || '').trim();
+  const rawQuery = [artist, category, query].filter(Boolean).join(' ').trim();
+  const cleanQuery = String(rawQuery || '').trim();
   if (isBlockedNsfwQuery(cleanQuery)) {
     return { results: [], category: NSFW_CATEGORIES.XVIDEOS_VIDEO, total: 0, page, blocked: true };
   }
   const pageNum = Math.max(0, Number(page) || 0);
   const maxItems = Math.max(1, Math.min(30, Number(limit) || 15));
-  const cacheKey = `xv_${sort}_${cleanQuery.toLowerCase()}_${pageNum}_${maxItems}`;
+  const cacheKey = `xv_${sort}_${durationFilter}_${lazy ? '1' : '0'}_${cleanQuery.toLowerCase()}_${pageNum}_${maxItems}`;
 
   const cached = searchCache.get(cacheKey);
   if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
@@ -1354,9 +1364,13 @@ export async function searchXvideos({
   const job = (async () => {
     const isTrending = !cleanQuery || /^(trending|hot|popular|top|best)$/i.test(cleanQuery);
     const sortParam = sort && sort !== 'relevance' ? `&sort=${encodeURIComponent(sort)}` : '';
-    const targetUrl = isTrending
+    const durParam = durationFilter === 'short' ? '&durf=1-10min'
+      : durationFilter === 'medium' ? '&durf=10-20min'
+      : durationFilter === 'long' ? '&durf=20min_more'
+      : '';
+    const targetUrl = isTrending && !durParam
       ? `https://www.xvideos.com/${pageNum > 0 ? `new/${pageNum}` : ''}`
-      : `https://www.xvideos.com/?k=${encodeURIComponent(cleanQuery)}${pageNum > 0 ? `&p=${pageNum}` : ''}${sortParam}`;
+      : `https://www.xvideos.com/?k=${encodeURIComponent(cleanQuery || 'trending')}${pageNum > 0 ? `&p=${pageNum}` : ''}${sortParam}${durParam}`;
 
     const results = [];
     try {
@@ -1376,6 +1390,10 @@ export async function searchXvideos({
         const thumb = img.attr('data-src') || img.attr('src') || null;
         const pvvUrl = img.attr('data-pvv') || $(el).attr('data-pvv') || null;
         const duration = $(el).find('.duration').text().trim() || 'HD';
+        const uploader = $(el).find('.Metadata .name, .thumb-under .name, p.metadata a .name').first().text().trim() || artist || 'XVideos';
+        const metaText = $(el).find('.Metadata, p.metadata').text().trim();
+        const viewsMatch = metaText.match(/([\d.,]+\s*[kKmM]?)\s*Views/i);
+        const views = viewsMatch ? viewsMatch[1].trim() : '';
         if (!title || !href || href.startsWith('#') || isBlockedNsfwQuery(title)) return;
         const fullPageUrl = href.startsWith('http') ? href : `https://www.xvideos.com${href.startsWith('/') ? '' : '/'}${href}`;
         blocks.push({
@@ -1384,16 +1402,20 @@ export async function searchXvideos({
           fullPageUrl,
           thumb,
           pvvUrl: pvvUrl && pvvUrl.endsWith('.mp4') ? pvvUrl : null,
-          duration
+          duration,
+          uploader,
+          views
         });
       });
 
       const sliced = blocks.slice(0, maxItems);
-      await Promise.all(
-        sliced.slice(0, 6).map(async (b) => {
-          b.resolved = await resolveXvideosStream(b.fullPageUrl, signal).catch(() => null);
-        })
-      );
+      if (!lazy) {
+        await Promise.all(
+          sliced.slice(0, 6).map(async (b) => {
+            b.resolved = await resolveXvideosStream(b.fullPageUrl, signal).catch(() => null);
+          })
+        );
+      }
 
       for (const b of sliced) {
         const fallbackUrls = [...new Set([
@@ -1403,7 +1425,8 @@ export async function searchXvideos({
         const videoUrl = b.resolved?.streamUrl || b.pvvUrl || null;
         results.push({
           id: String(b.id),
-          title: b.title.slice(0, 80),
+          title: b.title.slice(0, 140),
+          fullTitle: b.title,
           type: 'video',
           mediaType: 'video',
           isAdult: true,
@@ -1414,10 +1437,14 @@ export async function searchXvideos({
           thumbUrl: b.thumb || b.pvvUrl || null,
           pageUrl: b.fullPageUrl,
           duration: b.duration,
+          artist: b.uploader || artist || 'XVideos',
+          views: b.views || '',
+          categories: category ? [category] : [],
           headers: { Referer: 'https://www.xvideos.com/', 'User-Agent': USER_AGENT },
           streamHeaders: { Referer: 'https://www.xvideos.com/', 'User-Agent': USER_AGENT },
           category: NSFW_CATEGORIES.XVIDEOS_VIDEO,
-          source: 'XVideos'
+          source: 'XVideos',
+          sourceKey: 'xvideos'
         });
       }
     } catch (err) {
@@ -1574,4 +1601,12 @@ export async function searchAdultMovies({
   } finally {
     inFlightRequests.delete(cacheKey);
   }
+}
+
+export async function searchPornhub(opts = {}) {
+  return defaultAdultCatalog.searchPornhub(opts);
+}
+
+export async function resolvePornhubStream(pageUrl, signal = null) {
+  return defaultAdultCatalog.resolvePornhubStream(pageUrl, signal);
 }

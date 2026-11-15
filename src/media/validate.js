@@ -1,3 +1,5 @@
+import { gunzipSync } from 'node:zlib';
+
 /**
  * Media validation — never trust HTTP status alone.
  * Checks MIME, magic bytes, dimensions, duration, size and decodability.
@@ -18,6 +20,18 @@ export const MAGIC = {
   wav: { mime: 'audio/wav', bytes: [[0x52, 0x49, 0x46, 0x46]], at: 8, also: [[0x57, 0x41, 0x56, 0x45]] }
 };
 
+export function isTgsBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 16 || buffer.length > 256 * 1024) return false;
+  if (buffer[0] !== 0x1f || buffer[1] !== 0x8b) return false;
+  try {
+    const raw = gunzipSync(buffer, { maxOutputLength: 1024 * 1024 });
+    const head = raw.toString('utf8', 0, Math.min(raw.length, 400)).trimStart();
+    return head.startsWith('{') && /"layers"\s*:|"v"\s*:/.test(head);
+  } catch {
+    return false;
+  }
+}
+
 function matchesPattern(buffer, pattern, offset = 0) {
   if (buffer.length < offset + pattern.length) return false;
   return pattern.every((byte, i) => buffer[offset + i] === byte);
@@ -26,6 +40,7 @@ function matchesPattern(buffer, pattern, offset = 0) {
 /** Detect the real container/MIME from magic bytes. */
 export function detectMime(buffer) {
   if (!buffer || buffer.length < 12) return null;
+  if (isTgsBuffer(buffer)) return 'application/x-tgsticker';
   for (const [name, sig] of Object.entries(MAGIC)) {
     if (sig.ftyp) {
       // ISO-BMFF: bytes 4..8 == 'ftyp'
@@ -50,6 +65,7 @@ export function detectMime(buffer) {
 /** Classify into our coarse media kinds. */
 export function classifyMedia(mime) {
   if (!mime) return 'unknown';
+  if (mime === 'application/x-tgsticker') return 'animated';
   if (mime.startsWith('image/')) return 'image';
   if (mime.startsWith('video/')) return 'video';
   if (mime.startsWith('audio/')) return 'audio';

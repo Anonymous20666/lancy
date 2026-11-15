@@ -134,7 +134,7 @@ export class InfiniteRadio {
    if(!t?.id||excluded.has(t.id))continue;
    const tKey=normTrackTitleKey(t.artist,t.title);
    if(tKey&&excludedTitles.has(tKey))continue;
-   if(added<3&&s.upcoming.length<100){
+   if(added<3){
     this.app.musicQueueManager.enqueue(s.chatId,{...t,mediaType:isVideo?'video':'audio',requester:'Infinite radio'});
     r.seen.push(t.id);excluded.add(t.id);
     if(tKey){r.seenTitles.push(tKey);excludedTitles.add(tKey);}

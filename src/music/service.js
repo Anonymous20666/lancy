@@ -6,16 +6,76 @@ import { AiDjEngine } from './aiDj.js';
 import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { originalPlayDelivery } from './originalPlayCard.js';
-import { isMusicOwner } from './accounts.js';
+import { isMusicOwner, isMusicSuperAdmin } from './accounts.js';
 import { KeyedLock, MusicError } from './model.js';
-import { checkChatMediaPermissions } from '../telegram/permissions.js';
+import { checkChatMediaPermissions, isGroupSuperAdminMember, isAnonymousGroupAdmin } from '../telegram/permissions.js';
 import { ProgressTracker } from '../telegram/progress.js';
 import { RichMessageBuilder, rt } from '../telegram/rich.js';
 import { normalizeDownloadQuality } from '../media/telegramLimits.js';
 export const EQ_PRESETS = ['off','studio','bass','vocal','nightcore','vaporwave','8d'];
 export const EQ_CYCLE_PRESETS = ['off','studio','bass','vocal','8d'];
+
+function parseDurationTokens(str) {
+  const s = String(str || '').trim().toLowerCase();
+  if (!s) return null;
+  if (/^\d+(?::\d{1,2}){1,2}(?:\.\d+)?$/.test(s)) {
+    const parts = s.split(':').map(Number);
+    if (parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+    if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+    if (parts.length === 2) return parts[0] * 60 + parts[1];
+  }
+  const unitRe = /^(?:(\d+(?:\.\d+)?)\s*h(?:ours?|rs?)?\s*)?(?:(\d+(?:\.\d+)?)\s*m(?:in(?:ute)?s?)?\s*)?(?:(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?)?$/i;
+  const um = s.match(unitRe);
+  if (um && (um[1] !== undefined || um[2] !== undefined || um[3] !== undefined)) {
+    const hrs = Number(um[1] || 0);
+    const mins = Number(um[2] || 0);
+    const secs = Number(um[3] || 0);
+    return hrs * 3600 + mins * 60 + secs;
+  }
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    return Number(s);
+  }
+  return null;
+}
+
+export function parseSeekInput(raw, currentPos = 0, duration = 0) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  const stepMatch = text.match(/^(?:step|set|button|skip)\s+(.+)$/i);
+  if (stepMatch) {
+    const val = parseDurationTokens(stepMatch[1].replace(/^[+-]/, '').trim());
+    if (val === null || !Number.isFinite(val) || val < 5 || val > 600) return null;
+    return { kind: 'step', seconds: Math.round(val) };
+  }
+  let sign = 0;
+  let body = text;
+  if (/^[+-]/.test(body)) {
+    sign = body.startsWith('-') ? -1 : 1;
+    body = body.slice(1).trim();
+  } else if (/^(?:ff|forward|fwd|\+)\s+/i.test(body)) {
+    sign = 1;
+    body = body.replace(/^(?:ff|forward|fwd|\+)\s+/i, '').trim();
+  } else if (/^(?:rw|rewind|back|-)\s+/i.test(body)) {
+    sign = -1;
+    body = body.replace(/^(?:rw|rewind|back|-)\s+/i, '').trim();
+  }
+  const parsedSec = parseDurationTokens(body);
+  if (parsedSec === null || !Number.isFinite(parsedSec)) return null;
+  const dur = Math.max(0, Number(duration) || 0);
+  const base = Math.max(0, Number(currentPos) || 0);
+  if (sign !== 0) {
+    const delta = sign * parsedSec;
+    let target = Math.max(0, base + delta);
+    if (dur > 2 && target >= dur) target = Math.max(0, dur - 2);
+    return { kind: 'relative', delta, targetSeconds: target };
+  }
+  let target = Math.max(0, parsedSec);
+  if (dur > 2 && target >= dur) target = Math.max(0, dur - 2);
+  return { kind: 'absolute', targetSeconds: target };
+}
+
 export class MusicService {
-  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.userDownloads=new Map(); this.maxDownloads=16; this.maxUserDownloads=2; this.channelPanels=new ChannelPanels({service:this});this.setup=new CallSetup({service:this});this.channels=new SavedChannels({service:this});this.radio=new InfiniteRadio({app});this.aiDj=new AiDjEngine({app});this.listenCards=new Map();this.cardLocks=new KeyedLock();this.lyricJobs=new Map();this.activePolls=new Map(); }
+  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.userDownloads=new Map(); this.maxDownloads=16; this.maxUserDownloads=2; this.channelPanels=new ChannelPanels({service:this});this.setup=new CallSetup({service:this});this.channels=new SavedChannels({service:this});this.radio=new InfiniteRadio({app});this.aiDj=new AiDjEngine({app});this.listenCards=new Map();this.cardLocks=new KeyedLock();this.lyricJobs=new Map();this.activePolls=new Map();this.pendingSeeks=new Map(); }
   getSkipVoteThreshold(chatId){
     const perChat=chatId!=null?this.app?.db?.getSetting?.(`music.skipVoteThreshold.${chatId}`,null):null;
     const raw=perChat!==null&&perChat!==undefined?perChat:this.app?.settings?.get?.('music.skipVoteThreshold');
@@ -101,7 +161,20 @@ export class MusicService {
     const playback=root.playbackId;root.cardLyrics={trackId:track.id,status:'pending'};
     const job=Promise.resolve(this.lyrics.get(track,{force})).then(result=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:result?.found?'ready':'unavailable',result};}).catch(()=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:'unavailable'};}).finally(()=>{this.lyricJobs.delete(root.chatId);if(!this.app.musicQueueManager.closed)void this.app.musicQueueManager.updatePlayerCard(root.chatId).catch(()=>{});});this.lyricJobs.set(root.chatId,job);
   }
-  owner(ctx) { return isMusicOwner(this.app,ctx.tgId); }
+  owner(ctx) { return isMusicOwner(this.app,ctx?.tgId); }
+  superAdmin(ctx) { return isMusicSuperAdmin(this.app,ctx?.tgId); }
+  async #isChatSuperAdmin(ctx, id = null) {
+    if (!ctx || id == null || Number(id) >= 0) return false;
+    if (isAnonymousGroupAdmin(ctx.message, id)) return true;
+    const chatType = ctx.chatType || ctx.message?.chat?.type || ctx.query?.message?.chat?.type || (this.app?.musicQueueManager?.getSession?.(id)?.isChannel ? 'channel' : null);
+    if (chatType === 'channel' && ctx.channelAdminVerified) return true;
+    const uid = Number(ctx.tgId);
+    if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+    const member = await ctx.api?.getChatMember?.(Number(id), uid).catch(() => null);
+    if (!member) return false;
+    if (chatType === 'channel') return ['creator', 'administrator'].includes(member.status);
+    return isGroupSuperAdminMember(member);
+  }
   #isTrackReady(session, entry) {
     if (!entry) return false;
     if (entry.queuedMedia) return true;
@@ -142,7 +215,7 @@ export class MusicService {
   }
   isVcSudo(ctx, id = null) {
     if (!ctx) return false;
-    if (this.owner(ctx)) return true;
+    if (this.superAdmin(ctx)) return true;
     const { global, chat } = this.getVcSudoList(id);
     const combined = new Set([...global, ...chat].map(s => String(s).toLowerCase().replace(/^@/, '')));
     if (ctx.tgId !== undefined && ctx.tgId !== null && combined.has(String(ctx.tgId).toLowerCase())) return true;
@@ -163,19 +236,30 @@ export class MusicService {
     return false;
   }
   async vcsudoCommand(ctx, args = []) {
+    return this.#manageVcSudo(ctx, args, { defaultAction: null });
+  }
+  async rmsudoCommand(ctx, args = []) {
+    return this.#manageVcSudo(ctx, args, { defaultAction: 'remove' });
+  }
+  async #manageVcSudo(ctx, args = [], { defaultAction = null } = {}) {
     const chatId = Number(ctx.chatId);
     const targetChatId = chatId < 0 ? chatId : null;
-    if (!this.owner(ctx) && !this.isVcSudo(ctx, targetChatId)) {
-      throw Object.assign(new MusicError('ADMIN_ONLY', 'Only the Bot Owner or authorized VC Sudo users can manage /vcsudo.'), { silent: true });
+    if (!this.superAdmin(ctx) && !this.isVcSudo(ctx, targetChatId) && !(await this.#isChatSuperAdmin(ctx, targetChatId))) {
+      throw Object.assign(new MusicError('ADMIN_ONLY', 'Only the Bot Owner, Super Admins, or authorized VC Sudo users can manage /vcsudo.'), { silent: true });
     }
     const rawArgs = (Array.isArray(args) ? args : String(args || '').split(/\s+/)).map(s => String(s || '').trim()).filter(Boolean);
-    const sub = String(rawArgs[0] || '').toLowerCase();
-    const isGlobal = rawArgs.includes('--global') || rawArgs.includes('-g') || !targetChatId;
+    const hasGlobalFlag = rawArgs.some(a => a === '--global' || a === '-g');
+    const positional = rawArgs.filter(a => a !== '--global' && a !== '-g');
+    const isGlobal = hasGlobalFlag || !targetChatId;
+    if (hasGlobalFlag && targetChatId && !this.superAdmin(ctx) && !this.isVcSudo(ctx, null)) {
+      throw Object.assign(new MusicError('ADMIN_ONLY', 'Only the Bot Owner, Super Admins, or Global VC Sudo users can modify Global VC Sudo.'), { silent: true });
+    }
     const scopeKey = isGlobal ? 'music.vcsudo.global' : `music.vcsudo.${targetChatId}`;
     const scopeLabel = isGlobal ? 'Global VC Sudo' : `Chat VC Sudo (${targetChatId})`;
     const current = new Set((this.app?.db?.getSetting?.(scopeKey, []) || []).map(s => String(s).replace(/^@/, '')));
+    const firstLower = String(positional[0] || '').toLowerCase();
 
-    if (sub === 'list' || (!sub && !ctx.replyTo?.from?.id)) {
+    if (firstLower === 'list' || (!defaultAction && !firstLower && !ctx.replyTo?.from?.id)) {
       const { global, chat } = this.getVcSudoList(targetChatId);
       const enforced = this.isVcSudoEnforced(targetChatId);
       const lines = [
@@ -190,46 +274,115 @@ export class MusicService {
         '<b>Usage:</b>',
         '• Reply <code>/vcsudo</code> to a user\'s message to grant/revoke VC Sudo',
         '• <code>/vcsudo add &lt;user_id|@username&gt;</code>',
+        '• <code>/rmsudo &lt;user_id|@username&gt;</code> (or reply <code>/rmsudo</code>)',
         '• <code>/vcsudo remove &lt;user_id|@username&gt;</code>',
-        '• <code>/vcsudo clear</code>'
+        '• <code>/rmsudo clear</code> · <code>/vcsudo clear</code>'
       );
       return lines.join('\n');
     }
 
-    if (sub === 'clear') {
+    if (firstLower === 'clear' || (defaultAction === 'remove' && firstLower === 'all')) {
       this.app?.db?.setSetting?.(scopeKey, []);
       return `🛡️ Cleared all entries in ${scopeLabel}. Only Bot Owner (and Global VC Sudo) can control VC now.`;
     }
 
-    if (sub === 'strict' || sub === 'enforce') {
-      const mode = String(rawArgs[1] || 'on').toLowerCase();
+    if (!defaultAction && (firstLower === 'strict' || firstLower === 'enforce')) {
+      const mode = String(positional[1] || 'on').toLowerCase();
       const val = !['off', 'false', '0', 'disable'].includes(mode);
       const enforceKey = targetChatId ? `music.vcsudo.enforced.${targetChatId}` : 'music.vcsudo.enforced';
       this.app?.db?.setSetting?.(enforceKey, val);
       return `🛡️ VC Sudo strict mode is now <b>${val ? 'ON (random group admins blocked & unauthorized users ignored silently)' : 'OFF'}</b>.`;
     }
 
-    const argTarget = ['add', 'remove', 'del', 'rm'].includes(sub) ? rawArgs[1] : rawArgs[0];
-    const replyTarget = ctx.replyTo?.from?.id ? String(ctx.replyTo.from.id) : null;
-    const rawTarget = replyTarget || String(argTarget || '').replace(/^@/, '').trim();
-    if (!rawTarget || (!/^\d+$/.test(rawTarget) && !/^[a-zA-Z0-9_]{3,32}$/.test(rawTarget))) {
-      throw new MusicError('INVALID_VCSUDO', 'Reply /vcsudo to a user\'s message, or pass a user ID / @username: /vcsudo add <user-id>');
+    const isSubVerb = ['add', 'remove', 'del', 'rm'].includes(firstLower);
+    const op = defaultAction === 'remove'
+      ? 'remove'
+      : (isSubVerb ? firstLower : null);
+    const targetArgs = (isSubVerb ? positional.slice(1) : positional)
+      .map(s => String(s || '').replace(/^@/, '').trim())
+      .filter(Boolean);
+
+    const replyId = ctx.replyTo?.from?.id ? String(ctx.replyTo.from.id) : null;
+    const replyUname = ctx.replyTo?.from?.username ? String(ctx.replyTo.from.username).replace(/^@/, '').trim() : null;
+    const validTargetRe = /^(?:\d+|[a-zA-Z0-9_]{3,32})$/;
+    const invalidUsage = defaultAction === 'remove'
+      ? 'Reply /rmsudo to a user\'s message, or pass a user ID / @username: /rmsudo <user-id>'
+      : 'Reply /vcsudo to a user\'s message, or pass a user ID / @username: /vcsudo add <user-id>';
+
+    if (targetArgs.length > 0 && targetArgs.some(t => !validTargetRe.test(t))) {
+      throw new MusicError('INVALID_VCSUDO', invalidUsage);
     }
 
-    const keyNorm = rawTarget.toLowerCase();
-    const existingMatch = [...current].find(x => x.toLowerCase() === keyNorm);
-    if (['remove', 'del', 'rm'].includes(sub) || (!['add'].includes(sub) && existingMatch)) {
-      if (existingMatch) current.delete(existingMatch);
+    let targets = targetArgs;
+    if (!targets.length) {
+      if (!replyId || !validTargetRe.test(replyId)) {
+        throw new MusicError('INVALID_VCSUDO', invalidUsage);
+      }
+      targets = [replyId];
+    }
+
+    const replyLookup = (!targetArgs.length && replyId)
+      ? [replyId, ...(replyUname && validTargetRe.test(replyUname) ? [replyUname] : [])]
+      : null;
+
+    const findMatches = (candidates) => {
+      const norms = new Set(candidates.map(c => c.toLowerCase()));
+      return [...current].filter(x => norms.has(x.toLowerCase()));
+    };
+
+    const existingMatches = replyLookup ? findMatches(replyLookup) : findMatches(targets);
+    const isRemove = ['remove', 'del', 'rm'].includes(op) || (!['add'].includes(op) && existingMatches.length > 0);
+
+    if (isRemove) {
+      const removed = [];
+      const notFound = [];
+      if (replyLookup) {
+        for (const m of existingMatches) {
+          current.delete(m);
+          removed.push(m);
+        }
+        if (!removed.length) notFound.push(replyId);
+      } else {
+        for (const rawTarget of targets) {
+          const match = [...current].find(x => x.toLowerCase() === rawTarget.toLowerCase());
+          if (match) {
+            current.delete(match);
+            removed.push(match);
+          } else {
+            notFound.push(rawTarget);
+          }
+        }
+      }
       this.app?.db?.setSetting?.(scopeKey, [...current]);
       if (targetChatId) this.app?.db?.setSetting?.(`music.vcsudo.enforced.${targetChatId}`, true);
-      return `🛡️ Removed <code>${rawTarget}</code> from ${scopeLabel}.`;
+      if (removed.length > 0) {
+        const removedHtml = removed.map(u => `<code>${u}</code>`).join(', ');
+        const extra = notFound.length ? ` (not in list: ${notFound.map(u => `<code>${u}</code>`).join(', ')})` : '';
+        return `🛡️ Removed ${removedHtml} from ${scopeLabel}.${extra}`;
+      }
+      const missingHtml = notFound.map(u => `<code>${u}</code>`).join(', ');
+      let msg = `🛡️ ${missingHtml} is not listed in ${scopeLabel}.`;
+      if (!isGlobal) {
+        const globalMatches = new Set(this.getVcSudoList(targetChatId).global.map(x => x.toLowerCase()));
+        const inGlobal = (replyLookup || targets).find(t => globalMatches.has(t.toLowerCase()));
+        if (inGlobal) {
+          msg += `\n💡 <code>${inGlobal}</code> is in <b>Global VC Sudo</b> — use <code>/rmsudo ${inGlobal} --global</code> if authorized.`;
+        }
+      }
+      return msg;
     }
 
-    current.add(rawTarget);
+    const added = [];
+    for (const rawTarget of targets) {
+      const existing = [...current].find(x => x.toLowerCase() === rawTarget.toLowerCase());
+      if (!existing) current.add(rawTarget);
+      added.push(existing || rawTarget);
+    }
     this.app?.db?.setSetting?.(scopeKey, [...current]);
     if (targetChatId) this.app?.db?.setSetting?.(`music.vcsudo.enforced.${targetChatId}`, true);
     else this.app?.db?.setSetting?.('music.vcsudo.enforced', true);
-    return `🛡️ Added <code>${rawTarget}</code> to ${scopeLabel}. They are now authorized to control Voice Chat playback and queues.`;
+    const addedHtml = added.map(u => `<code>${u}</code>`).join(', ');
+    return `🛡️ Added ${addedHtml} to ${scopeLabel}. They are now authorized to control Voice Chat playback and queues.`;
   }
   async chatDjCommand(ctx, text) {
     const id = await this.authorize(ctx, true, null, { allowDj: true });
@@ -295,14 +448,14 @@ export class MusicService {
     if(remote){
       if(Number(ctx.chatId)<=0 || Number(ctx.chatId)!==Number(ctx.tgId))throw new MusicError('PERMISSION_DENIED','Use your own private chat to control a channel.');
       const chat=await ctx.api?.getChat(id).catch(()=>null);
-      if(!chat || (chat.type!=='channel'&&!this.owner(ctx)))throw new MusicError('PERMISSION_DENIED','Only verified channel administrators can use this private controller.');
+      if(!chat || (chat.type!=='channel'&&!this.superAdmin(ctx)))throw new MusicError('PERMISSION_DENIED','Only verified channel administrators can use this private controller.');
       if(chat.type==='channel'){
         const me=ctx.api?.me || (await ctx.api?.getMe?.().catch(()=>null));
         const botId=me?.id;
         const bot=botId?await ctx.api.getChatMember(id,botId).catch(()=>null):null;
         if(!bot||!['creator','administrator'].includes(bot.status))throw new MusicError('BOT_ADMIN_REQUIRED','Make this bot a channel administrator before opening its private dashboard.');
-      }
-    }else if(this.owner(ctx) || this.isVcSudo(ctx, id))return id;
+      }else if(this.superAdmin(ctx))return id;
+    }else if(this.superAdmin(ctx) || this.isVcSudo(ctx, id))return id;
     const isChannelChat = Boolean(ctx.isChannel || ctx.chatType === 'channel' || ctx.message?.chat?.type === 'channel' || this.app?.musicQueueManager?.getSession?.(id)?.isChannel);
     const nativeChannelPost = Boolean(
       isChannelChat && !ctx.query && (
@@ -318,10 +471,13 @@ export class MusicService {
       )
     );
     if (!remote && nativeChannelPost) return id;
+    if (isChannelChat && !remote && ctx.channelAdminVerified === true) return id;
     if (!remote && !isChannelChat && Number(ctx.chatId) < 0 && !ctx.query && Number(ctx.tgId) === id) return id;
+    if (!remote && !isChannelChat && Number(ctx.chatId) < 0 && isAnonymousGroupAdmin(ctx.message, id)) return id;
     const vcSudoEnforced = !remote && Number(id) < 0 && !isChannelChat && this.isVcSudoEnforced(id);
     if (vcSudoEnforced && destructive) {
       if (allowDj && this.isDj(ctx, id)) return id;
+      if (await this.#isChatSuperAdmin(ctx, id)) return id;
       throw Object.assign(new MusicError('ADMIN_ONLY', 'Only authorized VC Sudo users can operate the player or change Voice Chat playback.'), { silent: true });
     }
     const uid = Number(ctx.tgId);
@@ -516,13 +672,123 @@ export class MusicService {
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','submode','subsync','subtrack','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
     // performs fresh authorization and full callback/message validation first.
-    if(['stop','leave'].includes(action))return this._control(ctx,action,[...args]);
+    if(['stop','leave','seekby'].includes(action))return this._control(ctx,action,[...args]);
     return this.controlLock.run(destination,()=>this._control(ctx,action,[...args]));
+  }
+  #formatSeekClock(seconds) {
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const hrs = Math.floor(total / 3600);
+    const mins = Math.floor((total % 3600) / 60);
+    const secs = String(total % 60).padStart(2, '0');
+    return hrs > 0 ? `${hrs}:${String(mins).padStart(2, '0')}:${secs}` : `${mins}:${secs}`;
+  }
+  async #coalesceSeekBy(ctx, s, id, delta) {
+    const qm = this.app.musicQueueManager;
+    const rootSession = qm.getSession(id);
+    const dur = Number(rootSession.currentTrack?.durationSeconds || 0);
+    let state = this.pendingSeeks.get(id);
+    const basePos = state
+      ? state.currentTarget
+      : (typeof qm.getEstimatedPosition === 'function'
+        ? qm.getEstimatedPosition(id)
+        : ((typeof rootSession.positionSeconds === 'number' && Number.isFinite(rootSession.positionSeconds)) ? rootSession.positionSeconds : 0));
+    let targetPos = Math.max(0, basePos + delta);
+    if (dur > 2 && targetPos >= dur) targetPos = Math.max(0, dur - 2);
+
+    rootSession.positionSeconds = targetPos;
+    rootSession.lastKnownPositionSeconds = targetPos;
+    rootSession.positionUpdatedAt = Date.now();
+    if (s && s !== rootSession) s.positionSeconds = targetPos;
+
+    if (!state) {
+      state = {
+        currentTarget: targetPos,
+        queuedTarget: targetPos,
+        totalDelta: delta,
+        timer: null,
+        running: false,
+        waiters: []
+      };
+      this.pendingSeeks.set(id, state);
+    } else {
+      state.currentTarget = targetPos;
+      state.queuedTarget = targetPos;
+      state.totalDelta += delta;
+    }
+
+    if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+      const signLabel = state.totalDelta >= 0 ? `+${Math.round(state.totalDelta)}s` : `${Math.round(state.totalDelta)}s`;
+      await ctx.api.answerCallbackQuery(ctx.query.id, {
+        text: `${delta >= 0 ? '⏩' : '⏪'} ${this.#formatSeekClock(targetPos)} (${signLabel})`
+      }).catch(() => {});
+    }
+
+    const coalesceMs = Math.max(0, Number(this.seekCoalesceMs ?? (typeof this.app?.voiceClient?.checkHealth === 'function' ? 350 : 0)));
+
+    const flush = async () => {
+      if (state.running) return;
+      state.running = true;
+      try {
+        while (state.queuedTarget !== null) {
+          const nextPos = state.queuedTarget;
+          state.queuedTarget = null;
+          await qm.seek(id, nextPos);
+        }
+        const waiters = state.waiters.splice(0);
+        for (const w of waiters) w.resolve(true);
+      } catch (err) {
+        const waiters = state.waiters.splice(0);
+        for (const w of waiters) w.reject(err);
+      } finally {
+        state.running = false;
+        if (state.queuedTarget !== null && !state.timer) {
+          void flush();
+        } else if (!state.timer && state.queuedTarget === null) {
+          this.pendingSeeks.delete(id);
+        }
+      }
+    };
+
+    return new Promise((resolve, reject) => {
+      state.waiters.push({ resolve, reject });
+      if (coalesceMs > 0) {
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = setTimeout(() => {
+          state.timer = null;
+          void flush();
+        }, coalesceMs);
+        state.timer.unref?.();
+      } else {
+        void flush();
+      }
+    });
+  }
+  async customSeekInput(ctx, rawText) {
+    const id = await this.authorize(ctx, true, null, { allowDj: true });
+    const qm = this.app.musicQueueManager;
+    const s = qm.getSession(id);
+    const curPos = typeof qm.getEstimatedPosition === 'function' ? qm.getEstimatedPosition(id) : (Number(s.positionSeconds) || 0);
+    const dur = Number(s.currentTrack?.durationSeconds || 0);
+    const parsed = parseSeekInput(rawText, curPos, dur);
+    if (!parsed) {
+      throw new MusicError('CANNOT_SEEK', 'Send seconds (e.g. 45, +90, -30), a timestamp (e.g. 12:30, 1:05:00), or "step 45" to set your custom skip button step.');
+    }
+    if (parsed.kind === 'step') {
+      const stepSec = qm.setSeekStep(id, parsed.seconds);
+      s.lastNotice = `⏱ Custom skip buttons set to ±${stepSec}s.`;
+    } else {
+      await qm.seek(id, parsed.targetSeconds);
+      s.lastNotice = `⏩ Jumped to ${this.#formatSeekClock(parsed.targetSeconds)}.`;
+    }
+    const isCinema = (s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie') && s.view !== 'queue';
+    if (s.view === 'seekmenu') s.view = isCinema ? 'cinema' : 'player';
+    await qm.updatePlayerCard(id, { forceEdit: true });
+    return parsed;
   }
   async #startCinemaDownload(ctx, s, id, targetItem, qualityRaw = null) {
     const downloader=this.app?.movieDownloader;
@@ -583,7 +849,7 @@ export class MusicService {
     })();
   }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','submode','subsync','subtrack','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isViewerVote=['voteskip','votequeue'].includes(action);
     const isDownloadAct=['downloadnow','downloadq','dlq'].includes(action);
     const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh'].includes(action);
@@ -824,21 +1090,48 @@ export class MusicService {
       await qm.setVolume(id,targetVol,{skipCardUpdate:true});
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`🔊 Volume: ${targetVol}%`}).catch(()=>{});
     }
-    else if(action==='seek')await qm.seek(id,Number(args[0]));
+    else if(action==='seek'){
+      const rawSeek=args.join(' ').trim();
+      if(!rawSeek){
+        s.view='seekmenu';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏱ Custom Seek & Skip Step'}).catch(()=>{});
+      }else{
+        const rootSession=qm.getSession(id);
+        const curPos=typeof qm.getEstimatedPosition==='function'?qm.getEstimatedPosition(id):(Number(rootSession.positionSeconds)||0);
+        const dur=Number(rootSession.currentTrack?.durationSeconds||0);
+        const parsed=parseSeekInput(rawSeek,curPos,dur);
+        if(parsed?.kind==='step'){
+          const stepSec=qm.setSeekStep(id,parsed.seconds);
+          s.seekStepSeconds=stepSec;
+          s.lastNotice=`⏱ Custom skip buttons set to ±${stepSec}s.`;
+        }else if(parsed){
+          await qm.seek(id,parsed.targetSeconds);
+        }else{
+          await qm.seek(id,Number(args[0]));
+        }
+      }
+    }
     else if(action==='seekby'){
-      const rootSession=qm.getSession(id);
-      const basePos=Number.isFinite(Number(rootSession.positionSeconds))
-        ? Number(rootSession.positionSeconds)
-        : (Number.isFinite(Number(s.positionSeconds)) ? Number(s.positionSeconds) : 0);
       const delta=Number(args[0])||0;
-      const dur=Number(rootSession.currentTrack?.durationSeconds||0);
-      let targetPos=Math.max(0,basePos+delta);
-      if(dur>2&&targetPos>=dur)targetPos=Math.max(0,dur-2);
-      await qm.seek(id,targetPos);
+      await this.#coalesceSeekBy(ctx,s,id,delta);
+    }
+    else if(action==='seekmenu'){
+      const subOp=String(args[0]||'').toLowerCase();
+      if(subOp==='back'){
+        s.view=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')?'cinema':'player';
+      }else{
+        s.view='seekmenu';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'⏱ Custom Seek & Skip Step'}).catch(()=>{});
+      }
+    }
+    else if(action==='setseekstep'){
+      const stepSec=qm.setSeekStep(id,Number(args[0])||30);
+      const rootSession=qm.getSession(id);
+      rootSession.seekStepSeconds=stepSec;
+      s.seekStepSeconds=stepSec;
+      s.lastNotice=`⏱ Skip step set to ±${stepSec}s`;
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery){
-        const mins=Math.floor(targetPos/60);
-        const secs=String(Math.floor(targetPos%60)).padStart(2,'0');
-        await ctx.api.answerCallbackQuery(ctx.query.id,{text:`${delta>=0?'⏩':'⏪'} ${mins}:${secs}`}).catch(()=>{});
+        await ctx.api.answerCallbackQuery(ctx.query.id,{text:`⏱ Skip buttons set to ±${stepSec}s`}).catch(()=>{});
       }
     }
     else if(action==='shuffle'){
@@ -984,13 +1277,25 @@ export class MusicService {
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`EQ preset: ${s.eqPreset}`}).catch(()=>{});
     }
     else if(action==='submode'){
-      const modes=['screen','live','off'];
+      const modes=['screen','live','vc','off'];
       const cur=modes.includes(s.subtitleMode)?s.subtitleMode:'screen';
       const req=args[0]&&modes.includes(String(args[0]).toLowerCase())?String(args[0]).toLowerCase():null;
       const nextMode=req||modes[(modes.indexOf(cur)+1)%modes.length];
       await qm.setSubtitleMode(id,nextMode);
-      const label=nextMode==='screen'?'Burned on VC Screen':nextMode==='live'?'Live Chat/Card Cues':'Off';
+      const label=nextMode==='screen'?'Burned on VC Screen':nextMode==='live'?'Live Chat/Card Cues':nextMode==='vc'?'Burned + VC Chat Cues':'Off';
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`💬 Subtitles: ${label}`}).catch(()=>{});
+    }
+    else if(action==='streammode'){
+      const req=args[0]&&['rtmp','interactive'].includes(String(args[0]).toLowerCase())?String(args[0]).toLowerCase():null;
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'📡 Switching VC stream engine…'}).catch(()=>{});
+      const nextEngine=await qm.setStreamMode(id,req);
+      s.streamMode=nextEngine;
+    }
+    else if(action==='vcmsg'){
+      const msgText=args.join(' ').trim();
+      const sendRes=await qm.sendVcChatMessage(id,msgText);
+      if(!sendRes?.ok)throw new MusicError('VC_MESSAGE_FAILED',sendRes?.reason==='empty'?'Include a message after /vcmsg.':'Active Voice Chat unavailable for in-call messages.');
+      s.lastNotice=`💬 Sent to VC chat: ${msgText.slice(0,80)}`;
     }
     else if(action==='subsync'){
       const op=String(args[0]||'').toLowerCase();
@@ -1019,6 +1324,14 @@ export class MusicService {
         await ctx.api.answerCallbackQuery(ctx.query.id,{text:picked?`🌐 Subtitle: ${picked.track?.label||`Track ${picked.index+1}`}`:'No alternate subtitle tracks on this video'}).catch(()=>{});
       }
     }
+    else if(action==='subcheck'){
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery){
+        await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🔍 Checking live audio vs subtitles…'}).catch(()=>{});
+      }
+      const chk=await qm.checkSubtitleSync(id,{autoFix:args[0]!=='probe'});
+      const st=chk?.sync||{};
+      s.lastNotice=st.message||(st.status==='none'?'No subtitle track loaded':'Subtitle sync checked');
+    }
     else if(action==='selectaccount'){
       if(s.connected||s.prepared)throw new MusicError('ACCOUNT_BUSY','Leave the current prepared session/call before changing its account.');
       const pool=await this.app.voiceClient.accounts(id);const account=pool.accounts.find(a=>a.alias===args[0]&&a.status==='available'&&a.enabled);
@@ -1033,7 +1346,8 @@ export class MusicService {
     }
     s.overlayView=null;s.overlayAt=0;
     const isCinema=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')&&s.view!=='queue';
-    if(['player','stop','leave','seek','seekby','selectaccount'].includes(action)||(s.view!=='queue'&&s.view!=='mqueue'&&['pause','resume','skip','previous'].includes(action)))s.view=isCinema?'cinema':'player';
+    if((['player','stop','leave','seekby','selectaccount'].includes(action)||(action==='seek'&&args.length>0))&&s.view!=='seekmenu')s.view=isCinema?'cinema':'player';
+    else if(s.view!=='queue'&&s.view!=='mqueue'&&s.view!=='seekmenu'&&['pause','resume','skip','previous'].includes(action))s.view=isCinema?'cinema':'player';
     if(action==='player'&&s.status==='stopped'){s.status='idle';s.lastError=null;}
     s.controlRevision=(s.controlRevision||0)+1; await qm.updatePlayerCard(id,{forceEdit:Boolean(ctx.query)});return s;
   }
@@ -1159,7 +1473,7 @@ export class MusicService {
     } catch {
       throw new MusicError('INVALID_DESTINATION','Could not access that channel. Make sure the channel username or link is correct and the bot has been added as an administrator to the channel.');
     }
-    if(!Number.isSafeInteger(chat.id)||chat.id>=0||(!this.owner(ctx)&&chat.type!=='channel'))throw new MusicError('INVALID_DESTINATION','Choose a channel you administer.');
+    if(!Number.isSafeInteger(chat.id)||chat.id>=0||(!this.superAdmin(ctx)&&chat.type!=='channel'))throw new MusicError('INVALID_DESTINATION','Choose a channel you administer.');
     await this.authorize(ctx,true,chat.id);
     if(chat.type==='channel')await this.channels.save(ctx,chat.id);
     this.destinations.set(`${this.botKey(ctx)}:${ctx.tgId}`,chat.id);

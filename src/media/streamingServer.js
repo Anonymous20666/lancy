@@ -12,6 +12,91 @@ import { resolveFfmpegPath } from './convert.js';
 
 const execFileAsync = promisify(execFile);
 
+const ISO_LANG_ALIAS = {
+  jpn: 'ja', jp: 'ja', ja: 'ja', japanese: 'ja',
+  eng: 'en', en: 'en', english: 'en',
+  spa: 'es', es: 'es', spanish: 'es',
+  fre: 'fr', fra: 'fr', fr: 'fr', french: 'fr',
+  ger: 'de', deu: 'de', de: 'de', german: 'de',
+  ita: 'it', it: 'it', italian: 'it',
+  por: 'pt', pt: 'pt', portuguese: 'pt',
+  rus: 'ru', ru: 'ru', russian: 'ru',
+  kor: 'ko', ko: 'ko', korean: 'ko',
+  chi: 'zh', zho: 'zh', cmn: 'zh', zh: 'zh', chinese: 'zh', mandarin: 'zh', cantonese: 'zh',
+  hin: 'hi', hi: 'hi', hindi: 'hi',
+  ara: 'ar', ar: 'ar', arabic: 'ar',
+  tur: 'tr', tr: 'tr', turkish: 'tr',
+  tha: 'th', th: 'th', thai: 'th',
+  vie: 'vi', vi: 'vi', vietnamese: 'vi',
+  ind: 'id', id: 'id', indonesian: 'id',
+  tam: 'ta', ta: 'ta', tamil: 'ta',
+  tel: 'te', te: 'te', telugu: 'te',
+  mal: 'ml', ml: 'ml', malayalam: 'ml',
+  ben: 'bn', bn: 'bn', bengali: 'bn',
+  pol: 'pl', pl: 'pl', polish: 'pl',
+  ukr: 'uk', uk: 'uk', ukrainian: 'uk',
+  nld: 'nl', dut: 'nl', nl: 'nl', dutch: 'nl',
+  swe: 'sv', sv: 'sv', swedish: 'sv',
+  nor: 'no', nob: 'no', nno: 'no', no: 'no', norwegian: 'no',
+  dan: 'da', da: 'da', danish: 'da',
+  fin: 'fi', fi: 'fi', finnish: 'fi',
+  fil: 'tl', tgl: 'tl', tl: 'tl', tagalog: 'tl', filipino: 'tl',
+  per: 'fa', fas: 'fa', fa: 'fa', persian: 'fa',
+  heb: 'he', he: 'he', hebrew: 'he',
+  und: '', mul: '', zxx: ''
+};
+
+export function normalizeLangCode(raw) {
+  const cleaned = String(raw || '').trim().toLowerCase();
+  if (!cleaned) return '';
+  if (ISO_LANG_ALIAS[cleaned] !== undefined) return ISO_LANG_ALIAS[cleaned];
+  const primary = cleaned.split(/[-_;\s,]/)[0];
+  if (ISO_LANG_ALIAS[primary] !== undefined) return ISO_LANG_ALIAS[primary];
+  return /^[a-z]{2,3}$/.test(primary) ? primary : '';
+}
+
+export function isDubAudioLabel(label = '') {
+  return /\b(?:dub(?:bed)?|english\s*dub|eng\s*dub|vff|vfq|latino\s*dub|castellano\s*dub)\b/i.test(String(label || ''));
+}
+
+function classifyMpdResource(absUrl, mimeHint = '', isTextHint = false) {
+  let pathname = '';
+  let formatParam = '';
+  try {
+    const parsed = new URL(absUrl);
+    pathname = parsed.pathname.toLowerCase();
+    formatParam = String(
+      parsed.searchParams.get('format')
+      || parsed.searchParams.get('fmt')
+      || parsed.searchParams.get('type')
+      || ''
+    ).toLowerCase();
+  } catch {
+    pathname = String(absUrl || '').split('?')[0].toLowerCase();
+  }
+  const mime = String(mimeHint || '').toLowerCase();
+
+  if (pathname.endsWith('.vtt') || mime.includes('text/vtt') || formatParam === 'vtt' || formatParam === 'webvtt') {
+    return { ext: 'vtt', contentType: 'text/vtt; charset=utf-8', forceContentType: 'text/vtt; charset=utf-8' };
+  }
+  if (pathname.endsWith('.srt') || mime.includes('subrip') || formatParam === 'srt') {
+    return { ext: 'srt', contentType: 'text/plain; charset=utf-8', forceContentType: 'text/plain; charset=utf-8' };
+  }
+  if (pathname.endsWith('.ttml') || pathname.endsWith('.dfxp') || mime.includes('ttml') || formatParam === 'ttml' || formatParam === 'dfxp') {
+    return { ext: 'ttml', contentType: 'application/ttml+xml; charset=utf-8', forceContentType: 'application/ttml+xml; charset=utf-8' };
+  }
+  if (pathname.endsWith('.ass') || pathname.endsWith('.ssa') || mime.includes('x-ssa') || mime.includes('x-ass')) {
+    return { ext: 'ass', contentType: 'text/plain; charset=utf-8', forceContentType: 'text/plain; charset=utf-8' };
+  }
+  if (isTextHint) {
+    return { ext: 'vtt', contentType: null, forceContentType: null };
+  }
+  if (pathname.endsWith('.m4a') || pathname.endsWith('.aac') || mime.startsWith('audio/')) {
+    return { ext: pathname.endsWith('.aac') ? 'aac' : 'm4a', contentType: 'audio/mp4', forceContentType: 'audio/mp4' };
+  }
+  return { ext: 'mp4', contentType: 'video/mp4', forceContentType: 'video/mp4' };
+}
+
 export const DEFAULT_STREAM_PUBLIC_URL = 'https://pappysonghttps.duckdns.org';
 
 /**
@@ -121,9 +206,10 @@ export class VideoStreamingServer {
     }
 
     // 1.5 Loopback progressive movie/episode relay (/movie-proxy/:token[.ext]) for PyTgCalls
-    const proxyMatch = pathname.match(/^\/movie-proxy\/([a-f0-9]{16,64})(?:\.(?:m3u8|mpd|ts|mp4|mkv|m4s|aac|key))?$/i);
+    const proxyMatch = pathname.match(/^\/movie-proxy\/([a-f0-9]{16,64})(?:\.(?:m3u8|mpd|ts|mp4|mkv|m4s|m4a|aac|key|vtt|srt|ttml|dfxp|ass|ssa))?$/i);
     if (proxyMatch) {
-      await this.#handleMovieProxy(req, res, proxyMatch[1]);
+      const seekSeconds = Math.max(0, parseFloat(parsedUrl.searchParams.get('start') || '0') || 0);
+      await this.#handleMovieProxy(req, res, proxyMatch[1], seekSeconds);
       return;
     }
 
@@ -400,7 +486,7 @@ export class VideoStreamingServer {
     return downloadPromise;
   }
 
-  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000 } = {}) {
+  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000, maxHeight = 720, preferredAudioLang = null } = {}) {
     if (!url || !/^https?:\/\//i.test(String(url))) return null;
     const now = Date.now();
     for (const [k, v] of this.remoteStreams) {
@@ -408,6 +494,8 @@ export class VideoStreamingServer {
     }
     const token = randomBytes(16).toString('hex');
     const urlStr = String(url);
+    const capHeight = Number.isFinite(Number(maxHeight)) && Number(maxHeight) > 0 ? Math.round(Number(maxHeight)) : 720;
+    const prefAudio = normalizeLangCode(preferredAudioLang);
     const detectedDash = Boolean(isDash || /dash\+xml/i.test(String(contentType || '')) || /\.mpd(\?|$)/i.test(urlStr));
     const detectedHls = !detectedDash && Boolean(isHls || /mpegurl/i.test(String(contentType || '')) || /\.m3u8(\?|$)/i.test(urlStr));
     this.remoteStreams.set(token, {
@@ -416,11 +504,14 @@ export class VideoStreamingServer {
       contentType: detectedDash ? 'application/dash+xml' : detectedHls ? 'application/vnd.apple.mpegurl' : contentType,
       isHls: detectedHls,
       isDash: detectedDash,
+      maxHeight: capHeight,
+      preferredAudioLang: prefAudio,
       forceContentType: null,
       childTokens: new Map(),
+      hlsPlaylistCache: new Map(),
       expiresAt: now + ttlMs
     });
-    return `http://127.0.0.1:${this.port}/movie-proxy/${token}${detectedDash ? '.mpd' : ''}`;
+    return `http://127.0.0.1:${this.port}/movie-proxy/${token}${detectedDash ? '.mpd' : detectedHls ? '.m3u8' : ''}`;
   }
 
   #registerChildProxyStream(parentEntry, targetUrl, { isHls = false, isBasePrefix = false, contentType = 'video/mp2t', forceContentType = null } = {}) {
@@ -454,18 +545,147 @@ export class VideoStreamingServer {
       contentType,
       isHls: Boolean(isHls),
       isBasePrefix: Boolean(isBasePrefix),
+      maxHeight: parentEntry.maxHeight || 720,
+      preferredAudioLang: parentEntry.preferredAudioLang || '',
       forceContentType,
       isChildSegment: !isHls && !isBasePrefix,
       createdAt: now,
       childTokens: new Map(),
+      hlsPlaylistCache: parentEntry.hlsPlaylistCache || new Map(),
       expiresAt: parentEntry.expiresAt
     });
     parentEntry.childTokens?.set(cacheKey, childToken);
     return childToken;
   }
 
+  #selectBestVideoVariant(variants, maxHeight = 720) {
+    if (!Array.isArray(variants) || variants.length <= 1) return variants?.[0] || null;
+    const cap = Number.isFinite(Number(maxHeight)) && Number(maxHeight) > 0 ? Number(maxHeight) : 720;
+    const withHeight = variants.filter((v) => Number(v.height) > 0);
+    if (withHeight.length) {
+      const within = withHeight.filter((v) => v.height <= cap);
+      const pool = within.length ? within : withHeight;
+      return pool.reduce((best, cur) => {
+        if (!best) return cur;
+        if (within.length) {
+          if (cur.height !== best.height) return cur.height > best.height ? cur : best;
+        } else {
+          if (cur.height !== best.height) return cur.height < best.height ? cur : best;
+        }
+        return (cur.bandwidth || 0) > (best.bandwidth || 0) ? cur : best;
+      }, null);
+    }
+    // Without explicit RESOLUTION/height metadata, prefer moderate bandwidth (<=3.5 Mbps) to avoid 4K decode stalls
+    const withBw = variants.filter((v) => Number(v.bandwidth) > 0);
+    if (!withBw.length) return variants[0];
+    const moderate = withBw.filter((v) => v.bandwidth <= 3_500_000);
+    if (moderate.length) {
+      return moderate.reduce((a, b) => (b.bandwidth > a.bandwidth ? b : a));
+    }
+    return withBw.reduce((a, b) => (b.bandwidth < a.bandwidth ? b : a));
+  }
+
+  #scoreDashAudioSet(attrs, inner, prefLang = '') {
+    const langRaw = attrs.match(/\blang\s*=\s*["']([^"']+)["']/i)?.[1]
+      || inner.match(/\blang\s*=\s*["']([^"']+)["']/i)?.[1]
+      || '';
+    const lang = normalizeLangCode(langRaw);
+    const labelText = [
+      attrs.match(/\blabel\s*=\s*["']([^"']+)["']/i)?.[1],
+      inner.match(/<Label[^>]*>([\s\S]*?)<\/Label>/i)?.[1]
+    ].filter(Boolean).join(' ');
+    const roles = [...inner.matchAll(/<Role[^>]*\bvalue\s*=\s*["']([^"']+)["']/gi)].map((m) => m[1].toLowerCase());
+    const isDub = roles.includes('dub') || isDubAudioLabel(labelText);
+    const isMain = roles.includes('main') || roles.includes('original');
+    const isComment = roles.some((r) => r.includes('commentary') || r.includes('description') || r.includes('alternate'))
+      || /\b(?:commentary|descriptive|audio\s*description)\b/i.test(labelText);
+
+    let score = 0;
+    if (prefLang && lang) {
+      score += (lang === prefLang) ? 100 : -80;
+    }
+    if (isMain) score += 30;
+    if (isDub) score -= 120;
+    else score += 30;
+    if (isComment) score -= 100;
+    return score;
+  }
+
+  #pruneMpdVideoRepresentations(xmlText, maxHeight = 720, preferredAudioLang = '') {
+    const prefLang = normalizeLangCode(preferredAudioLang);
+
+    const pruneScope = (scopeXml) => {
+      const audioSets = [];
+      let setIdx = 0;
+      const afterVideo = String(scopeXml || '').replace(/<AdaptationSet\b([^>]*)>([\s\S]*?)<\/AdaptationSet>/gi, (full, attrs, inner) => {
+        const curIdx = setIdx++;
+        const isExplicitText = /\bcontentType\s*=\s*["']text["']/i.test(attrs)
+          || /\bmimeType\s*=\s*["'](?:text\/|application\/(?:ttml\+xml|x-subrip))/i.test(`${attrs} ${inner}`);
+        const isExplicitAudio = /\bcontentType\s*=\s*["']audio["']/i.test(attrs)
+          || (!/\bcontentType\s*=\s*["'](?:video|text)["']/i.test(attrs) && /\bmimeType\s*=\s*["']audio\//i.test(`${attrs} ${inner}`));
+
+        if (isExplicitAudio && !isExplicitText) {
+          audioSets.push({ idx: curIdx, score: this.#scoreDashAudioSet(attrs, inner, prefLang) });
+          return full;
+        }
+
+        const repMatches = [...inner.matchAll(/<Representation\b([^>]*)(?:\/>|>([\s\S]*?)<\/Representation>)/gi)];
+        if (repMatches.length <= 1 || isExplicitText) return full;
+
+        const isVideoSet = /\bcontentType\s*=\s*["']video["']/i.test(attrs)
+          || repMatches.some((m) => /\bheight\s*=\s*["']\d+["']/i.test(m[1]) || /\bmimeType\s*=\s*["']video\//i.test(m[1]));
+        if (!isVideoSet) return full;
+
+        const candidates = repMatches.map((m, idx) => {
+          const repAttrs = m[1] || '';
+          const hMatch = repAttrs.match(/\bheight\s*=\s*["'](\d+)["']/i);
+          const bwMatch = repAttrs.match(/\bbandwidth\s*=\s*["'](\d+)["']/i);
+          return {
+            idx,
+            height: Number(hMatch?.[1] || 0),
+            bandwidth: Number(bwMatch?.[1] || 0)
+          };
+        });
+        const winner = this.#selectBestVideoVariant(candidates, maxHeight);
+        if (!winner) return full;
+
+        let repIdx = 0;
+        const prunedInner = inner.replace(/<Representation\b([^>]*)(?:\/>|>([\s\S]*?)<\/Representation>)\s*/gi, (repBlock) => {
+          const keep = repIdx === winner.idx;
+          repIdx += 1;
+          return keep ? `${repBlock.trimEnd()}\n\t\t\t` : '';
+        });
+        return `<AdaptationSet${attrs}>${prunedInner}</AdaptationSet>`;
+      });
+
+      if (audioSets.length <= 1) return afterVideo;
+      const bestAudio = audioSets.reduce((best, cur) => (cur.score > best.score ? cur : best), audioSets[0]);
+      // Only strip clearly worse audio AdaptationSets (e.g., dub vs original, wrong language)
+      const hasDistinctWinner = audioSets.some((s) => s.idx !== bestAudio.idx && s.score < bestAudio.score);
+      if (!hasDistinctWinner) return afterVideo;
+
+      let outIdx = 0;
+      return afterVideo.replace(/<AdaptationSet\b([^>]*)>([\s\S]*?)<\/AdaptationSet>\s*/gi, (full) => {
+        const curIdx = outIdx++;
+        const isAud = audioSets.some((s) => s.idx === curIdx);
+        if (isAud && curIdx !== bestAudio.idx) return '';
+        return full;
+      });
+    };
+
+    const src = String(xmlText || '');
+    if (/<Period\b/i.test(src)) {
+      return src.replace(/<Period\b([^>]*)>([\s\S]*?)<\/Period>/gi, (_, attrs, inner) => `<Period${attrs}>${pruneScope(inner)}</Period>`);
+    }
+    return pruneScope(src);
+  }
+
   #rewriteMpdManifest(xmlText, baseUrl, parentEntry) {
-    const raw = String(xmlText || '');
+    const raw = this.#pruneMpdVideoRepresentations(
+      String(xmlText || ''),
+      parentEntry?.maxHeight || 720,
+      parentEntry?.preferredAudioLang || ''
+    );
     const decodeXml = (s) => String(s || '')
       .replace(/&amp;/g, '&')
       .replace(/&lt;/g, '<')
@@ -473,7 +693,7 @@ export class VideoStreamingServer {
       .replace(/&quot;/g, '"')
       .replace(/&#39;/g, "'");
 
-    const registerBasePrefix = (targetRaw) => {
+    const registerBasePrefix = (targetRaw, contextHint = null) => {
       try {
         const abs = new URL(decodeXml(String(targetRaw || '').trim()), baseUrl).toString();
         if (abs.endsWith('/')) {
@@ -483,20 +703,41 @@ export class VideoStreamingServer {
           });
           return `http://127.0.0.1:${this.port}/movie-proxy-base/${baseTok}/`;
         }
+        const resInfo = classifyMpdResource(abs, contextHint?.mimeType, contextHint?.isText);
         const singleTok = this.#registerChildProxyStream(parentEntry, abs, {
           isHls: false,
-          contentType: 'video/mp4',
-          forceContentType: 'video/mp4'
+          contentType: resInfo.contentType || 'application/octet-stream',
+          forceContentType: resInfo.forceContentType
         });
-        return `http://127.0.0.1:${this.port}/movie-proxy/${singleTok}.mp4`;
+        return `http://127.0.0.1:${this.port}/movie-proxy/${singleTok}.${resInfo.ext}`;
       } catch {
         return targetRaw;
       }
     };
 
     let sawBaseUrl = false;
-    let out = raw.replace(/<BaseURL>([\s\S]*?)<\/BaseURL>/gi, (_, inner) => {
+    let out = raw.replace(/<AdaptationSet\b([^>]*)>([\s\S]*?)<\/AdaptationSet>/gi, (full, attrs, inner) => {
+      if (!/<BaseURL>/i.test(inner)) return full;
+      const mimeType = (
+        inner.match(/\bmimeType\s*=\s*["']([^"']+)["']/i)?.[1]
+        || attrs.match(/\bmimeType\s*=\s*["']([^"']+)["']/i)?.[1]
+        || ''
+      );
+      const isText = /\bcontentType\s*=\s*["']text["']/i.test(attrs)
+        || /\b(?:text\/|ttml|subrip)/i.test(mimeType);
+      const updatedInner = inner.replace(/<BaseURL>([\s\S]*?)<\/BaseURL>/gi, (_, baseInner) => {
+        sawBaseUrl = true;
+        return `<BaseURL>${registerBasePrefix(baseInner, { mimeType, isText })}</BaseURL>`;
+      });
+      return `<AdaptationSet${attrs}>${updatedInner}</AdaptationSet>`;
+    });
+
+    out = out.replace(/<BaseURL>([\s\S]*?)<\/BaseURL>/gi, (_, inner) => {
       sawBaseUrl = true;
+      const trimmed = String(inner || '').trim();
+      if (/^http:\/\/127\.0\.0\.1:\d+\/movie-proxy(?:-base)?\//.test(trimmed)) {
+        return `<BaseURL>${trimmed}</BaseURL>`;
+      }
       return `<BaseURL>${registerBasePrefix(inner)}</BaseURL>`;
     });
     if (!sawBaseUrl) {
@@ -513,23 +754,389 @@ export class VideoStreamingServer {
     return out;
   }
 
-  #rewriteHlsPlaylist(text, baseUrl, parentEntry) {
-    const lines = String(text || '').split(/\r?\n/);
+  #sliceHlsMediaLines(lines, targetSeek) {
+    if (!(targetSeek > 0.05)) return { lines, skippedSec: 0 };
+    const totalSegments = lines.filter((l) => /^#EXTINF\s*:/i.test(l.trim())).length;
+    if (totalSegments <= 1) return { lines, skippedSec: 0 };
+
+    const sliced = [];
+    let accumSec = 0;
+    let skippedCount = 0;
+    let skippingDone = false;
+    let pendingExtInf = null;
+    let pendingSegmentTags = [];
+    let mediaSeqIndex = -1;
+    let initialMediaSeq = 0;
+    let discSeqIndex = -1;
+    let initialDiscSeq = 0;
+    let skippedDiscontinuities = 0;
+    let activeKeyLine = null;
+    let activeMapLine = null;
+    let firstSegEmitted = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const rawLine = lines[i];
+      const tr = rawLine.trim();
+      if (!tr) {
+        if (skippingDone || pendingExtInf === null) sliced.push(rawLine);
+        continue;
+      }
+      if (/^#EXT-X-MEDIA-SEQUENCE\s*:\s*(\d+)/i.test(tr)) {
+        const m = tr.match(/^#EXT-X-MEDIA-SEQUENCE\s*:\s*(\d+)/i);
+        initialMediaSeq = Number(m?.[1] || 0);
+        mediaSeqIndex = sliced.length;
+        sliced.push(rawLine);
+        continue;
+      }
+      if (/^#EXT-X-DISCONTINUITY-SEQUENCE\s*:\s*(\d+)/i.test(tr)) {
+        const m = tr.match(/^#EXT-X-DISCONTINUITY-SEQUENCE\s*:\s*(\d+)/i);
+        initialDiscSeq = Number(m?.[1] || 0);
+        discSeqIndex = sliced.length;
+        sliced.push(rawLine);
+        continue;
+      }
+      if (/^#EXT-X-KEY\b/i.test(tr)) {
+        if (!firstSegEmitted) {
+          activeKeyLine = rawLine;
+        } else {
+          sliced.push(rawLine);
+        }
+        continue;
+      }
+      if (/^#EXT-X-MAP\b/i.test(tr)) {
+        if (!firstSegEmitted) {
+          activeMapLine = rawLine;
+        } else {
+          sliced.push(rawLine);
+        }
+        continue;
+      }
+      if (/^#EXT-X-DISCONTINUITY\b/i.test(tr)) {
+        if (!firstSegEmitted) {
+          skippedDiscontinuities += 1;
+        } else {
+          sliced.push(rawLine);
+        }
+        continue;
+      }
+      const extInfMatch = tr.match(/^#EXTINF\s*:\s*([0-9.]+)/i);
+      if (extInfMatch) {
+        pendingExtInf = { line: rawLine, dur: parseFloat(extInfMatch[1]) || 0 };
+        continue;
+      }
+      if (tr.startsWith('#')) {
+        if (pendingExtInf !== null && /^#EXT-X-(?:BYTERANGE|PROGRAM-DATE-TIME|BITRATE)\b/i.test(tr)) {
+          pendingSegmentTags.push(rawLine);
+        } else if (!firstSegEmitted && /^#EXT-X-ENDLIST\b/i.test(tr)) {
+          sliced.push(rawLine);
+        } else {
+          sliced.push(rawLine);
+        }
+        continue;
+      }
+      if (pendingExtInf !== null) {
+        const canSkipMore = (skippedCount < totalSegments - 1);
+        if (!skippingDone && canSkipMore && (accumSec + pendingExtInf.dur <= targetSeek + 0.05)) {
+          accumSec += pendingExtInf.dur;
+          skippedCount += 1;
+          pendingExtInf = null;
+          pendingSegmentTags = [];
+          continue;
+        }
+        if (!firstSegEmitted) {
+          firstSegEmitted = true;
+          if (skippedDiscontinuities > 0) {
+            if (discSeqIndex >= 0) {
+              sliced[discSeqIndex] = `#EXT-X-DISCONTINUITY-SEQUENCE:${initialDiscSeq + skippedDiscontinuities}`;
+            } else {
+              const insertAt = mediaSeqIndex >= 0 ? mediaSeqIndex + 1 : sliced.length;
+              sliced.splice(insertAt, 0, `#EXT-X-DISCONTINUITY-SEQUENCE:${skippedDiscontinuities}`);
+              if (mediaSeqIndex >= 0 && insertAt <= mediaSeqIndex) mediaSeqIndex += 1;
+            }
+          }
+          if (activeKeyLine) sliced.push(activeKeyLine);
+          if (activeMapLine) sliced.push(activeMapLine);
+        }
+        skippingDone = true;
+        sliced.push(pendingExtInf.line);
+        for (const tLine of pendingSegmentTags) sliced.push(tLine);
+        sliced.push(rawLine);
+        pendingExtInf = null;
+        pendingSegmentTags = [];
+      } else {
+        sliced.push(rawLine);
+      }
+    }
+    if (skippedCount > 0 && mediaSeqIndex >= 0) {
+      sliced[mediaSeqIndex] = `#EXT-X-MEDIA-SEQUENCE:${initialMediaSeq + skippedCount}`;
+    }
+    return { lines: sliced, skippedSec: accumSec };
+  }
+
+  #scoreHlsAudioTrack(track, prefLang = '') {
+    let score = 0;
+    if (prefLang && track.lang) {
+      score += (track.lang === prefLang) ? 100 : -80;
+    }
+    if (track.isDub) score -= 120;
+    else score += 30;
+    if (/\b(?:main|original)\b/i.test(track.name || '')) score += 15;
+    if (/\b(?:commentary|description|descriptive)\b/i.test(track.name || '')) score -= 100;
+    if (track.isDefault) score += 4;
+    if (track.isAutoSelect) score += 2;
+    return score;
+  }
+
+  #pruneHlsMasterLines(lines, maxHeight = 720, preferredAudioLang = '') {
+    const prefLang = normalizeLangCode(preferredAudioLang);
+    const audioTracks = [];
+    for (let i = 0; i < lines.length; i++) {
+      const tr = lines[i].trim();
+      if (!/^#EXT-X-MEDIA:\b/i.test(tr) || !/\bTYPE=AUDIO\b/i.test(tr)) continue;
+      const groupId = tr.match(/\bGROUP-ID="([^"]+)"/i)?.[1] || '';
+      const langRaw = tr.match(/\bLANGUAGE="([^"]+)"/i)?.[1] || '';
+      const name = tr.match(/\bNAME="([^"]+)"/i)?.[1] || '';
+      const uri = tr.match(/\bURI="([^"]+)"/i)?.[1] || null;
+      const isDefault = /\bDEFAULT=YES\b/i.test(tr);
+      const isAutoSelect = /\bAUTOSELECT=YES\b/i.test(tr);
+      const isDub = isDubAudioLabel(name) || isDubAudioLabel(groupId);
+      const track = {
+        idx: i,
+        line: lines[i],
+        groupId,
+        lang: normalizeLangCode(langRaw) || normalizeLangCode(name),
+        name,
+        uri,
+        isDefault,
+        isAutoSelect,
+        isDub
+      };
+      track.score = this.#scoreHlsAudioTrack(track, prefLang);
+      audioTracks.push(track);
+    }
+
+    const groupBestScore = new Map();
+    for (const a of audioTracks) {
+      const prev = groupBestScore.get(a.groupId);
+      if (prev === undefined || a.score > prev) groupBestScore.set(a.groupId, a.score);
+    }
+
+    const variants = [];
+    for (let i = 0; i < lines.length; i++) {
+      const tr = lines[i].trim();
+      if (!/^#EXT-X-STREAM-INF\b/i.test(tr)) continue;
+      let uriIdx = -1;
+      for (let j = i + 1; j < lines.length; j++) {
+        const nxt = lines[j].trim();
+        if (!nxt) continue;
+        if (!nxt.startsWith('#')) uriIdx = j;
+        break;
+      }
+      if (uriIdx < 0) continue;
+      const resMatch = tr.match(/\bRESOLUTION=(\d+)x(\d+)/i);
+      const bwMatch = tr.match(/\b(?:AVERAGE-BANDWIDTH|BANDWIDTH)=(\d+)/i);
+      const audioMatch = tr.match(/\bAUDIO="([^"]+)"/i);
+      const audioGroup = audioMatch?.[1] || null;
+      variants.push({
+        infIdx: i,
+        uriIdx,
+        width: Number(resMatch?.[1] || 0),
+        height: Number(resMatch?.[2] || 0),
+        bandwidth: Number(bwMatch?.[1] || 0),
+        audioGroup,
+        audioScore: audioGroup && groupBestScore.has(audioGroup) ? groupBestScore.get(audioGroup) : 0,
+        uri: lines[uriIdx].trim()
+      });
+    }
+
+    let candidateVariants = variants;
+    if (variants.length > 1 && audioTracks.length) {
+      const maxAudScore = variants.reduce((mx, v) => Math.max(mx, v.audioScore), -Infinity);
+      const topAudioPool = variants.filter((v) => v.audioScore >= maxAudScore - 30);
+      if (topAudioPool.length) candidateVariants = topAudioPool;
+    }
+
+    const winner = candidateVariants.length > 1
+      ? this.#selectBestVideoVariant(candidateVariants, maxHeight)
+      : candidateVariants[0] || variants[0] || null;
+
+    const dropIndices = new Set();
+    if (variants.length > 1 && winner) {
+      for (const v of variants) {
+        if (v !== winner) {
+          dropIndices.add(v.infIdx);
+          dropIndices.add(v.uriIdx);
+        }
+      }
+    }
+
+    const matchingAudio = winner?.audioGroup
+      ? audioTracks.filter((a) => !a.groupId || a.groupId === winner.audioGroup)
+      : audioTracks;
+    const audioPool = matchingAudio.length ? matchingAudio : audioTracks;
+    const winningAudio = audioPool.length
+      ? audioPool.reduce((best, cur) => (cur.score > best.score ? cur : best), audioPool[0])
+      : null;
+
+    const filtered = [];
+    let hasSeparateAudio = false;
+    let winningAudioUri = null;
+    for (let i = 0; i < lines.length; i++) {
+      if (dropIndices.has(i)) continue;
+      let rawLine = lines[i];
+      const tr = rawLine.trim();
+      if (/^#EXT-X-MEDIA:\b/i.test(tr)) {
+        if (/\bTYPE=SUBTITLES\b/i.test(tr)) continue;
+        if (/\bTYPE=AUDIO\b/i.test(tr) && winningAudio) {
+          if (i !== winningAudio.idx) continue;
+          if (!/\bDEFAULT=YES\b/i.test(rawLine)) {
+            if (/\bDEFAULT=\w+/i.test(rawLine)) {
+              rawLine = rawLine.replace(/\bDEFAULT=\w+/i, 'DEFAULT=YES');
+            } else {
+              rawLine = `${rawLine},DEFAULT=YES,AUTOSELECT=YES`;
+            }
+          }
+          if (winningAudio.uri) {
+            hasSeparateAudio = true;
+            winningAudioUri = winningAudio.uri;
+          }
+        }
+      }
+      filtered.push(rawLine);
+    }
+    return {
+      lines: filtered,
+      winningVideoUri: winner?.uri || null,
+      winningAudioUri,
+      hasSeparateAudio
+    };
+  }
+
+  #cacheVodHlsPlaylist(entry, keyUrl, text, finalUrl) {
+    if (!entry?.hlsPlaylistCache || !text) return;
+    const isVod = /^#EXT-X-ENDLIST\b/im.test(text) || /^#EXT-X-PLAYLIST-TYPE\s*:\s*VOD\b/im.test(text);
+    if (!isVod) return;
+    if (entry.hlsPlaylistCache.size > 64) {
+      const oldest = entry.hlsPlaylistCache.keys().next().value;
+      if (oldest) entry.hlsPlaylistCache.delete(oldest);
+    }
+    entry.hlsPlaylistCache.set(keyUrl, { text, finalUrl: finalUrl || keyUrl, cachedAt: Date.now() });
+  }
+
+  async #fetchHlsPlaylistText(absUrl, parentEntry) {
+    let cached = parentEntry?.hlsPlaylistCache?.get(absUrl);
+    if (cached && Date.now() - cached.cachedAt <= 30 * 60 * 1000) {
+      return cached;
+    }
+    const up = await fetch(absUrl, {
+      method: 'GET',
+      headers: {
+        ...(parentEntry?.headers || {}),
+        'User-Agent': parentEntry?.headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+      },
+      redirect: 'follow',
+      signal: AbortSignal.timeout(4000)
+    });
+    if (!up?.ok) return null;
+    const rawText = await up.text();
+    if (!rawText || !rawText.trimStart().startsWith('#EXTM3U')) return null;
+    const finalUrl = up.url || absUrl;
+    this.#cacheVodHlsPlaylist(parentEntry, absUrl, rawText, finalUrl);
+    return { text: rawText, finalUrl };
+  }
+
+  async #computeAlignedHlsAudioSeek(absVideoUrl, absAudioUrl, parentEntry, targetSeek) {
+    try {
+      const vidCached = await this.#fetchHlsPlaylistText(absVideoUrl, parentEntry);
+      if (!vidCached?.text) return { alignedAudioSeek: null, videoSkippedSec: 0, audioSkippedSec: null };
+      const vidSliced = this.#sliceHlsMediaLines(vidCached.text.split(/\r?\n/), targetSeek);
+      const videoSkippedSec = Number(vidSliced.skippedSec || 0);
+      let alignedAudioSeek = videoSkippedSec > 0.05 ? Math.max(0, videoSkippedSec - 0.05) : 0;
+      let audioSkippedSec = null;
+
+      if (absAudioUrl) {
+        try {
+          const audCached = await this.#fetchHlsPlaylistText(absAudioUrl, parentEntry);
+          if (audCached?.text) {
+            const audLines = audCached.text.split(/\r?\n/);
+            let audSliced = this.#sliceHlsMediaLines(audLines, alignedAudioSeek);
+            // Guarantee audio never starts after video's first kept segment.
+            if (audSliced.skippedSec > videoSkippedSec + 0.005) {
+              const fallbackSeek = Math.max(0, videoSkippedSec - 0.25);
+              alignedAudioSeek = fallbackSeek;
+              audSliced = this.#sliceHlsMediaLines(audLines, alignedAudioSeek);
+              if (audSliced.skippedSec > videoSkippedSec + 0.005) {
+                alignedAudioSeek = 0;
+                audSliced = { skippedSec: 0 };
+              }
+            }
+            audioSkippedSec = Number(audSliced.skippedSec || 0);
+          }
+        } catch {}
+      }
+      return { alignedAudioSeek, videoSkippedSec, audioSkippedSec };
+    } catch {
+      return { alignedAudioSeek: null, videoSkippedSec: 0, audioSkippedSec: null };
+    }
+  }
+
+  async #rewriteHlsPlaylist(text, baseUrl, parentEntry, seekSeconds = 0) {
+    let lines = String(text || '').split(/\r?\n/);
     const hasInitMap = /^#EXT-X-MAP:/im.test(text);
     const base = `http://127.0.0.1:${this.port}/movie-proxy`;
+    const targetSeek = Math.max(0, Number(seekSeconds) || 0);
+    const isMaster = /^#EXT-X-STREAM-INF\b/im.test(text);
     let expectVariantPlaylist = false;
+    let alignedAudioSeek = null;
+    let resolvedSkippedSec = 0;
+    let resolvedAudioSkippedSec = null;
 
+    if (isMaster) {
+      const pruned = this.#pruneHlsMasterLines(
+        lines,
+        parentEntry?.maxHeight || 720,
+        parentEntry?.preferredAudioLang || ''
+      );
+      lines = pruned.lines;
+      if (targetSeek > 0.05 && pruned.winningVideoUri) {
+        try {
+          const absVid = new URL(pruned.winningVideoUri, baseUrl).toString();
+          const absAud = pruned.hasSeparateAudio && pruned.winningAudioUri
+            ? new URL(pruned.winningAudioUri, baseUrl).toString()
+            : null;
+          const aligned = await this.#computeAlignedHlsAudioSeek(absVid, absAud, parentEntry, targetSeek);
+          resolvedSkippedSec = Number(aligned.videoSkippedSec || 0);
+          if (absAud) {
+            alignedAudioSeek = aligned.alignedAudioSeek;
+            resolvedAudioSkippedSec = aligned.audioSkippedSec;
+          }
+        } catch {}
+      }
+    } else if (/^#EXTINF\s*:/im.test(text)) {
+      if (targetSeek > 0.05) {
+        const sliced = this.#sliceHlsMediaLines(lines, targetSeek);
+        lines = sliced.lines;
+        resolvedSkippedSec = sliced.skippedSec || 0;
+      }
+    }
+
+    const mediaSegTokens = [];
     const rewriteUri = (rawUri, opts) => {
       try {
         const abs = new URL(rawUri, baseUrl).toString();
         const tok = this.#registerChildProxyStream(parentEntry, abs, opts);
-        return `${base}/${tok}.${opts.ext}`;
+        if (!opts.isHls && (opts.ext === 'ts' || opts.ext === 'm4s')) {
+          mediaSegTokens.push(tok);
+        }
+        const effSeek = (opts.isAudioMedia && alignedAudioSeek !== null) ? alignedAudioSeek : targetSeek;
+        const seekSuffix = (opts.ext === 'm3u8' && effSeek > 0.05) ? `?start=${effSeek.toFixed(3)}` : '';
+        return `${base}/${tok}.${opts.ext}${seekSuffix}`;
       } catch {
         return rawUri;
       }
     };
 
-    return lines.map((line) => {
+    const out = lines.map((line) => {
       const trimmed = line.trim();
       if (!trimmed) return line;
 
@@ -543,10 +1150,11 @@ export class VideoStreamingServer {
         }
         if (/^#EXT-X-(?:KEY|MAP|MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed) && /\bURI="([^"]+)"/i.test(line)) {
           const isSubPlaylist = /^#EXT-X-(?:MEDIA|I-FRAME-STREAM-INF)\b/i.test(trimmed);
+          const isAudioMedia = /^#EXT-X-MEDIA\b/i.test(trimmed) && /\bTYPE=AUDIO\b/i.test(trimmed);
           const isKey = /^#EXT-X-KEY\b/i.test(trimmed);
           const isMap = /^#EXT-X-MAP\b/i.test(trimmed);
           const opts = isSubPlaylist
-            ? { isHls: true, contentType: 'application/vnd.apple.mpegurl', forceContentType: 'application/vnd.apple.mpegurl', ext: 'm3u8' }
+            ? { isHls: true, isAudioMedia, contentType: 'application/vnd.apple.mpegurl', forceContentType: 'application/vnd.apple.mpegurl', ext: 'm3u8' }
             : isKey
               ? { isHls: false, contentType: 'application/octet-stream', forceContentType: 'application/octet-stream', ext: 'key' }
               : isMap
@@ -578,6 +1186,16 @@ export class VideoStreamingServer {
         ? { isHls: false, contentType: 'video/mp4', forceContentType: 'video/mp4', ext: 'm4s' }
         : { isHls: false, contentType: 'video/mp2t', forceContentType: 'video/mp2t', ext: 'ts' });
     }).filter((l) => l !== null).join('\n');
+
+    for (let k = 0; k < mediaSegTokens.length; k++) {
+      const segEntry = this.remoteStreams.get(mediaSegTokens[k]);
+      if (segEntry) segEntry.nextSegmentTokens = mediaSegTokens.slice(k + 1, k + 3);
+    }
+    return {
+      text: out,
+      skippedSec: resolvedSkippedSec,
+      audioSkippedSec: resolvedAudioSkippedSec
+    };
   }
 
   #getCachedSegment(token) {
@@ -592,8 +1210,9 @@ export class VideoStreamingServer {
   }
 
   #putCachedSegment(token, body, contentType) {
-    const maxEntry = 12 * 1024 * 1024;
-    const maxTotal = 48 * 1024 * 1024;
+    const maxEntry = 16 * 1024 * 1024;
+    const capMb = Math.max(48, Math.min(1024, Number(process.env.MOVIE_SEG_CACHE_MB || 192) || 192));
+    const maxTotal = capMb * 1024 * 1024;
     if (!Buffer.isBuffer(body) || !body.length || body.length > maxEntry) return;
     const prev = this.segmentCache.get(token);
     if (prev) {
@@ -613,21 +1232,91 @@ export class VideoStreamingServer {
       this.segmentCache.delete(oldestKey);
       if (oldest) this.segmentCacheBytes = Math.max(0, this.segmentCacheBytes - oldest.body.length);
     }
-    this.segmentCache.set(token, { body, contentType, expiresAt: now + 30_000 });
+    this.segmentCache.set(token, { body, contentType, expiresAt: now + 60_000 });
     this.segmentCacheBytes += body.length;
   }
 
-  async #handleMovieProxy(req, res, token) {
+  #loadChildSegment(token, entry, upstreamHeaders) {
+    if (this.inflightSegments.has(token)) {
+      return this.inflightSegments.get(token);
+    }
+    const headers = upstreamHeaders || {
+      ...(entry.headers || {}),
+      'User-Agent': entry.headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
+    };
+    const loader = (async () => {
+      const up = await fetch(entry.url, {
+        method: 'GET',
+        headers,
+        redirect: 'follow',
+        signal: AbortSignal.timeout(20_000)
+      });
+      if (!up.ok) return { status: up.status, headers: {}, body: null };
+      const cl = Number(up.headers.get('content-length') || 0);
+      if (cl > 16 * 1024 * 1024) {
+        return { status: up.status, streamThrough: up, headers: {} };
+      }
+      const buf = Buffer.from(await up.arrayBuffer());
+      const ctypeOut = entry.forceContentType || up.headers.get('content-type') || entry.contentType || 'video/mp2t';
+      this.#putCachedSegment(token, buf, ctypeOut);
+      return { status: 200, contentType: ctypeOut, body: buf };
+    })().finally(() => {
+      this.inflightSegments.delete(token);
+    });
+    this.inflightSegments.set(token, loader);
+    return loader;
+  }
+
+  #scheduleLookaheadPrefetch(entry) {
+    if (!this.server || !Array.isArray(entry?.nextSegmentTokens) || !entry.nextSegmentTokens.length) return;
+    const now = Date.now();
+    for (const nextToken of entry.nextSegmentTokens) {
+      if (this.inflightSegments.size >= 8) break;
+      const nextEntry = this.remoteStreams.get(nextToken);
+      if (!nextEntry || !nextEntry.isChildSegment || now > nextEntry.expiresAt) continue;
+      if (this.#getCachedSegment(nextToken) || this.inflightSegments.has(nextToken)) continue;
+      void this.#loadChildSegment(nextToken, nextEntry).catch(() => {});
+    }
+  }
+
+  async #sendRewrittenHls(res, rawText, baseUrl, entry, seekSeconds) {
+    const rewritten = await this.#rewriteHlsPlaylist(rawText, baseUrl, entry, seekSeconds);
+    const outBuf = Buffer.from(rewritten.text, 'utf8');
+    const hdrs = {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Content-Length': outBuf.length,
+      'Cache-Control': 'no-store',
+      'Access-Control-Allow-Origin': '*'
+    };
+    if (seekSeconds > 0.05 && Number.isFinite(rewritten.skippedSec) && rewritten.skippedSec > 0) {
+      hdrs['X-Lancy-Skipped-Sec'] = Number(rewritten.skippedSec).toFixed(3);
+    }
+    if (seekSeconds > 0.05 && Number.isFinite(rewritten.audioSkippedSec) && rewritten.audioSkippedSec >= 0) {
+      hdrs['X-Lancy-Audio-Skipped-Sec'] = Number(rewritten.audioSkippedSec).toFixed(3);
+    }
+    res.writeHead(200, hdrs);
+    res.end(outBuf);
+  }
+
+  async #handleMovieProxy(req, res, token, seekSeconds = 0) {
     const entry = this.remoteStreams.get(token);
     if (!entry || Date.now() > entry.expiresAt) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('Stream expired or not found');
       return;
     }
+    if (entry.isHls && req.method === 'GET' && entry.hlsPlaylistCache?.has(entry.url)) {
+      const cachedPls = entry.hlsPlaylistCache.get(entry.url);
+      if (cachedPls && Date.now() - cachedPls.cachedAt < 30 * 60 * 1000) {
+        await this.#sendRewrittenHls(res, cachedPls.text, cachedPls.finalUrl || entry.url, entry, seekSeconds);
+        return;
+      }
+    }
     const cacheableSegment = Boolean(entry.isChildSegment && req.method === 'GET' && !req.headers.range);
     if (cacheableSegment) {
       const cached = this.#getCachedSegment(token);
       if (cached) {
+        this.#scheduleLookaheadPrefetch(entry);
         res.writeHead(200, {
           'Content-Type': cached.contentType,
           'Content-Length': cached.body.length,
@@ -637,6 +1326,7 @@ export class VideoStreamingServer {
         return;
       }
       if (this.inflightSegments.has(token)) {
+        this.#scheduleLookaheadPrefetch(entry);
         const shared = await this.inflightSegments.get(token).catch(() => null);
         if (shared?.body) {
           res.writeHead(200, {
@@ -657,26 +1347,8 @@ export class VideoStreamingServer {
     if (req.headers['if-range'] && !entry.isHls) upstreamHeaders['If-Range'] = req.headers['if-range'];
 
     if (cacheableSegment) {
-      const loader = (async () => {
-        const up = await fetch(entry.url, {
-          method: 'GET',
-          headers: upstreamHeaders,
-          redirect: 'follow',
-          signal: AbortSignal.timeout(20_000)
-        });
-        if (!up.ok) return { status: up.status, headers: {}, body: null };
-        const cl = Number(up.headers.get('content-length') || 0);
-        if (cl > 12 * 1024 * 1024) {
-          return { status: up.status, streamThrough: up, headers: {} };
-        }
-        const buf = Buffer.from(await up.arrayBuffer());
-        const ctypeOut = entry.forceContentType || up.headers.get('content-type') || entry.contentType || 'video/mp2t';
-        this.#putCachedSegment(token, buf, ctypeOut);
-        return { status: 200, contentType: ctypeOut, body: buf };
-      })().finally(() => {
-        this.inflightSegments.delete(token);
-      });
-      this.inflightSegments.set(token, loader);
+      const loader = this.#loadChildSegment(token, entry, upstreamHeaders);
+      this.#scheduleLookaheadPrefetch(entry);
       try {
         const fetched = await loader;
         if (fetched?.body) {
@@ -767,18 +1439,21 @@ export class VideoStreamingServer {
     if (maybePlaylist || maybeDash) {
       const lenHint = Number(upstream.headers.get('content-length') || 0);
       if (!lenHint || lenHint <= 8 * 1024 * 1024) {
-        const rawBuf = Buffer.from(await upstream.arrayBuffer());
+        let rawBuf;
+        try {
+          rawBuf = Buffer.from(await upstream.arrayBuffer());
+        } catch {
+          if (!res.headersSent) {
+            try { res.writeHead(499, { 'Content-Type': 'text/plain' }); res.end(); } catch {}
+          }
+          return;
+        }
         const headSample = rawBuf.subarray(0, 512).toString('utf8').trimStart();
         if (headSample.startsWith('#EXTM3U')) {
-          const rewritten = this.#rewriteHlsPlaylist(rawBuf.toString('utf8'), upstream.url || entry.url, entry);
-          const outBuf = Buffer.from(rewritten, 'utf8');
-          res.writeHead(200, {
-            'Content-Type': 'application/vnd.apple.mpegurl',
-            'Content-Length': outBuf.length,
-            'Cache-Control': 'no-store',
-            'Access-Control-Allow-Origin': '*'
-          });
-          res.end(outBuf);
+          const rawText = rawBuf.toString('utf8');
+          const finalUrl = upstream.url || entry.url;
+          this.#cacheVodHlsPlaylist(entry, entry.url, rawText, finalUrl);
+          await this.#sendRewrittenHls(res, rawText, finalUrl, entry, seekSeconds);
           return;
         }
         if (maybeDash && /<MPD\b/i.test(headSample)) {

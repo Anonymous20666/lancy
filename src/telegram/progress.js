@@ -12,15 +12,27 @@ import { isPermissionError, recordChatPermissionRestriction, formatMediaRestrict
  * re-renders on every `set(patch)` AND on a heartbeat, so elapsed time and
  * ETA keep ticking even when the underlying job is quiet for a while.
  */
-const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests|flood wait dropped|FLOOD_WAIT/i;
+const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests|flood wait|skipped during active flood wait|FLOOD_WAIT/i;
+const activeTrackersByChat = new Map(); // String(chatId) -> Set<ProgressTracker>
 
 export class ProgressTracker {
-  constructor({ api, chatId, messageId = null, replyToMessageId = null, heartbeatMs = 1000, action = 'typing', log } = {}) {
+  static stopForChat(chatId) {
+    if (chatId === undefined || chatId === null) return;
+    const key = String(chatId);
+    const set = activeTrackersByChat.get(key);
+    if (!set) return;
+    for (const t of set) {
+      try { t.stop(); } catch {}
+    }
+    activeTrackersByChat.delete(key);
+  }
+
+  constructor({ api, chatId, messageId = null, replyToMessageId = null, heartbeatMs = 3500, action = 'typing', log } = {}) {
     this.api = api;
     this.chatId = chatId;
     this.messageId = messageId;
     this.replyToMessageId = replyToMessageId;
-    this.heartbeatMs = heartbeatMs;
+    this.heartbeatMs = Math.max(3000, Number(heartbeatMs) || 3500);
     this.action = action;
     this.log = log ?? logger().child({ module: 'progress' });
     this.indicator = action && api && chatId ? new ActionIndicator(api, chatId, action) : null;
@@ -41,6 +53,19 @@ export class ProgressTracker {
 
   /** Send the initial progress message or edit existing screen message (returns its id). */
   async start(richMessage) {
+    if (this.chatId !== undefined && this.chatId !== null) {
+      const key = String(this.chatId);
+      const existing = activeTrackersByChat.get(key);
+      if (existing) {
+        for (const prev of existing) {
+          if (prev !== this && (!this.messageId || prev.messageId === this.messageId)) {
+            try { prev.stop(); } catch {}
+          }
+        }
+      }
+      if (!activeTrackersByChat.has(key)) activeTrackersByChat.set(key, new Set());
+      activeTrackersByChat.get(key).add(this);
+    }
     this.startedAt = Date.now();
     if (this.indicator) {
       this.indicator.start(this.action);
@@ -76,10 +101,18 @@ export class ProgressTracker {
     this.state = { ...initialState };
     await this.start(this.#render());
     this.timer = setInterval(() => {
-      if (!this.closed) void this.update(this.#render());
+      if (this.closed || this.elapsedMs() > 180000) {
+        this.#stop();
+        return;
+      }
+      void this.update(this.#render());
     }, this.heartbeatMs);
     this.timer.unref?.();
     return this.messageId;
+  }
+
+  stop() {
+    this.#stop();
   }
 
   /** Merge new progress into the live state and re-render (throttled). */
@@ -116,14 +149,22 @@ export class ProgressTracker {
     try {
       await this.api.editMessageRich(this.chatId, this.messageId, richMessage, { dropOnFloodWait: true });
     } catch (error) {
-      if (!BENIGN_EDIT_ERRORS.test(String(error?.description ?? error?.message ?? error?.code))) {
+      const errText = `${error?.code || ''} ${error?.description || ''} ${error?.message || ''}`;
+      if (!BENIGN_EDIT_ERRORS.test(errText)) {
         this.log.warn({ err: error }, 'progress edit failed');
       }
     }
-  }, 1000);
+  }, 2500);
 
   #stop() {
     this.closed = true;
+    if (this.chatId !== undefined && this.chatId !== null) {
+      const set = activeTrackersByChat.get(String(this.chatId));
+      if (set) {
+        set.delete(this);
+        if (set.size === 0) activeTrackersByChat.delete(String(this.chatId));
+      }
+    }
     if (this.indicator) {
       this.indicator.stop();
     }

@@ -57,6 +57,25 @@ export class MovieSessions {
       dlKeptPages: Array.isArray(s.dlKeptPages) ? [...new Set(s.dlKeptPages.map(Number))] : [],
       dlKeptMessageIds: Array.isArray(s.dlKeptMessageIds) ? [...new Set(s.dlKeptMessageIds.map(Number))].slice(-80) : [],
       adultMode: s.adultMode || null,
+      sourceMode: s.sourceMode === 'xvideos' ? 'xvideos' : 'movie',
+      xvMode: s.xvMode || null,
+      xvQuery: s.xvQuery || '',
+      xvCat: s.xvCat || '',
+      xvArtist: s.xvArtist || '',
+      xvSort: s.xvSort || 'relevance',
+      xvDur: s.xvDur || 'all',
+      xvQuality: s.xvQuality || '480p',
+      xvResults: Array.isArray(s.xvResults) ? s.xvResults.slice(0, 30) : [],
+      xvSelected: s.xvSelected instanceof Set
+        ? [...s.xvSelected].map(Number).filter(Number.isFinite)
+        : (Array.isArray(s.xvSelected) ? s.xvSelected.map(Number).filter(Number.isFinite) : []),
+      xvCurrentIdx: Number(s.xvCurrentIdx || 0),
+      xvResolved: s.xvResolved || null,
+      xvResPage: Number(s.xvResPage || 0),
+      xvApiPage: Number(s.xvApiPage || 0),
+      xvTotalPages: Math.max(1, Number(s.xvTotalPages || 1)),
+      xvCatPage: Number(s.xvCatPage || 0),
+      xvArtistPage: Number(s.xvArtistPage || 0),
       notice: s.notice || null,
       messageId: s.messageId || null,
       activeCardIds: Array.isArray(s.activeCardIds) ? s.activeCardIds.slice(-10) : [],
@@ -80,10 +99,28 @@ export class MovieSessions {
         if (Array.isArray(arr)) selMap.set(Number(k), new Set(arr.map(Number)));
       }
     }
+    const xvSel = new Set(Array.isArray(raw.xvSelected) ? raw.xvSelected.map(Number).filter(Number.isFinite) : []);
     return {
       ...raw,
       chatId: Number(raw.chatId),
       userId: raw.userId != null ? Number(raw.userId) : null,
+      sourceMode: raw.sourceMode === 'xvideos' ? 'xvideos' : 'movie',
+      xvMode: raw.xvMode || null,
+      xvQuery: raw.xvQuery || '',
+      xvCat: raw.xvCat || '',
+      xvArtist: raw.xvArtist || '',
+      xvSort: raw.xvSort || 'relevance',
+      xvDur: raw.xvDur || 'all',
+      xvQuality: raw.xvQuality || '480p',
+      xvResults: Array.isArray(raw.xvResults) ? raw.xvResults : [],
+      xvSelected: xvSel,
+      xvCurrentIdx: Number(raw.xvCurrentIdx || 0),
+      xvResolved: raw.xvResolved || null,
+      xvResPage: Number(raw.xvResPage || 0),
+      xvApiPage: Number(raw.xvApiPage || 0),
+      xvTotalPages: Math.max(1, Number(raw.xvTotalPages || 1)),
+      xvCatPage: Number(raw.xvCatPage || 0),
+      xvArtistPage: Number(raw.xvArtistPage || 0),
       episodeCache: epCache,
       selectedBySeason: selMap,
       dlMediaMessageIds: Array.isArray(raw.dlMediaMessageIds) ? raw.dlMediaMessageIds.map(Number).filter(Number.isFinite) : [],
@@ -187,7 +224,7 @@ export class MovieSessions {
     return sid ? this.get(sid) : null;
   }
 
-  create({ chatId, userId = null, botKey = null, destination = null, panelToken = null, view = 'hub', query = '', results = [], channelMode = false, adultMode = null } = {}) {
+  create({ chatId, userId = null, botKey = null, destination = null, panelToken = null, view = 'hub', query = '', results = [], channelMode = false, adultMode = null, sourceMode = 'movie' } = {}) {
     this.#sweep();
     const id = randomBytes(3).toString('hex'); // 6 chars
     const session = {
@@ -200,7 +237,24 @@ export class MovieSessions {
       panelToken,
       channelMode: Boolean(channelMode),
       adultMode,
-      view, // 'hub' | 'results' | 'movie' | 'season' | 'seasons' | 'categories' | 'dl'
+      sourceMode: sourceMode === 'xvideos' ? 'xvideos' : 'movie',
+      xvMode: null,
+      xvQuery: '',
+      xvCat: '',
+      xvArtist: '',
+      xvSort: 'relevance',
+      xvDur: 'all',
+      xvQuality: '480p',
+      xvResults: [],
+      xvSelected: new Set(),
+      xvCurrentIdx: 0,
+      xvResolved: null,
+      xvResPage: 0,
+      xvApiPage: 0,
+      xvTotalPages: 1,
+      xvCatPage: 0,
+      xvArtistPage: 0,
+      view, // 'hub' | 'results' | 'movie' | 'season' | 'seasons' | 'categories' | 'dl' | 'xv_results' | 'xv_detail' | 'xv_cats' | 'xv_artists'
       query: String(query || ''),
       categoryLabel: '',
       categories: [],

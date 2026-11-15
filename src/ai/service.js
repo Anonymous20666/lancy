@@ -82,7 +82,7 @@ export class AIService extends EventEmitter {
       endpoint: this.settings?.get('ai.endpoint') || 'http://127.0.0.1:11434',
       model: this.settings?.get('ai.model') || 'qwen2.5:0.5b',
       apiKey: this.settings?.get('ai.apiKey') ?? '',
-      timeoutMs: (this.settings?.get('ai.timeoutSeconds') ?? 30) * 1000
+      timeoutMs: Math.min(8000, (this.settings?.get('ai.timeoutSeconds') ?? 6) * 1000)
     };
   }
 

@@ -5,14 +5,229 @@ import asyncio
 import hmac
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import shlex
 import signal
 import secrets
 import re
+import sys
 import time
+import uuid
 from pathlib import Path
 from aiohttp import web
+
+AV_SYNC_SCRIPT = str(Path(__file__).resolve().with_name('av_sync.py'))
+AV_HUB_SCRIPT = str(Path(__file__).resolve().with_name('av_hub.py'))
+RTMP_HUB_SCRIPT = str(Path(__file__).resolve().with_name('rtmp_hub.py'))
+_VOICE_DIR = Path(__file__).resolve().parent
+if str(_VOICE_DIR) not in sys.path:
+    sys.path.insert(0, str(_VOICE_DIR))
+import av_hub
+import av_sync
+import rtmp_streamer
+import sub_align
+
+_INITIAL_PPID = os.getppid()
+_ENV_PARENT_PID = os.environ.get('VOICE_BRIDGE_PARENT_PID')
+_EXPECTED_PPID = int(_ENV_PARENT_PID) if (_ENV_PARENT_PID and _ENV_PARENT_PID.isdigit()) else _INITIAL_PPID
+
+
+def _parent_exited():
+    if _EXPECTED_PPID > 1:
+        if os.getppid() != _EXPECTED_PPID:
+            return True
+        try:
+            os.kill(_EXPECTED_PPID, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+    elif _ENV_PARENT_PID:
+        return True
+    return False
+
+
+if _ENV_PARENT_PID:
+    av_sync._set_pdeathsig(signal.SIGTERM)
+    if _parent_exited():
+        sys.exit(0)
+
+
+def _write_sub_config(
+    sync_id,
+    *,
+    enabled,
+    subtitle_path,
+    base_sec,
+    subtitle_offset,
+    drift_sec_per_sec=0.0,
+    drift_anchor_sec=0.0,
+    manual_override=False,
+    same_route=False,
+    auto_normalize=True,
+    force_check_seq=0,
+):
+    cfg_path = av_sync.sub_config_path_for(sync_id)
+    payload = {
+        'enabled': bool(enabled and subtitle_path),
+        'subtitle_path': str(subtitle_path or ''),
+        'base_sec': round(float(base_sec or 0.0), 4),
+        'subtitle_offset': round(float(subtitle_offset or 0.0), 3),
+        'drift_sec_per_sec': round(sub_align.clamp_drift_rate(drift_sec_per_sec), 6),
+        'drift_anchor_sec': round(float(drift_anchor_sec or 0.0), 3),
+        'manual_override': bool(manual_override),
+        'same_route': bool(same_route),
+        'auto_normalize': bool(auto_normalize),
+        'force_check_seq': int(force_check_seq or 0),
+    }
+    tmp_path = cfg_path.with_name(f'{cfg_path.name}.{os.getpid()}.tmp')
+    tmp_path.write_text(json.dumps(payload), encoding='utf-8')
+    os.replace(tmp_path, cfg_path)
+    return str(cfg_path)
+
+
+def _read_sub_sync_snapshot(sync_id):
+    if not sync_id:
+        return None, None
+    cfg = None
+    st = None
+    try:
+        cp = av_sync.sub_config_path_for(sync_id)
+        if cp.is_file():
+            cfg = json.loads(cp.read_text(encoding='utf-8'))
+    except Exception:
+        cfg = None
+    try:
+        sp = av_sync.substatus_path_for(sync_id)
+        if sp.is_file():
+            st = json.loads(sp.read_text(encoding='utf-8'))
+    except Exception:
+        st = None
+    return cfg, st
+
+
+def _init_sync_state(sync_id):
+    shm_p = av_sync.shm_path_for(sync_id)
+    if not sync_id:
+        return False
+    state = None
+    fd = None
+    mm = None
+    try:
+        fd, mm, state = av_sync._open_sync_state(shm_p)
+        state.paused = 0
+        state.sync_flags = 0
+        state.skew_ms = 0
+        return True
+    except Exception:
+        return False
+    finally:
+        state = None
+        if mm is not None:
+            try:
+                mm.close()
+            except Exception:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+
+
+def _mutate_sync_state(sync_id, mutator):
+    shm_p = av_sync.shm_path_for(sync_id)
+    if not sync_id or not shm_p.is_file():
+        return False
+    state = None
+    try:
+        fd, mm, state = av_sync._open_sync_state(shm_p)
+    except Exception:
+        return False
+    try:
+        mutator(state)
+        return True
+    except Exception:
+        return False
+    finally:
+        state = None
+        try:
+            mm.close()
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
+def _bump_sub_gen(sync_id):
+    def _inc(st):
+        st.sub_gen = int(st.sub_gen) + 1
+    return _mutate_sync_state(sync_id, _inc)
+
+
+_ISO_LANG_ALIAS = {
+    'ja': 'ja', 'jpn': 'ja', 'jap': 'ja', 'japanese': 'ja',
+    'en': 'en', 'eng': 'en', 'english': 'en',
+    'ko': 'ko', 'kor': 'ko', 'korean': 'ko',
+    'zh': 'zh', 'zho': 'zh', 'chi': 'zh', 'cmn': 'zh', 'yue': 'zh', 'chinese': 'zh',
+    'es': 'es', 'spa': 'es', 'spanish': 'es',
+    'fr': 'fr', 'fra': 'fr', 'fre': 'fr', 'french': 'fr',
+    'de': 'de', 'deu': 'de', 'ger': 'de', 'german': 'de',
+    'it': 'it', 'ita': 'it', 'italian': 'it',
+    'ru': 'ru', 'rus': 'ru', 'russian': 'ru',
+    'ar': 'ar', 'ara': 'ar', 'arabic': 'ar',
+    'hi': 'hi', 'hin': 'hi', 'hindi': 'hi',
+    'pt': 'pt', 'por': 'pt', 'portuguese': 'pt',
+    'tr': 'tr', 'tur': 'tr', 'turkish': 'tr',
+    'th': 'th', 'tha': 'th', 'thai': 'th',
+    'id': 'id', 'ind': 'id', 'indonesian': 'id',
+    'vi': 'vi', 'vie': 'vi', 'vietnamese': 'vi',
+    'pl': 'pl', 'pol': 'pl', 'polish': 'pl',
+    'nl': 'nl', 'nld': 'nl', 'dut': 'nl', 'dutch': 'nl',
+    'sv': 'sv', 'swe': 'sv', 'no': 'no', 'nor': 'no', 'da': 'da', 'dan': 'da', 'fi': 'fi', 'fin': 'fi',
+    'he': 'he', 'heb': 'he', 'fa': 'fa', 'per': 'fa', 'fas': 'fa',
+    'ta': 'ta', 'tam': 'ta', 'te': 'te', 'tel': 'te', 'ml': 'ml', 'mal': 'ml',
+}
+
+
+def _norm_lang(raw):
+    s = re.split(r'[-_\s]', str(raw or '').strip().lower())[0]
+    if not s or s in {'und', 'auto', 'unknown', 'none'}:
+        return ''
+    return _ISO_LANG_ALIAS.get(s, s)
+
+
+def _set_sync_paused(sync_id, paused):
+    def _upd(st):
+        st.paused = 1 if paused else 0
+    return _mutate_sync_state(sync_id, _upd)
+
+
+def _read_sync_metrics(sync_id):
+    out = {}
+
+    def _rd(st):
+        a = float(st.audio_sec or 0.0)
+        v = float(st.video_sec or 0.0)
+        if int(st.audio_state) == 1 and int(st.video_state) == 1:
+            pos = min(a, v) if (a > 0.0 and v > 0.0) else max(a, v)
+        elif int(st.video_state) == 1:
+            pos = v
+        else:
+            pos = a
+        out['media_pts_sec'] = round(max(0.0, pos), 3)
+        out['paused'] = bool(int(st.paused) == 1)
+        out['sync_flags'] = int(st.sync_flags)
+        out['skew_ms'] = int(st.skew_ms)
+        out['audio_state'] = int(st.audio_state)
+        out['video_state'] = int(st.video_state)
+
+    if _mutate_sync_state(sync_id, _rd):
+        return out
+    return None
 
 log = logging.getLogger('lancy.voice')
 
@@ -96,19 +311,26 @@ def strip_reconnect_at_eof(cmd_str):
     return shlex.join(out)
 
 
-def _upsert_ffmpeg_input_sync_flags(args, *, pre_seek=None, copyts=False):
+def _upsert_ffmpeg_input_sync_flags(args, *, pre_seek=None, copyts=False, input_url=None):
     """Ensure -copyts and input -ss appear strictly before -i when hybrid synchronized seeking is active."""
     cleaned = []
     skip_next = False
+    replace_next_input = False
     for tok in args:
         if skip_next:
             skip_next = False
+            continue
+        if replace_next_input:
+            replace_next_input = False
+            cleaned.append(str(input_url) if input_url else tok)
             continue
         if tok == '-copyts':
             continue
         if (pre_seek is not None or copyts) and tok == '-ss':
             skip_next = True
             continue
+        if tok == '-i' and input_url:
+            replace_next_input = True
         cleaned.append(tok)
 
     prefix = []
@@ -143,8 +365,10 @@ def rewrite_video_ffmpeg_command(
     fps=None,
     trim_start=None,
     normalize_pts=False,
+    pts_anchor=None,
     pre_seek=None,
     copyts=False,
+    input_url=None,
 ):
     """Ensure a single consolidated -vf pipeline outputting exact width:height yuv420p frames aligned to audio PTS."""
     w = max(2, int(width) - (int(width) % 2))
@@ -152,10 +376,17 @@ def rewrite_video_ffmpeg_command(
     vf_parts = []
     if trim_start is not None and not is_image:
         vf_parts.append(f'trim=start={float(trim_start):.3f}')
-    if (normalize_pts or trim_start is not None) and not is_image:
+    if pts_anchor is not None and not is_image:
+        vf_parts.append(f'setpts=PTS-{float(pts_anchor):.3f}/TB')
+    elif (normalize_pts or trim_start is not None) and not is_image:
         vf_parts.append('setpts=PTS-STARTPTS')
-    if fps is not None and not is_image and int(fps) > 0:
-        vf_parts.append(f'fps=fps={int(fps)}')
+    if fps is not None and not is_image and float(fps) > 0:
+        fps_f = float(fps)
+        fps_str = str(int(round(fps_f))) if abs(fps_f - round(fps_f)) < 1e-3 else f'{fps_f:.3f}'.rstrip('0').rstrip('.')
+        if pts_anchor is not None:
+            vf_parts.append(f'fps=fps={fps_str}:start_time=0')
+        else:
+            vf_parts.append(f'fps=fps={fps_str}')
     vf_parts.extend([f'scale={w}:{h}:flags=lanczos', 'setsar=1'])
     if subtitle_path:
         esc_sub = str(subtitle_path).replace('\\', '\\\\').replace(':', '\\:').replace("'", "\\'").replace('[', '\\[').replace(']', '\\]')
@@ -163,7 +394,7 @@ def rewrite_video_ffmpeg_command(
     vf_parts.append('format=yuv420p')
     vf_expr = ','.join(vf_parts)
 
-    args = _upsert_ffmpeg_input_sync_flags(shlex.split(str(cmd_str)), pre_seek=pre_seek, copyts=copyts)
+    args = _upsert_ffmpeg_input_sync_flags(shlex.split(str(cmd_str)), pre_seek=pre_seek, copyts=copyts, input_url=input_url)
     cleaned = []
     skip_next = False
     has_map = False
@@ -182,8 +413,10 @@ def rewrite_video_ffmpeg_command(
     inserted_map = False
     inserted_vf = False
     for tok in cleaned:
-        if not inserted_map and not has_map and stream_index is not None and video_count > 1 and not is_image and tok == '-f':
-            out_args.extend(['-map', f'0:{int(stream_index)}'])
+        if not inserted_map and tok == '-f':
+            if not has_map and stream_index is not None and video_count > 1 and not is_image:
+                out_args.extend(['-map', f'0:{int(stream_index)}'])
+            out_args.extend(['-an', '-sn', '-dn'])
             inserted_map = True
         if not inserted_vf and tok.startswith('pipe:'):
             out_args.extend(['-vf', vf_expr])
@@ -192,6 +425,170 @@ def rewrite_video_ffmpeg_command(
     if not inserted_vf:
         out_args.extend(['-vf', vf_expr])
     return shlex.join(out_args)
+
+
+def wrap_av_sync_pair(
+    audio_cmd,
+    video_cmd,
+    *,
+    frame_bytes,
+    fps=30,
+    sample_rate=48000,
+    channels=2,
+    sync_id=None,
+    width=0,
+    height=0,
+    sub_config_path=None,
+):
+    """Wrap matched microphone/camera FFmpeg commands in a synchronized startup barrier and drift monitor."""
+    if not audio_cmd or not video_cmd or int(frame_bytes or 0) <= 0:
+        return audio_cmd, video_cmd
+    if not os.path.isfile(AV_SYNC_SCRIPT):
+        return audio_cmd, video_cmd
+    sid = re.sub(r'[^a-zA-Z0-9_-]', '_', str(sync_id or uuid.uuid4().hex))[:64]
+    # NTgCalls ShellReader uses boost::process::v2::environment::find_executable(), which
+    # expects a bare command name in PATH (like "ffmpeg") rather than a slash path.
+    py = 'python3'
+    script = shlex.quote(AV_SYNC_SCRIPT)
+    eff_fps = max(1.0, float(fps or 30))
+    # Lazily prune stale shm & sub config/status files (>30m old)
+    shm_dir = Path('/dev/shm') if Path('/dev/shm').is_dir() else Path('/tmp')
+    try:
+        cutoff = time.time() - 1800
+        for pat in ('lancy-av-*.shm', 'lancy-sub-*.json', 'lancy-substatus-*.json'):
+            for p in shm_dir.glob(pat):
+                try:
+                    if p.stat().st_mtime < cutoff:
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    audio_sub_flag = f' --sub-config {shlex.quote(str(sub_config_path))}' if sub_config_path else ''
+    wrapped_a = (
+        f'{py} {script} --role audio --sync-id {shlex.quote(sid)} '
+        f'--sample-rate {int(sample_rate)} --channels {int(channels)} --fps {eff_fps:.3f}{audio_sub_flag} -- {audio_cmd}'
+    )
+    sub_flags = ''
+    if sub_config_path and int(width or 0) > 0 and int(height or 0) > 0:
+        sub_flags = f' --width {int(width)} --height {int(height)} --sub-config {shlex.quote(str(sub_config_path))}'
+    wrapped_v = (
+        f'{py} {script} --role video --sync-id {shlex.quote(sid)} '
+        f'--frame-bytes {int(frame_bytes)} --fps {eff_fps:.3f}{sub_flags} -- {video_cmd}'
+    )
+    return wrapped_a, wrapped_v
+
+
+def _extract_av_output_opts(args, *, is_video):
+    out_map = None
+    vf_val = None
+    af_val = None
+    fps_val = None
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == '-map' and i + 1 < len(args):
+            out_map = args[i + 1]
+            i += 2
+            continue
+        if is_video and tok in {'-vf', '-filter:v'} and i + 1 < len(args):
+            vf_val = args[i + 1]
+            i += 2
+            continue
+        if is_video and tok == '-r' and i + 1 < len(args):
+            fps_val = args[i + 1]
+            i += 2
+            continue
+        if (not is_video) and tok in {'-af', '-filter:a'} and i + 1 < len(args):
+            af_val = args[i + 1]
+            i += 2
+            continue
+        i += 1
+    return out_map, vf_val, af_val, fps_val
+
+
+def build_unified_av_ffmpeg_command(audio_cmd, video_cmd, *, output_format='raw'):
+    """Merge matched audio & video FFmpeg commands into ONE single-demuxer FFmpeg command.
+
+    Supports both interleaved `-f nut` (output_format='nut', preserving per-packet PTS)
+    and legacy dual-pipe raw (`output_format='raw'` using `av_hub.AUDIO_PIPE_PLACEHOLDER`).
+    """
+    if not audio_cmd or not video_cmd:
+        return None
+    try:
+        v_args = shlex.split(str(video_cmd))
+        a_args = shlex.split(str(audio_cmd))
+    except ValueError:
+        return None
+
+    if not v_args or not a_args:
+        return None
+    if os.path.basename(v_args[0]) != 'ffmpeg' or os.path.basename(a_args[0]) != 'ffmpeg':
+        return None
+    if '-i' not in v_args or '-i' not in a_args:
+        return None
+
+    vi = v_args.index('-i')
+    ai = a_args.index('-i')
+    if vi + 1 >= len(v_args) or ai + 1 >= len(a_args):
+        return None
+    if v_args[vi + 1] != a_args[ai + 1]:
+        return None
+
+    # Require identical input -ss seek offsets before sharing the single demuxer.
+    def _pre_ss(prefix):
+        for k in range(len(prefix) - 1):
+            if prefix[k] == '-ss':
+                try:
+                    return float(prefix[k + 1])
+                except ValueError:
+                    return None
+        return 0.0
+
+    v_ss = _pre_ss(v_args[:vi])
+    a_ss = _pre_ss(a_args[:ai])
+    if v_ss is None or a_ss is None or abs(v_ss - a_ss) > 0.02:
+        return None
+
+    v_prefix = v_args[:vi + 2]
+    v_out = v_args[vi + 2:]
+    a_out = list(a_args[ai + 2:])
+    if 'pipe:1' not in v_out or 'pipe:1' not in a_out:
+        return None
+
+    if str(output_format or 'raw').lower() == 'nut':
+        v_map, v_vf, _, v_r = _extract_av_output_opts(v_out, is_video=True)
+        a_map, _, a_af, _ = _extract_av_output_opts(a_out, is_video=False)
+        out = [
+            *v_prefix,
+            '-map', v_map or '0:v:0',
+            '-map', a_map or '0:a:0',
+            '-sn', '-dn',
+        ]
+        if v_vf:
+            out.extend(['-vf', v_vf])
+        if v_r:
+            out.extend(['-r', v_r])
+        if a_af:
+            out.extend(['-af', a_af])
+        out.extend([
+            '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p',
+            '-c:a', 'pcm_s16le', '-ac', '2', '-ar', '48000',
+            '-write_index', '0',
+            '-f', 'nut', 'pipe:1',
+        ])
+        return shlex.join(out)
+
+    replaced_audio_pipe = False
+    for idx in range(len(a_out) - 1, -1, -1):
+        if a_out[idx] == 'pipe:1':
+            a_out[idx] = av_hub.AUDIO_PIPE_PLACEHOLDER
+            replaced_audio_pipe = True
+            break
+    if not replaced_audio_pipe:
+        return None
+
+    return shlex.join([*v_prefix, *v_out, *a_out])
 
 
 def rewrite_audio_ffmpeg_command(
@@ -203,10 +600,12 @@ def rewrite_audio_ffmpeg_command(
     copyts=False,
     trim_start=None,
     normalize_pts=False,
+    pts_anchor=None,
     strip_first_pts_zero=False,
+    input_url=None,
 ):
     """Align microphone FFmpeg stream selection, trim offset, and PTS to the active video pipeline."""
-    args = _upsert_ffmpeg_input_sync_flags(shlex.split(str(cmd_str)), pre_seek=pre_seek, copyts=copyts)
+    args = _upsert_ffmpeg_input_sync_flags(shlex.split(str(cmd_str)), pre_seek=pre_seek, copyts=copyts, input_url=input_url)
     cleaned = []
     skip_next = False
     af_value = None
@@ -234,7 +633,9 @@ def rewrite_audio_ffmpeg_command(
     af_parts = []
     if trim_start is not None:
         af_parts.append(f'atrim=start={float(trim_start):.3f}')
-    if normalize_pts or trim_start is not None:
+    if pts_anchor is not None:
+        af_parts.append(f'asetpts=PTS-{float(pts_anchor):.3f}/TB')
+    elif normalize_pts or trim_start is not None:
         af_parts.append('asetpts=PTS-STARTPTS')
     base_af = af_value or 'aresample=48000:async=1'
     if strip_first_pts_zero:
@@ -270,23 +671,51 @@ def _parse_start_time(val):
     return None
 
 
-def _pick_primary_audio_stream(audio_streams):
+def _pick_primary_audio_stream(audio_streams, preferred_lang=None):
     if not audio_streams:
         return None
-    def score(st):
+    pref = _norm_lang(preferred_lang)
+
+    def _meta(st):
         disp = st.get('disposition') or {}
         tags = st.get('tags') or {}
-        lang = str(tags.get('language') or '').lower()
-        title = str(tags.get('title') or '').lower()
+        lang = _norm_lang(tags.get('language'))
+        title = str(tags.get('title') or tags.get('handler_name') or '').lower()
+        is_dub = bool(disp.get('dub')) or bool(re.search(r'\b(?:dub|dubbed)\b', title))
+        is_orig = bool(disp.get('original')) or ('original' in title and not is_dub)
+        is_comm = bool(disp.get('comment') or disp.get('descriptions') or disp.get('visual_impaired')) or any(
+            k in title for k in ('commentary', 'description', 'descriptive', 'director', 'audio description')
+        )
+        return disp, lang, is_dub, is_orig, is_comm
+
+    def score(st):
+        disp, lang, is_dub, is_orig, is_comm = _meta(st)
         pts = 0
-        if disp.get('default'):
-            pts += 30
-        if lang in {'eng', 'en', 'und', ''}:
+        if pref:
+            if lang == pref:
+                pts += 150
+            elif lang:
+                pts -= 80
+        if is_orig:
+            pts += 80
+        if is_dub:
+            pts -= 140
+        if is_comm:
+            pts -= 120
+        if disp.get('default') and not is_dub and not is_comm:
             pts += 15
-        if any(k in title for k in ('commentary', 'description', 'descriptive', 'director')):
-            pts -= 50
+        try:
+            ch = int(st.get('channels') or 0)
+            if ch >= 6:
+                pts += 4
+            elif ch == 2:
+                pts += 2
+        except Exception:
+            pass
         return pts
-    return max(audio_streams, key=score)
+
+    chosen = max(audio_streams, key=score)
+    return chosen
 
 
 def _parse_fps(raw):
@@ -305,14 +734,14 @@ def _parse_fps(raw):
         return None
 
 
-async def probe_media_stream_info(path):
+async def probe_media_stream_info(path, preferred_lang=None):
     """Probe primary video and audio stream indices, dimensions, fps, duration, and start timestamps."""
     proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             'ffprobe', '-v', 'error', '-probesize', '2000000', '-analyzeduration', '2000000',
-            '-show_entries', 'stream=index,codec_type,codec_name,width,height,start_time,avg_frame_rate,r_frame_rate',
-            '-show_entries', 'stream_tags=language,title:stream_disposition=default,attached_pic:format=start_time,duration',
+            '-show_entries', 'stream=index,codec_type,codec_name,width,height,channels,start_time,avg_frame_rate,r_frame_rate',
+            '-show_entries', 'stream_tags=language,title,handler_name:stream_disposition=default,original,dub,comment,descriptions,visual_impaired,attached_pic:format=format_name,start_time,duration',
             '-of', 'json', str(path),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
@@ -322,6 +751,7 @@ async def probe_media_stream_info(path):
         fmt = info.get('format') or {}
         fmt_start = _parse_start_time(fmt.get('start_time'))
         fmt_duration = _parse_start_time(fmt.get('duration'))
+        fmt_name = str(fmt.get('format_name') or '').lower()
         video_streams = [
             s for s in all_streams
             if s.get('codec_type') == 'video' and int(s.get('width') or 0) > 0 and int(s.get('height') or 0) > 0
@@ -341,11 +771,16 @@ async def probe_media_stream_info(path):
         v_fps = _parse_fps(chosen_video.get('avg_frame_rate')) or _parse_fps(chosen_video.get('r_frame_rate'))
 
         audio_streams = [s for s in all_streams if s.get('codec_type') == 'audio']
-        chosen_audio = _pick_primary_audio_stream(audio_streams)
+        chosen_audio = _pick_primary_audio_stream(audio_streams, preferred_lang=preferred_lang)
         a_idx = chosen_audio.get('index') if chosen_audio else None
         a_start = _parse_start_time(chosen_audio.get('start_time')) if chosen_audio else None
         if chosen_audio and a_start is None:
             a_start = fmt_start
+        a_tags = (chosen_audio.get('tags') or {}) if chosen_audio else {}
+        a_disp = (chosen_audio.get('disposition') or {}) if chosen_audio else {}
+        a_lang = _norm_lang(a_tags.get('language'))
+        a_title = str(a_tags.get('title') or a_tags.get('handler_name') or '').lower()
+        a_is_dub = bool(a_disp.get('dub')) or bool(re.search(r'\b(?:dub|dubbed)\b', a_title))
 
         return {
             'width': int(chosen_video['width']),
@@ -354,17 +789,60 @@ async def probe_media_stream_info(path):
             'video_count': len(video_streams),
             'is_image': is_image,
             'video_start_time': v_start,
+            'format_start_time': fmt_start,
             'fps': v_fps,
             'duration': fmt_duration,
+            'format_name': fmt_name,
             'audio_stream_index': int(a_idx) if a_idx is not None else None,
             'audio_count': len(audio_streams),
             'audio_start_time': a_start,
+            'audio_language': a_lang or None,
+            'audio_is_dub': a_is_dub,
         }
     except Exception:
         if proc and proc.returncode is None:
             try: proc.kill()
             except Exception: pass
     return None
+
+
+async def probe_initial_packet_pts(path, video_stream_index=None, audio_stream_index=None):
+    """Probe earliest decoded video & audio packet PTS (seconds) in one ffprobe pass."""
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error', '-read_intervals', '%+#120',
+            '-show_entries', 'packet=codec_type,stream_index,pts_time,dts_time',
+            '-of', 'csv=p=0', str(path),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        v_vals = []
+        a_vals = []
+        for line in (stdout or b'').decode('utf-8', 'replace').splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 3:
+                continue
+            ctype = parts[0]
+            try:
+                s_idx = int(parts[1])
+            except Exception:
+                s_idx = None
+            val = _parse_start_time(parts[2])
+            if val is None and len(parts) >= 4:
+                val = _parse_start_time(parts[3])
+            if val is None:
+                continue
+            if ctype == 'video' and (video_stream_index is None or s_idx is None or s_idx == int(video_stream_index)):
+                v_vals.append(val)
+            elif ctype == 'audio' and (audio_stream_index is None or s_idx is None or s_idx == int(audio_stream_index)):
+                a_vals.append(val)
+        return (min(v_vals) if v_vals else None), (min(a_vals) if a_vals else None)
+    except Exception:
+        if proc and proc.returncode is None:
+            try: proc.kill()
+            except Exception: pass
+    return None, None
 
 
 async def probe_seek_first_pts(path, seek_sec=0.0):
@@ -481,8 +959,12 @@ class Bridge:
                         async with self.chat_lock(event.chat_id):
                             call = self.calls.get(event.chat_id)
                             if not call or call['alias'] != alias or call['status'] != 'playing': return
+                            if time.monotonic() - float(call.get('last_seek_at') or 0.0) < 2.5:
+                                return
                             try:
-                                elapsed = await engine.time(event.chat_id)
+                                raw_elapsed = float(await engine.time(event.chat_id))
+                                base_t = float(call.get('engine_time_base') or 0.0)
+                                elapsed = max(0.0, raw_elapsed - base_t) if raw_elapsed >= base_t else raw_elapsed
                                 pos = max(0.0, float(call.get('offset') or 0.0) + float(elapsed))
                                 if pos > 0:
                                     call['last_known_position'] = max(float(call.get('last_known_position') or 0.0), pos)
@@ -493,6 +975,14 @@ class Bridge:
                                     self.events.put_nowait({'chat_id': event.chat_id, 'playback_id': call['playback_id'], 'status': 'ended'})
                             except Exception:
                                 call['clock_errors'] += 1
+                @client.on_raw_update()
+                async def on_raw_vc(_, raw_upd, users=None, chats=None):
+                    try:
+                        from pyrogram import raw as _raw
+                        if isinstance(raw_upd, _raw.types.UpdateGroupCallMessage):
+                            await self._handle_group_call_message(alias, raw_upd, users or {}, chats or {})
+                    except Exception:
+                        pass
                 await asyncio.wait_for(engine.start(), 30)
             if any(a.get('uid') == uid for a in self.accounts.values() if a is not account):
                 await client.stop()
@@ -687,6 +1177,335 @@ class Bridge:
                 if was_leased:
                     self.release_destination(a, chat)
 
+    @staticmethod
+    def _input_group_call(native_call):
+        if native_call is None:
+            return None
+        call_id = getattr(native_call, 'id', None)
+        access_hash = getattr(native_call, 'access_hash', None)
+        if call_id is None or access_hash is None:
+            return None
+        from pyrogram import raw
+        return raw.types.InputGroupCall(id=int(call_id), access_hash=int(access_hash))
+
+    async def ensure_call_settings(self, a, chat, call, *, messages_enabled=None):
+        """Enable/query Telegram Layer 228 native GroupCall settings (in-call messaging)."""
+        if a is None or a.get('client') is None or not isinstance(call, dict):
+            return {'ok': False, 'reason': 'unavailable'}
+        input_call = self._input_group_call(call.get('native_call'))
+        if input_call is None:
+            return {'ok': False, 'reason': 'no_native_call'}
+        from pyrogram import raw
+        threshold = 0 if self.factory else 10
+        if messages_enabled is None:
+            try:
+                full_call = await asyncio.wait_for(
+                    a['client'].invoke(raw.functions.phone.GetGroupCall(call=input_call, limit=1), sleep_threshold=threshold),
+                    8,
+                )
+                gc = getattr(full_call, 'call', None)
+                cur = bool(getattr(gc, 'messages_enabled', False)) if gc is not None else False
+                call['messages_enabled'] = cur
+                return {'ok': True, 'messages_enabled': cur}
+            except Exception as err:
+                return {'ok': False, 'reason': classify(err)}
+        try:
+            await asyncio.wait_for(
+                a['client'].invoke(
+                    raw.functions.phone.ToggleGroupCallSettings(
+                        call=input_call,
+                        messages_enabled=bool(messages_enabled),
+                    ),
+                    sleep_threshold=threshold,
+                ),
+                8,
+            )
+            call['messages_enabled'] = bool(messages_enabled)
+            return {'ok': True, 'messages_enabled': bool(messages_enabled)}
+        except Exception as err:
+            if type(err).__name__ in {'ChatAdminRequired', 'RightForbidden', 'ChannelPrivate', 'ChatWriteForbidden'}:
+                return {'ok': False, 'code': 'PERMISSION_DENIED', 'messages_enabled': bool(call.get('messages_enabled', False))}
+            log.debug('ToggleGroupCallSettings skipped chat=%s err=%s', chat, type(err).__name__)
+            return {'ok': False, 'code': classify(err), 'messages_enabled': bool(call.get('messages_enabled', False))}
+
+    async def _ensure_rtmp_chat_participant(self, a, chat, call):
+        """Join GroupCall muted/video_stopped when SendGroupCallMessage requires participant membership."""
+        if a is None or a.get('client') is None or not isinstance(call, dict):
+            return False
+        input_call = self._input_group_call(call.get('native_call'))
+        if input_call is None:
+            return False
+        try:
+            from pyrogram import raw
+            threshold = 0 if self.factory else 10
+            await asyncio.wait_for(
+                a['client'].invoke(
+                    raw.functions.phone.JoinGroupCall(
+                        call=input_call,
+                        join_as=raw.types.InputPeerSelf(),
+                        params=raw.types.DataJSON(data='{}'),
+                        muted=True,
+                        video_stopped=True,
+                    ),
+                    sleep_threshold=threshold,
+                ),
+                8,
+            )
+            call['_joined_msg_participant'] = True
+            return True
+        except Exception:
+            return False
+
+    async def _handle_group_call_message(self, alias, update, users, chats):
+        """Forward incoming Telegram UpdateGroupCallMessage events to Node via /events."""
+        from collections import deque
+        msg = getattr(update, 'message', None)
+        u_call = getattr(update, 'call', None)
+        call_id = getattr(u_call, 'id', None)
+        if msg is None or call_id is None:
+            return
+        text_obj = getattr(msg, 'message', None)
+        text = str(getattr(text_obj, 'text', None) or text_obj or '').strip()
+        if not text:
+            return
+        from_peer = getattr(msg, 'from_id', None)
+        sender_id = (
+            getattr(from_peer, 'user_id', None)
+            or getattr(from_peer, 'channel_id', None)
+            or getattr(from_peer, 'chat_id', None)
+        )
+        sender_name = None
+        if sender_id is not None:
+            u = users.get(sender_id) if isinstance(users, dict) else None
+            c = chats.get(sender_id) if isinstance(chats, dict) else None
+            ent = u or c
+            if ent is not None:
+                first = str(getattr(ent, 'first_name', '') or '').strip()
+                last = str(getattr(ent, 'last_name', '') or '').strip()
+                title = str(getattr(ent, 'title', '') or '').strip()
+                uname = str(getattr(ent, 'username', '') or '').strip()
+                sender_name = ' '.join(x for x in (first, last) if x) or title or (f'@{uname}' if uname else str(sender_id))
+        msg_id = getattr(msg, 'id', None)
+        acct = self.accounts.get(alias) or {}
+        if sender_id is not None and acct.get('uid') == sender_id:
+            # Skip our own echoed subtitle/reply messages
+            return
+        matched_chat = None
+        for chat_id, call in list(self.calls.items()):
+            nc = call.get('native_call')
+            if call.get('alias') == alias and nc is not None and getattr(nc, 'id', None) == call_id:
+                matched_chat = chat_id
+                seen = call.setdefault('_seen_vc_msg_ids', deque(maxlen=64))
+                if msg_id is not None and msg_id in seen:
+                    return
+                if msg_id is not None:
+                    seen.append(msg_id)
+                break
+        if matched_chat is None:
+            return
+        if self.events.full():
+            try:
+                self.events.get_nowait()
+            except Exception:
+                pass
+        self.events.put_nowait({
+            'type': 'vc_message',
+            'chat_id': int(matched_chat),
+            'call_id': int(call_id),
+            'message_id': int(msg_id) if msg_id is not None else None,
+            'sender_id': int(sender_id) if sender_id is not None else None,
+            'sender_name': sender_name,
+            'from_admin': bool(getattr(msg, 'from_admin', False)),
+            'text': text,
+            'date': int(getattr(msg, 'date', 0) or 0),
+        })
+
+    async def send_call_message(self, data):
+        chat = int(data['chat_id'])
+        text = str(data.get('text') or '').strip()
+        if chat >= 0 or not text:
+            raise VoiceFailure('INVALID_REQUEST')
+        text = text[:4096]
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call or call.get('native_call') is None:
+                raise VoiceFailure('NO_ACTIVE_CALL')
+            a = self.accounts.get(call['alias'])
+            if not a or not a.get('client'):
+                raise VoiceFailure('SESSION_NOT_READY')
+            input_call = self._input_group_call(call.get('native_call'))
+            from pyrogram import raw
+            threshold = 0 if self.factory else 10
+            req = raw.functions.phone.SendGroupCallMessage(
+                call=input_call,
+                random_id=secrets.randbits(63),
+                message=raw.types.TextWithEntities(text=text, entities=[]),
+            )
+            try:
+                res = await asyncio.wait_for(a['client'].invoke(req, sleep_threshold=threshold), 10)
+            except Exception as err:
+                err_txt = f'{type(err).__name__} {err}'.upper()
+                if call.get('stream_mode') == 'rtmp' and ('JOIN' in err_txt or 'GROUPCALL_FORBIDDEN' in err_txt):
+                    joined = await self._ensure_rtmp_chat_participant(a, chat, call)
+                    if joined:
+                        res = await asyncio.wait_for(
+                            a['client'].invoke(
+                                raw.functions.phone.SendGroupCallMessage(
+                                    call=input_call,
+                                    random_id=secrets.randbits(63),
+                                    message=raw.types.TextWithEntities(text=text, entities=[]),
+                                ),
+                                sleep_threshold=threshold,
+                            ),
+                            10,
+                        )
+                    else:
+                        return {'ok': False, 'code': classify(err), 'error': type(err).__name__}
+                else:
+                    return {'ok': False, 'code': classify(err), 'error': type(err).__name__}
+            sent_ids = []
+            for upd in (getattr(res, 'updates', None) or []):
+                msg_obj = getattr(upd, 'message', None)
+                mid = getattr(msg_obj, 'id', None)
+                if mid is not None:
+                    sent_ids.append(int(mid))
+            return {'ok': True, 'sent': True, 'message_ids': sent_ids}
+
+    async def delete_call_messages(self, data):
+        chat = int(data['chat_id'])
+        raw_ids = data.get('message_ids') or []
+        msg_ids = [int(x) for x in raw_ids if x is not None]
+        if chat >= 0 or not msg_ids:
+            raise VoiceFailure('INVALID_REQUEST')
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call or call.get('native_call') is None:
+                raise VoiceFailure('NO_ACTIVE_CALL')
+            a = self.accounts.get(call['alias'])
+            if not a or not a.get('client'):
+                raise VoiceFailure('SESSION_NOT_READY')
+            input_call = self._input_group_call(call.get('native_call'))
+            from pyrogram import raw
+            threshold = 0 if self.factory else 10
+            try:
+                await asyncio.wait_for(
+                    a['client'].invoke(
+                        raw.functions.phone.DeleteGroupCallMessages(call=input_call, messages=msg_ids),
+                        sleep_threshold=threshold,
+                    ),
+                    8,
+                )
+                return {'ok': True, 'deleted': len(msg_ids)}
+            except Exception as err:
+                return {'ok': False, 'code': classify(err), 'error': type(err).__name__}
+
+    async def update_call_settings(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0:
+            raise VoiceFailure('INVALID_REQUEST')
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call or call.get('native_call') is None:
+                raise VoiceFailure('NO_ACTIVE_CALL')
+            a = self.accounts.get(call['alias'])
+            if not a or not a.get('client'):
+                raise VoiceFailure('SESSION_NOT_READY')
+            msg_en = data.get('messages_enabled')
+            return await self.ensure_call_settings(a, chat, call, messages_enabled=(None if msg_en is None else bool(msg_en)))
+
+    async def _get_group_call_is_rtmp(self, a, native_call):
+        """Inspect whether an active Telegram GroupCall is configured with rtmp_stream=True."""
+        if native_call is None or a is None or a.get('client') is None:
+            return None
+        direct = getattr(native_call, 'rtmp_stream', None)
+        if direct is not None:
+            return bool(direct)
+        try:
+            from pyrogram import raw
+            call_id = getattr(native_call, 'id', None)
+            access_hash = getattr(native_call, 'access_hash', None)
+            if call_id is None or access_hash is None:
+                return None
+            input_call = raw.types.InputGroupCall(id=int(call_id), access_hash=int(access_hash))
+            threshold = 0 if self.factory else 10
+            full_call = await asyncio.wait_for(
+                a['client'].invoke(raw.functions.phone.GetGroupCall(call=input_call, limit=1), sleep_threshold=threshold),
+                8,
+            )
+            gc = getattr(full_call, 'call', None)
+            if gc is not None and getattr(gc, 'rtmp_stream', None) is not None:
+                return bool(gc.rtmp_stream)
+        except Exception:
+            pass
+        return None
+
+    async def _create_group_call(self, a, chat, peer, *, vc_title=None, rtmp_stream=False):
+        from pyrogram import raw
+        threshold = 0 if self.factory else 10
+        kwargs = {'peer': peer, 'random_id': secrets.randbits(31), 'title': vc_title or 'Lancy music'}
+        if rtmp_stream:
+            kwargs['rtmp_stream'] = True
+        try:
+            await asyncio.wait_for(
+                a['client'].invoke(raw.functions.phone.CreateGroupCall(**kwargs), sleep_threshold=threshold),
+                15,
+            )
+        except Exception as create_err:
+            if type(create_err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
+                raise VoiceFailure('PERMISSION_DENIED') from None
+            if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 10:
+                await asyncio.sleep(getattr(create_err, 'value', 1))
+            else:
+                raise
+        _, call = await self.native_call(a['client'], chat)
+        if call is None and (not self.factory or getattr(self, 'auto_create_call_in_tests', False)):
+            for _ in range(6):
+                await asyncio.sleep(0.3)
+                _, call = await self.native_call(a['client'], chat)
+                if call is not None:
+                    break
+        return call
+
+    async def _discard_group_call(self, a, native_call):
+        if native_call is None or a is None or a.get('client') is None:
+            return
+        try:
+            from pyrogram import raw
+            call_id = getattr(native_call, 'id', None)
+            access_hash = getattr(native_call, 'access_hash', None)
+            if call_id is None or access_hash is None:
+                return
+            input_call = raw.types.InputGroupCall(id=int(call_id), access_hash=int(access_hash))
+            threshold = 0 if self.factory else 10
+            await asyncio.wait_for(
+                a['client'].invoke(raw.functions.phone.DiscardGroupCall(call=input_call), sleep_threshold=threshold),
+                10,
+            )
+        except Exception:
+            pass
+
+    async def _fetch_rtmp_ingest(self, a, peer, *, revoke=False):
+        from pyrogram import raw
+        threshold = 0 if self.factory else 10
+        try:
+            res = await asyncio.wait_for(
+                a['client'].invoke(
+                    raw.functions.phone.GetGroupCallStreamRtmpUrl(peer=peer, revoke=bool(revoke)),
+                    sleep_threshold=threshold,
+                ),
+                12,
+            )
+        except Exception as err:
+            if type(err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
+                raise VoiceFailure('PERMISSION_DENIED') from None
+            raise
+        url = str(getattr(res, 'url', '') or '').strip()
+        key = str(getattr(res, 'key', '') or '').strip()
+        if not url or not key:
+            raise VoiceFailure('CALL_FAILED')
+        target = f"{url.rstrip('/')}/{key.lstrip('/')}"
+        return target, url, key
+
     async def setup(self, data):
         chat = int(data['chat_id']); stage = data.get('stage')
         if chat >= 0 or self.closing: raise VoiceFailure('INVALID_REQUEST')
@@ -746,33 +1565,48 @@ class Bridge:
                 a['managed'].add(chat)
                 return {'ok': True, 'account_alias': a['alias']}
             if stage != 'start' or data.get('create') is not True: raise VoiceFailure('INVALID_REQUEST')
+            req_mode = str(data.get('stream_mode') or '').strip().lower()
+            wants_rtmp = req_mode == 'rtmp'
+            explicit_mode = req_mode in {'interactive', 'rtmp'}
+            force_switch = bool(data.get('force_switch'))
             await self.resolve_destination(a['client'], chat)
             peer, call = await self.native_call(a['client'], chat)
             created = False
+            if call is not None and (force_switch or explicit_mode):
+                existing_is_rtmp = await self._get_group_call_is_rtmp(a, call)
+                if force_switch or (existing_is_rtmp is not None and existing_is_rtmp != wants_rtmp):
+                    old_call = self.calls.pop(chat, None)
+                    if old_call:
+                        await self._stop_rtmp_proc(old_call, wait_settle=False)
+                        self._cleanup_sub_overlay(old_call)
+                    if not self.factory:
+                        clear_engine_cache(a['engine'], chat)
+                        try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                        except Exception: pass
+                    await self._discard_group_call(a, call)
+                    if not self.factory:
+                        await asyncio.sleep(0.4)
+                    _, call = await self.native_call(a['client'], chat)
             if call is None:
                 if not self.factory:
                     clear_engine_cache(a['engine'], chat)
                     try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                     except Exception: pass
                     self.calls.pop(chat, None)
-                from pyrogram import raw
-                threshold = 0 if self.factory else 10
                 vc_title = str(data.get('vc_title') or data.get('title') or '').strip()[:64] or 'Lancy music'
-                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title=vc_title), sleep_threshold=threshold), 15)
-                _, call = await self.native_call(a['client'], chat)
-                if call is None and not self.factory:
-                    for _ in range(6):
-                        await asyncio.sleep(0.3)
-                        _, call = await self.native_call(a['client'], chat)
-                        if call is not None: break
+                call = await self._create_group_call(a, chat, peer, vc_title=vc_title, rtmp_stream=wants_rtmp)
                 if call is None: raise VoiceFailure('NO_ACTIVE_CALL')
                 created = True
+            actual_rtmp = await self._get_group_call_is_rtmp(a, call)
+            resolved_mode = 'rtmp' if (actual_rtmp if actual_rtmp is not None else wants_rtmp) else 'interactive'
+            if resolved_mode == 'rtmp' and (not self.factory or getattr(self, 'test_rtmp_ingest', False)):
+                await self._fetch_rtmp_ingest(a, peer)
             call_invite_link = await self.resolve_call_invite_link(a, call)
             a['managed'].add(chat)
             # Setup is not an active media transport. Retain per-chat membership
             # and routing metadata without reserving a native call.
             self.release_destination(a, chat)
-            return {'ok': True, 'account_alias': a['alias'], 'call_ready': True, 'created': created, 'call_invite_link': call_invite_link}
+            return {'ok': True, 'account_alias': a['alias'], 'call_ready': True, 'created': created, 'call_invite_link': call_invite_link, 'stream_mode': resolved_mode}
 
     async def leave_membership(self, a, chat):
         if chat not in a.get('managed', set()): return
@@ -833,60 +1667,380 @@ class Bridge:
         except Exception:
             pass
 
-    def shift_subtitle(self, sub_path, offset_sec, playback_id, *, subtitle_offset=0.0):
-        """Normalize subtitles to UTF-8 SRT shifted by seek (`offset_sec`) minus manual nudge (`subtitle_offset`)."""
+    def shift_subtitle(self, sub_path, offset_sec, playback_id, *, subtitle_offset=0.0, drift_sec_per_sec=0.0, drift_anchor_sec=0.0):
+        """Normalize subtitles to UTF-8 SRT/ASS shifted by seek (`offset_sec`), manual nudge (`subtitle_offset`), and FPS drift."""
         if not sub_path:
             return None
         try:
-            total_shift = float(offset_sec or 0.0) - float(subtitle_offset or 0.0)
-            is_srt = str(sub_path).lower().endswith('.srt')
-            if abs(total_shift) < 0.01 and is_srt:
-                return sub_path
-            text = Path(sub_path).read_text(encoding='utf-8', errors='replace').lstrip('\ufeff')
+            seek_s = float(offset_sec or 0.0)
+            sub_off_s = float(subtitle_offset or 0.0)
+            drift_r = sub_align.clamp_drift_rate(drift_sec_per_sec)
+            anchor_s = float(drift_anchor_sec or 0.0)
+            total_shift = seek_s - sub_off_s
+            p = Path(sub_path)
+            raw = p.read_text(encoding='utf-8', errors='replace').lstrip('\ufeff')
+            is_ass = p.suffix.lower() in {'.ass', '.ssa'}
             shift_ms = int(round(total_shift * 1000))
-            out_blocks = []
-            idx = 1
-            def to_ms(ts):
-                cleaned = ts.strip()
-                m = re.match(r'^(\d{1,3}):(\d{2}):(\d{2})[,.](\d{1,3})$', cleaned)
-                if m:
-                    return (((int(m[1]) * 60) + int(m[2])) * 60 + int(m[3])) * 1000 + int(m[4].ljust(3, '0')[:3])
-                s = re.match(r'^(\d{1,2}):(\d{2})[,.](\d{1,3})$', cleaned)
-                if s:
-                    return ((int(s[1]) * 60) + int(s[2])) * 1000 + int(s[3].ljust(3, '0')[:3])
+            out_dir = self.root / 'subs'
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_id = re.sub(r'[^A-Za-z0-9_-]', '', str(playback_id or 'sub'))[:24] or 'sub'
+
+            def _map_cue_ms(raw_ms):
+                if abs(drift_r) < 1e-6:
+                    return raw_ms - shift_ms
+                t_media = sub_align.inverse_map_sub_ms_to_media_sec(
+                    raw_ms,
+                    subtitle_offset=sub_off_s,
+                    drift_sec_per_sec=drift_r,
+                    drift_anchor_sec=anchor_s,
+                )
+                return int(round((t_media - seek_s) * 1000.0))
+
+            if is_ass and '[Events]' in raw and 'Dialogue:' in raw:
+                def fmt_ass_ms(ms):
+                    ms = max(0, int(ms))
+                    cs = (ms // 10) % 100
+                    sec = (ms // 1000) % 60
+                    mn = (ms // 60000) % 60
+                    hr = ms // 3600000
+                    return f'{hr:d}:{mn:02d}:{sec:02d}.{cs:02d}'
+
+                norm_bytes, _ = sub_align._normalize_ass_script(raw)
+                lines = norm_bytes.decode('utf-8', errors='replace').split('\n')
+                shifted_lines = []
+                in_events = False
+                cols = None
+                kept_dialogue = 0
+                for line in lines:
+                    s = line.strip()
+                    if s.startswith('[') and s.endswith(']'):
+                        in_events = (s.lower() == '[events]')
+                        if in_events:
+                            cols = None
+                        shifted_lines.append(line)
+                        continue
+                    if in_events and s.lower().startswith('format:'):
+                        cols = [c.strip().lower() for c in s.split(':', 1)[1].split(',')]
+                        shifted_lines.append(line)
+                        continue
+                    if in_events and s.startswith('Dialogue:'):
+                        ef_cols = cols or ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text']
+                        body = line.split(':', 1)[1].lstrip()
+                        parts = body.split(',', len(ef_cols) - 1)
+                        if len(parts) == len(ef_cols):
+                            idx_map = {n: i for i, n in enumerate(ef_cols)}
+                            si = idx_map.get('start', 1)
+                            ei = idx_map.get('end', 2)
+                            s_ms = sub_align._parse_ass_ts_ms(parts[si])
+                            e_ms = sub_align._parse_ass_ts_ms(parts[ei])
+                            if s_ms is None or e_ms is None or _map_cue_ms(e_ms) <= 0:
+                                continue
+                            nst = max(0, _map_cue_ms(s_ms))
+                            nen = max(nst + 250, _map_cue_ms(e_ms))
+                            parts[si] = fmt_ass_ms(nst)
+                            parts[ei] = fmt_ass_ms(nen)
+                            shifted_lines.append('Dialogue: ' + ','.join(parts))
+                            kept_dialogue += 1
+                            continue
+                    shifted_lines.append(line)
+                if kept_dialogue > 0:
+                    out_path = out_dir / f'shifted_{safe_id}.ass'
+                    out_path.write_text('\n'.join(shifted_lines) + '\n', encoding='utf-8')
+                    return str(out_path)
                 return None
+
+            cues = sub_align.dedupe_overlapping_cues(sub_align.parse_subtitle_cues(raw, is_ass=is_ass), trim_overlaps=True)
             def fmt_ms(ms):
                 ms = max(0, int(ms))
                 rem, msec = divmod(ms, 1000)
                 rem, sec = divmod(rem, 60)
                 hr, mn = divmod(rem, 60)
                 return f'{hr:02d}:{mn:02d}:{sec:02d},{msec:03d}'
-            for block in re.split(r'\r?\n\r?\n+', text.replace('\r\n', '\n').replace('\r', '\n')):
-                lines = [l for l in block.split('\n') if l.strip()]
-                if not lines or re.match(r'^(?:WEBVTT|NOTE\b|STYLE\b|REGION\b)', lines[0], re.I):
+            out_blocks = []
+            idx = 1
+            for st, en, ass_txt in cues:
+                mapped_end = _map_cue_ms(en)
+                if mapped_end <= 0:
                     continue
-                ti = next((i for i, l in enumerate(lines) if '-->' in l), -1)
-                if ti < 0: continue
-                parts = [p.strip().split()[0] for p in lines[ti].split('-->')]
-                if len(parts) < 2: continue
-                st, en = to_ms(parts[0]), to_ms(parts[1])
-                if st is None or en is None or en - shift_ms <= 0:
-                    continue
-                nst = max(0, st - shift_ms)
-                nen = max(nst + 250, en - shift_ms)
-                body = re.sub(r'<[^>]+>|\{\\[^}]+\}', '', '\n'.join(lines[ti + 1:])).strip()
-                if body:
+                nst = max(0, _map_cue_ms(st))
+                nen = max(nst + 250, mapped_end)
+                body = ass_txt.replace(r'\N', '\n')
+                body = re.sub(r'\{[^}]+\}', '', body).strip()
+                if body and not sub_align.PROMO_SUB_RE.search(body):
                     out_blocks.append(f'{idx}\n{fmt_ms(nst)} --> {fmt_ms(nen)}\n{body}')
                     idx += 1
-            if not out_blocks: return None
-            out_dir = self.root / 'subs'
-            out_dir.mkdir(parents=True, exist_ok=True)
-            safe_id = re.sub(r'[^A-Za-z0-9_-]', '', str(playback_id or 'sub'))[:24] or 'sub'
+            if not out_blocks:
+                return None
             out_path = out_dir / f'shifted_{safe_id}.srt'
             out_path.write_text('\n\n'.join(out_blocks) + '\n', encoding='utf-8')
             return str(out_path)
         except Exception:
             return sub_path
+
+    def _cleanup_hub(self, call):
+        if not isinstance(call, dict):
+            return
+        proc = call.pop('_hub_proc', None)
+        sid = call.pop('_hub_sync_id', None)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        if sid:
+            av_hub.cleanup_hub_files(sid)
+
+    async def _stop_rtmp_proc(self, call, *, wait_settle=True):
+        if not isinstance(call, dict):
+            return
+        call['rtmp_gen'] = int(call.get('rtmp_gen') or 0) + 1
+        watch = call.pop('_rtmp_watch_task', None)
+        if watch is not None and not watch.done():
+            watch.cancel()
+        stderr_task = call.pop('_rtmp_stderr_task', None)
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
+        proc = call.pop('_rtmp_proc', None)
+        had_proc = False
+        if proc is not None and proc.returncode is None:
+            had_proc = True
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                try:
+                    proc.kill()
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except Exception:
+                    pass
+        if had_proc and wait_settle:
+            await asyncio.sleep(0.15)
+
+    def _cleanup_sub_overlay(self, call, *, unlink_config=True):
+        if not isinstance(call, dict):
+            return
+        self._cleanup_hub(call)
+        rtmp_watch = call.pop('_rtmp_watch_task', None)
+        if rtmp_watch is not None and not rtmp_watch.done():
+            try: rtmp_watch.cancel()
+            except Exception: pass
+        rtmp_err = call.pop('_rtmp_stderr_task', None)
+        if rtmp_err is not None and not rtmp_err.done():
+            try: rtmp_err.cancel()
+            except Exception: pass
+        rtmp_proc = call.pop('_rtmp_proc', None)
+        if rtmp_proc is not None and rtmp_proc.returncode is None:
+            try: rtmp_proc.terminate()
+            except Exception: pass
+        task = call.pop('_sub_align_task', None)
+        if task is not None and not task.done():
+            try:
+                task.cancel()
+            except Exception:
+                pass
+        if unlink_config:
+            cfg = call.pop('sub_config_path', None)
+            if cfg:
+                try:
+                    Path(cfg).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            sid = call.get('av_sync_id')
+            if sid:
+                for p in (av_sync.shm_path_for(sid), av_sync.substatus_path_for(sid)):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+    def _hot_update_subtitles(self, call):
+        sid = call.get('av_sync_id') if isinstance(call, dict) else None
+        cfg_path = call.get('sub_config_path') if isinstance(call, dict) else None
+        if not sid or not cfg_path:
+            return False
+        sub_path = call.get('subtitle_path')
+        enabled = bool(sub_path and Path(sub_path).is_file())
+        _write_sub_config(
+            sid,
+            enabled=enabled,
+            subtitle_path=sub_path,
+            base_sec=float(call.get('sub_base_sec') or 0.0),
+            subtitle_offset=float(call.get('subtitle_offset') or 0.0),
+            drift_sec_per_sec=float(call.get('sub_drift_sec_per_sec') or 0.0),
+            drift_anchor_sec=float(call.get('sub_drift_anchor_sec') or 0.0),
+            manual_override=bool(call.get('manual_sub_override')),
+            same_route=bool(call.get('subtitle_same_route')),
+            auto_normalize=True,
+            force_check_seq=int(call.get('_sub_force_check_seq') or 0),
+        )
+        _bump_sub_gen(sid)
+        return True
+
+    def _sync_live_sub_monitor_state(self, call):
+        """Pull live checker/normalizer updates written by av_sync/rtmp_hub back onto call state."""
+        sid = call.get('av_sync_id') if isinstance(call, dict) else None
+        if not sid:
+            return None
+        cfg, st = _read_sub_sync_snapshot(sid)
+        if cfg and not call.get('manual_sub_override') and call.get('subtitle_path'):
+            if str(cfg.get('subtitle_path') or '') == str(call.get('subtitle_path') or ''):
+                try:
+                    cfg_off = float(cfg.get('subtitle_offset') or 0.0)
+                    cfg_drift = float(cfg.get('drift_sec_per_sec') or 0.0)
+                    cfg_anchor = float(cfg.get('drift_anchor_sec') or 0.0)
+                    if abs(cfg_off - float(call.get('subtitle_offset') or 0.0)) >= 0.05:
+                        call['subtitle_offset'] = cfg_off
+                        call['auto_subtitle_offset'] = cfg_off
+                    if abs(cfg_drift - float(call.get('sub_drift_sec_per_sec') or 0.0)) >= 0.0001:
+                        call['sub_drift_sec_per_sec'] = cfg_drift
+                        call['sub_drift_anchor_sec'] = cfg_anchor
+                except Exception:
+                    pass
+        if isinstance(st, dict) and st.get('status'):
+            cur_st = call.get('subtitle_sync')
+            cur_ts = float(cur_st.get('updated_at') or 0.0) if isinstance(cur_st, dict) else 0.0
+            if float(st.get('updated_at') or 0.0) >= cur_ts:
+                call['subtitle_sync'] = st
+        return st
+
+    def _apply_probe_sub_result(self, chat, call, res, *, is_same_route=False, force_normalize=False):
+        if not isinstance(res, dict):
+            return False
+        aligned = round(max(-25.0, min(25.0, float(res.get('offset') or 0.0))), 1)
+        drift_rate = sub_align.clamp_drift_rate(res.get('drift_sec_per_sec') or 0.0)
+        drift_anchor = float(res.get('drift_anchor_sec') or 0.0)
+        drift_mpm = round(drift_rate * 60000.0, 2)
+        z_val = float(res.get('z_score') or 0.0)
+        confident = bool(res.get('confident'))
+        manual = bool(call.get('manual_sub_override')) and not force_normalize
+
+        strong_same_route_fix = bool(is_same_route and confident and abs(aligned) >= 1.1 and z_val >= 2.8 and res.get('half_consensus', True))
+        should_apply = bool(
+            confident
+            and not manual
+            and (force_normalize or not is_same_route or strong_same_route_fix)
+        )
+        applied_change = False
+        if should_apply:
+            cur_off = float(call.get('subtitle_offset') or 0.0)
+            cur_drift = float(call.get('sub_drift_sec_per_sec') or 0.0)
+            call['auto_subtitle_offset'] = aligned
+            if abs(aligned - cur_off) >= 0.4 or abs(drift_rate - cur_drift) >= 0.0005:
+                call['subtitle_offset'] = aligned
+                call['sub_drift_sec_per_sec'] = drift_rate if abs(drift_rate) >= 0.0005 else 0.0
+                call['sub_drift_anchor_sec'] = drift_anchor if abs(drift_rate) >= 0.0005 else 0.0
+                self._hot_update_subtitles(call)
+                applied_change = True
+                log.info(
+                    'Auto-normalized subtitles destination=%s offset=%+.1fs drift=%.1fms/min z=%.2f',
+                    chat,
+                    aligned,
+                    drift_mpm,
+                    z_val,
+                )
+        elif confident:
+            call['auto_subtitle_offset'] = aligned
+
+        st_label = str(res.get('status') or ('synced' if (confident and abs(aligned) < 0.45) else 'uncertain'))
+        if applied_change:
+            st_label = 'auto_normalized'
+        msg = (
+            f'Auto-normalized subtitles ({aligned:+.1f}s' + (f', {drift_mpm:+.0f}ms/min' if abs(drift_rate) >= 0.0005 else '') + ')'
+            if applied_change
+            else (
+                f'Subtitles verified in sync ({aligned:+.1f}s)'
+                if st_label == 'synced'
+                else (
+                    f'Subtitles out of sync (~{aligned:+.1f}s)'
+                    if st_label in {'desynced', 'drifted'}
+                    else (
+                        'Subtitle cut may not match audio'
+                        if st_label == 'mismatch'
+                        else 'Monitoring live speech for subtitle sync'
+                    )
+                )
+            )
+        )
+        call['subtitle_sync'] = {
+            'status': st_label,
+            'checked_at_sec': float(res.get('window_start') or 0.0),
+            'residual_sec': 0.0 if applied_change else round(aligned - float(call.get('subtitle_offset') or 0.0), 2),
+            'applied_offset_sec': float(call.get('subtitle_offset') or 0.0),
+            'suggested_offset_sec': aligned if confident else float(call.get('subtitle_offset') or 0.0),
+            'drift_ms_per_min': drift_mpm if should_apply or abs(drift_rate) >= 0.0005 else 0.0,
+            'drift_sec_per_sec': float(call.get('sub_drift_sec_per_sec') or 0.0),
+            'drift_anchor_sec': float(call.get('sub_drift_anchor_sec') or 0.0),
+            'z_score': round(z_val, 2),
+            'confident': confident,
+            'auto_normalized': applied_change or bool((call.get('subtitle_sync') or {}).get('auto_normalized')),
+            'manual_override': manual,
+            'message': msg,
+            'updated_at': round(time.time(), 3),
+        }
+        return applied_change
+
+    def _maybe_schedule_sub_align(self, _a, chat, call, *, force_normalize=False):
+        old_task = call.pop('_sub_align_task', None)
+        if old_task is not None and not old_task.done():
+            try:
+                old_task.cancel()
+            except Exception:
+                pass
+        if self.factory or not call.get('video'):
+            return
+        sub_path = call.get('subtitle_path')
+        if not sub_path or not Path(sub_path).is_file():
+            return
+        if call.get('manual_sub_override') and not force_normalize:
+            return
+        if not call.get('sub_config_path') or not call.get('av_sync_id'):
+            return
+        media_url = str(call.get('path') or '')
+        if not media_url or '.mpd' in media_url.lower():
+            return
+
+        target_pid = call.get('playback_id')
+        target_sub = sub_path
+        is_hls = bool(call.get('_is_hls_proxy'))
+        is_same_route = bool(call.get('subtitle_same_route'))
+        seek_hint = float(call.get('position_seconds') if force_normalize and call.get('position_seconds') is not None else (call.get('offset') or 0.0))
+        origin_pts = call.get('_v0_origin')
+        a_stream_idx = (call.get('_probe_info') or {}).get('audio_stream_index')
+
+        async def _align_worker():
+            try:
+                res = await asyncio.to_thread(
+                    sub_align.probe_audio_and_align,
+                    media_url,
+                    target_sub,
+                    seek_offset=seek_hint,
+                    is_hls_proxy=is_hls,
+                    same_route=is_same_route,
+                    audio_stream_index=a_stream_idx,
+                    origin_pts_sec=origin_pts,
+                )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+            if not isinstance(res, dict):
+                return
+            async with self.chat_lock(chat):
+                cur = self.calls.get(chat)
+                if (
+                    cur is not call
+                    or cur.get('playback_id') != target_pid
+                    or cur.get('subtitle_path') != target_sub
+                    or (cur.get('manual_sub_override') and not force_normalize)
+                    or cur.get('status') not in {'playing', 'paused'}
+                ):
+                    return
+                self._apply_probe_sub_result(chat, cur, res, is_same_route=is_same_route, force_normalize=force_normalize)
+
+        try:
+            call['_sub_align_task'] = asyncio.create_task(_align_worker())
+        except Exception:
+            pass
 
     async def publisher_step(self, operation, stage, timeout=8):
         try: return await asyncio.wait_for(operation, timeout)
@@ -948,7 +2102,497 @@ class Bridge:
             if attempt < 2: await asyncio.sleep(0.2)
         raise VoiceFailure('PERMISSION_DENIED', {'stage':'verification_failed','present':participant is not None,'muted':bool(getattr(participant,'muted',True)),'can_self_unmute':bool(getattr(participant,'can_self_unmute',False)),'source_present':bool(getattr(participant,'source',0))})
 
+    async def _resolve_media_sync_plan(self, call, *, base_path, offset_val, max_w, max_h, target_fps=30, video_active=True, probe_any=False):
+        """Resolve probed stream geometry, HLS seek deltas, PTS anchoring, and subtitle shift."""
+        pref_lang = call.get('preferred_audio_lang')
+        info = call.get('_probe_info')
+        if info is None and (video_active or probe_any):
+            info = (await probe_media_stream_info(base_path, preferred_lang=pref_lang)) or (await probe_video_stream_info(base_path) if video_active else None)
+            if info:
+                call['_probe_info'] = info
+        if info and info.get('duration') and not call.get('duration'):
+            try:
+                call['duration'] = float(info['duration'])
+            except Exception:
+                pass
+        is_img = info.get('is_image', False) if info else False
+        is_hls_proxy = bool(
+            call.get('remote_proxy')
+            and (
+                '.m3u8' in base_path.lower()
+                or 'hls' in str((info or {}).get('format_name') or '').lower()
+            )
+        )
+        hls_seek_url = (
+            f"{base_path}{'&' if '?' in base_path else '?'}start={offset_val:.3f}"
+            if (is_hls_proxy and offset_val > 0.05)
+            else None
+        )
+        sync_trim_start = None
+        sync_pre_seek = None
+        sync_copyts = False
+        sync_normalize_pts = False
+        sync_pts_anchor = None
+        sync_strip_first_pts_zero = True
+        call.pop('_landed_offset', None)
+        sub_shift_offset = offset_val
+
+        hls_audio_trim_start = None
+        hls_video_trim_start = None
+        base_v0_raw = info.get('video_start_time') if info else None
+        base_a0_raw = info.get('audio_start_time') if info else None
+        fmt_s0_raw = info.get('format_start_time') if info else None
+
+        pkt_v0 = call.get('_v0_origin') if '_v0_origin' in call else None
+        pkt_a0 = call.get('_a0_origin') if '_a0_origin' in call else None
+        if not is_img and (('_v0_origin' not in call and (is_hls_proxy or base_v0_raw is None)) or (is_hls_proxy and offset_val <= 0.05 and '_a0_origin' not in call)):
+            pv0, pa0 = await probe_initial_packet_pts(
+                base_path,
+                video_stream_index=info.get('stream_index') if info else None,
+                audio_stream_index=info.get('audio_stream_index') if info else None,
+            )
+            if pv0 is not None:
+                pkt_v0 = pv0
+                call['_v0_origin'] = pv0
+            elif base_v0_raw is not None and float(base_v0_raw) >= 0.0:
+                pkt_v0 = float(base_v0_raw)
+                call['_v0_origin'] = pkt_v0
+            else:
+                call['_v0_origin'] = 0.0
+                pkt_v0 = 0.0
+            if pa0 is not None:
+                pkt_a0 = pa0
+                call['_a0_origin'] = pa0
+            elif base_a0_raw is not None and float(base_a0_raw) >= 0.0:
+                pkt_a0 = float(base_a0_raw)
+                call['_a0_origin'] = pkt_a0
+
+        base_v0 = float(pkt_v0) if (pkt_v0 is not None and float(pkt_v0) >= 0.0) else (float(base_v0_raw) if (base_v0_raw is not None and float(base_v0_raw) >= 0.0) else 0.0)
+        if fmt_s0_raw is not None:
+            fmt_origin = max(0.0, float(fmt_s0_raw))
+        elif pkt_v0 is not None and pkt_a0 is not None:
+            fmt_origin = max(0.0, min(float(pkt_v0), float(pkt_a0)))
+        elif base_v0_raw is not None and base_a0_raw is not None:
+            fmt_origin = max(0.0, min(float(base_v0_raw), float(base_a0_raw)))
+        else:
+            fmt_origin = base_v0
+        call['_is_hls_proxy'] = is_hls_proxy
+
+        if is_hls_proxy and offset_val > 0.05:
+            # Loopback HLS playlist is pre-sliced to target segment via ?start=offset_val.
+            # Probe actual first packet PTS of video & audio in one parallel batch so -copyts + T_anchor
+            # aligns audio & video to the exact same timeline instant even on split/demuxed HLS playlists.
+            sync_pre_seek = 0.0
+            sync_copyts = False
+            sync_trim_start = None
+            sync_pts_anchor = None
+            sync_normalize_pts = True
+            sub_shift_offset = offset_val
+            seek_info, (v_pkt, a_pkt), (hdr_v, hdr_a) = await asyncio.gather(
+                probe_media_stream_info(hls_seek_url, preferred_lang=pref_lang),
+                probe_initial_packet_pts(
+                    hls_seek_url,
+                    video_stream_index=info.get('stream_index') if info else None,
+                    audio_stream_index=info.get('audio_stream_index') if info else None,
+                ),
+                asyncio.to_thread(sub_align._fetch_hls_skipped_hdrs, hls_seek_url),
+            )
+            if seek_info and not info:
+                info = seek_info
+                call['_probe_info'] = seek_info
+
+            same_epoch = (
+                v_pkt is not None
+                and a_pkt is not None
+                and abs(float(v_pkt) - float(a_pkt)) <= 20.0
+                and (pkt_a0 is None or pkt_v0 is None or abs(float(pkt_v0) - float(pkt_a0)) <= 5.0)
+            )
+            if same_epoch:
+                t_anchor = max(float(v_pkt), float(a_pkt))
+                movie_landed = max(0.0, t_anchor - base_v0)
+                if not (hdr_v is not None and movie_landed <= 0.1 and float(hdr_v) > 1.0):
+                    sync_copyts = True
+                    sync_trim_start = round(max(0.0, t_anchor), 3)
+                    sync_pts_anchor = sync_trim_start
+                    sync_strip_first_pts_zero = False
+                    if hdr_v is None or abs(movie_landed - offset_val) <= 30.0:
+                        sub_shift_offset = movie_landed
+                        call['_landed_offset'] = movie_landed
+                else:
+                    v_el = float(v_pkt) - base_v0
+                    a_el = float(a_pkt) - float(pkt_a0 if pkt_a0 is not None else base_v0)
+                    diff = v_el - a_el
+                    if 0.025 <= diff <= 15.0:
+                        hls_audio_trim_start = round(diff, 3)
+                    elif -15.0 <= diff <= -0.025:
+                        hls_video_trim_start = round(-diff, 3)
+                    sub_shift_offset = max(0.0, float(hdr_v))
+                    call['_landed_offset'] = sub_shift_offset
+            elif v_pkt is not None and a_pkt is not None and pkt_a0 is not None and pkt_v0 is not None:
+                v_el = max(0.0, float(v_pkt) - base_v0)
+                a_el = max(0.0, float(a_pkt) - float(pkt_a0))
+                t_rel = max(v_el, a_el)
+                if (t_rel - a_el) >= 0.025:
+                    hls_audio_trim_start = round(min(15.0, t_rel - a_el), 3)
+                if (t_rel - v_el) >= 0.025:
+                    hls_video_trim_start = round(min(15.0, t_rel - v_el), 3)
+                cand = t_rel
+                if hdr_v is not None and cand <= 0.1 and float(hdr_v) > 1.0:
+                    cand = float(hdr_v)
+                sub_shift_offset = cand
+                call['_landed_offset'] = cand
+            elif seek_info:
+                v_s = seek_info.get('video_start_time')
+                a_s = seek_info.get('audio_start_time')
+                if v_s is not None and a_s is not None:
+                    delta = float(v_s) - float(a_s)
+                    if 0.025 <= delta <= 15.0:
+                        hls_audio_trim_start = round(delta, 3)
+                        eff_t = float(v_s)
+                    elif -15.0 <= delta <= -0.025:
+                        hls_video_trim_start = round(-delta, 3)
+                        eff_t = float(a_s)
+                    else:
+                        eff_t = float(v_s)
+                    cand = max(0.0, eff_t - base_v0)
+                    if cand <= 0.1 and hdr_v is not None and abs(float(hdr_v) - offset_val) <= 25.0:
+                        if hdr_a is not None and 0.025 <= (float(hdr_v) - float(hdr_a)) <= 15.0 and hls_audio_trim_start is None:
+                            hls_audio_trim_start = round(float(hdr_v) - float(hdr_a), 3)
+                        sub_shift_offset = max(0.0, float(hdr_v))
+                        call['_landed_offset'] = sub_shift_offset
+                    elif abs(cand - offset_val) <= 25.0:
+                        sub_shift_offset = cand
+                        call['_landed_offset'] = sub_shift_offset
+                elif hdr_v is not None and abs(float(hdr_v) - offset_val) <= 25.0:
+                    if hdr_a is not None and 0.025 <= (float(hdr_v) - float(hdr_a)) <= 15.0:
+                        hls_audio_trim_start = round(float(hdr_v) - float(hdr_a), 3)
+                    sub_shift_offset = max(0.0, float(hdr_v))
+                    call['_landed_offset'] = sub_shift_offset
+            elif hdr_v is not None and abs(float(hdr_v) - offset_val) <= 25.0:
+                if hdr_a is not None and 0.025 <= (float(hdr_v) - float(hdr_a)) <= 15.0:
+                    hls_audio_trim_start = round(float(hdr_v) - float(hdr_a), 3)
+                sub_shift_offset = max(0.0, float(hdr_v))
+                call['_landed_offset'] = sub_shift_offset
+        elif is_hls_proxy and not is_img and pkt_v0 is not None and pkt_a0 is not None:
+            sync_pre_seek = 0.0
+            sync_normalize_pts = True
+            if abs(float(pkt_v0) - float(pkt_a0)) >= 0.025 and abs(float(pkt_v0) - float(pkt_a0)) <= 15.0:
+                t_anchor = max(float(pkt_v0), float(pkt_a0))
+                sync_copyts = True
+                sync_trim_start = round(max(0.0, t_anchor), 3)
+                sync_pts_anchor = sync_trim_start
+                sync_strip_first_pts_zero = False
+                sub_shift_offset = max(0.0, t_anchor - base_v0)
+        elif info is not None and not info.get('is_image', False):
+            # Anchor both FFmpeg pipelines to a single container timestamp T0 via -copyts and PTS-T0/TB
+            # while fast-seeking with input -ss so B-frames, edit lists, and delayed audio stay locked within <=1 frame.
+            target_t0 = fmt_origin + offset_val
+            v_cand = pkt_v0 if pkt_v0 is not None else base_v0_raw
+            a_cand = pkt_a0 if pkt_a0 is not None else base_a0_raw
+            if (
+                offset_val <= 0.05
+                and v_cand is not None
+                and a_cand is not None
+                and abs(float(v_cand) - float(a_cand)) > 0.025
+                and abs(max(float(v_cand), float(a_cand)) - fmt_origin) <= 15.0
+            ):
+                target_t0 = max(float(v_cand), float(a_cand))
+            sync_copyts = True
+            sync_pre_seek = offset_val if offset_val > 0.05 else 0.0
+            sync_trim_start = round(max(0.0, target_t0), 3)
+            sync_pts_anchor = sync_trim_start
+            sync_normalize_pts = True
+            sync_strip_first_pts_zero = False
+            sub_shift_offset = max(0.0, float(sync_trim_start) - fmt_origin)
+        elif offset_val > 0.05 and not (info and info.get('is_image', False)):
+            sync_pre_seek = offset_val
+            sync_copyts = False
+            sync_trim_start = None
+            sync_pts_anchor = None
+            sync_normalize_pts = True
+            sync_strip_first_pts_zero = True
+            sub_shift_offset = offset_val
+
+        is_img = info.get('is_image', False) if info else False
+        scaled = compute_target_video_size(info['width'], info['height'], max_w, max_h, adjust_by_height=True) if (info and info.get('width') and info.get('height')) else None
+        final_w, final_h = scaled if scaled else (max(2, max_w - (max_w % 2)), max(2, max_h - (max_h % 2)))
+        return {
+            'info': info,
+            'is_img': is_img,
+            'is_hls_proxy': is_hls_proxy,
+            'hls_seek_url': hls_seek_url,
+            'sync_trim_start': sync_trim_start,
+            'sync_pre_seek': sync_pre_seek,
+            'sync_copyts': sync_copyts,
+            'sync_normalize_pts': sync_normalize_pts,
+            'sync_pts_anchor': sync_pts_anchor,
+            'sync_strip_first_pts_zero': sync_strip_first_pts_zero,
+            'hls_audio_trim_start': hls_audio_trim_start,
+            'hls_video_trim_start': hls_video_trim_start,
+            'sub_shift_offset': sub_shift_offset,
+            'final_w': final_w,
+            'final_h': final_h,
+        }
+
+    async def _start_rtmp_proc(self, a, chat, call, cmd_args, *, is_standby=False):
+        """Replace active RTMP pusher process cleanly so Telegram sees one continuous publisher."""
+        await self._stop_rtmp_proc(call, wait_settle=True)
+        gen = int(call.get('rtmp_gen') or 0) + 1
+        call['rtmp_gen'] = gen
+        call['_last_rtmp_args'] = list(cmd_args)
+        call['rtmp_standby'] = bool(is_standby)
+        call['rtmp_started_at'] = time.monotonic()
+        call['last_seek_at'] = call['rtmp_started_at']
+
+        if self.factory and not getattr(self, 'spawn_rtmp_in_tests', False):
+            hook = getattr(self, 'rtmp_mock_spawn', None)
+            if callable(hook):
+                res = hook(chat, cmd_args, is_standby=is_standby)
+                if asyncio.iscoroutine(res):
+                    await res
+            call['_rtmp_proc'] = None
+            return
+
+        rtmp_target = call.get('_rtmp_target')
+        sub_env = None
+        if rtmp_target:
+            sub_env = dict(os.environ)
+            sub_env['LANCY_RTMP_TARGET'] = str(rtmp_target)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd_args,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=sub_env,
+        )
+        call['_rtmp_proc'] = proc
+
+        from collections import deque
+        err_tail = deque(maxlen=24)
+
+        async def _drain_stderr():
+            try:
+                while proc.stderr is not None:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    txt = rtmp_streamer.scrub_rtmp_secret(line.decode('utf-8', 'replace').strip(), rtmp_target)
+                    if txt:
+                        err_tail.append(txt[:240])
+            except Exception:
+                pass
+
+        async def _watch_proc():
+            try:
+                rc = await proc.wait()
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                rc = 1
+            if stderr_task is not None:
+                try:
+                    await asyncio.wait_for(stderr_task, timeout=0.5)
+                except Exception:
+                    pass
+            async with self.chat_lock(chat):
+                cur = self.calls.get(chat)
+                if cur is not call or int(cur.get('rtmp_gen') or 0) != gen:
+                    return
+                if self.closing:
+                    return
+                if rc == 0 and cur.get('status') == 'playing' and not is_standby:
+                    cur['status'] = 'ended'
+                    if self.events.full():
+                        self.events.get_nowait()
+                    self.events.put_nowait({'chat_id': chat, 'playback_id': cur.get('playback_id'), 'status': 'ended'})
+                    return
+                if cur.get('status') in {'playing', 'paused'}:
+                    if err_tail:
+                        log.warning('RTMP ffmpeg exited rc=%s chat=%s tail=%s', rc, chat, ' | '.join(err_tail))
+                    try:
+                        _, live_native = await self.native_call(a['client'], chat)
+                    except Exception:
+                        live_native = cur.get('native_call')
+                    if live_native is None:
+                        await self._close_dropped_call(a, chat, cur, reason='RTMP_CALL_ENDED', probe_time=False, emit_event=True, ignore_leave_error=True)
+                    else:
+                        cur['status'] = 'error'
+                        cur['_rtmp_target'] = None
+
+        stderr_task = asyncio.create_task(_drain_stderr())
+        watch_task = asyncio.create_task(_watch_proc())
+        call['_rtmp_stderr_task'] = stderr_task
+        call['_rtmp_watch_task'] = watch_task
+
+    async def _stream_rtmp(self, a, chat, call):
+        """Push one unified H.264 + AAC FLV stream into Telegram's native RTMPS ingest."""
+        if not call.get('_rtmp_target'):
+            peer = await asyncio.wait_for(a['client'].resolve_peer(chat), 15) if a.get('client') else None
+            if peer is None:
+                raise VoiceFailure('CALL_FAILED')
+            rtmp_target, _, _ = await self._fetch_rtmp_ingest(a, peer)
+            call['_rtmp_target'] = rtmp_target
+
+        offset_val = float(call.get('offset') or 0.0)
+        base_path = re.sub(r'[?&]start=[0-9.]+', '', str(call.get('path') or ''))
+        is_channel = bool(call.get('is_channel'))
+        has_video = bool(call.get('video'))
+        video_active = has_video or is_channel
+        default_quality = 'FHD_1080p' if video_active else 'HD_720p'
+        requested_quality = str(call.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or default_quality)
+        q_dims = {'SD_480p': (854, 480), 'HD_720p': (1280, 720), 'FHD_1080p': (1920, 1080)}.get(requested_quality, (1920, 1080) if video_active else (1280, 720))
+        plan = await self._resolve_media_sync_plan(
+            call,
+            base_path=base_path,
+            offset_val=offset_val,
+            max_w=q_dims[0],
+            max_h=q_dims[1],
+            target_fps=30,
+            video_active=video_active,
+            probe_any=True,
+        )
+        info = plan['info'] or {}
+        is_img = plan['is_img']
+        is_hls_proxy = plan['is_hls_proxy']
+        source_input = plan['hls_seek_url'] or base_path
+        src_fps = info.get('fps')
+        eff_fps = max(15.0, min(60.0, float(src_fps or 30)))
+        final_w, final_h = int(plan['final_w']), int(plan['final_h'])
+
+        # Pick bitrate tier matching actual output resolution so 720p gets high-headroom 720p and 1080p gets true crisp 1080p.
+        bitrate_quality = requested_quality
+        if requested_quality == 'FHD_1080p' and final_w <= 1280 and final_h <= 720:
+            bitrate_quality = 'HD_720p'
+
+        has_video_stream = bool(info.get('video_count', 1 if video_active else 0) > 0)
+        has_audio_stream = bool(info.get('audio_count', 1) > 0)
+        sub_raw = call.get('subtitle_path')
+        sub_user_offset = float(call.get('subtitle_offset') or 0.0)
+        sub_drift_rate = float(call.get('sub_drift_sec_per_sec') or 0.0)
+        sub_drift_anchor = float(call.get('sub_drift_anchor_sec') or 0.0)
+        sub_shift_offset = float(plan['sub_shift_offset'])
+        call['sub_base_sec'] = sub_shift_offset
+
+        eff_v_trim = plan['hls_video_trim_start'] if (plan['hls_video_trim_start'] is not None and not is_img) else (plan['sync_trim_start'] if not is_img else None)
+        eff_a_trim = plan['hls_audio_trim_start'] if (plan['hls_audio_trim_start'] is not None and not is_img) else (plan['sync_trim_start'] if not is_img else None)
+        pts_anchor = None if is_img else plan['sync_pts_anchor']
+
+        old_sub_cfg = call.pop('sub_config_path', None)
+        if old_sub_cfg:
+            try:
+                Path(old_sub_cfg).unlink(missing_ok=True)
+            except Exception:
+                pass
+        old_sid = call.get('av_sync_id')
+        if old_sid:
+            try:
+                av_sync.substatus_path_for(old_sid).unlink(missing_ok=True)
+            except Exception:
+                pass
+        call['av_sync_id'] = None
+
+        use_rtmp_hub = bool(video_active and has_video_stream and not is_img and os.path.isfile(RTMP_HUB_SCRIPT))
+        if use_rtmp_hub:
+            sync_id = uuid.uuid4().hex[:12]
+            sub_enabled = bool(sub_raw and Path(sub_raw).is_file())
+            cfg_path = _write_sub_config(
+                sync_id,
+                enabled=sub_enabled,
+                subtitle_path=sub_raw,
+                base_sec=sub_shift_offset,
+                subtitle_offset=sub_user_offset,
+                drift_sec_per_sec=sub_drift_rate,
+                drift_anchor_sec=sub_drift_anchor,
+                manual_override=bool(call.get('manual_sub_override')),
+                same_route=bool(call.get('subtitle_same_route')),
+                auto_normalize=True,
+                force_check_seq=int(call.get('_sub_force_check_seq') or 0),
+            )
+            _init_sync_state(sync_id)
+            call['av_sync_id'] = sync_id
+            call['sub_config_path'] = cfg_path
+            dec_args = rtmp_streamer.build_rtmp_decoder_args(
+                source_input,
+                has_audio_stream=has_audio_stream,
+                width=final_w,
+                height=final_h,
+                fps=eff_fps,
+                video_stream_index=info.get('stream_index'),
+                audio_stream_index=info.get('audio_stream_index'),
+                video_count=int(info.get('video_count') or 1),
+                audio_count=int(info.get('audio_count') or 1),
+                pre_seek=0.0 if is_hls_proxy else offset_val,
+                copyts=plan['sync_copyts'],
+                video_trim_start=eff_v_trim,
+                audio_trim_start=eff_a_trim,
+                pts_anchor=pts_anchor,
+                eq=call.get('eq') or 'off',
+                bass=bool(call.get('bass')),
+                volume=call.get('volume', 100),
+                is_hls_proxy=is_hls_proxy,
+                realtime=True,
+            )
+            cmd_args = [
+                sys.executable,
+                RTMP_HUB_SCRIPT,
+                '--sync-id', sync_id,
+                '--width', str(final_w),
+                '--height', str(final_h),
+                '--fps', f'{eff_fps:.3f}',
+                '--video-quality', bitrate_quality,
+                '--sub-config', cfg_path,
+                '--rtmp-env', 'LANCY_RTMP_TARGET',
+                *(['--no-audio-eof'] if not has_audio_stream else []),
+                '--',
+                *dec_args,
+            ]
+        else:
+            active_sub = (
+                self.shift_subtitle(
+                    sub_raw,
+                    sub_shift_offset,
+                    call.get('playback_id'),
+                    subtitle_offset=sub_user_offset,
+                    drift_sec_per_sec=sub_drift_rate,
+                    drift_anchor_sec=sub_drift_anchor,
+                )
+                if (sub_raw and Path(sub_raw).is_file())
+                else None
+            )
+            cmd_args = rtmp_streamer.build_rtmp_ffmpeg_args(
+                source_input,
+                call['_rtmp_target'],
+                video=video_active,
+                has_video_stream=has_video_stream,
+                has_audio_stream=has_audio_stream,
+                is_image=is_img,
+                width=final_w,
+                height=final_h,
+                fps=eff_fps,
+                video_quality=bitrate_quality,
+                video_stream_index=info.get('stream_index'),
+                audio_stream_index=info.get('audio_stream_index'),
+                video_count=int(info.get('video_count') or 1),
+                audio_count=int(info.get('audio_count') or 1),
+                subtitle_path=active_sub,
+                pre_seek=0.0 if is_hls_proxy else offset_val,
+                copyts=plan['sync_copyts'] if not is_img else False,
+                video_trim_start=eff_v_trim,
+                audio_trim_start=eff_a_trim,
+                pts_anchor=pts_anchor,
+                eq=call.get('eq') or 'off',
+                bass=bool(call.get('bass')),
+                volume=call.get('volume', 100),
+                is_hls_proxy=is_hls_proxy,
+            )
+        call['publisher_verified'] = True
+        call['publisher_muted'] = False
+        await self._start_rtmp_proc(a, chat, call, cmd_args, is_standby=False)
+
     async def stream(self, a, chat, call):
+        if call.get('stream_mode') == 'rtmp':
+            return await self._stream_rtmp(a, chat, call)
+
         from pytgcalls.types import MediaStream, AudioQuality, VideoQuality, GroupCallConfig
         try:
             from pytgcalls.types.raw import Stream, VideoParameters
@@ -956,7 +2600,22 @@ class Bridge:
             Stream = None
             VideoParameters = None
 
-        ff = f'-ss {call["offset"]:.3f}' if call['offset'] else ''
+        offset_val = float(call.get('offset') or 0.0)
+        base_path = re.sub(r'[?&]start=[0-9.]+', '', str(call.get('path') or ''))
+        cached_info = call.get('_probe_info')
+        known_hls_proxy = bool(
+            call.get('remote_proxy')
+            and (
+                '.m3u8' in base_path.lower()
+                or 'hls' in str((cached_info or {}).get('format_name') or '').lower()
+            )
+        )
+        effective_path = (
+            f"{base_path}{'&' if '?' in base_path else '?'}start={offset_val:.3f}"
+            if (known_hls_proxy and offset_val > 0.05)
+            else base_path
+        )
+        ff = f'-ss {offset_val:.3f}' if (offset_val > 0.05 and not known_hls_proxy) else ''
         is_channel = bool(call.get('is_channel'))
         has_video = bool(call.get('video'))
         video_active = has_video or is_channel
@@ -996,47 +2655,35 @@ class Bridge:
         if video_active:
             ff += ' --video ---mid -sws_flags lanczos'
 
-        stream = MediaStream(call['path'], audio_parameters=AudioQuality.HIGH, video_parameters=video_params, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
+        stream = MediaStream(effective_path, audio_parameters=AudioQuality.HIGH, video_parameters=video_params, audio_flags=MediaStream.Flags.REQUIRED, video_flags=video_flags, ffmpeg_parameters=ff or None)
         play_stream = stream
         if Stream is not None and callable(getattr(stream, 'check_stream', None)):
             await stream.check_stream()
-            info = (await probe_media_stream_info(call['path'])) or (await probe_video_stream_info(call['path'])) if video_active else None
-            sync_trim_start = None
-            sync_pre_seek = None
-            sync_copyts = False
-            sync_normalize_pts = False
-            offset_val = float(call.get('offset') or 0.0)
-            sub_user_offset = float(call.get('subtitle_offset') or 0.0)
-            sub_shift_offset = offset_val
             target_fps = 30
             if getattr(stream, 'camera', None) is not None:
                 target_fps = int(getattr(stream.camera.parameters, 'frame_rate', 30) or 30)
-
-            if video_active and info and not info.get('is_image', False):
-                v_start = info.get('video_start_time')
-                a_start = info.get('audio_start_time')
-                if v_start is not None or a_start is not None:
-                    if v_start is not None and a_start is not None and abs(v_start - a_start) <= 15.0:
-                        common_start = max(v_start, a_start)
-                    else:
-                        common_start = v_start if v_start is not None else a_start
-                    drift = abs((v_start or 0.0) - (a_start or 0.0)) if (v_start is not None and a_start is not None) else 0.0
-                    sync_normalize_pts = True
-                    if offset_val > 0.05 or drift >= 0.025:
-                        sync_copyts = True
-                        sync_trim_start = float(common_start) + offset_val
-                        sync_pre_seek = max(0.0, offset_val - 8.0) if offset_val > 8.5 else 0.0
-                        if v_start is not None:
-                            sub_shift_offset = max(0.0, sync_trim_start - float(v_start))
-
-            if offset_val > 0.05 and sync_trim_start is None and not (info and info.get('is_image', False)):
-                fallback_start = (await probe_seek_first_pts(call['path'], 0.0)) if video_active else 0.0
-                base_start = float(fallback_start) if fallback_start is not None else 0.0
-                sync_copyts = True
-                sync_trim_start = base_start + offset_val
-                sync_pre_seek = max(0.0, offset_val - 8.0) if offset_val > 8.5 else 0.0
-                sync_normalize_pts = True
-                sub_shift_offset = offset_val
+            plan = await self._resolve_media_sync_plan(
+                call,
+                base_path=base_path,
+                offset_val=offset_val,
+                max_w=max_w,
+                max_h=max_h,
+                target_fps=target_fps,
+                video_active=video_active,
+            )
+            info = plan['info']
+            is_hls_proxy = plan['is_hls_proxy']
+            hls_seek_url = plan['hls_seek_url']
+            sync_trim_start = plan['sync_trim_start']
+            sync_pre_seek = plan['sync_pre_seek']
+            sync_copyts = plan['sync_copyts']
+            sync_normalize_pts = plan['sync_normalize_pts']
+            sync_pts_anchor = plan['sync_pts_anchor']
+            sync_strip_first_pts_zero = plan['sync_strip_first_pts_zero']
+            hls_audio_trim_start = plan['hls_audio_trim_start']
+            hls_video_trim_start = plan['hls_video_trim_start']
+            sub_shift_offset = plan['sub_shift_offset']
+            sub_user_offset = float(call.get('subtitle_offset') or 0.0)
 
             if getattr(stream, 'microphone', None) is not None and getattr(stream.microphone, 'path', None):
                 if video_active and not (info and info.get('is_image', False)):
@@ -1046,33 +2693,65 @@ class Bridge:
                         audio_count=info.get('audio_count', 1) if info else 1,
                         pre_seek=sync_pre_seek,
                         copyts=sync_copyts,
-                        trim_start=sync_trim_start,
+                        trim_start=hls_audio_trim_start if hls_audio_trim_start is not None else sync_trim_start,
                         normalize_pts=sync_normalize_pts or bool(sync_copyts),
-                        strip_first_pts_zero=True,
+                        pts_anchor=sync_pts_anchor,
+                        strip_first_pts_zero=sync_strip_first_pts_zero,
+                        input_url=hls_seek_url,
                     )
                 elif offset_val > 0.05:
                     stream.microphone.path = rewrite_audio_ffmpeg_command(
                         stream.microphone.path,
-                        pre_seek=offset_val,
+                        pre_seek=0.0 if is_hls_proxy else offset_val,
                         normalize_pts=True,
+                        input_url=hls_seek_url,
                     )
                 elif call.get('remote_proxy') or '-reconnect_at_eof' in str(stream.microphone.path):
                     stream.microphone.path = strip_reconnect_at_eof(stream.microphone.path)
 
             if video_active and getattr(stream, 'camera', None) is not None:
-                scaled = compute_target_video_size(info['width'], info['height'], max_w, max_h, adjust_by_height=True) if info else None
                 cam_w = int(getattr(stream.camera.parameters, 'width', max_w) or max_w)
                 cam_h = int(getattr(stream.camera.parameters, 'height', max_h) or max_h)
-                final_w, final_h = scaled if scaled else (max(2, cam_w - (cam_w % 2)), max(2, cam_h - (cam_h % 2)))
+                final_w, final_h = (plan['final_w'], plan['final_h']) if info else (max(2, cam_w - (cam_w % 2)), max(2, cam_h - (cam_h % 2)))
                 stream.camera.parameters.width = final_w
                 stream.camera.parameters.height = final_h
                 sub_raw = call.get('subtitle_path')
+                is_img = plan['is_img']
+                has_paired_av = bool(
+                    getattr(stream, 'microphone', None) is not None
+                    and getattr(stream.microphone, 'path', None)
+                    and not is_img
+                    and os.path.isfile(AV_SYNC_SCRIPT)
+                )
+                old_sub_cfg = call.pop('sub_config_path', None)
+                if old_sub_cfg:
+                    try:
+                        Path(old_sub_cfg).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                old_sid = call.get('av_sync_id')
+                if old_sid:
+                    try:
+                        av_sync.substatus_path_for(old_sid).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                call['av_sync_id'] = None
+                sub_drift_rate = float(call.get('sub_drift_sec_per_sec') or 0.0)
+                sub_drift_anchor = float(call.get('sub_drift_anchor_sec') or 0.0)
                 active_sub = (
-                    self.shift_subtitle(sub_raw, sub_shift_offset, call.get('playback_id'), subtitle_offset=sub_user_offset)
-                    if (sub_raw and Path(sub_raw).is_file())
+                    self.shift_subtitle(
+                        sub_raw,
+                        sub_shift_offset,
+                        call.get('playback_id'),
+                        subtitle_offset=sub_user_offset,
+                        drift_sec_per_sec=sub_drift_rate,
+                        drift_anchor_sec=sub_drift_anchor,
+                    )
+                    if (not has_paired_av and sub_raw and Path(sub_raw).is_file())
                     else None
                 )
-                is_img = info.get('is_image', False) if info else False
+                eff_video_trim = hls_video_trim_start if (hls_video_trim_start is not None and not is_img) else (sync_trim_start if not is_img else None)
+                eff_video_anchor = None if is_img else sync_pts_anchor
                 stream.camera.path = rewrite_video_ffmpeg_command(
                     stream.camera.path,
                     final_w,
@@ -1082,18 +2761,77 @@ class Bridge:
                     video_count=info.get('video_count', 1) if info else 1,
                     is_image=is_img,
                     fps=target_fps if not is_img else None,
-                    trim_start=sync_trim_start if not is_img else None,
+                    trim_start=eff_video_trim,
                     normalize_pts=(sync_normalize_pts or not is_img),
+                    pts_anchor=eff_video_anchor,
                     pre_seek=sync_pre_seek if not is_img else None,
                     copyts=sync_copyts if not is_img else False,
+                    input_url=hls_seek_url if not is_img else None,
                 )
+                if getattr(stream, 'microphone', None) is not None and getattr(stream.microphone, 'path', None) and getattr(stream.camera, 'path', None):
+                    pair_id = f"{call.get('playback_id') or abs(int(chat))}-{uuid.uuid4().hex[:8]}"
+                    sid = re.sub(r'[^a-zA-Z0-9_-]', '_', pair_id)[:64]
+                    sub_cfg_path = None
+                    if not is_img and os.path.isfile(AV_SYNC_SCRIPT):
+                        sub_cfg_path = _write_sub_config(
+                            sid,
+                            enabled=bool(sub_raw and Path(sub_raw).is_file()),
+                            subtitle_path=sub_raw,
+                            base_sec=sub_shift_offset,
+                            subtitle_offset=sub_user_offset,
+                            drift_sec_per_sec=sub_drift_rate,
+                            drift_anchor_sec=sub_drift_anchor,
+                            manual_override=bool(call.get('manual_sub_override')),
+                            same_route=bool(call.get('subtitle_same_route')),
+                            auto_normalize=True,
+                            force_check_seq=int(call.get('_sub_force_check_seq') or 0),
+                        )
+                        call['av_sync_id'] = sid
+                        call['sub_config_path'] = sub_cfg_path
+                        call['sub_base_sec'] = float(sub_shift_offset)
+
+                    wrap_a_in = stream.microphone.path
+                    wrap_v_in = stream.camera.path
+                    is_real_engine = (not self.factory) and type(a.get('engine')).__module__.startswith('pytgcalls')
+                    if (is_real_engine or getattr(self, 'use_av_hub_in_tests', False)) and not is_img and os.path.isfile(AV_HUB_SCRIPT):
+                        unified_cmd = build_unified_av_ffmpeg_command(wrap_a_in, wrap_v_in, output_format='nut')
+                        if unified_cmd:
+                            self._cleanup_hub(call)
+                            hub_proc = await asyncio.create_subprocess_exec(
+                                sys.executable, AV_HUB_SCRIPT, '--role', 'hub', '--sync-id', sid, '--',
+                                *shlex.split(unified_cmd),
+                                stdin=asyncio.subprocess.DEVNULL,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            call['_hub_proc'] = hub_proc
+                            call['_hub_sync_id'] = sid
+                            wrap_a_in = f"python3 {shlex.quote(AV_HUB_SCRIPT)} --role read-audio --sync-id {shlex.quote(sid)}"
+                            wrap_v_in = f"python3 {shlex.quote(AV_HUB_SCRIPT)} --role read-video --sync-id {shlex.quote(sid)}"
+
+                    stream.microphone.path, stream.camera.path = wrap_av_sync_pair(
+                        wrap_a_in,
+                        wrap_v_in,
+                        frame_bytes=final_w * final_h * 3 // 2,
+                        fps=target_fps if not is_img else 30,
+                        sync_id=sid,
+                        width=final_w if sub_cfg_path else 0,
+                        height=final_h if sub_cfg_path else 0,
+                        sub_config_path=sub_cfg_path,
+                    )
             play_stream = Stream(
                 microphone=getattr(stream, 'microphone', None),
                 speaker=getattr(stream, 'speaker', None),
                 camera=getattr(stream, 'camera', None),
                 screen=getattr(stream, 'screen', None),
             )
+        call['last_seek_at'] = time.monotonic()
         await asyncio.wait_for(a['engine'].play(chat, play_stream, config=GroupCallConfig(auto_start=False)), 25)
+        try:
+            t_after = float(await asyncio.wait_for(a['engine'].time(chat), 1.5))
+            call['engine_time_base'] = t_after if t_after >= 0.5 else 0.0
+        except Exception:
+            call['engine_time_base'] = 0.0
         if call.get('status') != 'paused':
             try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 15)
             except VoiceFailure: raise
@@ -1186,6 +2924,21 @@ class Bridge:
         if not await asyncio.wait_for(hydrate(), 25):
             raise VoiceFailure('PERMISSION_DENIED')
 
+    async def _call_elapsed_seconds(self, engine, chat, call, *, timeout=3.0):
+        if call.get('stream_mode') == 'rtmp':
+            if call.get('status') in {'playing', 'paused'} and not call.get('rtmp_standby'):
+                sid = call.get('av_sync_id')
+                if sid:
+                    metrics = _read_sync_metrics(sid)
+                    if metrics and int(metrics.get('video_state') or 0) != 0:
+                        return max(0.0, float(metrics.get('media_pts_sec') or 0.0))
+            if call.get('status') == 'playing' and not call.get('rtmp_standby'):
+                return max(0.0, time.monotonic() - float(call.get('rtmp_started_at') or time.monotonic()))
+            return 0.0
+        raw_elapsed = float(await asyncio.wait_for(engine.time(chat), timeout))
+        base_t = float(call.get('engine_time_base') or 0.0)
+        return max(0.0, raw_elapsed - base_t) if raw_elapsed >= base_t else raw_elapsed
+
     async def play(self, data):
         chat = int(data['chat_id'])
         if chat >= 0 or self.closing: raise VoiceFailure('INVALID_REQUEST')
@@ -1194,15 +2947,26 @@ class Bridge:
             sub_path = self.source_subtitle(data.get('subtitle_path'))
             a = await self.lease(chat, data.get('account_alias'))
             previous = self.calls.get(chat)
-            if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status']}
+            if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status'], 'stream_mode': previous.get('stream_mode', 'interactive')}
+            req_mode = str(data.get('stream_mode') or '').strip().lower()
+            stream_mode = req_mode if req_mode in {'interactive', 'rtmp'} else (previous.get('stream_mode', 'interactive') if previous else 'interactive')
+            wants_rtmp = stream_mode == 'rtmp'
             call_duration = float(data.get('duration_seconds') or 0)
             start_sec = max(0.0, float(data.get('start_seconds') or 0.0))
             if call_duration > 0 and start_sec >= call_duration:
                 start_sec = max(0.0, call_duration - 2.0)
             vc_title = str(data.get('vc_title') or data.get('title') or '').strip()[:64]
             sub_offset = float(data.get('subtitle_offset') or 0.0)
+            sub_same_route = bool(data.get('subtitle_same_route'))
+            pref_audio_lang = _norm_lang(data.get('preferred_audio_lang') or data.get('original_language'))
             created_with_title = False
-            call = {'alias': a['alias'], 'path': path, 'subtitle_path': sub_path, 'subtitle_offset': sub_offset, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'remote_proxy': bool(data.get('remote_proxy')), 'duration': call_duration, 'offset': start_sec, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': start_sec if start_sec > 0 else None, 'last_known_position': start_sec, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic(), 'vc_title': vc_title}
+            if previous:
+                if previous.get('stream_mode') == 'rtmp':
+                    await self._stop_rtmp_proc(previous, wait_settle=(stream_mode != 'rtmp'))
+                self._cleanup_sub_overlay(previous)
+            call = {'alias': a['alias'], 'path': path, 'stream_mode': stream_mode, 'preferred_audio_lang': pref_audio_lang, 'reject_dub': bool(data.get('reject_dub')), 'subtitle_path': sub_path, 'subtitle_offset': sub_offset, 'subtitle_same_route': sub_same_route, 'manual_sub_override': abs(sub_offset) >= 0.05, 'auto_subtitle_offset': None, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if call.get('bass') else 'off')) if False else str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'remote_proxy': bool(data.get('remote_proxy')), 'duration': call_duration, 'offset': start_sec, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': start_sec if start_sec > 0 else None, 'last_known_position': start_sec, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic(), 'vc_title': vc_title}
+            if previous and previous.get('stream_mode') == 'rtmp' and stream_mode == 'rtmp' and previous.get('_rtmp_target'):
+                call['_rtmp_target'] = previous['_rtmp_target']
             if data.get('volume') is not None:
                 call['volume'] = int(data['volume'])
             elif previous and 'volume' in previous:
@@ -1217,41 +2981,53 @@ class Bridge:
                     not getattr(self, 'auto_create_call_in_tests', False)
                     and previous is not None
                     and previous.get('alias') == a['alias']
-                    and previous.get('status') in {'playing', 'paused', 'buffering'}
+                    and previous.get('stream_mode', 'interactive') == stream_mode
+                    and previous.get('status') in {'playing', 'paused', 'buffering', 'idle'}
                     and previous.get('native_call') is not None
                 )
                 if can_reuse_call:
                     call['native_call'] = previous['native_call']
-                elif not self.factory or getattr(self, 'auto_create_call_in_tests', False):
+                elif not self.factory or getattr(self, 'auto_create_call_in_tests', False) or wants_rtmp:
                     await self.resolve_destination(a['client'], chat)
                     try: peer, native = await self.native_call(a['client'], chat)
                     except Exception: peer, native = None, None
+                    if native is not None and (req_mode in {'interactive', 'rtmp'} or previous is None or previous.get('stream_mode') != stream_mode):
+                        existing_is_rtmp = await self._get_group_call_is_rtmp(a, native)
+                        if existing_is_rtmp is not None and existing_is_rtmp != wants_rtmp:
+                            if not self.factory:
+                                clear_engine_cache(a['engine'], chat)
+                                try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
+                                except Exception: pass
+                            await self._discard_group_call(a, native)
+                            if not self.factory:
+                                await asyncio.sleep(0.6)
+                                try:
+                                    _, chk_native = await self.native_call(a['client'], chat)
+                                    if chk_native is not None:
+                                        await self._discard_group_call(a, chk_native)
+                                        await asyncio.sleep(0.4)
+                                except Exception:
+                                    pass
+                            native = None
                     prev_id = getattr(previous.get('native_call'), 'id', None) if previous else None
                     curr_id = getattr(native, 'id', None) if native else None
                     need_reset = (not self.factory and previous is None) or native is None or (prev_id is not None and curr_id != prev_id)
-                    if need_reset:
+                    if need_reset and not wants_rtmp:
                         clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                         except Exception: pass
                     if peer is not None and native is None:
-                        from pyrogram import raw
-                        try:
-                            await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title=vc_title or 'Lancy music'), sleep_threshold=10), 15)
-                            created_with_title = bool(vc_title)
-                            for _ in range(6):
-                                await asyncio.sleep(0.3)
-                                _, native = await self.native_call(a['client'], chat)
-                                if native is not None: break
-                        except Exception as create_err:
-                            if type(create_err).__name__ in {'ChatAdminRequired', 'ChannelPrivate', 'ChatWriteForbidden'}:
-                                raise VoiceFailure('PERMISSION_DENIED') from None
-                            if type(create_err).__name__ == 'FloodWait' and getattr(create_err, 'value', 0) <= 10:
-                                await asyncio.sleep(getattr(create_err, 'value', 1))
-                                _, native = await self.native_call(a['client'], chat)
+                        native = await self._create_group_call(a, chat, peer, vc_title=vc_title, rtmp_stream=wants_rtmp)
+                        created_with_title = bool(vc_title and native is not None)
                     if native is not None:
                         call['native_call'] = native
+                        if wants_rtmp and not call.get('_rtmp_target') and peer is not None and (not self.factory or getattr(self, 'test_rtmp_ingest', False)):
+                            rtmp_target, _, _ = await self._fetch_rtmp_ingest(a, peer)
+                            call['_rtmp_target'] = rtmp_target
+                        elif wants_rtmp and self.factory and not call.get('_rtmp_target'):
+                            call['_rtmp_target'] = 'rtmps://mock-tg-rtmp.local/live/mock-key'
                         bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
-                        if bind and hasattr(bind, '_cache'):
+                        if not wants_rtmp and bind and hasattr(bind, '_cache'):
                             try:
                                 bind._cache.drop_cache(chat)
                                 bind._cache.set_cache(chat, native)
@@ -1261,22 +3037,17 @@ class Bridge:
                 try:
                     await self.stream(a, chat, call)
                 except Exception as stream_err:
-                    if (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) in {'NO_ACTIVE_CALL', 'CALL_FAILED', 'PUBLISHER_UNVERIFIED'}:
+                    if (not wants_rtmp) and (not self.factory or getattr(self, 'auto_create_call_in_tests', False)) and classify(stream_err) in {'NO_ACTIVE_CALL', 'CALL_FAILED', 'PUBLISHER_UNVERIFIED'}:
                         clear_engine_cache(a['engine'], chat)
                         try: await asyncio.wait_for(a['engine'].leave_call(chat), 5)
                         except Exception: pass
                         try: await self.resolve_destination(a['client'], chat)
                         except Exception: pass
                         peer, native = await self.native_call(a['client'], chat)
-                        if native is None:
-                            from pyrogram import raw
+                        if native is None and peer is not None:
                             try:
-                                await asyncio.wait_for(a['client'].invoke(raw.functions.phone.CreateGroupCall(peer=peer, random_id=secrets.randbits(31), title=vc_title or 'Lancy music'), sleep_threshold=10), 15)
-                                created_with_title = bool(vc_title)
-                                for _ in range(6):
-                                    await asyncio.sleep(0.3)
-                                    _, native = await self.native_call(a['client'], chat)
-                                    if native is not None: break
+                                native = await self._create_group_call(a, chat, peer, vc_title=vc_title, rtmp_stream=False)
+                                created_with_title = bool(vc_title and native is not None)
                             except Exception: pass
                         if native is not None:
                             bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
@@ -1296,18 +3067,43 @@ class Bridge:
                         raise stream_err
                 if vc_title and not created_with_title:
                     await self.set_group_call_title(a, call.get('native_call'), vc_title)
+                if call.get('native_call') is not None and (not self.factory or getattr(self, 'test_call_settings', False) or data.get('messages_enabled') is not None):
+                    msg_pref = data.get('messages_enabled')
+                    await self.ensure_call_settings(a, chat, call, messages_enabled=(True if msg_pref is None else bool(msg_pref)))
                 call_invite_link = await self.resolve_call_invite_link(a, call.get('native_call'))
                 if call_invite_link:
                     call['call_invite_link'] = call_invite_link
                 self.prune_shifted_subtitles(active_playback_id=call['playback_id'])
+                landed_pos = float(call.get('_landed_offset')) if call.get('_landed_offset') is not None else start_sec
+                if call.get('_landed_offset') is not None:
+                    call['offset'] = landed_pos
+                    if landed_pos > 0:
+                        call['position_seconds'] = landed_pos
+                        call['last_known_position'] = landed_pos
                 call['status'] = 'playing'; self.calls[chat] = call; self.last_failures.pop(chat, None); self.last_ended_positions.pop(chat, None)
-                return {'ok': True, 'account_alias': a['alias'], 'status': 'playing', 'position_seconds': start_sec, 'call_invite_link': call.get('call_invite_link')}
+                self._maybe_schedule_sub_align(a, chat, call)
+                probe_meta = call.get('_probe_info') or {}
+                return {
+                    'ok': True,
+                    'account_alias': a['alias'],
+                    'status': 'playing',
+                    'position_seconds': landed_pos,
+                    'call_invite_link': call.get('call_invite_link'),
+                    'stream_mode': stream_mode,
+                    'messages_enabled': call.get('messages_enabled'),
+                    'audio_language': probe_meta.get('audio_language'),
+                    'audio_is_dub': bool(probe_meta.get('audio_is_dub')),
+                }
             except Exception as error:
+                if call.get('stream_mode') == 'rtmp':
+                    await self._stop_rtmp_proc(call, wait_settle=False)
+                self._cleanup_sub_overlay(call)
                 self.remember_failure(chat, error)
                 # A failed replacement can leave native media partially changed. Retain lease
                 # until this chat's leave is confirmed; sibling calls remain independent.
                 try:
-                    await asyncio.wait_for(a['engine'].leave_call(chat), 15)
+                    if call.get('stream_mode') != 'rtmp':
+                        await asyncio.wait_for(a['engine'].leave_call(chat), 15)
                     self.calls.pop(chat, None); self.release_destination(a, chat)
                 except Exception:
                     call['status'] = 'error'; self.calls[chat] = call
@@ -1327,43 +3123,102 @@ class Bridge:
                     return {'ok': True, 'status': 'stopped'}
                 raise VoiceFailure('NO_ACTIVE_CALL')
             a = self.accounts[call['alias']]; engine = a['engine']
+            is_rtmp = call.get('stream_mode') == 'rtmp'
+            hot_paused = False
+            hot_resumed = False
             if op == 'stop':
+                if is_rtmp:
+                    await self._stop_rtmp_proc(call, wait_settle=False)
+                self._cleanup_sub_overlay(call)
                 clear_engine_cache(engine, chat)
-                try: await asyncio.wait_for(engine.leave_call(chat), 15)
-                except Exception as e:
-                    if classify(e) != 'NO_ACTIVE_CALL': raise
+                if is_rtmp:
+                    if not self.factory or getattr(self, 'auto_create_call_in_tests', False):
+                        await self._discard_group_call(a, call.get('native_call'))
+                else:
+                    try: await asyncio.wait_for(engine.leave_call(chat), 15)
+                    except Exception as e:
+                        if classify(e) != 'NO_ACTIVE_CALL': raise
                 if data.get('leave_membership'): await self.leave_membership(a, chat)
                 self.calls.pop(chat, None); self.prepared.pop(chat, None); self.last_ended_positions.pop(chat, None); self.release_destination(a, chat); a.get('group_grants', set()).discard(chat)
                 return {'ok': True, 'status': 'stopped'}
             if op == 'idle':
-                # Empty raw stream replaces FFmpeg sources without leaving the call.
-                from pytgcalls.types.raw.stream import Stream
-                from pytgcalls.types import GroupCallConfig
-                await asyncio.wait_for(engine.play(chat, Stream(), config=GroupCallConfig(auto_start=False)), 10)
-                call['status'] = 'idle'; call['playback_id'] = None; call['position_seconds'] = None
+                self._cleanup_sub_overlay(call)
+                if is_rtmp:
+                    call['status'] = 'idle'; call['playback_id'] = None; call['position_seconds'] = None
+                    if call.get('_rtmp_target'):
+                        await self._start_rtmp_proc(a, chat, call, rtmp_streamer.build_rtmp_standby_args(call['_rtmp_target']), is_standby=True)
+                else:
+                    # Empty raw stream replaces FFmpeg sources without leaving the call.
+                    from pytgcalls.types.raw.stream import Stream
+                    from pytgcalls.types import GroupCallConfig
+                    await asyncio.wait_for(engine.play(chat, Stream(), config=GroupCallConfig(auto_start=False)), 10)
+                    call['status'] = 'idle'; call['playback_id'] = None; call['position_seconds'] = None
             elif op in {'pause', 'resume'}:
+                rtmp_proc = call.get('_rtmp_proc')
+                rtmp_hub_live = bool(is_rtmp and call.get('av_sync_id') and not call.get('rtmp_standby') and (
+                    (self.factory and getattr(self, 'rtmp_mock_spawn', None) is not None)
+                    or (self.factory and call.get('_rtmp_proc') is None and call.get('av_sync_id'))
+                    or (rtmp_proc is not None and rtmp_proc.returncode is None)
+                ))
                 if op == 'pause' and call.get('status') == 'playing':
                     try:
-                        elapsed = float(await asyncio.wait_for(engine.time(chat), 2))
+                        elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=2.0)
                         paused_pos = max(0.0, float(call.get('offset') or 0.0) + elapsed)
                         if call.get('duration'):
                             paused_pos = min(paused_pos, max(0.0, float(call['duration']) - 1.0))
                         call['last_known_position'] = max(float(call.get('last_known_position') or 0.0), paused_pos)
                         call['position_seconds'] = call['last_known_position']
+                        if is_rtmp and not rtmp_hub_live:
+                            call['offset'] = call['last_known_position']
                     except Exception:
                         pass
-                await asyncio.wait_for(getattr(engine, op)(chat), 10)
-                if op == 'resume':
-                    try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
-                    except Exception:
-                        try: await asyncio.wait_for(engine.pause(chat), 8)
-                        except Exception: pass
-                        raise
+                if is_rtmp:
+                    if op == 'pause':
+                        call['status'] = 'paused'
+                        if rtmp_hub_live:
+                            _set_sync_paused(call.get('av_sync_id'), True)
+                            hot_paused = True
+                        elif call.get('_rtmp_target'):
+                            await self._start_rtmp_proc(a, chat, call, rtmp_streamer.build_rtmp_standby_args(call['_rtmp_target']), is_standby=True)
+                    else:
+                        call['status'] = 'playing'
+                        if rtmp_hub_live:
+                            _set_sync_paused(call.get('av_sync_id'), False)
+                            hot_resumed = True
+                        else:
+                            call['offset'] = float(call.get('last_known_position') or call.get('offset') or 0.0)
+                            await self._stream_rtmp(a, chat, call)
+                else:
+                    if call.get('av_sync_id'):
+                        if op == 'pause':
+                            _mutate_sync_state(call.get('av_sync_id'), lambda st: setattr(st, 'sync_flags', int(st.sync_flags) | 4))
+                            if not self.factory:
+                                await asyncio.sleep(0.08)
+                        _set_sync_paused(call.get('av_sync_id'), op == 'pause')
+                    await asyncio.wait_for(getattr(engine, op)(chat), 10)
+                    if op == 'resume':
+                        try: await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
+                        except Exception:
+                            try: await asyncio.wait_for(engine.pause(chat), 8)
+                            except Exception: pass
+                            if call.get('av_sync_id'):
+                                _set_sync_paused(call.get('av_sync_id'), True)
+                            raise
                 call['status'] = 'paused' if op == 'pause' else 'playing'; call['last_progress'] = time.monotonic()
             elif op == 'volume':
                 volume = int(data['volume'])
                 if not 0 <= volume <= 200: raise VoiceFailure('INVALID_REQUEST')
-                if self.factory:
+                if is_rtmp:
+                    prev_vol = call.get('volume', 100)
+                    call['volume'] = volume
+                    if call.get('status') == 'playing' and prev_vol != volume:
+                        elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=2.0)
+                        new_offset = min(max(0.0, call.get('offset', 0.0) + elapsed), max(0.0, (call.get('duration') or 0.0) - 1.0)) if call.get('duration') else max(0.0, call.get('offset', 0.0) + elapsed)
+                        call['offset'] = new_offset
+                        await self._stream_rtmp(a, chat, call)
+                        call['position_seconds'] = new_offset
+                        call['last_progress'] = time.monotonic()
+                elif self.factory:
                     await asyncio.wait_for(engine.change_volume_call(chat, volume), 10)
                     call['volume'] = volume
                 else:
@@ -1409,7 +3264,7 @@ class Bridge:
                             pass
                     if not mtproto_ok and call.get('status') in {'playing', 'paused'} and prev_vol != volume:
                         try:
-                            elapsed = float(await asyncio.wait_for(engine.time(chat), 3))
+                            elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=3.0)
                         except Exception:
                             elapsed = 0.0
                         new_offset = min(max(0.0, call.get('offset', 0.0) + elapsed), max(0.0, (call.get('duration') or 0.0) - 1.0)) if call.get('duration') else max(0.0, call.get('offset', 0.0) + elapsed)
@@ -1429,9 +3284,47 @@ class Bridge:
                 sub_offset = float(data.get('subtitle_offset')) if data.get('subtitle_offset') is not None else float(call.get('subtitle_offset') or 0.0)
                 old_sub = call.get('subtitle_path')
                 old_sub_offset = float(call.get('subtitle_offset') or 0.0)
-                if (sub_path != old_sub or abs(sub_offset - old_sub_offset) >= 0.005) and call.get('status') in {'playing', 'paused'}:
+                manual_flag = data.get('subtitle_manual_override')
+                if manual_flag is not None:
+                    call['manual_sub_override'] = bool(manual_flag)
+                elif data.get('subtitle_offset') is not None and abs(sub_offset - old_sub_offset) >= 0.005:
+                    call['manual_sub_override'] = True
+                if data.get('subtitle_same_route') is not None:
+                    call['subtitle_same_route'] = bool(data.get('subtitle_same_route'))
+                sub_swapped = (sub_path != old_sub)
+                changed = (sub_swapped or abs(sub_offset - old_sub_offset) >= 0.005)
+                if sub_swapped:
+                    call['auto_subtitle_offset'] = None
+                    call['sub_drift_sec_per_sec'] = 0.0
+                    call['sub_drift_anchor_sec'] = 0.0
+                    call['subtitle_sync'] = None
+                    call['_sub_force_check_seq'] = int(call.get('_sub_force_check_seq') or 0) + 1
+                elif abs(sub_offset - old_sub_offset) >= 0.005 and isinstance(call.get('subtitle_sync'), dict):
+                    call['subtitle_sync'] = {
+                        **call['subtitle_sync'],
+                        'applied_offset_sec': sub_offset,
+                        'manual_override': bool(call.get('manual_sub_override')),
+                        'updated_at': round(time.time(), 3),
+                    }
+                if call.get('sub_config_path') and call.get('av_sync_id') and call.get('status') in {'playing', 'paused'}:
+                    call['subtitle_path'] = sub_path
+                    call['subtitle_offset'] = sub_offset
+                    self._hot_update_subtitles(call)
+                    if sub_swapped and sub_path and not call.get('manual_sub_override'):
+                        self._maybe_schedule_sub_align(a, chat, call)
+                    return {
+                        'ok': True,
+                        'status': call['status'],
+                        'position_seconds': call.get('position_seconds'),
+                        'hot_reloaded': True,
+                        'subtitle_offset': call.get('subtitle_offset'),
+                        'sub_drift_sec_per_sec': float(call.get('sub_drift_sec_per_sec') or 0.0),
+                        'sub_drift_anchor_sec': float(call.get('sub_drift_anchor_sec') or 0.0),
+                        'subtitle_sync': call.get('subtitle_sync'),
+                    }
+                elif changed and call.get('status') in {'playing', 'paused'}:
                     try:
-                        elapsed = float(await asyncio.wait_for(engine.time(chat), 3))
+                        elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=3.0)
                     except Exception:
                         elapsed = 0.0
                     new_offset = max(0.0, call.get('offset', 0.0) + elapsed)
@@ -1441,9 +3334,10 @@ class Bridge:
                     call['subtitle_offset'] = sub_offset
                     call['offset'] = new_offset
                     try:
-                        await self.stream(a, chat, call)
-                        if was_paused:
-                            await asyncio.wait_for(engine.pause(chat), 8)
+                        if not (is_rtmp and was_paused):
+                            await self.stream(a, chat, call)
+                            if was_paused and not is_rtmp:
+                                await asyncio.wait_for(engine.pause(chat), 8)
                         call['position_seconds'] = new_offset
                         call['last_progress'] = time.monotonic()
                     except Exception:
@@ -1451,28 +3345,138 @@ class Bridge:
                         call['subtitle_offset'] = old_sub_offset
                         call['offset'] = old_offset
                         raise
+                    if sub_swapped and sub_path and not call.get('manual_sub_override'):
+                        self._maybe_schedule_sub_align(a, chat, call)
                 else:
                     call['subtitle_path'] = sub_path
                     call['subtitle_offset'] = sub_offset
+            elif op == 'subcheck':
+                sub_path = call.get('subtitle_path')
+                auto_fix = bool(data.get('auto_fix', True))
+                if not sub_path or not Path(sub_path).is_file():
+                    call['subtitle_sync'] = {
+                        'status': 'none',
+                        'message': 'No subtitle track active',
+                        'updated_at': round(time.time(), 3),
+                    }
+                    return {
+                        'ok': True,
+                        'status': call['status'],
+                        'position_seconds': call.get('position_seconds'),
+                        'subtitle_offset': float(call.get('subtitle_offset') or 0.0),
+                        'auto_subtitle_offset': call.get('auto_subtitle_offset'),
+                        'sub_drift_sec_per_sec': float(call.get('sub_drift_sec_per_sec') or 0.0),
+                        'sub_drift_anchor_sec': float(call.get('sub_drift_anchor_sec') or 0.0),
+                        'subtitle_sync': call['subtitle_sync'],
+                    }
+                if auto_fix:
+                    call['manual_sub_override'] = False
+                call['_sub_force_check_seq'] = int(call.get('_sub_force_check_seq') or 0) + 1
+                self._hot_update_subtitles(call)
+                probe_res = None
+                probe_fn = getattr(self, 'sub_align_probe', None)
+                media_url = str(call.get('path') or '')
+                is_same_route = bool(call.get('subtitle_same_route'))
+                if callable(probe_fn):
+                    try:
+                        maybe = probe_fn(
+                            media_url,
+                            sub_path,
+                            seek_offset=float(call.get('position_seconds') or call.get('offset') or 0.0),
+                            is_hls_proxy=bool(call.get('_is_hls_proxy')),
+                            same_route=is_same_route,
+                        )
+                        probe_res = await maybe if asyncio.iscoroutine(maybe) else maybe
+                    except Exception:
+                        probe_res = None
+                elif not self.factory and media_url and '.mpd' not in media_url.lower():
+                    try:
+                        probe_res = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                sub_align.probe_audio_and_align,
+                                media_url,
+                                sub_path,
+                                seek_offset=float(call.get('position_seconds') or call.get('offset') or 0.0),
+                                is_hls_proxy=bool(call.get('_is_hls_proxy')),
+                                same_route=is_same_route,
+                                audio_stream_index=(call.get('_probe_info') or {}).get('audio_stream_index'),
+                                origin_pts_sec=call.get('_v0_origin'),
+                            ),
+                            timeout=16.0,
+                        )
+                    except Exception:
+                        probe_res = None
+                self._sync_live_sub_monitor_state(call)
+                if isinstance(probe_res, dict) and (probe_res.get('confident') or not isinstance(call.get('subtitle_sync'), dict)):
+                    self._apply_probe_sub_result(
+                        chat,
+                        call,
+                        probe_res,
+                        is_same_route=is_same_route,
+                        force_normalize=auto_fix,
+                    )
+                self._sync_live_sub_monitor_state(call)
+                if call.get('subtitle_sync') is None:
+                    call['subtitle_sync'] = {
+                        'status': 'monitoring',
+                        'applied_offset_sec': float(call.get('subtitle_offset') or 0.0),
+                        'drift_sec_per_sec': float(call.get('sub_drift_sec_per_sec') or 0.0),
+                        'drift_anchor_sec': float(call.get('sub_drift_anchor_sec') or 0.0),
+                        'message': 'Live speech sync check triggered',
+                        'updated_at': round(time.time(), 3),
+                    }
+                return {
+                    'ok': True,
+                    'status': call['status'],
+                    'position_seconds': call.get('position_seconds'),
+                    'subtitle_offset': float(call.get('subtitle_offset') or 0.0),
+                    'auto_subtitle_offset': call.get('auto_subtitle_offset'),
+                    'sub_drift_sec_per_sec': float(call.get('sub_drift_sec_per_sec') or 0.0),
+                    'sub_drift_anchor_sec': float(call.get('sub_drift_anchor_sec') or 0.0),
+                    'subtitle_sync': call.get('subtitle_sync'),
+                }
             elif op == 'seek':
                 position = float(data['seconds'])
                 if position < 0 or (call['duration'] > 0 and position >= call['duration']): raise VoiceFailure('INVALID_REQUEST')
                 previous_offset = call['offset']; call['offset'] = position; paused = call['status'] == 'paused'
-                try: await self.stream(a, chat, call)
-                except Exception:
-                    call['offset'] = previous_offset
-                    raise
-                if paused: await asyncio.wait_for(engine.pause(chat), 10)
-                call['position_seconds'] = position; call['last_known_position'] = position; call['last_progress'] = time.monotonic()
-            return {'ok': True, 'status': call['status'], 'position_seconds': call.get('position_seconds')}
+                call.pop('_landed_offset', None)
+                call['last_seek_at'] = time.monotonic()
+                if abs(position - previous_offset) >= 15.0:
+                    call['_sub_force_check_seq'] = int(call.get('_sub_force_check_seq') or 0) + 1
+                if not (paused and is_rtmp):
+                    try: await self.stream(a, chat, call)
+                    except Exception:
+                        call['offset'] = previous_offset
+                        raise
+                    if paused and not is_rtmp:
+                        if call.get('av_sync_id'):
+                            _set_sync_paused(call.get('av_sync_id'), True)
+                        await asyncio.wait_for(engine.pause(chat), 10)
+                landed_pos = float(call.get('_landed_offset')) if call.get('_landed_offset') is not None else position
+                call['offset'] = landed_pos; call['position_seconds'] = landed_pos; call['last_known_position'] = landed_pos; call['last_progress'] = time.monotonic()
+                if paused and is_rtmp:
+                    call['sub_base_sec'] = landed_pos
+                    self._hot_update_subtitles(call)
+                if call.get('subtitle_path') and not call.get('manual_sub_override') and (call.get('auto_subtitle_offset') is None or abs(landed_pos - previous_offset) >= 15.0):
+                    if abs(landed_pos - previous_offset) >= 15.0:
+                        call['auto_subtitle_offset'] = None
+                        call['subtitle_sync'] = None
+                    if not (paused and is_rtmp):
+                        self._maybe_schedule_sub_align(a, chat, call)
+            res = {'ok': True, 'status': call['status'], 'position_seconds': call.get('position_seconds'), 'stream_mode': call.get('stream_mode', 'interactive')}
+            if hot_paused:
+                res['hot_paused'] = True
+            if hot_resumed:
+                res['hot_resumed'] = True
+            return res
 
     async def _close_dropped_call(self, a, chat, call, *, reason=None, probe_time=False, emit_event=False, ignore_leave_error=True):
         """Record the last known playback timestamp and release a dropped call cleanly."""
         pos = float(call.get('last_known_position') or call.get('offset') or 0.0)
         engine = a.get('engine') if a else None
-        if probe_time and engine is not None and call.get('status') in {'playing', 'paused'}:
+        if probe_time and (engine is not None or call.get('stream_mode') == 'rtmp') and call.get('status') in {'playing', 'paused'}:
             try:
-                elapsed = float(await asyncio.wait_for(engine.time(chat), 1.5))
+                elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=1.5)
                 pos = max(pos, float(call.get('offset') or 0.0) + elapsed)
             except Exception:
                 pass
@@ -1481,13 +3485,16 @@ class Bridge:
         pos = max(0.0, pos)
         if pos > 0:
             self.last_ended_positions[chat] = pos
-        if engine is not None:
+        if call.get('stream_mode') == 'rtmp':
+            await self._stop_rtmp_proc(call, wait_settle=False)
+        elif engine is not None:
             clear_engine_cache(engine, chat)
             try:
                 await asyncio.wait_for(engine.leave_call(chat), 10)
             except Exception as leave_error:
                 if not ignore_leave_error and classify(leave_error) != 'NO_ACTIVE_CALL':
                     raise
+        self._cleanup_sub_overlay(call)
         self.calls.pop(chat, None)
         self.prune_shifted_subtitles()
         if a is not None:
@@ -1520,9 +3527,10 @@ class Bridge:
             call = self.calls.get(chat)
             if not call: return {'ok': True, 'active': False, 'last_failure': self.last_failures.get(chat), 'last_position_seconds': self.last_ended_positions.get(chat)}
             a = self.accounts[call['alias']]
+            is_rtmp = call.get('stream_mode') == 'rtmp'
             if call['status'] in {'playing', 'paused'}:
                 try:
-                    elapsed = float(await asyncio.wait_for(a['engine'].time(chat), 5))
+                    elapsed = await self._call_elapsed_seconds(a['engine'], chat, call, timeout=5.0)
                     # Native NTgCalls BaseSink::time returns chrono::seconds, not milliseconds.
                     position = call['offset'] + elapsed
                     if position != call['position_seconds']: call['last_progress'] = time.monotonic()
@@ -1541,7 +3549,7 @@ class Bridge:
                         return {'ok': True, 'active': False, 'last_position_seconds': pos if pos > 0 else self.last_ended_positions.get(chat)}
                     call['clock_errors'] += 1; call['position_seconds'] = None
                     if call['clock_errors'] >= 3: call['status'] = 'error'
-            if call['status'] == 'playing' and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
+            if call['status'] == 'playing' and not is_rtmp and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
                 call['publisher_check_after'] = time.monotonic() + 5
                 try:
                     _, participant = await self.native_publisher(a, chat, call['native_call'])
@@ -1561,12 +3569,16 @@ class Bridge:
                     peer, native = await self.native_call(a['client'], chat)
                     if native is not None:
                         bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)
-                        if bind and hasattr(bind, '_cache'):
+                        if not is_rtmp and bind and hasattr(bind, '_cache'):
                             try:
                                 bind._cache.drop_cache(chat)
                                 bind._cache.set_cache(chat, native)
                             except Exception: pass
                         call['native_call'] = native
+                    elif is_rtmp:
+                        raise VoiceFailure('NO_ACTIVE_CALL')
+                    if is_rtmp:
+                        call['_rtmp_target'] = None
                     await self.stream(a, chat, call)
                     call['status'] = 'playing'; call['clock_errors'] = 0
                     call['last_progress'] = time.monotonic()
@@ -1579,7 +3591,18 @@ class Bridge:
             if call.get('status') == 'error' and call.get('retries', 0) >= 2 and time.monotonic() >= call.get('retry_after', 0) and classify(self.last_failures.get(chat, {}).get('code')) == 'NO_ACTIVE_CALL':
                 pos = await self._close_dropped_call(a, chat, call, reason='NO_ACTIVE_CALL', probe_time=False, emit_event=False, ignore_leave_error=True)
                 return {'ok': True, 'active': False, 'last_failure': self.last_failures.get(chat), 'last_position_seconds': pos if pos > 0 else self.last_ended_positions.get(chat)}
-            return {'ok': True, 'active': True, 'last_failure': self.last_failures.get(chat), 'info': {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted','call_invite_link','subtitle_offset']}}
+            self._sync_live_sub_monitor_state(call)
+            info_out = {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted','call_invite_link','subtitle_offset','auto_subtitle_offset','subtitle_same_route','sub_drift_sec_per_sec','sub_drift_anchor_sec','stream_mode','messages_enabled']}
+            if call.get('subtitle_sync') is not None:
+                info_out['subtitle_sync'] = call.get('subtitle_sync')
+            probe_meta = call.get('_probe_info') or {}
+            info_out['audio_language'] = probe_meta.get('audio_language')
+            info_out['audio_is_dub'] = bool(probe_meta.get('audio_is_dub'))
+            if call.get('av_sync_id'):
+                sync_m = _read_sync_metrics(call.get('av_sync_id'))
+                if sync_m is not None:
+                    info_out['av_sync'] = sync_m
+            return {'ok': True, 'active': True, 'last_failure': self.last_failures.get(chat), 'info': info_out}
 
     async def shutdown(self):
         self.closing = True
@@ -1602,8 +3625,12 @@ def make_app(bridge, token):
         except VoiceFailure as e: return web.json_response({'ok': False, 'error': e.code, 'message': MESSAGES.get(e.code, MESSAGES['CALL_FAILED']), 'publisher_state':e.publisher_state}, status=409)
         except (ValueError, KeyError, TypeError): return web.json_response({'ok': False, 'error': 'INVALID_REQUEST', 'message': MESSAGES['INVALID_REQUEST']}, status=400)
         except Exception as e:
-            code = classify(e); log.warning('Voice operation failed kind=%s', type(e).__name__)
-            return web.json_response({'ok': False, 'error': code, 'message': MESSAGES.get(code, MESSAGES['CALL_FAILED']), 'error_kind':type(e).__name__}, status=503)
+            code = classify(e)
+            payload = {'ok': False, 'error': code, 'message': MESSAGES.get(code, MESSAGES['CALL_FAILED']), 'error_kind': type(e).__name__}
+            if type(e).__name__ == 'ShellError':
+                payload['error_detail'] = str(e)[:240]
+            log.warning('Voice operation failed kind=%s', type(e).__name__)
+            return web.json_response(payload, status=503)
     app = web.Application(middlewares=[authenticate], client_max_size=32768)
     async def health(request): return web.json_response({'ok': True, 'protocol': 2, 'ready': any(a['status'] == 'available' and a['enabled'] for a in bridge.accounts.values()), 'active_calls_count': len(bridge.calls), 'session_configured': bool(bridge.accounts), 'mode': 'account_pool'})
     async def events(request):
@@ -1624,33 +3651,50 @@ def make_app(bridge, token):
     async def control(request): return web.json_response(await bridge.control(request.match_info['op'], await request.json()))
     async def status(request): return web.json_response(await bridge.status(int(request.query['chat_id'])))
     async def call_invite(request): return web.json_response(await bridge.call_invite_link(int(request.query['chat_id'])))
+    async def call_settings(request): return web.json_response(await bridge.update_call_settings(await request.json()))
+    async def call_message(request): return web.json_response(await bridge.send_call_message(await request.json()))
+    async def call_messages_delete(request): return web.json_response(await bridge.delete_call_messages(await request.json()))
     app.router.add_get('/events', events)
     app.router.add_get('/health', health); app.router.add_get('/accounts', accounts)
     app.router.add_post('/accounts/register', register); app.router.add_post('/accounts/configure', configure)
     app.router.add_post('/destination/setup', setup); app.router.add_post('/destination/existing-group', existing)
     app.router.add_post('/call/play', play); app.router.add_get('/call/status', status); app.router.add_get('/call/invite-link', call_invite)
-    app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek|subtitle}', control)
+    app.router.add_post('/call/settings', call_settings); app.router.add_post('/call/message', call_message); app.router.add_post('/call/messages/delete', call_messages_delete)
+    app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek|subtitle|subcheck}', control)
     async def cleanup(_): await bridge.shutdown()
     app.on_cleanup.append(cleanup)
     return app
 
 async def main():
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
+    handlers = [logging.StreamHandler(sys.stderr)]
+    try:
+        log_dir = Path(os.environ['MUSIC_CACHE_DIR']).resolve().parent / 'logs'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        handlers.append(RotatingFileHandler(log_dir / 'voice.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'))
+    except Exception:
+        pass
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s', handlers=handlers, force=True)
     host = os.environ.get('VOICE_BRIDGE_HOST', '127.0.0.1')
     if host not in {'127.0.0.1', '::1'}: raise RuntimeError('Voice bridge must bind loopback')
     bridge = Bridge(os.environ['MUSIC_CACHE_DIR'])
     app = make_app(bridge, os.environ.get('VOICE_BRIDGE_TOKEN', ''))
     # Access logs disabled: no credential-bearing request data or URLs.
+    av_sync._set_pdeathsig(signal.SIGTERM)
+    if _parent_exited():
+        return
     runner = web.AppRunner(app, access_log=None); await runner.setup()
+    if _parent_exited():
+        await runner.cleanup()
+        return
     await web.TCPSite(runner, host, int(os.environ.get('VOICE_BRIDGE_PORT', '3056'))).start()
     done = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT): loop.add_signal_handler(sig, done.set)
-    parent = os.getppid()
     async def watch_parent():
         while not done.is_set():
-            await asyncio.sleep(5)
-            if os.getppid() != parent: done.set()
+            await asyncio.sleep(0.5)
+            if _parent_exited():
+                done.set()
     watcher = asyncio.create_task(watch_parent())
     try: await done.wait()
     finally:

@@ -49,23 +49,136 @@ export function serializeSrt(cues = []) {
     .concat(cues.length ? '\n' : '');
 }
 
+const VTT_TIMING_RE = /^(\d{1,3}:\d{2}(?::\d{2})?[,.]\d{1,3})\s*-->\s*(\d{1,3}:\d{2}(?::\d{2})?[,.]\d{1,3})(?:\s|$)/;
+
 export function parseSrt(srtText) {
-  const blocks = String(srtText || '').replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').split(/\n{2,}/);
+  const lines = String(srtText || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n');
   const cues = [];
-  for (const b of blocks) {
-    const lines = b.split('\n').map((l) => l.trimEnd()).filter(Boolean);
-    if (!lines.length) continue;
-    if (/^(?:WEBVTT|NOTE\b|STYLE\b|REGION\b)/i.test(lines[0])) continue;
-    const timingIdx = lines.findIndex((l) => l.includes('-->'));
-    if (timingIdx < 0) continue;
-    const [left, right] = lines[timingIdx].split('-->').map((s) => s.trim().split(/\s+/)[0]);
-    const startMs = parseTimestampMs(left);
-    const endMs = parseTimestampMs(right);
-    if (startMs === null || endMs === null || endMs <= startMs) continue;
-    const text = lines.slice(timingIdx + 1)
+  let skipBlock = false;
+  let activeCue = null;
+
+  const flushActive = () => {
+    if (!activeCue) return;
+    const text = activeCue.lines
       .join('\n')
       .replace(/<[^>]+>/g, '')
       .replace(/\{\\[^}]+\}/g, '')
+      .trim();
+    if (text && activeCue.endMs > activeCue.startMs) {
+      cues.push({ startMs: activeCue.startMs, endMs: activeCue.endMs, text });
+    }
+    activeCue = null;
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trimEnd();
+    const trimmed = line.trim();
+    if (!trimmed) {
+      skipBlock = false;
+      flushActive();
+      continue;
+    }
+    if (!activeCue && (/^(?:WEBVTT(?:\s|$)|X-TIMESTAMP-MAP\b)/i.test(trimmed))) {
+      continue;
+    }
+    if (!activeCue && /^(?:NOTE\b|STYLE\b|REGION\b)/i.test(trimmed)) {
+      skipBlock = true;
+      continue;
+    }
+    const timingM = trimmed.match(VTT_TIMING_RE);
+    if (timingM) {
+      skipBlock = false;
+      flushActive();
+      const startMs = parseTimestampMs(timingM[1]);
+      const endMs = parseTimestampMs(timingM[2]);
+      if (startMs !== null && endMs !== null && endMs > startMs) {
+        activeCue = { startMs, endMs, lines: [] };
+      }
+      continue;
+    }
+    if (skipBlock) continue;
+    // Skip cue identifier/index line right before a timing line (only before cue text or for numeric SRT indices)
+    if (i + 1 < lines.length && VTT_TIMING_RE.test(lines[i + 1].trim())) {
+      if (!activeCue || (activeCue.lines.length > 0 && /^\d+$/.test(trimmed))) {
+        flushActive();
+        continue;
+      }
+    }
+    if (activeCue) {
+      activeCue.lines.push(line);
+    }
+  }
+  flushActive();
+  cues.sort((a, b) => a.startMs - b.startMs);
+  return cues;
+}
+
+function decodeTtmlEntities(text = '') {
+  return String(text || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;|&#39;|&#x27;/gi, "'")
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&amp;/g, '&');
+}
+
+function parseTtmlTimestampMs(raw, tickRate = 10000000) {
+  const s = String(raw || '').trim();
+  if (!s) return null;
+  const standard = parseTimestampMs(s);
+  if (standard !== null) return standard;
+  const colonFrames = s.match(/^(\d{1,3}):(\d{2}):(\d{2})[:.](\d{1,2})$/);
+  if (colonFrames) {
+    const h = Number(colonFrames[1]), m = Number(colonFrames[2]), sec = Number(colonFrames[3]), f = Number(colonFrames[4]);
+    return (((h * 60 + m) * 60 + sec) * 1000) + Math.round((f / 24) * 1000);
+  }
+  const tickM = s.match(/^(\d+(?:\.\d+)?)t$/i);
+  if (tickM && tickRate > 0) return Math.round((Number(tickM[1]) / tickRate) * 1000);
+  const msM = s.match(/^(\d+(?:\.\d+)?)ms$/i);
+  if (msM) return Math.round(Number(msM[1]));
+  const secM = s.match(/^(\d+(?:\.\d+)?)s$/i);
+  if (secM) return Math.round(Number(secM[1]) * 1000);
+  const minM = s.match(/^(\d+(?:\.\d+)?)m$/i);
+  if (minM) return Math.round(Number(minM[1]) * 60000);
+  const hrM = s.match(/^(\d+(?:\.\d+)?)h$/i);
+  if (hrM) return Math.round(Number(hrM[1]) * 3600000);
+  return null;
+}
+
+export function parseTtml(xmlText) {
+  const src = String(xmlText || '').replace(/^\uFEFF/, '');
+  const tickMatch = src.match(/\b(?:ttp:)?tickRate\s*=\s*["'](\d+)["']/i);
+  const tickRate = tickMatch ? Number(tickMatch[1]) || 10000000 : 10000000;
+  const cues = [];
+  for (const m of src.matchAll(/<(?:[a-z0-9]+:)?p\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9]+:)?p>/gi)) {
+    const attrs = m[1] || '';
+    const inner = m[2] || '';
+    const beginRaw = attrs.match(/\bbegin\s*=\s*["']([^"']+)["']/i)?.[1];
+    const endRaw = attrs.match(/\bend\s*=\s*["']([^"']+)["']/i)?.[1];
+    const durRaw = attrs.match(/\bdur\s*=\s*["']([^"']+)["']/i)?.[1];
+    const startMs = parseTtmlTimestampMs(beginRaw, tickRate);
+    let endMs = parseTtmlTimestampMs(endRaw, tickRate);
+    if (startMs !== null && endMs === null && durRaw) {
+      const durMs = parseTtmlTimestampMs(durRaw, tickRate);
+      if (durMs !== null && durMs > 0) endMs = startMs + durMs;
+    }
+    if (startMs === null || endMs === null || endMs <= startMs) continue;
+    const text = decodeTtmlEntities(
+      inner
+        .replace(/<(?:[a-z0-9]+:)?br\b[^>]*\/?>/gi, '\n')
+        .replace(/<[^>]+>/g, '')
+    )
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join('\n')
       .trim();
     if (!text) continue;
     cues.push({ startMs, endMs, text });
@@ -74,17 +187,144 @@ export function parseSrt(srtText) {
   return cues;
 }
 
+function parseAssTimestampMs(raw) {
+  const m = String(raw || '').trim().match(/^(\d{1,3}):(\d{2}):(\d{2})[.:](\d{1,3})$/);
+  if (!m) return null;
+  const h = Number(m[1]), min = Number(m[2]), s = Number(m[3]), frac = m[4];
+  const ms = frac.length === 2 ? Number(frac) * 10 : Number(frac.padEnd(3, '0').slice(0, 3));
+  return (((h * 60 + min) * 60 + s) * 1000) + ms;
+}
+
+export function parseAss(assText) {
+  const lines = String(assText || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .split('\n');
+  let startIdx = 1, endIdx = 2, textIdx = 9;
+  const cues = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (/^Format\s*:/i.test(line)) {
+      const cols = line.replace(/^Format\s*:/i, '').split(',').map((c) => c.trim().toLowerCase());
+      const sI = cols.indexOf('start');
+      const eI = cols.indexOf('end');
+      const tI = cols.indexOf('text');
+      if (sI >= 0 && eI >= 0 && tI >= 0) {
+        startIdx = sI;
+        endIdx = eI;
+        textIdx = tI;
+      }
+      continue;
+    }
+    if (!/^Dialogue\s*:/i.test(line)) continue;
+    const payload = line.replace(/^Dialogue\s*:\s*/i, '');
+    const parts = payload.split(',');
+    if (parts.length <= Math.max(startIdx, endIdx, textIdx)) continue;
+    const startMs = parseAssTimestampMs(parts[startIdx]);
+    const endMs = parseAssTimestampMs(parts[endIdx]);
+    if (startMs === null || endMs === null || endMs <= startMs) continue;
+    const rawText = parts.slice(textIdx).join(',');
+    // Skip ASS vector drawing paths (\p1..)
+    if (/\{[^}]*\\p[1-9][^}]*\}/.test(rawText)) continue;
+    const cleanText = rawText
+      .replace(/\{[^}]*\}/g, '')
+      .replace(/\\[nN]/g, '\n')
+      .replace(/\\h/g, ' ')
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    if (!cleanText) continue;
+    cues.push({ startMs, endMs, text: cleanText });
+  }
+  cues.sort((a, b) => a.startMs - b.startMs);
+  return cues;
+}
+
+export function parseAnySubtitleText(rawText, extHint = '') {
+  const sample = String(rawText || '').replace(/^\uFEFF/, '').trimStart();
+  const hint = String(extHint || '').toLowerCase();
+  if (!sample) return [];
+  if (hint === 'ttml' || hint === 'dfxp' || /^(?:<\?xml\b|<tt\b)/i.test(sample) || /<(?:tt:)?p\b[^>]*\bbegin=/i.test(sample.slice(0, 2000))) {
+    const ttmlCues = parseTtml(sample);
+    if (ttmlCues.length) return ttmlCues;
+  }
+  if (hint === 'ass' || hint === 'ssa' || /^\[Script Info\]/im.test(sample.slice(0, 1200)) || /^Dialogue\s*:/im.test(sample)) {
+    const assCues = parseAss(sample);
+    if (assCues.length) return assCues;
+  }
+  return parseSrt(sample);
+}
+
+const CUE_MAX_SPAN_CACHE = new WeakMap();
+
+function getMaxCueSpanMs(cues) {
+  let maxSpan = CUE_MAX_SPAN_CACHE.get(cues);
+  if (maxSpan === undefined) {
+    maxSpan = 0;
+    for (let i = 0; i < cues.length; i++) {
+      const span = (Number(cues[i]?.endMs) || 0) - (Number(cues[i]?.startMs) || 0);
+      if (span > maxSpan) maxSpan = span;
+    }
+    CUE_MAX_SPAN_CACHE.set(cues, maxSpan);
+  }
+  return maxSpan;
+}
+
 export function getCueAt(cues, positionMs) {
   if (!Array.isArray(cues) || !cues.length || !Number.isFinite(positionMs)) return null;
-  let lo = 0, hi = cues.length - 1;
+  // Upper-bound binary search: find rightmost cue with startMs <= positionMs
+  let lo = 0, hi = cues.length - 1, right = -1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    const c = cues[mid];
-    if (positionMs < c.startMs) hi = mid - 1;
-    else if (positionMs > c.endMs) lo = mid + 1;
-    else return c;
+    if (cues[mid].startMs <= positionMs) {
+      right = mid;
+      lo = mid + 1;
+    } else {
+      hi = mid - 1;
+    }
   }
-  return null;
+  if (right < 0) return null;
+  const maxSpan = getMaxCueSpanMs(cues);
+  const active = [];
+  for (let i = right; i >= 0; i--) {
+    const c = cues[i];
+    if (positionMs - c.startMs > maxSpan + 1000) break;
+    if (c.startMs <= positionMs && positionMs <= c.endMs) {
+      active.push(c);
+    }
+  }
+  if (!active.length) return null;
+  if (active.length === 1) return active[0];
+  active.reverse();
+  const seenLines = new Set();
+  const lines = [];
+  let minStart = active[0].startMs;
+  let maxEnd = active[0].endMs;
+  for (const c of active) {
+    if (c.startMs < minStart) minStart = c.startMs;
+    if (c.endMs > maxEnd) maxEnd = c.endMs;
+    for (const ln of String(c.text || '').split(/\r?\n/)) {
+      const clean = ln.trim();
+      if (!clean || seenLines.has(clean)) continue;
+      seenLines.add(clean);
+      lines.push(clean);
+    }
+  }
+  return { startMs: minStart, endMs: maxEnd, text: lines.join('\n') };
+}
+
+export function mapMediaSecToSubMs(mediaSec, { offsetSec = 0, driftRate = 0, driftAnchorSec = 0 } = {}) {
+  const t = Number(mediaSec) || 0;
+  const off = Number(offsetSec) || 0;
+  const rawDrift = Number(driftRate) || 0;
+  const drift = Math.max(-0.08, Math.min(0.08, rawDrift));
+  const anchor = Number(driftAnchorSec) || 0;
+  const subSec = t - off - (drift * (t - anchor));
+  return Math.max(0, Math.round(subSec * 1000));
 }
 
 export function shiftSrtText(srtText, offsetSeconds = 0) {
@@ -111,7 +351,7 @@ function cleanTitleForSearch(title) {
     .trim();
 }
 
-const PROMO_SUB_RE = /\b(?:opensubtitles\.(?:org|com)|osdb\.link|subscene\.com|yify-?subtitles|addic7ed\.com|podnapisi\.net|hoofoot\.ru|advertise\s+your\s+product|api\.opensubtitles|ai\.opensubtitles)\b/i;
+const PROMO_SUB_RE = /\b(?:opensubtitles\.(?:org|com)|osdb\.link|subscene\.com|yify-?subtitles|addic7ed\.com|podnapisi\.net|hoofoot\.ru|advertise\s+your\s+product|api\.opensubtitles|ai\.opensubtitles|getray\.app)\b/i;
 
 function isPromoCueText(text = '') {
   return PROMO_SUB_RE.test(String(text || ''));
@@ -204,12 +444,17 @@ function dedupeOverlappingCues(cues = []) {
   const sorted = [...cues].sort((a, b) => a.startMs - b.startMs);
   const out = [];
   for (const cue of sorted) {
-    const prev = out[out.length - 1];
-    if (prev && prev.text === cue.text && cue.startMs <= prev.endMs + 250) {
-      prev.endMs = Math.max(prev.endMs, cue.endMs);
-    } else {
-      out.push({ ...cue });
+    let merged = false;
+    for (let j = out.length - 1; j >= 0 && j >= out.length - 6; j--) {
+      const prev = out[j];
+      if (cue.startMs > prev.endMs + 250) continue;
+      if (prev.text === cue.text) {
+        prev.endMs = Math.max(prev.endMs, cue.endMs);
+        merged = true;
+        break;
+      }
     }
+    if (!merged) out.push({ ...cue });
   }
   return out;
 }
@@ -297,14 +542,14 @@ export class SubtitleService {
     const sameRouteHints = allHints.filter((h) => !h.tier || h.tier === 'same_route');
     const metaHints = allHints.filter((h) => h.tier === 'meta_match');
     const streamSig = this.#streamSignature({ streamUrl, subtitleHints: sameRouteHints.length ? sameRouteHints : allHints });
-    const streamFilePath = this.#cacheFilePath(`${metaKey}|${streamSig}|v3`);
-    const altHintPath = this.#cacheFilePath(`${metaKey}|${streamSig}|alt_hint_v3`);
-    const fallbackFilePath = this.#cacheFilePath(`${metaKey}|${streamSig === 'meta' ? '' : `${streamSig}|`}os_v3`);
+    const streamFilePath = this.#cacheFilePath(`${metaKey}|${streamSig}|v4`);
+    const altHintPath = this.#cacheFilePath(`${metaKey}|${streamSig}|alt_hint_v4`);
+    const fallbackFilePath = this.#cacheFilePath(`${metaKey}|${streamSig === 'meta' ? '' : `${streamSig}|`}os_v4`);
     const tracksFilePath = `${streamFilePath}.tracks.json`;
 
     if (existsSync(streamFilePath)) {
       const cues = this.loadCues(streamFilePath);
-      let savedTracks = [{ filePath: streamFilePath, language, label: 'Synced Subtitles', source: 'cache', cuesCount: cues.length }];
+      let savedTracks = [{ filePath: streamFilePath, language, label: 'Synced Subtitles', source: 'cache', sameRoute: false, cuesCount: cues.length }];
       if (existsSync(tracksFilePath)) {
         try {
           const parsedTracks = JSON.parse(readFileSync(tracksFilePath, 'utf8'));
@@ -322,6 +567,7 @@ export class SubtitleService {
           language,
           label: savedTracks[0]?.label || 'Synced Subtitles',
           source: savedTracks[0]?.source || 'cache',
+          sameRoute: Boolean(isRouteBound || savedTracks[0]?.sameRoute),
           tracks: savedTracks
         };
       }
@@ -329,48 +575,68 @@ export class SubtitleService {
 
     const candidates = [];
     const seenPaths = new Set();
+    const seenSigs = new Set();
     const pushTrack = (res) => {
       if (!res?.filePath || !res.cues?.length || seenPaths.has(res.filePath)) return;
+      const firstTxt = String(res.cues[0]?.text || '').slice(0, 48);
+      const dedupSig = `${String(res.language || '').toLowerCase()}|${String(res.label || '').toLowerCase()}|${res.cues.length}|${firstTxt}`;
+      if (seenSigs.has(dedupSig)) return;
       seenPaths.add(res.filePath);
+      seenSigs.add(dedupSig);
       candidates.push(res);
     };
 
     const isContainerStream = Boolean(streamUrl) && !/\.(?:m3u8|mpd)(\?|$)/i.test(String(streamUrl));
+    const baseTrackKey = `${metaKey}|${streamSig}`;
 
-    // 1. Same-route subtitle hints attached to the exact resolved stream (.vtt/.srt / full HLS VTT)
+    // 1. ALL same-route subtitle hints attached to the exact resolved stream (.vtt/.srt/.ttml/.ass / full HLS VTT)
     if (sameRouteHints.length) {
-      const hintRes = await this.#fetchFromSubtitleHints(
+      const hintTracks = await this.#fetchFromSubtitleHints(
         sameRouteHints,
         { language, title, defaultHeaders: headers, durationSeconds },
-        streamFilePath
-      ).catch(() => null);
-      if (hintRes) pushTrack(hintRes);
+        streamFilePath,
+        { collectAll: true, baseKey: baseTrackKey }
+      ).catch(() => []);
+      for (const ht of (Array.isArray(hintTracks) ? hintTracks : (hintTracks ? [hintTracks] : []))) {
+        pushTrack(ht);
+      }
     }
 
     // 2. Embedded container text tracks (MKV/MP4) inspected cleanly via ffprobe BEFORE cross-host hints/OpenSubtitles
     if (streamUrl && isContainerStream && this.#canProbeMediaSource(streamUrl)) {
-      const embPath = candidates.length ? altHintPath : streamFilePath;
+      const embPath = seenPaths.has(streamFilePath) ? altHintPath : streamFilePath;
       const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, embPath, { language }).catch(() => null);
       if (emb && cuesFitDuration(emb.cues, durationSeconds, { strictMinRatio: false })) {
         pushTrack(emb);
       }
     }
 
-    // 3. Meta-matched hints from companion routes (only if no primary same-route/embedded track yet, or as Track #2)
+    // 3. ALL meta-matched hints from companion routes (e.g. Punkflix/Berlin/stream nodes)
     if (metaHints.length) {
-      const metaOut = candidates.length ? altHintPath : streamFilePath;
-      if (!seenPaths.has(metaOut)) {
-        const metaRes = await this.#fetchFromSubtitleHints(
-          metaHints,
-          { language, title, defaultHeaders: headers, durationSeconds },
-          metaOut
-        ).catch(() => null);
-        if (metaRes) pushTrack(metaRes);
+      const metaPrimaryPath = seenPaths.has(streamFilePath)
+        ? (seenPaths.has(altHintPath) ? this.#cacheFilePath(`${baseTrackKey}|meta_primary_v4`) : altHintPath)
+        : streamFilePath;
+      const metaTracks = await this.#fetchFromSubtitleHints(
+        metaHints,
+        { language, title, defaultHeaders: headers, durationSeconds },
+        metaPrimaryPath,
+        { collectAll: true, baseKey: `${baseTrackKey}|meta` }
+      ).catch(() => []);
+      for (const mt of (Array.isArray(metaTracks) ? metaTracks : (metaTracks ? [metaTracks] : []))) {
+        pushTrack(mt);
       }
     }
 
-    // 4. OpenSubtitles lookup (strict score + release tag + duration span validation)
-    if (candidates.length < 2) {
+    // 4. OpenSubtitles lookup ONLY when source tracks don't already have a clean full target-language dialogue track (or <2 total and lacking clean source)
+    const wantEn = /^en/i.test(String(language || 'eng'));
+    const hasCleanSourceDialogue = candidates.some((c) => {
+      if (!['embedded', 'subtitle_hint'].includes(c.source)) return false;
+      const lang = String(c.language || '').toLowerCase();
+      const lbl = String(c.label || '').toLowerCase();
+      const langMatches = wantEn ? /^(?:en|eng|english)\b/.test(lang) : lang.includes(String(language).toLowerCase());
+      return langMatches && !/\b(?:forced|signs)\b/.test(lbl);
+    });
+    if (candidates.length < 2 && !hasCleanSourceDialogue) {
       let osRes = null;
       if (existsSync(fallbackFilePath)) {
         const cachedOs = this.loadCues(fallbackFilePath);
@@ -379,9 +645,10 @@ export class SubtitleService {
         }
       }
       if (!osRes) {
+        const osOutPath = seenPaths.has(streamFilePath) ? fallbackFilePath : streamFilePath;
         osRes = await this.#fetchFromOpenSubtitles(
           { title, year, imdbId, season, episode, language, durationSeconds, releaseHint: releaseHint || streamSource },
-          candidates.length ? fallbackFilePath : streamFilePath
+          osOutPath
         ).catch(() => null);
       }
       if (osRes) pushTrack(osRes);
@@ -395,24 +662,42 @@ export class SubtitleService {
 
     if (!candidates.length) return null;
 
-    // Prioritize verified Embedded > Same-Route Hint > Meta-Match Hint > OpenSubtitles
+    // Prioritize Embedded > Same-Route Hint > Meta-Match Hint > OpenSubtitles, preferring clean dialogue in target language
     const tierOrder = { embedded: 0, subtitle_hint: 1, meta_hint: 2, opensubtitles: 3 };
-    candidates.sort((a, b) => (tierOrder[a.source] ?? 9) - (tierOrder[b.source] ?? 9));
+    const rankCandidate = (c) => {
+      const tier = tierOrder[c.source] ?? 9;
+      const lang = String(c.language || '').toLowerCase();
+      const lbl = String(c.label || '').toLowerCase();
+      const langOk = wantEn ? (/^(?:en|eng|english)\b/.test(lang) || /\benglish\b/.test(lbl)) : lang.includes(String(language).toLowerCase());
+      const isForcedOrSigns = /\b(?:forced|signs)\b/.test(lbl);
+      const isSdh = /\b(?:sdh|cc|hearing\s*impaired)\b/.test(lbl);
+      return (tier * 100) + (langOk ? 0 : 40) + (isForcedOrSigns ? 20 : isSdh ? 5 : 0);
+    };
+    candidates.sort((a, b) => rankCandidate(a) - rankCandidate(b));
 
-    const tracks = candidates.slice(0, 3).map((c) => ({
+    const tracks = candidates.slice(0, 8).map((c) => ({
       filePath: c.filePath,
       language: c.language || language,
       label: c.label || 'Subtitles',
       source: c.source,
+      sameRoute: ['embedded', 'subtitle_hint'].includes(c.source),
       cuesCount: c.cues.length
     }));
     const primary = candidates[0];
+    // Ensure primary track is also cached at streamFilePath so cache-hit lookup succeeds cleanly
+    if (primary.filePath !== streamFilePath && !existsSync(streamFilePath)) {
+      try {
+        writeFileSync(streamFilePath, serializeSrt(primary.cues), 'utf8');
+        this.cueCache.set(streamFilePath, primary.cues);
+      } catch {}
+    }
     try {
       writeFileSync(tracksFilePath, JSON.stringify(tracks), 'utf8');
     } catch {}
 
     return {
       ...primary,
+      sameRoute: ['embedded', 'subtitle_hint'].includes(primary?.source),
       tracks
     };
   }
@@ -448,64 +733,139 @@ export class SubtitleService {
     }
 
     const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-    const segUrls = [];
+    const segEntries = [];
     const seen = new Set();
+    let pendingDurSec = 0;
+    let accumStartMs = 0;
     for (const line of lines) {
+      const extMatch = line.match(/^#EXTINF\s*:\s*([0-9.]+)/i);
+      if (extMatch) {
+        pendingDurSec = Math.max(0, parseFloat(extMatch[1]) || 0);
+        continue;
+      }
       if (line.startsWith('#')) continue;
       try {
         const abs = new URL(line, playlistUrl).toString();
         if (!seen.has(abs)) {
           seen.add(abs);
-          segUrls.push(abs);
+          segEntries.push({ url: abs, startMs: Math.round(accumStartMs), durMs: Math.round(pendingDurSec * 1000) });
         }
+        accumStartMs += pendingDurSec * 1000;
+        pendingDurSec = 0;
       } catch {}
     }
-    const maxSegs = Math.min(segUrls.length, 500);
-    const selected = segUrls.slice(0, maxSegs);
-    const parts = new Array(selected.length).fill('');
-    const deadline = Date.now() + 25_000;
-    const batchSize = 6;
+    const maxSegs = Math.min(segEntries.length, 2500);
+    const selected = segEntries.slice(0, maxSegs);
+    const rawSegs = new Array(selected.length).fill('');
+    const deadline = Date.now() + 30_000;
+    const batchSize = 10;
     for (let i = 0; i < selected.length && Date.now() < deadline; i += batchSize) {
       const slice = selected.slice(i, i + batchSize);
-      await Promise.all(slice.map(async (segUrl, idx) => {
+      await Promise.all(slice.map(async (seg, idx) => {
         try {
-          const segRes = await this.fetch(segUrl, {
+          const segRes = await this.fetch(seg.url, {
             headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...headers },
             signal: AbortSignal.timeout(6500)
           });
           if (!segRes?.ok) return;
-          parts[i + idx] = typeof segRes.text === 'function'
-            ? await segRes.text()
-            : Buffer.from(await segRes.arrayBuffer()).toString('utf8');
+          if (typeof segRes.arrayBuffer === 'function') {
+            const b = Buffer.from(await segRes.arrayBuffer());
+            rawSegs[i + idx] = (b[0] === 0x1f && b[1] === 0x8b) ? gunzipSync(b).toString('utf8') : b.toString('utf8');
+          } else if (typeof segRes.text === 'function') {
+            rawSegs[i + idx] = await segRes.text();
+          }
         } catch {}
       }));
     }
-    return parts.filter(Boolean).join('\n\n');
+
+    let baseMpegtsOriginMs = null;
+    const mergedCues = [];
+    for (let i = 0; i < selected.length; i++) {
+      const segText = rawSegs[i];
+      if (!segText) continue;
+      const segStartMs = selected[i].startMs;
+      const segDurMs = selected[i].durMs || 60000;
+      let segCues = parseSrt(segText);
+      const tsMapM = segText.match(/X-TIMESTAMP-MAP=.*?(?:MPEGTS:(\d+).*?LOCAL:([0-9:.]+)|LOCAL:([0-9:.]+).*?MPEGTS:(\d+))/i);
+      if (tsMapM) {
+        const mpegtsTicks = Number(tsMapM[1] || tsMapM[4] || 0);
+        const localRaw = tsMapM[2] || tsMapM[3] || '';
+        const localMs = parseTimestampMs(localRaw);
+        if (Number.isFinite(mpegtsTicks) && localMs !== null) {
+          const mpegtsMs = (mpegtsTicks * 1000) / 90000;
+          const mapDeltaMs = mpegtsMs - localMs;
+          const firstCueMs = segCues.length ? segCues[0].startMs : 0;
+          if (baseMpegtsOriginMs === null && localMs === 0 && mpegtsMs >= 0) {
+            if (i === 0 && (!segCues.length || firstCueMs < Math.max(segDurMs + 5000, 120000))) {
+              baseMpegtsOriginMs = mpegtsMs;
+            } else if (i > 0) {
+              const cuesLookLocal = !segCues.length || firstCueMs < Math.max(segStartMs - 1000, segDurMs + 5000);
+              baseMpegtsOriginMs = cuesLookLocal ? Math.max(0, mpegtsMs - segStartMs) : mpegtsMs;
+            }
+          }
+          if (segCues.length) {
+            let shiftByMs = 0;
+            if (mpegtsTicks === 0 && localMs > 1000 && firstCueMs >= localMs - 500) {
+              shiftByMs = -localMs;
+            } else {
+              const origin = baseMpegtsOriginMs ?? 0;
+              const candidateDeltaMs = mapDeltaMs - origin;
+              const alreadyGlobal = segStartMs > 1000 && firstCueMs >= segStartMs - 1000;
+              if (!alreadyGlobal && Math.abs(candidateDeltaMs) > 500) {
+                shiftByMs = candidateDeltaMs;
+              }
+            }
+            if (Math.abs(shiftByMs) > 500) {
+              segCues = segCues
+                .map((c) => {
+                  const sMs = Math.max(0, Math.round(c.startMs + shiftByMs));
+                  const eMs = Math.max(sMs + 250, Math.round(c.endMs + shiftByMs));
+                  return c.endMs + shiftByMs <= 0 ? null : { startMs: sMs, endMs: eMs, text: c.text };
+                })
+                .filter(Boolean);
+            }
+          }
+        }
+      }
+      for (const c of segCues) mergedCues.push(c);
+    }
+    return mergedCues.length ? serializeSrt(dedupeOverlappingCues(mergedCues)) : '';
   }
 
-  async #fetchFromSubtitleHints(hints, { language = 'eng', title = '', defaultHeaders = {}, durationSeconds = null }, outPath) {
+  async #fetchFromSubtitleHints(hints, { language = 'eng', title = '', defaultHeaders = {}, durationSeconds = null }, outPath, { collectAll = false, baseKey = '' } = {}) {
     const wantEn = /^en/i.test(String(language || 'eng'));
+    const seenUrls = new Set();
     const ranked = (Array.isArray(hints) ? hints : [])
       .map((h) => ({
         url: String(h?.url || h?.file || '').trim(),
-        lang: String(h?.language || h?.lang || h?.label || '').trim(),
+        lang: String(h?.language || h?.lang || h?.langCode || '').trim(),
+        label: String(h?.label || '').trim(),
+        typeHint: String(h?.type || h?.format || '').trim().toLowerCase(),
         tier: h?.tier || 'same_route',
         headers: { ...(defaultHeaders || {}), ...(h?.headers && typeof h.headers === 'object' ? h.headers : {}) }
       }))
-      .filter((h) => /^https?:\/\//i.test(h.url))
+      .filter((h) => {
+        if (!/^https?:\/\//i.test(h.url) || seenUrls.has(h.url)) return false;
+        seenUrls.add(h.url);
+        return true;
+      })
       .map((h) => {
-        const l = h.lang.toLowerCase();
-        let score = h.tier === 'same_route' ? 20 : 0;
-        if (wantEn && /\b(en|eng|english)\b/i.test(l)) score += 30;
-        else if (!wantEn && l.includes(String(language).toLowerCase())) score += 30;
-        if (/sdh|hearing|cc|forced/i.test(l)) score -= 4;
+        const l = `${h.lang} ${h.label}`.toLowerCase();
+        let score = h.tier === 'same_route' ? 25 : 0;
+        if (wantEn && /\b(en|eng|english)\b/i.test(l)) score += 40;
+        else if (!wantEn && l.includes(String(language).toLowerCase())) score += 40;
+        if (/\b(?:forced|signs)\b/i.test(l)) score -= 12;
+        else if (/\b(?:sdh|hearing|cc)\b/i.test(l)) score -= 4;
         if (/\.srt(\?|$)/i.test(h.url)) score += 3;
         return { ...h, score };
       })
       .sort((a, b) => b.score - a.score);
 
-    for (const cand of ranked.slice(0, 4)) {
-      if (wantEn && ranked.some((r) => r.score >= 25) && cand.score < 20) break;
+    const collected = [];
+    const maxCandidates = collectAll ? 12 : 4;
+    for (let idx = 0; idx < Math.min(ranked.length, maxCandidates); idx++) {
+      const cand = ranked[idx];
+      if (!collectAll && wantEn && ranked.some((r) => r.score >= 25) && cand.score < 20) break;
       try {
         const res = await this.fetch(cand.url, {
           headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...cand.headers },
@@ -526,41 +886,165 @@ export class SubtitleService {
             text = await this.#fetchHlsVttPlaylist(cand.url, cand.headers, durationSeconds);
           }
         }
-        const rawCues = parseSrt(text).filter((c) => !isPromoCueText(c.text));
+        const extHint = cand.typeHint || (cand.url.split('?')[0].match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase();
+        const rawCues = parseAnySubtitleText(text, extHint).filter((c) => !isPromoCueText(c.text));
         const cues = dedupeOverlappingCues(rawCues);
         const strictMin = cand.tier === 'meta_match';
         if (cues.length < 5 || !cuesFitDuration(cues, durationSeconds, { strictMinRatio: strictMin })) continue;
         const canonicalSrt = serializeSrt(cues);
-        writeFileSync(outPath, canonicalSrt, 'utf8');
-        this.cueCache.set(outPath, cues);
+        const urlHash = createHash('sha1').update(cand.url).digest('hex').slice(0, 10);
+        const targetOut = (collectAll && collected.length > 0)
+          ? this.#cacheFilePath(`${baseKey || outPath}|hint|${urlHash}|v4`)
+          : outPath;
+        writeFileSync(targetOut, canonicalSrt, 'utf8');
+        this.cueCache.set(targetOut, cues);
         const isMetaTier = cand.tier === 'meta_match';
-        const cleanLabel = wantEn
+        const fallbackLabel = wantEn
           ? (isMetaTier ? 'English Subtitles (Matched)' : 'English Subtitles')
           : `${title ? `${title} · ` : ''}Subtitles`;
-        return {
+        const cleanLabel = cand.label || (cand.lang && !/^(?:en|eng|english)$/i.test(cand.lang) ? `${cand.lang} Subtitles` : fallbackLabel);
+        const trackObj = {
           found: true,
-          filePath: outPath,
+          filePath: targetOut,
           cues,
-          language,
-          label: cleanLabel,
+          language: cand.lang || language,
+          label: isMetaTier && !cand.label ? fallbackLabel : cleanLabel,
           source: isMetaTier ? 'meta_hint' : 'subtitle_hint'
         };
+        if (!collectAll) return trackObj;
+        collected.push(trackObj);
       } catch {}
     }
+    return collectAll ? collected : null;
+  }
+
+  async #resolveImdbIdViaCinemeta({ title, year, season, episode } = {}) {
+    const clean = cleanTitleForSearch(title);
+    if (!clean) return '';
+    const isSeries = Boolean(season && episode);
+    const kind = isSeries ? 'series' : 'movie';
+    const wantToks = tokenizeSubTitle(clean).filter((w) => w.length >= 2 && !['the', 'and', 'for', 'with'].includes(w));
+    try {
+      const res = await this.fetch(
+        `https://v3-cinemeta.strem.io/catalog/${kind}/top/search=${encodeURIComponent(clean)}.json`,
+        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(5000) }
+      );
+      if (!res?.ok) return '';
+      const data = await res.json().catch(() => null);
+      const metas = Array.isArray(data?.metas) ? data.metas : [];
+      let bestId = '';
+      let bestScore = -1;
+      for (const m of metas.slice(0, 8)) {
+        const imdb = String(m?.imdb_id || m?.id || '').trim();
+        if (!/^tt\d+$/i.test(imdb)) continue;
+        const candToks = new Set(tokenizeSubTitle(m?.name || ''));
+        let hits = 0;
+        for (const w of wantToks) {
+          if (candToks.has(w)) hits += 1;
+        }
+        if (wantToks.length > 0 && hits === 0) continue;
+        let score = hits * 15;
+        if (wantToks.length > 0 && hits === wantToks.length) score += 20;
+        const relYr = Number(String(m?.releaseInfo || m?.year || '').slice(0, 4)) || 0;
+        if (year && relYr > 1900) {
+          if (relYr === Number(year)) score += 18;
+          else if (Math.abs(relYr - Number(year)) > 2) score -= 25;
+        }
+        if (score > bestScore) {
+          bestScore = score;
+          bestId = imdb;
+        }
+      }
+      return bestScore >= 10 ? bestId : '';
+    } catch {
+      return '';
+    }
+  }
+
+  async #fetchFromStremioOpenSubtitles({ title, imdbId, season, episode, language = 'eng', durationSeconds = null }, outPath) {
+    const normImdb = String(imdbId || '').trim();
+    if (!/^tt\d+$/i.test(normImdb)) return null;
+    const isSeries = Boolean(season && episode);
+    const endpoint = isSeries
+      ? `https://opensubtitles-v3.strem.io/subtitles/series/${normImdb}:${Number(season)}:${Number(episode)}.json`
+      : `https://opensubtitles-v3.strem.io/subtitles/movie/${normImdb}.json`;
+    try {
+      const res = await this.fetch(endpoint, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(6500) });
+      if (!res?.ok) return null;
+      const data = await res.json().catch(() => null);
+      const subs = Array.isArray(data?.subtitles) ? data.subtitles : [];
+      if (!subs.length) return null;
+
+      const wantLang = String(language || 'eng').toLowerCase();
+      const wantPrefix = wantLang.slice(0, 2);
+      const candidates = subs
+        .filter((s) => s?.url && typeof s.url === 'string')
+        .map((s) => {
+          const sl = String(s?.lang || '').toLowerCase();
+          const urlL = s.url.toLowerCase();
+          let score = 0;
+          if (sl === wantLang || (wantPrefix === 'en' && /^(?:en|eng|english)$/.test(sl))) score += 50;
+          else if (wantPrefix && sl.startsWith(wantPrefix)) score += 35;
+          else if (/^(?:en|eng)/.test(sl)) score += 5;
+          else return { s, score: -100 };
+          if (urlL.includes('.srt')) score += 10;
+          else if (urlL.includes('.vtt')) score += 6;
+          if (String(s?.SubEncoding || '').toUpperCase().includes('UTF')) score += 4;
+          return { s, score };
+        })
+        .filter((x) => x.score >= 30)
+        .sort((a, b) => b.score - a.score);
+
+      for (const { s } of candidates.slice(0, 4)) {
+        try {
+          const dlRes = await this.fetch(s.url, { headers: { Accept: 'text/plain,*/*' }, signal: AbortSignal.timeout(8000) });
+          if (!dlRes?.ok) continue;
+          const buf = Buffer.from(await dlRes.arrayBuffer());
+          const rawText = (s.url.endsWith('.gz') || (buf[0] === 0x1f && buf[1] === 0x8b))
+            ? gunzipSync(buf).toString('utf8')
+            : buf.toString('utf8');
+          const cues = dedupeOverlappingCues(parseAnySubtitleText(rawText).filter((c) => !isPromoCueText(c.text)));
+          if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
+          const canonicalSrt = serializeSrt(cues);
+          writeFileSync(outPath, canonicalSrt, 'utf8');
+          this.cueCache.set(outPath, cues);
+          return {
+            found: true,
+            filePath: outPath,
+            cues,
+            language: String(s?.lang || language || 'eng'),
+            label: `${title} (${String(s?.lang || language || 'ENG').toUpperCase()})`,
+            source: 'opensubtitles'
+          };
+        } catch {}
+      }
+    } catch {}
     return null;
   }
 
   async #fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language = 'eng', durationSeconds = null, releaseHint = '' }, outPath) {
+    let effImdb = imdbId ? (String(imdbId).startsWith('tt') ? String(imdbId) : `tt${String(imdbId).replace(/[^\d]/g, '')}`) : '';
+    if (!/^tt\d+$/i.test(effImdb)) {
+      effImdb = await this.#resolveImdbIdViaCinemeta({ title, year, season, episode });
+    }
+    if (effImdb) {
+      const stremioHit = await this.#fetchFromStremioOpenSubtitles(
+        { title, imdbId: effImdb, season, episode, language, durationSeconds },
+        outPath
+      );
+      if (stremioHit) return stremioHit;
+    }
+
     const parts = [];
     if (season && episode) {
       parts.push(`episode-${Number(episode)}`);
     }
-    if (imdbId) {
-      const numericImdb = String(imdbId).replace(/^tt/i, '').replace(/[^\d]/g, '');
+    if (effImdb) {
+      const numericImdb = effImdb.replace(/^tt/i, '').replace(/[^\d]/g, '');
       if (numericImdb) parts.push(`imdbid-${numericImdb}`);
     }
     const cleanTitle = cleanTitleForSearch(title);
-    if (!imdbId && cleanTitle) {
+    if (!effImdb && cleanTitle) {
       parts.push(`query-${encodeURIComponent(cleanTitle.toLowerCase())}`);
     }
     if (season && episode) {
@@ -575,7 +1059,7 @@ export class SubtitleService {
     if (!Array.isArray(rows) || !rows.length) return null;
 
     const ranked = rows
-      .filter((r) => r?.SubDownloadLink && String(r?.SubFormat || '').toLowerCase() === 'srt')
+      .filter((r) => r?.SubDownloadLink && ['srt', 'vtt', ''].includes(String(r?.SubFormat || '').toLowerCase()))
       .map((r) => ({ item: r, score: scoreSubtitleCandidate(r, { title, year, season, episode, releaseHint }) }))
       .filter((r) => r.score >= 28)
       .sort((a, b) => b.score - a.score);
@@ -591,7 +1075,7 @@ export class SubtitleService {
         const srtText = (item.SubDownloadLink.endsWith('.gz') || (buf[0] === 0x1f && buf[1] === 0x8b))
           ? gunzipSync(buf).toString('utf8')
           : buf.toString('utf8');
-        const cues = parseSrt(srtText).filter((c) => !isPromoCueText(c.text));
+        const cues = dedupeOverlappingCues(parseAnySubtitleText(srtText).filter((c) => !isPromoCueText(c.text)));
         if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
         const canonicalSrt = serializeSrt(cues);
         writeFileSync(outPath, canonicalSrt, 'utf8');
@@ -685,8 +1169,10 @@ export class SubtitleService {
     args.push('-i', streamUrl, '-map', mapSpec, '-f', 'srt', outPath);
     await this.runner(this.ffmpeg, args, { timeout: 25_000, maxBuffer: 2 * 1024 * 1024 });
     if (!existsSync(outPath)) return null;
-    const cues = this.loadCues(outPath).filter((c) => !isPromoCueText(c.text));
+    const cues = dedupeOverlappingCues(this.loadCues(outPath).filter((c) => !isPromoCueText(c.text)));
     if (cues.length < 5) return null;
+    writeFileSync(outPath, serializeSrt(cues), 'utf8');
+    this.cueCache.set(outPath, cues);
     return {
       found: true,
       filePath: outPath,

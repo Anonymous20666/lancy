@@ -40,7 +40,9 @@ function normalizeListItem(item, fallbackType = null) {
     providerId: id,
     type,
     title,
-    originalTitle: item.original_title || null,
+    originalTitle: item.original_title || item.originalTitle || null,
+    originalLanguage: item.original_language || item.originalLanguage || null,
+    language: item.language || item.original_language || null,
     releaseDate: item.release_date || item.first_air_date || null,
     year: item.year ? Number(item.year) : (item.release_date ? Number(String(item.release_date).slice(0, 4)) || null : null),
     poster: item.poster || null,
@@ -236,7 +238,9 @@ export class MovieApiClient {
       imdbId: data.imdb_id || data.imdbId || null,
       cast: Array.isArray(data.cast) ? data.cast.slice(0, 8) : [],
       director: data.director || null,
-      language: data.language || null,
+      language: data.language || data.original_language || base.language || null,
+      originalLanguage: data.original_language || data.originalLanguage || base.originalLanguage || null,
+      originalTitle: data.original_title || data.originalTitle || base.originalTitle || null,
       genres: Array.isArray(data.genres) ? data.genres : base.genres,
       media: data.media || null
     };
@@ -253,6 +257,9 @@ export class MovieApiClient {
       totalEpisodes: Number(data.total_episodes) || null,
       status: data.status || null,
       imdbId: data.imdb_id || data.imdbId || null,
+      language: data.language || data.original_language || base.language || null,
+      originalLanguage: data.original_language || data.originalLanguage || base.originalLanguage || null,
+      originalTitle: data.original_title || data.originalTitle || base.originalTitle || null,
       cast: Array.isArray(data.cast) ? data.cast.slice(0, 8) : [],
       genres: Array.isArray(data.genres) ? data.genres : base.genres,
       seasons
@@ -316,6 +323,7 @@ export class MovieApiClient {
       servers: safeServers,
       qualities: Array.isArray(data?.qualities) ? data.qualities : [],
       subtitles: Array.isArray(data?.subtitles) ? data.subtitles : [],
+      originalLanguage: data?.original_language || data?.originalLanguage || null,
       rootStream: data?.root_stream || null,
       viewingUrl: data?.viewing_url || null
     };

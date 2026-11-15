@@ -29,6 +29,7 @@ export const ADMIN_MUSIC_COMMANDS = [
   { command: 'movie', description: 'Admin: search & stream movies and multi-season TV series' },
   { command: 'movieai', description: 'Admin: unified AI Movie & Song conversational agent' },
   { command: 'vcsudo', description: 'Owner/Sudo: authorize users who can control VC in group chats' },
+  { command: 'rmsudo', description: 'Owner/Sudo: revoke VC Sudo authorization from a user' },
   { command: 'playlist', description: 'Save lists; admins can load into live queues' }
 ];
 export const PRIVATE_CHANNEL_COMMANDS = [

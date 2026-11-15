@@ -161,8 +161,8 @@ ${stickerSection}
 • Want your own private bot? Send /clone in private DM to launch your branded clone with your own name, multi-language support (7 languages!), and audience broadcasting!
 
 👥 GROUP CHATS & MULTITASKING
-• Add the bot to your group chats for shared music drops, media downloads, and Pinterest searches.
-• Group AI conversation is disabled. Reply to this bot with "play <title artist>" for download search, or use music commands.`;
+• Add the bot to your group chats for shared music drops, Custom Emojis, sticker tools, media downloads, and Pinterest searches.
+• Group AI conversation is disabled. Reply to this bot with "play <title artist>" for download search, or use music/emoji commands.`;
 
     b.expandableBlockquote(guideText);
     b.divider();
@@ -170,11 +170,19 @@ ${stickerSection}
     // Primary navigation — grouped rows.
     b.heading('୨୧ quick actions', 3);
     if (isGroup) {
-      // In groups: WhatsApp and AI are omitted; highlight Game Arena!
+      // In groups: WhatsApp and AI are omitted; highlight Game Arena, Music & Emoji/Sticker Studio!
       b.buttons([
         richButton.callback('🎮 Game Arena', 'game_hub:visual', { style: 'success' }),
         richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),
         richButton.callback('Player', encodeCallback('music', 'openplayer'))
+      ]);
+      b.buttons([
+        richButton.callback('✨ Custom Emojis', encodeCallback('cemoji', 'open'), { style: 'primary' }),
+        richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
+      ]);
+      b.buttons([
+        richButton.callback('🆔 Get Emoji ID', encodeCallback('cemoji', 'emoji_id')),
+        richButton.callback('🪄 Emoji Suggest', encodeCallback('cemoji', 'suggest_open'))
       ]);
       b.buttons([
         richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open')),
@@ -194,7 +202,8 @@ ${stickerSection}
       ]);
       b.buttons([
         richButton.callback('🔍 Pinterest Studio', encodeCallback('pinterest', 'open')),
-        richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open'))
+        richButton.callback('🎀 TG Stickers', encodeCallback('stickers', 'open')),
+        richButton.callback('✨ Custom Emojis', encodeCallback('cemoji', 'open'))
       ]);
       b.buttons([
         richButton.callback('🎵 Play Music', encodeCallback('downloader', 'play')),

@@ -87,7 +87,9 @@ export class MovieDownloader {
   #cacheKey(item, limitBytes = this.getLimitBytes(), quality = null) {
     const id = item?.id ?? item?.tmdbId ?? item?.providerId ?? null;
     if (!id) return null;
-    const type = String(item.type || (item.episode != null || item.episodeNumber != null ? 'tv' : 'movie')).toLowerCase();
+    const type = String(
+      item.type || (item.isAdult ? (item.sourceKey || 'adult') : (item.episode != null || item.episodeNumber != null ? 'tv' : 'movie'))
+    ).toLowerCase();
     const s = Number(item.season ?? item.seasonNumber ?? 0) || 0;
     const e = Number(item.episode ?? item.episodeNumber ?? 0) || 0;
     const tier = limitBytes >= 500 * 1024 * 1024 ? '2g' : '50m';
@@ -195,6 +197,23 @@ export class MovieDownloader {
 
     try {
       let track = item?.streamUrl || item?.videoUrl || item?.filePath ? item : null;
+      if (!track && item?.isAdult && item?.pageUrl && typeof this.app?.adultCatalog?.resolveStream === 'function') {
+        emit(`🔎 Resolving ${profile.short} 18+ stream for ${item?.title || 'video'}…`);
+        const resolvedAdult = await this.app.adultCatalog.resolveStream(item, {
+          preferredHeight: profile.height
+        }).catch(() => null);
+        if (resolvedAdult?.streamUrl) {
+          track = {
+            ...item,
+            streamUrl: resolvedAdult.streamUrl,
+            videoUrl: resolvedAdult.streamUrl,
+            isHls: Boolean(resolvedAdult.isHls),
+            variants: resolvedAdult.variants || item.variants || null,
+            streamHeaders: { ...(item.streamHeaders || item.headers || {}), ...(resolvedAdult.headers || {}) },
+            durationSeconds: resolvedAdult.durationSeconds || item.durationSeconds || null
+          };
+        }
+      }
       if (!track && this.app?.movieResolver) {
         emit(`🔎 Resolving ${profile.short} stream for ${item?.title || 'title'}…`);
         const res = await this.app.movieResolver.resolve(item, {
@@ -218,7 +237,20 @@ export class MovieDownloader {
       if (track.filePath && existsSync(track.filePath)) {
         outPath = track.filePath;
       } else {
-        const streamUrl = track.streamUrl || track.videoUrl || track.mediaUrl;
+        let streamUrl = track.streamUrl || track.videoUrl || track.mediaUrl;
+        if (Array.isArray(track.variants) && track.variants.length > 0) {
+          const validVariants = track.variants.filter((v) => v?.url && /^https?:\/\//i.test(v.url));
+          if (validVariants.length > 0) {
+            const sorted = [...validVariants].sort((a, b) => {
+              const ah = Number(a.height) || 480;
+              const bh = Number(b.height) || 480;
+              return Math.abs(ah - profile.height) - Math.abs(bh - profile.height);
+            });
+            if (sorted[0]?.url) {
+              streamUrl = sorted[0].url;
+            }
+          }
+        }
         if (!streamUrl) {
           cleanup();
           return { ok: false, reason: 'Playable video URL was unavailable.', cleanup: () => {} };

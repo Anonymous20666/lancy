@@ -306,7 +306,7 @@ export class CinemaVcAnnouncer {
   async onTrackStart({ chatId, track, session } = {}) {
     const cid = Number(chatId);
     if (!Number.isFinite(cid) || cid >= 0) return null;
-    if (!track || track.provider !== 'movie') return null;
+    if (!track || track.provider !== 'movie' || track.isAdult) return null;
     if (session?.isChannel) return null;
 
     if (session?._suppressCinemaAnnounce) {

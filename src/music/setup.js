@@ -87,8 +87,14 @@ export class CallSetup {
         const preSession=this.app.musicQueueManager.getSession(id);
         const queuedTitle=preSession.currentTrack?.title||(preSession.activeDeck==='movie'?preSession.movieUpcoming?.[0]?.title:preSession.upcoming?.[0]?.title)||(preSession.movieUpcoming?.[0]?.title||preSession.upcoming?.[0]?.title)||'';
         const vcTitle=String(queuedTitle).trim().slice(0,64)||undefined;
-        current();const result=await checked(voice.setup(id,'start',{create:true,...(vcTitle?{vc_title:vcTitle}:{})}));
-        const s=this.app.musicQueueManager.getSession(id);s.destinationTitle=chat.title||String(id);s.isChannel=chat.type==='channel';s.lastError=null;s.lastNotice=result.created?'Assistant ready · a new call/broadcast was created. Add a recording to start playback.':'Assistant ready · reusing the existing call. Add a recording or use the current player.';
+        const isMovieIntent=(
+          preSession.activeDeck==='movie'||
+          preSession.currentTrack?.provider==='movie'||
+          (!preSession.upcoming?.length&&Boolean(preSession.movieUpcoming?.length))
+        );
+        const streamMode=this.app.musicQueueManager.getDeckStreamMode?.(id,isMovieIntent?'movie':'music')||(preSession.streamMode==='rtmp'?'rtmp':isMovieIntent?'rtmp':'interactive');
+        current();const result=await checked(voice.setup(id,'start',{create:true,...(vcTitle?{vc_title:vcTitle}:{}),stream_mode:streamMode}));
+        const s=this.app.musicQueueManager.getSession(id);s.destinationTitle=chat.title||String(id);s.isChannel=chat.type==='channel';if(result?.stream_mode)s.streamMode=result.stream_mode;s.lastError=null;s.lastNotice=result.created?'Assistant ready · a new call/broadcast was created. Add a recording to start playback.':'Assistant ready · reusing the existing call. Add a recording or use the current player.';
         await this.app?.music?.syncSessionIdentity?.(s,ctx,chat,{bridgeInviteLink:result?.call_invite_link||null});
         return {...result,destination:id};
       }catch(error){

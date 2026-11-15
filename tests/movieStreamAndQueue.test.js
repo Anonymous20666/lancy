@@ -2705,3 +2705,524 @@ test('MovieStreamResolver avoids per-host 429 bursts, handles 429 backoff cleanl
     await new Promise((r) => upstreamSrv.close(r));
   }
 });
+
+test('HLS proxy slices fMP4 #EXT-X-MAP segments on ?start=seek, coalesces rapid +30s click spam, supports custom skip step & anti-misclick layout', async (t) => {
+  const { createServer } = await import('node:http');
+  const { VideoStreamingServer } = await import('../src/media/streamingServer.js');
+  const { parseSeekInput } = await import('../src/music/service.js');
+  const { CommandJobProcessor } = await import('../src/core/commandProcessor.js');
+
+  // 1. Test parseSeekInput across relative, absolute, timestamp, and step modes
+  assert.deepEqual(parseSeekInput('+45', 100, 3600), { kind: 'relative', delta: 45, targetSeconds: 145 });
+  assert.deepEqual(parseSeekInput('-30s', 100, 3600), { kind: 'relative', delta: -30, targetSeconds: 70 });
+  assert.deepEqual(parseSeekInput('+2m', 100, 3600), { kind: 'relative', delta: 120, targetSeconds: 220 });
+  assert.deepEqual(parseSeekInput('12:30', 100, 3600), { kind: 'absolute', targetSeconds: 750 });
+  assert.deepEqual(parseSeekInput('1:05:00', 100, 7200), { kind: 'absolute', targetSeconds: 3900 });
+  assert.deepEqual(parseSeekInput('90s', 100, 3600), { kind: 'absolute', targetSeconds: 90 });
+  assert.deepEqual(parseSeekInput('step 45s', 100, 3600), { kind: 'step', seconds: 45 });
+  assert.deepEqual(parseSeekInput('set 2m', 100, 3600), { kind: 'step', seconds: 120 });
+
+  // 2. Test VideoStreamingServer HLS fMP4 #EXT-X-MAP playlist slicing on ?start=25
+  const upstreamHls = createServer((req, res) => {
+    if (req.url === '/master.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",DEFAULT=YES,URI="audio.m3u8"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1920x1080,AUDIO="aud"',
+        'video.m3u8'
+      ].join('\n'));
+      return;
+    }
+    if (req.url === '/video.m3u8' || req.url === '/audio.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-TARGETDURATION:10',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXT-X-MAP:URI="init.mp4"',
+        '#EXTINF:10.000,',
+        'seg0.m4s',
+        '#EXTINF:10.000,',
+        'seg1.m4s',
+        '#EXTINF:10.000,',
+        'seg2.m4s',
+        '#EXTINF:10.000,',
+        'seg3.m4s',
+        '#EXT-X-ENDLIST'
+      ].join('\n'));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstreamHls.listen(0, '127.0.0.1', r));
+  const hlsPort = upstreamHls.address().port;
+
+  const streamSrv = new VideoStreamingServer({ port: 0, cacheDir: '/tmp' });
+  await streamSrv.start();
+  try {
+    const proxyUrl = streamSrv.registerRemoteStream({
+      url: `http://127.0.0.1:${hlsPort}/master.m3u8`,
+      isHls: true
+    });
+    assert.match(proxyUrl, /\.m3u8$/);
+
+    const masterRes = await fetch(`${proxyUrl}?start=25`);
+    const masterText = await masterRes.text();
+    assert.match(masterText, /\.m3u8\?start=25\.000/);
+
+    const childMatch = masterText.match(/http:\/\/127\.0\.0\.1:\d+\/movie-proxy\/[a-f0-9]+\.m3u8\?start=25\.000/);
+    assert.ok(childMatch, 'Master playlist must propagate ?start=25.000 to child renditions');
+
+    const childRes = await fetch(childMatch[0]);
+    const childText = await childRes.text();
+    assert.match(childText, /#EXT-X-MAP:URI="http:\/\/127\.0\.0\.1:\d+\/movie-proxy\/[a-f0-9]+\.mp4"/);
+    assert.match(childText, /#EXT-X-MEDIA-SEQUENCE:2/);
+    const segMatches = [...childText.matchAll(/#EXTINF:10\.000,/g)];
+    assert.equal(segMatches.length, 2, 'First 2 segments (20s) should be sliced out, leaving seg2 & seg3');
+  } finally {
+    await streamSrv.stop();
+    await new Promise((r) => upstreamHls.close(r));
+  }
+
+  // 3. Test rapid click-spam coalescing on +30s, null-clock preservation, custom step & anti-misclick layout
+  const h = buildTestHarness(t);
+  await h.qm.addMovies(-100999, [
+    {
+      id: 'mv-mentalist',
+      provider: 'movie',
+      title: 'The Mentalist · S01E18',
+      durationSeconds: 2566,
+      streamUrl: 'https://example.com/mentalist.m3u8',
+      isHls: true,
+      mediaType: 'video',
+      capabilities: { seek: true, video: true }
+    },
+    {
+      id: 'mv-next',
+      provider: 'movie',
+      title: 'The Mentalist · S01E19',
+      durationSeconds: 2566,
+      streamUrl: 'https://example.com/mentalist19.m3u8',
+      isHls: true,
+      mediaType: 'video',
+      capabilities: { seek: true, video: true }
+    }
+  ]);
+
+  const seekTargets = [];
+  h.qm.voice.seek = async (_id, secs) => {
+    await new Promise((r) => setTimeout(r, 25));
+    seekTargets.push(secs);
+    return { ok: true, position_seconds: secs };
+  };
+
+  const s = h.qm.getSession(-100999);
+  const ctx = h.makeCtx(-100999);
+  await h.service.player(ctx, -100999);
+  const liveMsgId = s.screenMessageId;
+  const rev = String(s.controlRevision || 0);
+
+  const btnLabel = (b) => Array.isArray(b.text)
+    ? b.text.map((x) => (typeof x === 'string' ? x : (x.alternative_text || ''))).join('')
+    : String(b.text || '');
+
+  // Verify anti-misclick layout: Row 1 has -30s, Pause, +30s, Custom s; Stop is on the bottom row
+  const initialCard = h.screen.renderCinemaPlayer(s);
+  const btnBlocks = initialCard.blocks.filter((b) => b.type === 'buttons');
+  const row1Texts = btnBlocks[0].buttons.map(btnLabel);
+  assert.deepEqual(row1Texts, ['-30s', '⏸ Pause', '+30s', '⏱ Custom s']);
+  assert.ok(!row1Texts.some((txt) => /Stop|Next/i.test(txt)), 'Row 1 must not contain Stop or Next near +30s');
+  const lastRowTexts = btnBlocks[btnBlocks.length - 1].buttons.map(btnLabel);
+  assert.ok(lastRowTexts.some((txt) => /Stop/i.test(txt)), 'Stop must be isolated on the bottom row');
+
+  // Simulate playback at 600s where positionSeconds momentarily becomes null
+  s.positionSeconds = null;
+  s.lastKnownPositionSeconds = 600;
+  s.positionUpdatedAt = Date.now();
+
+  // Enable 60ms coalescing window and fire 4 rapid +30s clicks concurrently through CommandJobProcessor
+  h.service.seekCoalesceMs = 60;
+  const proc = new CommandJobProcessor({ callbackDedupMs: 650 });
+  await Promise.all([1, 2, 3, 4].map((n) =>
+    proc.runCallback(
+      { chatId: -100999, tgId: ctx.tgId, messageId: liveMsgId, screen: 'music', action: 'seekby', args: ['30', rev] },
+      () => h.service.control({ ...ctx, query: { id: `burst-${n}` }, messageId: liveMsgId }, 'seekby', ['30', rev])
+    )
+  ));
+
+  assert.deepEqual(seekTargets, [720], '4 rapid +30s clicks from 600s (even with null positionSeconds) must coalesce into a single seek to 720s');
+  assert.equal(s.positionSeconds, 720);
+
+  // Set custom skip step to 45s via setseekstep and verify Row 1 buttons update to -45s / +45s
+  await h.service.control({ ...ctx, query: { id: 'step-45' }, messageId: liveMsgId }, 'setseekstep', ['45', rev]);
+  assert.equal(s.seekStepSeconds, 45);
+  const updatedCard = h.screen.renderCinemaPlayer(s);
+  const updatedRow1 = updatedCard.blocks.filter((b) => b.type === 'buttons')[0].buttons.map(btnLabel);
+  assert.deepEqual(updatedRow1, ['-45s', '⏸ Pause', '+45s', '⏱ Custom s']);
+
+  // Custom seek via chat input ("15:00") jumps to 900s
+  await h.service.customSeekInput(ctx, '15:00');
+  assert.equal(s.positionSeconds, 900);
+});
+
+test('StreamingServer prunes MPD to <=720p and aligns HLS master separate audio seek boundaries', async () => {
+  const upstream = http.createServer((req, res) => {
+    const u = req.url || '/';
+    if (u === '/manifest.mpd') {
+      res.writeHead(200, { 'Content-Type': 'application/dash+xml' });
+      res.end([
+        '<?xml version="1.0" encoding="utf-8"?>',
+        '<MPD type="static">',
+        '  <Period id="0">',
+        '    <AdaptationSet id="0" contentType="video">',
+        '      <Representation id="0" mimeType="video/mp4" codecs="hev1.1.6.L120.90" bandwidth="1055531" width="1920" height="1080"><SegmentTemplate media="chunk-$RepresentationID$-$Number$.m4s"/></Representation>',
+        '      <Representation id="1" mimeType="video/mp4" codecs="hev1.1.6.L93.90" bandwidth="589219" width="1280" height="720"><SegmentTemplate media="chunk-$RepresentationID$-$Number$.m4s"/></Representation>',
+        '      <Representation id="2" mimeType="video/mp4" codecs="hev1.1.6.L90.90" bandwidth="353171" width="854" height="480"><SegmentTemplate media="chunk-$RepresentationID$-$Number$.m4s"/></Representation>',
+        '    </AdaptationSet>',
+        '    <AdaptationSet id="1" contentType="audio">',
+        '      <Representation id="3" mimeType="audio/mp4" codecs="mp4a.40.2" bandwidth="128000"><SegmentTemplate media="chunk-$RepresentationID$-$Number$.m4s"/></Representation>',
+        '    </AdaptationSet>',
+        '  </Period>',
+        '</MPD>'
+      ].join('\n'));
+      return;
+    }
+    if (u === '/master.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a720",NAME="Original",DEFAULT=YES,URI="audio.m3u8"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a1080",NAME="Original",DEFAULT=YES,URI="audio.m3u8"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=6000000,RESOLUTION=1920x1080,AUDIO="a1080"',
+        'v1080.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1280x720,AUDIO="a720"',
+        'v720.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=854x480,AUDIO="a720"',
+        'v480.m3u8'
+      ].join('\n'));
+      return;
+    }
+    if (u === '/v720.m3u8') {
+      // Video segments: 9.0s + 9.0s (=18.0s skipped at seek=20.0s, leaving seg 2 starting at 18.0s!)
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-TARGETDURATION:10',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXT-X-PLAYLIST-TYPE:VOD',
+        '#EXT-X-MAP:URI="vinit.mp4"',
+        '#EXTINF:9.000,', 'v0.m4s',
+        '#EXTINF:9.000,', 'v1.m4s',
+        '#EXTINF:9.000,', 'v2.m4s',
+        '#EXT-X-ENDLIST'
+      ].join('\n'));
+      return;
+    }
+    if (u === '/audio.m3u8') {
+      // Audio segments: 6s * 4 -> seeking naively to 20s skips 3 segs (18s), wait at seek=17s -> video skips 9s, naive audio would skip 12s (>9s)!
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end([
+        '#EXTM3U',
+        '#EXT-X-TARGETDURATION:6',
+        '#EXT-X-MEDIA-SEQUENCE:0',
+        '#EXT-X-PLAYLIST-TYPE:VOD',
+        '#EXT-X-MAP:URI="ainit.mp4"',
+        '#EXTINF:6.000,', 'a0.m4s',
+        '#EXTINF:6.000,', 'a1.m4s',
+        '#EXTINF:6.000,', 'a2.m4s',
+        '#EXTINF:6.000,', 'a3.m4s',
+        '#EXT-X-ENDLIST'
+      ].join('\n'));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  const port = upstream.address().port;
+  const srv = new VideoStreamingServer({ port: 0, cacheDir: '/tmp' });
+  await srv.start();
+
+  try {
+    // 1. MPD single-representation pruning <=720p
+    const mpdUrl = srv.registerRemoteStream({ url: `http://127.0.0.1:${port}/manifest.mpd`, isDash: true });
+    const mpdBody = await (await fetch(mpdUrl)).text();
+    assert.ok(!mpdBody.includes('<Representation id="0"'), '1080p HEVC representation should be pruned');
+    assert.ok(mpdBody.includes('<Representation id="1"'), '720p representation should be selected');
+    assert.ok(!mpdBody.includes('<Representation id="2"'), '480p representation should be pruned');
+    assert.ok(mpdBody.includes('<Representation id="3"'), 'Audio representation must be kept');
+
+    // 2. HLS master variant pruning + aligned audio seek (seek=17.0s -> vSkipped=9.0s -> audio must get start<=8.92s, NOT 17.0s!)
+    const hlsUrl = srv.registerRemoteStream({ url: `http://127.0.0.1:${port}/master.m3u8`, isHls: true });
+    const hlsMaster = await (await fetch(`${hlsUrl}?start=17`)).text();
+    assert.ok(!hlsMaster.includes('1920x1080'), '1080p HLS variant must be pruned');
+    assert.ok(!hlsMaster.includes('854x480'), '480p HLS variant must be pruned');
+    assert.ok(hlsMaster.includes('1280x720'), '720p HLS variant must be kept');
+    assert.ok(!hlsMaster.includes('GROUP-ID="a1080"'), 'Unused audio group for pruned 1080p variant must be dropped');
+
+    const audioUri = hlsMaster.match(/#EXT-X-MEDIA:TYPE=AUDIO[^\n]+URI="([^"]+)"/)?.[1] || '';
+    assert.ok(audioUri, 'Rewritten audio media playlist URI must exist');
+    const audioStartParam = Number(new URL(audioUri).searchParams.get('start') || 0);
+    assert.ok(audioStartParam > 0 && audioStartParam <= 9.0, `Audio seek (${audioStartParam}s) must align <= video segment start (9.0s), not 17.0s`);
+
+    const audioChildText = await (await fetch(audioUri)).text();
+    assert.match(audioChildText, /#EXT-X-MEDIA-SEQUENCE:1/, 'Audio should skip only 1 segment (6.0s <= 9.0s video start), not 2 segments (12.0s)');
+  } finally {
+    await srv.stop();
+    await new Promise((r) => upstream.close(r));
+  }
+});
+
+test('MovieStreamResolver resolves TV episodes with alternate regional slug via verified episode metadata or MPD ProgramInformation Title, and MovieUi avoids duplicate failure log lines', async (t) => {
+  const upstreamSrv = http.createServer((req, res) => {
+    const pathname = (req.url || '').split('?')[0];
+    if (pathname === '/mako_good.mpd') {
+      res.writeHead(200, { 'Content-Type': 'application/dash+xml' });
+      res.end('<?xml version="1.0"?><MPD mediaPresentationDuration="PT24M26.5S"><BaseURL>http://127.0.0.1:' + upstreamSrv.address().port + '/seg/</BaseURL><ProgramInformation><Title>Outcasts</Title></ProgramInformation><Period><AdaptationSet contentType="video"><Representation id="0" width="1280" height="720"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>');
+      return;
+    }
+    if (pathname === '/mako_wrong.mpd') {
+      res.writeHead(200, { 'Content-Type': 'application/dash+xml' });
+      res.end('<?xml version="1.0"?><MPD mediaPresentationDuration="PT24M26.5S"><BaseURL>http://127.0.0.1:' + upstreamSrv.address().port + '/seg/</BaseURL><ProgramInformation><Title>Completely Different Pilot</Title></ProgramInformation><Period><AdaptationSet contentType="video"><Representation id="0" width="1280" height="720"><SegmentTemplate initialization="init-$RepresentationID$.m4s" media="chunk-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>');
+      return;
+    }
+    if (pathname === '/seg/init-0.m4s') {
+      res.writeHead(206, { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-3/4' });
+      res.end(Buffer.from('INIT'));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstreamSrv.listen(0, '127.0.0.1', r));
+  const upPort = upstreamSrv.address().port;
+
+  try {
+    const altSlugToken = Buffer.from(JSON.stringify({ r: { se: 1, ep: 1, slug: 'mako-mermaids-wabnto8voq7' } })).toString('base64');
+
+    // 1. Proxy returns verified TMDB episode meta + alternate regional title slug -> must resolve cleanly even without caller passing episodeTitle
+    const resolverWithMeta = new MovieStreamResolver({
+      movieApi: {
+        getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }),
+        getTvSeasonEpisodes: async () => ({
+          seriesId: '42025',
+          seasonNumber: 1,
+          episodes: [{ episodeNumber: 1, title: 'Outcasts', runtimeSeconds: 1440 }]
+        })
+      },
+      subtitles: null,
+      enableYtDlp: false,
+      enableWebFallback: false,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        if (u.startsWith(`http://127.0.0.1:${upPort}`)) return fetch(u, opts);
+        if (u.includes('proxy1.flikhub.net')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              meta: { id: 878009, name: 'Outcasts', season_number: 1, episode_number: 1, air_date: '2013-07-26', runtime: 24 },
+              source: { source: 'zendaya', type: 'dash', url: `http://127.0.0.1:${upPort}/mako_good.mpd?t=${encodeURIComponent(altSlugToken)}` }
+            })
+          };
+        }
+        return { ok: false, status: 404 };
+      }
+    });
+    const resMeta = await resolverWithMeta.resolve({
+      type: 'tv',
+      id: '42025',
+      title: 'Mako: Island of Secrets',
+      season: 1,
+      episode: 1,
+      year: 2013,
+      fetchSubtitles: false
+    });
+    assert.equal(resMeta.ok, true);
+    assert.equal(resMeta.track.title, 'Mako: Island of Secrets · S01E01 — Outcasts');
+    assert.equal(resMeta.track.isDash, true);
+
+    // 2. Proxy omits data.meta, alternate slug present -> verified via MPD <ProgramInformation><Title> against episodeTitle
+    const resolverMpdTitleOnly = new MovieStreamResolver({
+      movieApi: { getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }) },
+      subtitles: null,
+      enableYtDlp: false,
+      enableWebFallback: false,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        if (u.startsWith(`http://127.0.0.1:${upPort}`)) return fetch(u, opts);
+        if (u.includes('proxy.yenime.net')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              source: { source: 'zendaya', type: 'dash', url: `http://127.0.0.1:${upPort}/mako_good.mpd?t=${encodeURIComponent(altSlugToken)}` }
+            })
+          };
+        }
+        return { ok: false, status: 404 };
+      }
+    });
+    const resMpd = await resolverMpdTitleOnly.resolve({
+      type: 'tv',
+      id: '42025',
+      title: 'Mako: Island of Secrets',
+      episodeTitle: 'Outcasts',
+      season: 1,
+      episode: 1,
+      year: 2013,
+      durationSeconds: 1440,
+      fetchSubtitles: false
+    });
+    assert.equal(resMpd.ok, true);
+    assert.equal(resMpd.track.isDash, true);
+
+    // 3. Proxy omits data.meta AND MPD <ProgramInformation><Title> mismatches episodeTitle -> must reject strictly!
+    const resolverWrongMpdTitle = new MovieStreamResolver({
+      movieApi: { getPlaybackInfo: async () => ({ rootStream: null, subtitles: [] }) },
+      subtitles: null,
+      enableYtDlp: false,
+      enableWebFallback: false,
+      fetchImpl: async (url, opts) => {
+        const u = String(url);
+        if (u.startsWith(`http://127.0.0.1:${upPort}`)) return fetch(u, opts);
+        if (u.includes('proxy.yenime.net')) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              source: { source: 'zendaya', type: 'dash', url: `http://127.0.0.1:${upPort}/mako_wrong.mpd?t=${encodeURIComponent(altSlugToken)}` }
+            })
+          };
+        }
+        return { ok: false, status: 404 };
+      }
+    });
+    const resWrong = await resolverWrongMpdTitle.resolve({
+      type: 'tv',
+      id: '42025',
+      title: 'Mako: Island of Secrets',
+      episodeTitle: 'Outcasts',
+      season: 1,
+      episode: 1,
+      year: 2013,
+      durationSeconds: 1440,
+      fetchSubtitles: false
+    });
+    assert.equal(resWrong.ok, false, 'Mismatched MPD ProgramInformation Title without meta must be rejected');
+
+    // 4. MovieUi renders failure line at most once (no duplicate log line and no duplicate notice below Live Cinema Log)
+    const h = buildTestHarness(t);
+    h.app.movieResolver.resolve = async (_desc, opts = {}) => {
+      opts.onProgress?.('⏳ [1/5] Checking primary HD stream route…');
+      opts.onProgress?.('❌ No playable full-length feature stream found for this title.');
+      return { ok: false, track: null, reason: 'No playable non-trailer full stream found for this title.' };
+    };
+    const ctx = h.makeCtx(-10055);
+    await h.screen.handleCommand(ctx, '/movie', ['Breaking', 'Bad']);
+    const ms = h.app.movieSessions.getLatestForChat(-10055);
+    await h.screen.handle({ ...ctx, query: { id: 'q-tv-pk' }, messageId: ms.messageId }, 'mv', [ms.id, 'pk', '0']);
+    await h.screen.handle({ ...ctx, query: { id: 'q-tv-pe' }, messageId: ms.messageId }, 'mv', [ms.id, 'pe', '1-1']);
+    const errLogCount = (ms.logLines || []).filter((l) => l.includes('❌')).length;
+    assert.equal(errLogCount, 1, `Expected exactly 1 error line in logLines, got ${JSON.stringify(ms.logLines)}`);
+    const rendered = h.screen.movieUi.renderTvSeason(ctx, ms);
+    const renderedJson = JSON.stringify(rendered);
+    const occurrences = renderedJson.split('No playable full-length feature stream found for this title.').length - 1;
+    assert.equal(occurrences, 1, 'Failure message must render only once in Live Cinema Log without duplicating in ms.notice');
+  } finally {
+    await new Promise((r) => upstreamSrv.close(r));
+  }
+});
+
+test('MovieStreamResolver enforces Original Audio (skips English Dub for non-English originals) and warns only on true Dub-Only fallback', async (t) => {
+  const mkd = mkdtempSync(join(tmpdir(), 'lancy-orig-aud-'));
+  t.after(() => rmSync(mkd, { recursive: true, force: true }));
+
+  const sampleVtt = 'WEBVTT\n\n' + Array.from({ length: 6 }, (_, i) => `00:00:${String(10 + i * 5).padStart(2, '0')}.000 --> 00:00:${String(13 + i * 5).padStart(2, '0')}.000\nSub line ${i}\n`).join('\n');
+  const upstream = http.createServer((req, res) => {
+    const p = (req.url || '/').split('?')[0];
+    if (p === '/dub.m3u8' || p === '/orig.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      res.end('#EXTM3U\n#EXT-X-TARGETDURATION:2400\n#EXTINF:2400.0,\nseg0.ts\n#EXTINF:2400.0,\nseg0.ts\n#EXTINF:2400.0,\nseg0.ts\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (p === '/seg0.ts') {
+      res.writeHead(206, { 'Content-Type': 'video/mp2t' });
+      res.end(Buffer.alloc(1024));
+      return;
+    }
+    if (p === '/en.vtt') {
+      res.writeHead(200, { 'Content-Type': 'text/vtt' });
+      res.end(sampleVtt);
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => upstream.close(r)));
+  const port = upstream.address().port;
+
+  // Case 1: Wave A returns English Dub first AND Japanese Original second (or on Wave B) -> picks Japanese Original!
+  const resolverOrig = new MovieStreamResolver({
+    movieApi: {
+      getMovie: async () => ({ id: '635302', title: 'Demon Slayer', year: 2020, originalLanguage: 'ja', runtimeSeconds: 7000 }),
+      getPlaybackInfo: async () => ({ rootStream: null, originalLanguage: 'ja', subtitles: [] })
+    },
+    subtitles: new SubtitleService({ cacheDir: mkd, fetchImpl: async (u) => fetch(u) }),
+    enableYtDlp: false,
+    enableWebFallback: false,
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.startsWith(`http://127.0.0.1:${port}`)) return fetch(u, opts);
+      if (u.includes('punkflix.net/movie/635302.json')) {
+        return new Response(JSON.stringify({
+          title: 'Demon Slayer',
+          sources: [
+            { source: 'dubsrv', label: 'English Dub', lang: 'en', dub: true, hls: `http://127.0.0.1:${port}/dub.m3u8` },
+            { source: 'origsrv', label: 'Japanese Original', lang: 'ja', isOriginal: true, hls: `http://127.0.0.1:${port}/orig.m3u8`, subtitles: [{ lang: 'en', url: `http://127.0.0.1:${port}/en.vtt` }] }
+          ]
+        }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    }
+  });
+  const resOrig = await resolverOrig.resolve({ type: 'movie', id: '635302', title: 'Demon Slayer', year: 2020, originalLanguage: 'ja' });
+  assert.equal(resOrig.ok, true);
+  assert.equal(resOrig.track.streamUrl, `http://127.0.0.1:${port}/orig.m3u8`);
+  assert.equal(resOrig.track.audioLanguage, 'ja');
+  assert.equal(resOrig.track.audioIsDub, false);
+  assert.equal(resOrig.track.dubOnlyWarning, null);
+
+  // Case 2: Only English Dub exists everywhere -> falls back cleanly with ⚠️ Dub Only Available warning
+  const resolverDubOnly = new MovieStreamResolver({
+    movieApi: {
+      getMovie: async () => ({ id: '635302', title: 'Demon Slayer', year: 2020, originalLanguage: 'ja', runtimeSeconds: 7000 }),
+      getPlaybackInfo: async () => ({ rootStream: null, originalLanguage: 'ja', subtitles: [] })
+    },
+    subtitles: null,
+    enableYtDlp: false,
+    enableWebFallback: false,
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.startsWith(`http://127.0.0.1:${port}`)) return fetch(u, opts);
+      if (u.includes('punkflix.net/movie/635302.json')) {
+        return new Response(JSON.stringify({
+          title: 'Demon Slayer',
+          source: { label: 'English Dub', lang: 'en', dub: true, hls: `http://127.0.0.1:${port}/dub.m3u8` }
+        }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    }
+  });
+  const resDub = await resolverDubOnly.resolve({ type: 'movie', id: '635302', title: 'Demon Slayer', year: 2020, originalLanguage: 'ja', fetchSubtitles: false });
+  assert.equal(resDub.ok, true);
+  assert.equal(resDub.track.streamUrl, `http://127.0.0.1:${port}/dub.m3u8`);
+  assert.equal(resDub.track.audioIsDub, true);
+  assert.equal(resDub.track.dubOnlyWarning, '⚠️ Dub Only Available');
+});

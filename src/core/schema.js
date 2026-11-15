@@ -145,7 +145,8 @@ CREATE TABLE IF NOT EXISTS sticker_packs (
   query TEXT,
   count INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL DEFAULT 'pinterest', -- pinterest | manual | mixed
-  sticker_type TEXT NOT NULL DEFAULT 'static', -- static | video | animated
+  sticker_type TEXT NOT NULL DEFAULT 'static', -- static | video | animated | mixed
+  sticker_kind TEXT NOT NULL DEFAULT 'regular', -- regular | custom_emoji
   thumb_file_id TEXT,
   link TEXT,
   meta_json TEXT NOT NULL DEFAULT '{}',
@@ -162,9 +163,14 @@ CREATE TABLE IF NOT EXISTS sticker_items (
   sha256 TEXT,
   phash TEXT,
   type TEXT NOT NULL DEFAULT 'static',
+  custom_emoji_id TEXT,
+  item_format TEXT NOT NULL DEFAULT 'static',
+  source_sha256 TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_sticker_items_pack ON sticker_items(pack_id);
+CREATE INDEX IF NOT EXISTS idx_sticker_items_emoji ON sticker_items(emoji);
+CREATE INDEX IF NOT EXISTS idx_sticker_items_ceid ON sticker_items(custom_emoji_id);
 
 -- WhatsApp publications (logical pack -> physical pack splits)
 CREATE TABLE IF NOT EXISTS wa_publications (
@@ -257,6 +263,36 @@ CREATE TABLE IF NOT EXISTS tg_channels (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_tg_channels_user ON tg_channels(added_by);
+
+-- Per-bot (main + clone) admin & post permission ledger per channel
+CREATE TABLE IF NOT EXISTS tg_bot_channels (
+  bot_id TEXT NOT NULL,
+  channel_id INTEGER NOT NULL,
+  bot_username TEXT,
+  is_admin INTEGER NOT NULL DEFAULT 1,
+  can_post INTEGER NOT NULL DEFAULT 1,
+  verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (bot_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_tg_bot_channels_cid ON tg_bot_channels(channel_id);
+
+-- System-wide custom emoji ID catalog (seeded builtins + packs + user lookups)
+CREATE TABLE IF NOT EXISTS custom_emoji_catalog (
+  custom_emoji_id TEXT PRIMARY KEY,
+  unicode_emoji TEXT NOT NULL,
+  unicode_key TEXT NOT NULL,
+  set_name TEXT,
+  file_id TEXT,
+  is_video INTEGER NOT NULL DEFAULT 0,
+  is_animated INTEGER NOT NULL DEFAULT 0,
+  source TEXT NOT NULL DEFAULT 'discovered', -- builtin | pack | extracted | user
+  added_by INTEGER,
+  usage_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_ce_catalog_key ON custom_emoji_catalog(unicode_key, usage_count DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ce_catalog_set ON custom_emoji_catalog(set_name);
 
 -- Audit log
 CREATE TABLE IF NOT EXISTS audit_events (

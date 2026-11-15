@@ -16,7 +16,18 @@ import { getLyrics, getCachedLyrics, chunkLyrics, escapeHtml, formatBlockquoteLy
 import { getStreamPublicUrl } from '../media/streamingServer.js';
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
-import { resolvePendingDownload, checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError, verifyChannelAdmin, isNativeChannelPost } from './permissions.js';
+import {
+  resolvePendingDownload,
+  checkChatMediaPermissions,
+  formatMediaRestrictedNotice,
+  isPermissionError,
+  verifyChannelAdmin,
+  isNativeChannelPost,
+  invalidateChannelAdminCache,
+  getBotAdminIds,
+  isAnonymousGroupAdmin,
+  listVerifiedAdminChannels
+} from './permissions.js';
 import { GameEngine } from '../games/engine.js';
 import {
   invalidateForceJoinCache,
@@ -29,6 +40,8 @@ import {
   buildForceJoinManagerRich
 } from './forceJoin.js';
 import { searchNsfw, NSFW_CATEGORIES } from '../wallpaper/nsfwSearch.js';
+import { CommandJobProcessor } from '../core/commandProcessor.js';
+import { isPureStandardEmojiOnly } from '../stickers/customEmojiRegistry.js';
 
 const execFileAsync = promisify(execFile);
 export const inlineSearchCache = new Map();
@@ -106,8 +119,26 @@ export class TelegramController extends EventEmitter {
     this.pendingAudioCaches = new Set(); // query -> boolean
     this.pendingVideoCaches = new Set(); // videoId -> boolean
     this.audioMetadataMap = new Map(); // trackId -> { id, title, artist, album, cover, previewUrl }
+    this.groupMemberUpsertCache = new Map(); // `${chatId}:${userId}` -> timestamp
+    this.commandProcessor = this.app?.commandProcessor || new CommandJobProcessor({ log: this.log });
     this.gameEngine = new GameEngine({ api: this.api, db: this.db, log: this.log });
     this.#registerForceJoinStateHandler();
+  }
+
+  #recordGroupMemberThrottled(chatId, user, { force = false } = {}) {
+    if (!chatId || !user?.id || user.is_bot) return;
+    const key = `${chatId}:${user.id}`;
+    const now = Date.now();
+    if (!force) {
+      const last = this.groupMemberUpsertCache.get(key) || 0;
+      if (now - last < 300000) return; // 5-minute TTL for passive GC chatter
+    }
+    this.groupMemberUpsertCache.set(key, now);
+    if (this.groupMemberUpsertCache.size > 5000) {
+      const oldestKey = this.groupMemberUpsertCache.keys().next().value;
+      this.groupMemberUpsertCache.delete(oldestKey);
+    }
+    this.db.recordGroupMember(chatId, user);
   }
 
   getScreenMsg(chatId, tgId) {
@@ -244,11 +275,50 @@ export class TelegramController extends EventEmitter {
     return this;
   }
 
+  getAdminIds() {
+    return getBotAdminIds(this.settings);
+  }
+
+  isSuperAdmin(tgId) {
+    const id = Number(tgId);
+    if (!Number.isSafeInteger(id) || id <= 0) return false;
+    return this.isOwner(id) || this.getAdminIds().has(id);
+  }
+
+  #recordKnownChannel(chat, fromUser = null) {
+    if (!chat?.id || chat.type !== 'channel') return;
+    if (typeof this.db?.getTelegramChannel !== 'function' || typeof this.db?.recordTelegramChannel !== 'function') return;
+    try {
+      if (this.db.getTelegramChannel(chat.id)) return;
+      this.db.recordTelegramChannel({
+        channel_id: chat.id,
+        title: chat.title || 'Untitled Channel',
+        username: chat.username || null,
+        can_post: 1,
+        added_by: fromUser?.id || null
+      });
+    } catch {}
+  }
+
+  async #isAnyChannelAdmin(tgId) {
+    const id = Number(tgId);
+    if (!Number.isSafeInteger(id) || id <= 0) return false;
+    if (this.isSuperAdmin(id)) return true;
+    const channels = await listVerifiedAdminChannels({
+      db: this.db,
+      api: this.api,
+      settings: this.settings,
+      controller: this,
+      userId: id,
+      isSuperAdmin: false
+    });
+    return channels.length > 0;
+  }
+
   isAllowed(tgId, { isGroup = false, isChannel = false } = {}) {
     const id = Number(tgId);
     if (this.isOwner(id)) return { ok: true, role: 'owner' };
-    const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
-    if (adminIds.has(id)) return { ok: true, role: 'admin' };
+    if (this.getAdminIds().has(id)) return { ok: true, role: 'admin' };
 
     // Channels require live administrator verification via verifyChannelAdmin().
     if (isChannel) return { ok: false, role: 'channel_guest' };
@@ -349,6 +419,12 @@ export class TelegramController extends EventEmitter {
       { command: 'player', description: 'Open the destination music dashboard' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
+      { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
+      { command: 'emojipack', description: '✨ Custom Emoji Studio & HD Media Converter' },
+      { command: 'emoji2media', description: '🖼 Export custom emojis or stickers to HD media' },
+      { command: 'emojiid', description: '🆔 Extract custom emoji IDs & add to system catalog' },
+      { command: 'emojisuggest', description: '🪄 Match normal emojis to custom emojis + Remix' },
+      { command: 'postchannel', description: '📢 Post sticker/emoji pack to Telegram channel' },
       { command: 'search', description: '🔍 Search Pinterest (HD photos & aesthetic art)' },
       { command: 'music', description: '🎧 Fast music & Spotify track search' },
       { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
@@ -389,7 +465,11 @@ export class TelegramController extends EventEmitter {
       { command: 'pfp', description: '👥 Grab aesthetic matching PFP albums from Pinterest' },
       { command: 'matching', description: '👥 Grab 2-piece & multi-slide matching avatars' },
       { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
-      { command: 'postchannel', description: '📢 Post sticker pack to Telegram channel' },
+      { command: 'emojipack', description: '✨ Custom Emoji Studio & HD Media Converter' },
+      { command: 'emoji2media', description: '🖼 Export custom emojis or stickers to HD media' },
+      { command: 'emojiid', description: '🆔 Extract custom emoji IDs & add to system catalog' },
+      { command: 'emojisuggest', description: '🪄 Match normal emojis to custom emojis + Remix' },
+      { command: 'postchannel', description: '📢 Post sticker/emoji pack to Telegram channel' },
       { command: 'autopost', description: '📅 Schedule automated sticker drops' },
       { command: 'forcejoin', description: '🔒 Configure Force-Join channels & groups' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
@@ -474,14 +554,13 @@ export class TelegramController extends EventEmitter {
   }
 
   async #verifyChannelAccess(chatId, source, { fromUser = null, isChannelPost = false } = {}) {
-    const adminIds = new Set((this.settings.get('telegram.adminIds') ?? []).map(Number));
     return await verifyChannelAdmin({
       chatId,
       source,
       fromUser,
       api: this.api,
       isOwner: (id) => this.isOwner(id),
-      adminIds,
+      adminIds: this.getAdminIds(),
       isChannelPost
     });
   }
@@ -494,6 +573,7 @@ export class TelegramController extends EventEmitter {
 
     if (newUser?.id) {
       invalidateForceJoinCache(newUser.id);
+      invalidateChannelAdminCache(this.api, chatId, newUser.id);
     }
 
     const isGroup = Boolean(chatMember.chat.type === 'group' || chatMember.chat.type === 'supergroup');
@@ -522,6 +602,7 @@ export class TelegramController extends EventEmitter {
     const isChannel = chat.type === 'channel';
 
     if (isChannel) {
+      invalidateChannelAdminCache(this.api, chatId);
       if (['administrator', 'creator'].includes(newStatus)) {
         const canPost = newStatus === 'creator' || myChatMember.new_chat_member?.can_post_messages !== false;
         this.log.info?.({ channelId: chatId, title: chat.title, status: newStatus, canPost }, 'bot added or updated as admin in channel');
@@ -569,7 +650,7 @@ export class TelegramController extends EventEmitter {
     const botId = this.botContext?.botId ?? 0;
     const existing = this.db.get('SELECT id FROM users WHERE tg_id = ?', user.id);
     const isOwner = this.isOwner(user.id);
-    const isAdmin = (this.settings.get('telegram.adminIds') ?? []).map(Number).includes(Number(user.id));
+    const isAdmin = this.getAdminIds().has(Number(user.id));
     if (existing) {
       this.db.run(
         `UPDATE users SET username = ?, first_name = ?, last_name = ?, last_seen = datetime('now'),
@@ -3547,7 +3628,7 @@ export class TelegramController extends EventEmitter {
     const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
     const isChannel = Boolean(chatType === 'channel');
     if (isGroup && query.message?.chat?.id && query.from && !query.from.is_bot) {
-      this.db.recordGroupMember(query.message.chat.id, query.from);
+      this.#recordGroupMemberThrottled(query.message.chat.id, query.from);
     }
     let channelAdminVerified = false;
     if (isChannel) {
@@ -3559,13 +3640,22 @@ export class TelegramController extends EventEmitter {
         }).catch(() => {});
         return;
       }
+      this.#recordKnownChannel(query.message?.chat, query.from);
     }
-    const guard = channelAdminVerified ? { ok: true, role: 'channel_admin' } : this.isAllowed(query.from.id, { isGroup, isChannel });
-    if (!guard.ok && !isGroup && this.app?.music) {
-      const screen=this.screens.get('music'),ctx=this.#ctx(String(query.from.id),query);
-      if(screen?.privateChannelRequest?.(ctx,query)){
-        if(!await this.#enforceForceJoin(query.from,query.message?.chat?.id,{query}))return;
-        if(await screen.handlePrivateChannel(ctx,query)){void this.api.answerCallbackQuery(query.id).catch(()=>{});return;}
+    let guard = channelAdminVerified ? { ok: true, role: 'channel_admin' } : this.isAllowed(query.from.id, { isGroup, isChannel });
+    if (!guard.ok && !isGroup && !isChannel) {
+      if (this.app?.music) {
+        const screen=this.screens.get('music'),ctx=this.#ctx(String(query.from.id),query);
+        if(screen?.privateChannelRequest?.(ctx,query)){
+          if(!await this.#enforceForceJoin(query.from,query.message?.chat?.id,{query}))return;
+          if(await screen.handlePrivateChannel(ctx,query)){void this.api.answerCallbackQuery(query.id).catch(()=>{});return;}
+        }
+      }
+      const decodedPre = decodeCallback(query.data ?? '');
+      if (decodedPre && (decodedPre.screen === 'channel_post' || decodedPre.screen === 'autopost')) {
+        if (await this.#isAnyChannelAdmin(query.from.id)) {
+          guard = { ok: true, role: 'channel_admin' };
+        }
       }
     }
     if (!guard.ok) {
@@ -3581,9 +3671,9 @@ export class TelegramController extends EventEmitter {
         return;
       }
 
-      // Smart Dual-Tier Force-Join Gate on callbacks in private DM only (never in group chats or channels, owners bypass)
+      // Smart Dual-Tier Force-Join Gate on callbacks in private DM only (never in group chats or channels, super admins bypass)
       const isGroupCallback = (query.message?.chat?.type === 'group' || query.message?.chat?.type === 'supergroup' || query.message?.chat?.type === 'channel') || Number(query.message?.chat?.id) < 0;
-      if (!isGroupCallback && !this.isOwner(query.from.id) && !this.isMainOwner(query.from.id)) {
+      if (!isGroupCallback && !this.isSuperAdmin(query.from.id)) {
         const allowedByFj = await this.#enforceForceJoin(query.from, query.message?.chat?.id, { query });
         if (!allowedByFj) return;
       }
@@ -3603,7 +3693,7 @@ export class TelegramController extends EventEmitter {
       }
       const { screen, action, args } = decoded;
 
-      // Pagination actions on media messages should update in-place (browsing album slides)
+      // Pagination & adult cinema actions on media messages should update in-place
       const isPagination = Boolean(
         action === 'moreAlbum' ||
         action === 'prevAlbum' ||
@@ -3614,6 +3704,11 @@ export class TelegramController extends EventEmitter {
         action === 'more_slide' ||
         action === 'prev_slide' ||
         action === 'next_slide' ||
+        action === 'xvSo' ||
+        action === 'xvRun' ||
+        action === 'phRun' ||
+        action === 'amRun' ||
+        action.startsWith('ac') ||
         action.startsWith('pfp_') ||
         action.startsWith('nav_') ||
         action.startsWith('page_') ||
@@ -3647,8 +3742,30 @@ export class TelegramController extends EventEmitter {
         await this.api.answerCallbackQuery(query.id, { text: '♡ That screen is not available right now.' });
         return;
       }
+      const autoAckTimer = setTimeout(() => {
+        void this.api.answerCallbackQuery(query.id).catch(() => {});
+      }, 750);
+      autoAckTimer.unref?.();
+      try {
+        if (this.commandProcessor) {
+          await this.commandProcessor.runCallback(
+            {
+              chatId: query.message?.chat?.id ?? ctx.chatId,
+              tgId,
+              messageId: query.message?.message_id ?? ctx.messageId,
+              screen,
+              action,
+              args
+            },
+            (signal) => screenModule.handle({ ...ctx, signal }, action, args)
+          );
+        } else {
+          await screenModule.handle(ctx, action, args);
+        }
+      } finally {
+        clearTimeout(autoAckTimer);
+      }
       void this.api.answerCallbackQuery(query.id).catch(() => {});
-      await screenModule.handle(ctx, action, args);
     } catch (error) {
       this.log.error({ err: error, tgId, data }, 'callback failed');
       await this.api.answerCallbackQuery(query.id, { text: friendly(error), showAlert: true }).catch(() => {});
@@ -3674,25 +3791,26 @@ export class TelegramController extends EventEmitter {
       if (!channelAdminVerified) return; // Fail-closed silently in channels for non-admins
       message._channelAdminVerified = true;
       message._isNativeChannelPost = isNativeChannelPost(message, { isChannelPost });
+      this.#recordKnownChannel(message.chat, message.from);
     }
 
-    // In group chats, passively keep group roster up-to-date for /hidetag
+    // In group chats, passively keep group roster up-to-date for /hidetag (throttled per user)
     if (isGroup && chatId) {
       if (message.from && !message.from.is_bot) {
-        this.db.recordGroupMember(chatId, message.from);
+        this.#recordGroupMemberThrottled(chatId, message.from);
       }
       if (Array.isArray(message.new_chat_members)) {
         for (const newMember of message.new_chat_members) {
           if (!newMember.is_bot) {
-            this.db.recordGroupMember(chatId, newMember);
+            this.#recordGroupMemberThrottled(chatId, newMember, { force: true });
           }
         }
       }
       if (message.new_chat_member && !message.new_chat_member.is_bot) {
-        this.db.recordGroupMember(chatId, message.new_chat_member);
+        this.#recordGroupMemberThrottled(chatId, message.new_chat_member, { force: true });
       }
       if (message.new_chat_participant && !message.new_chat_participant.is_bot) {
-        this.db.recordGroupMember(chatId, message.new_chat_participant);
+        this.#recordGroupMemberThrottled(chatId, message.new_chat_participant, { force: true });
       }
       if (message.left_chat_member?.id) {
         this.db.removeGroupMember(chatId, message.left_chat_member.id);
@@ -3701,32 +3819,43 @@ export class TelegramController extends EventEmitter {
         this.db.removeGroupMember(chatId, message.left_chat_participant.id);
       }
       if (message.reply_to_message?.from && !message.reply_to_message.from.is_bot) {
-        this.db.recordGroupMember(chatId, message.reply_to_message.from);
+        this.#recordGroupMemberThrottled(chatId, message.reply_to_message.from);
       }
       if (message.forward_from && !message.forward_from.is_bot) {
-        this.db.recordGroupMember(chatId, message.forward_from);
+        this.#recordGroupMemberThrottled(chatId, message.forward_from);
       }
       if (message.pinned_message?.from && !message.pinned_message.from.is_bot) {
-        this.db.recordGroupMember(chatId, message.pinned_message.from);
+        this.#recordGroupMemberThrottled(chatId, message.pinned_message.from);
       }
       const entities = message.entities || message.caption_entities;
       if (Array.isArray(entities)) {
         for (const ent of entities) {
           if (ent?.type === 'text_mention' && ent.user && !ent.user.is_bot) {
-            this.db.recordGroupMember(chatId, ent.user);
+            this.#recordGroupMemberThrottled(chatId, ent.user);
           }
         }
       }
     }
 
-    const guard = channelAdminVerified
+    let guard = channelAdminVerified
       ? { ok: true, role: 'channel_admin' }
       : this.isAllowed(message.from?.id ?? message.sender_chat?.id ?? message.chat?.id, { isGroup, isChannel });
-    if (!guard.ok && !isGroup && this.app?.music) {
-      const screen=this.screens.get('music'),ctx=this.#ctx(tgId,{message});
-      if(screen?.privateChannelRequest?.(ctx,message)){
-        if(!await this.#enforceForceJoin(message.from,chatId,{message}))return;
-        if(await screen.handlePrivateChannel(ctx,message))return;
+    if (!guard.ok && !isGroup && !isChannel) {
+      if (this.app?.music) {
+        const screen=this.screens.get('music'),ctx=this.#ctx(tgId,{message});
+        if(screen?.privateChannelRequest?.(ctx,message)){
+          if(!await this.#enforceForceJoin(message.from,chatId,{message}))return;
+          if(await screen.handlePrivateChannel(ctx,message))return;
+        }
+      }
+      const rawCmdText = String(message.text ?? message.caption ?? '').trim();
+      const preCmd = rawCmdText.startsWith('/') ? rawCmdText.split(/\s+/)[0].split('@')[0].toLowerCase() : '';
+      const preState = this.sm?.state?.(tgId);
+      const isChannelMgmtReq =
+        ['/postchannel', '/posttochannel', '/drop', '/autopost', '/autoposting', '/schedulepost'].includes(preCmd) ||
+        [States.TG_CHANNEL_INPUT, States.TG_CHANNEL_CAPTION_INPUT, States.AUTOPOST_CUSTOM_DAYS, States.AUTOPOST_AI_CHAT].includes(preState);
+      if (isChannelMgmtReq && await this.#isAnyChannelAdmin(tgId)) {
+        guard = { ok: true, role: 'channel_admin' };
       }
     }
     if (!guard.ok) return; // silent for unrelated private features/strangers
@@ -3794,8 +3923,8 @@ export class TelegramController extends EventEmitter {
         'play', 'game', 'quiz', 'trivia', 'grid', 'wordgrid', 'pokemon', 'pokebattle', 'pokedex',
         'afro', 'naija', 'songgame', 'lyricgame', 'anime', 'flags', 'logos', 'cars',
         'scramble', 'emoji', 'riddle', 'ttt', 'tictactoe', 'connect4', 'rps', 'topleaderboard',
-        'grab', 'dl', 'download', 'pint', 'stickers', 'menu', 'autopost', 'postchannel',
-        'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp', 'forcejoin', 'fsub',
+        'grab', 'dl', 'download', 'pint', 'stickers', 'emojipack', 'cemoji', 'customemoji', 'emojify', 'makemoji', 'emoji2media', 'emojiid', 'getemojiid', 'emojisuggest', 'suggestemoji', 'menu', 'autopost', 'postchannel',
+        'setprefix', 'ai', 'whatsapp', 'hidetag', 'tagall', 'pfp', 'matching', 'matchingpfp', 'couplepfp', 'forcejoin', 'fsub', 'vcsudo', 'rmsudo',
         'nsfw', '18+', 'hentai', 'adult', 'ecchi', 'r18', 'porn'
       ];
       const matchPrefixAttempt = text.match(/^([^\w\s]{1,3})([a-z0-9]+)(\s+.*)?$/i);
@@ -3812,8 +3941,8 @@ export class TelegramController extends EventEmitter {
       }
     }
 
-    // Smart Dual-Tier Force-Join Gate for private DM actions only (never for group chats or channels, owners bypass)
-    if (!isGroup && !isChannel && !this.isOwner(tgId) && !this.isMainOwner(tgId)) {
+    // Smart Dual-Tier Force-Join Gate for private DM actions only (never for group chats or channels, super admins bypass)
+    if (!isGroup && !isChannel && !this.isSuperAdmin(tgId)) {
       const allowedByFj = await this.#enforceForceJoin(message.from, chatId, { message });
       if (!allowedByFj) return;
     }
@@ -4032,14 +4161,14 @@ export class TelegramController extends EventEmitter {
 
       if (command === '/reloadcommands' || command === '/reload_commands') {
         const isMain = this.isMainOwner(tgId);
-        const isClone = this.isCloneOwner(tgId);
-        if (!isMain && !isClone) {
+        const isSuper = this.isSuperAdmin(tgId);
+        if (!isSuper) {
           await this.api.sendMessage(chatId, `<blockquote>✕ Only bot owners or admins can hot-reload commands ♡</blockquote>`, { parse_mode: 'HTML' });
           return;
         }
 
         let report = '';
-        if (this.app?.multiBotManager && isMain) {
+        if (this.app?.multiBotManager && (isMain || (!this.botContext?.isClone && isSuper))) {
           const results = await this.app.multiBotManager.hotReloadAllCommands();
           const succeeded = results.filter((r) => r.success).length;
           report = `🌸 Hot-reloaded command suggestions across <b>${succeeded}</b> / <b>${results.length}</b> bots! ♡`;
@@ -4259,13 +4388,42 @@ export class TelegramController extends EventEmitter {
         await this.sm.reset(tgId, { reason: 'command' });
         const nsfw = this.screens.get('nsfw');
         const ctx = this.#ctx(tgId, { message }, { forceNew: true });
-        if (query && nsfw?.executeXvideosSearch) {
-          const sent = await nsfw.executeXvideosSearch(ctx, query);
-          updateScreenMsg(sent);
-        } else if (nsfw?.openXvideosHub) {
-          const sent = await nsfw.openXvideosHub(ctx);
-          updateScreenMsg(sent);
-        }
+        await this.commandProcessor.runCommand(
+          { chatId, tgId, command, query, isGroup, api: this.api, replyToMessageId: message.message_id },
+          async () => {
+            if (query && nsfw?.executeXvideosSearch) {
+              const sent = await nsfw.executeXvideosSearch(ctx, query);
+              updateScreenMsg(sent);
+              return sent;
+            } else if (nsfw?.openXvideosHub) {
+              const sent = await nsfw.openXvideosHub(ctx);
+              updateScreenMsg(sent);
+              return sent;
+            }
+          }
+        );
+        return;
+      }
+
+      if (command === '/pornhub' || command === '/ph') {
+        const query = rest.join(' ').trim();
+        await this.sm.reset(tgId, { reason: 'command' });
+        const nsfw = this.screens.get('nsfw');
+        const ctx = this.#ctx(tgId, { message }, { forceNew: true });
+        await this.commandProcessor.runCommand(
+          { chatId, tgId, command, query, isGroup, api: this.api, replyToMessageId: message.message_id },
+          async () => {
+            if (query && nsfw?.executePornhubSearch) {
+              const sent = await nsfw.executePornhubSearch(ctx, query);
+              updateScreenMsg(sent);
+              return sent;
+            } else if (nsfw?.openPornhubHub) {
+              const sent = await nsfw.openPornhubHub(ctx);
+              updateScreenMsg(sent);
+              return sent;
+            }
+          }
+        );
         return;
       }
 
@@ -4274,13 +4432,20 @@ export class TelegramController extends EventEmitter {
         await this.sm.reset(tgId, { reason: 'command' });
         const nsfw = this.screens.get('nsfw');
         const ctx = this.#ctx(tgId, { message }, { forceNew: true });
-        if (query && nsfw?.executeAdultMoviesSearch) {
-          const sent = await nsfw.executeAdultMoviesSearch(ctx, query);
-          updateScreenMsg(sent);
-        } else if (nsfw?.openAdultMovies) {
-          const sent = await nsfw.openAdultMovies(ctx);
-          updateScreenMsg(sent);
-        }
+        await this.commandProcessor.runCommand(
+          { chatId, tgId, command, query, isGroup, api: this.api, replyToMessageId: message.message_id },
+          async () => {
+            if (query && nsfw?.executeAdultMoviesSearch) {
+              const sent = await nsfw.executeAdultMoviesSearch(ctx, query);
+              updateScreenMsg(sent);
+              return sent;
+            } else if (nsfw?.openAdultMovies) {
+              const sent = await nsfw.openAdultMovies(ctx);
+              updateScreenMsg(sent);
+              return sent;
+            }
+          }
+        );
         return;
       }
 
@@ -4302,6 +4467,24 @@ export class TelegramController extends EventEmitter {
         await this.sm.reset(tgId, { reason: 'command' });
         const stickers = this.screens.get('stickers');
         const sent = await stickers?.open(this.#ctx(tgId, { message }, { forceNew: true }));
+        updateScreenMsg(sent);
+        return;
+      }
+      if (
+        command === '/emojipack' || command === '/cemoji' || command === '/customemoji' ||
+        command === '/emojify' || command === '/makemoji' || command === '/emoji2media' ||
+        command === '/emojiid' || command === '/getemojiid' ||
+        command === '/emojisuggest' || command === '/suggestemoji'
+      ) {
+        await this.sm.reset(tgId, { reason: 'command' });
+        const studio = this.screens.get('cemoji');
+        const ceCtx = this.#ctx(tgId, { message }, { forceNew: true });
+        const reverseMode = command === '/emoji2media';
+        const idMode = command === '/emojiid' || command === '/getemojiid';
+        const suggestMode = command === '/emojisuggest' || command === '/suggestemoji';
+        const sent = studio?.handleCommand
+          ? await studio.handleCommand(ceCtx, rest, { reverseMode, idMode, suggestMode, replyMessage: message.reply_to_message || null })
+          : await studio?.open(ceCtx);
         updateScreenMsg(sent);
         return;
       }
@@ -4535,12 +4718,12 @@ export class TelegramController extends EventEmitter {
         return;
       }
       if (command === '/admins') {
-        if (!this.isMainOwner(tgId) && !(this.settings.get('telegram.adminIds') ?? []).map(Number).includes(Number(tgId))) {
+        if (!this.isSuperAdmin(tgId)) {
           await this.api.sendMessage(chatId, '<blockquote>♡ Only studio administrators can view the team roster ♡</blockquote>', { parse_mode: 'HTML' });
           return;
         }
         const owners = (this.settings.get('general.ownerIds') ?? []).map(Number);
-        const admins = (this.settings.get('telegram.adminIds') ?? []).map(Number);
+        const admins = [...this.getAdminIds()];
 
         const formatUserLabel = (id) => {
           const row = this.db.get('SELECT username, first_name, last_name FROM users WHERE tg_id = ?', id);
@@ -4647,7 +4830,11 @@ export class TelegramController extends EventEmitter {
       // In Group Chat: interactive prompt input requires replying to the bot or tagging @bot
       // to avoid chat conflicts when group members talk with each other.
       const stateChat = this.sm.get?.(stateOwnerId)?.chatId;
-      const shouldHandleState = (stateChat == null || Number(stateChat) === Number(chatId)) && (isPrivate || isReplyToBot || isTag || (isChannelMsg && stateChat != null && Number(stateChat) === Number(chatId)));
+      const isAlbumContinuation = Boolean(
+        message.media_group_id && this.screens.get('cemoji')?.hasPendingAlbum?.(chatId, stateOwnerId, message.media_group_id)
+      );
+      const shouldHandleState = (stateChat == null || Number(stateChat) === Number(chatId))
+        && (isPrivate || isReplyToBot || isTag || isAlbumContinuation || (isChannelMsg && stateChat != null && Number(stateChat) === Number(chatId)));
       const ctx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
       const handled = shouldHandleState ? await this.sm.handleMessage(stateOwnerId, { ...message, chatId }, ctx) : false;
       if (!handled) {
@@ -4694,6 +4881,17 @@ export class TelegramController extends EventEmitter {
                 await downloaderScreen.executeDownload(dlCtx, url);
                 return;
               }
+            }
+          }
+
+          // Pure standard Unicode emoji DM auto-suggest (ignores regular text/AI prompts)
+          if (isPrivate && !isGroup && !isChannelMsg && text && isPureStandardEmojiOnly(text, message.entities)) {
+            const autoSuggest = this.settings.getForUser(Number(tgId), 'customEmoji.autoSuggestInDm', true);
+            const studio = autoSuggest ? this.screens.get('cemoji') : null;
+            if (studio?.suggestFromMessage) {
+              const sCtx = this.#ctx(tgId, { message }, { forceNew: true });
+              const handled = await studio.suggestFromMessage(sCtx, message, { silentIfEmpty: true });
+              if (handled) return;
             }
           }
 
@@ -4951,8 +5149,8 @@ export class TelegramController extends EventEmitter {
           this.sm?.update?.(tgId, { screenMessageId: targetMsgId });
           return res ?? { message_id: targetMsgId };
         } catch (error) {
-          const errMsg = String(error?.description ?? error?.message);
-          if (/not modified/i.test(errMsg)) {
+          const errMsg = String(error?.description ?? error?.message ?? '');
+          if (/not modified|too many requests|flood/i.test(errMsg) || error?.errorCode === 429 || error?.code === 'FLOOD_WAIT') {
             return { message_id: targetMsgId };
           }
           const sent = await this.api.sendRichMessage(targetChatId, rich, extra, files);
@@ -4989,8 +5187,8 @@ export class TelegramController extends EventEmitter {
       return;
     }
 
-    // 1. Check permissions: caller must be group creator/administrator or bot owner
-    let isAuthorized = this.isOwner(tgId);
+    // 1. Check permissions: caller must be group creator/administrator, anonymous group admin, or bot super admin
+    let isAuthorized = this.isSuperAdmin(tgId) || isAnonymousGroupAdmin(message, chatId);
     if (!isAuthorized) {
       try {
         const member = await this.api.getChatMember(chatId, Number(tgId));
@@ -5530,8 +5728,8 @@ export class TelegramController extends EventEmitter {
       return true;
     }
 
-    // Never block the Main Owner or the Owner of this Cloned Bot so they can always manage their bot!
-    if (this.isOwner(fromUser.id)) return true;
+    // Never block Bot Super Admins (Main Owner, Clone Owner, or ADMIN_IDS/telegram.adminIds) so they can always manage/use their bot!
+    if (this.isSuperAdmin(fromUser.id)) return true;
 
     try {
       const res = await checkUserForceJoin({
@@ -5896,8 +6094,8 @@ export class TelegramController extends EventEmitter {
     if (!isSettingPersonal) {
       // Trying to set group-wide or channel-wide prefix
       let isAdmin = isChannel
-        ? await this.#verifyChannelAccess(chatId, message, { fromUser: message.from, isChannelPost: true })
-        : this.isOwner(tgId);
+        ? (Boolean(message._channelAdminVerified) || await this.#verifyChannelAccess(chatId, message, { fromUser: message.from, isChannelPost: Boolean(message._isNativeChannelPost) }))
+        : (this.isSuperAdmin(tgId) || isAnonymousGroupAdmin(message, chatId));
       if (!isAdmin && !isChannel) {
         try {
           const member = await this.api.getChatMember(chatId, tgId);
@@ -6002,6 +6200,9 @@ export class TelegramController extends EventEmitter {
       [`👥 ${prefix}pfp <theme>`, 'Matching PFP albums (duo/couple)'],
       [`🔍 ${prefix}pint <search>`, 'Aesthetic Pinterest HD gallery'],
       [`🎀 ${prefix}stickers`, 'Telegram sticker studio'],
+      [`✨ ${prefix}emojipack`, 'Custom Emoji Studio & HD Export'],
+      [`🆔 ${prefix}emojiid`, 'Extract Custom Emoji IDs & index into catalog'],
+      [`🪄 ${prefix}emojisuggest`, 'Suggest custom emojis for normal emojis'],
       [`✨ ${prefix}menu`, 'Studio dashboard & settings']
     ]), { compact: true });
     b.expandableBlockquote(
@@ -6116,6 +6317,10 @@ export class TelegramController extends EventEmitter {
         { command: 'pfp', description: `[${prefix}pfp] Matching PFP albums` },
         { command: 'pint', description: `[${prefix}pint] Search aesthetic Pinterest` },
         { command: 'stickers', description: `[${prefix}stickers] Telegram sticker studio` },
+        { command: 'emojipack', description: `[${prefix}emojipack] Custom Emoji Studio & HD` },
+        { command: 'emoji2media', description: `[${prefix}emoji2media] Emoji/sticker to HD media` },
+        { command: 'emojiid', description: `[${prefix}emojiid] Get custom emoji IDs` },
+        { command: 'emojisuggest', description: `[${prefix}emojisuggest] Suggest custom emojis` },
         { command: 'postchannel', description: `[${prefix}postchannel] Post pack to channel` },
         { command: 'autopost', description: `[${prefix}autopost] Schedule sticker drops` },
         { command: 'setprefix', description: `[${prefix}setprefix] Change command trigger prefix` },

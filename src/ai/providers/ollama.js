@@ -5,11 +5,11 @@
 import { BUILTIN_SYSTEM_PROMPTS } from './builtin.js';
 
 export class OllamaProvider {
-  constructor({ endpoint = 'http://127.0.0.1:11434', model = 'qwen2.5:0.5b', timeoutMs = 30000 } = {}) {
+  constructor({ endpoint = 'http://127.0.0.1:11434', model = 'qwen2.5:0.5b', timeoutMs = 6000 } = {}) {
     this.name = 'ollama';
     this.endpoint = endpoint.replace(/\/$/, '');
     this.model = model && model.trim() ? model.trim() : 'qwen2.5:0.5b';
-    this.timeoutMs = timeoutMs;
+    this.timeoutMs = Math.min(8000, Math.max(2000, Number(timeoutMs) || 6000));
     this.available = null; // unknown until probed
   }
 
@@ -49,7 +49,7 @@ export class OllamaProvider {
             model: this.model,
             messages,
             stream: false,
-            options: { num_predict: maxTokens, temperature: 0.7 }
+            options: { num_predict: maxTokens, temperature: 0.7, num_thread: 4 }
           }),
           signal: controller.signal
         });
@@ -64,7 +64,7 @@ export class OllamaProvider {
         system,
         prompt: text,
         stream: false,
-        options: { num_predict: maxTokens, temperature: 0.7 }
+        options: { num_predict: maxTokens, temperature: 0.7, num_thread: 4 }
       };
       const response = await fetch(`${this.endpoint}/api/generate`, {
         method: 'POST',

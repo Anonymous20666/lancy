@@ -5,8 +5,13 @@
 import { generateAuraCaption, buildAestheticStickerCaption } from '../captions/engine.js';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
-import { renderChannelBanner, prepareStickerPhotoBuffer } from '../telegram/screens/channelPost.js';
-import { toLoopingPreviewVideo } from '../media/convert.js';
+import {
+  normalizePack,
+  prepareChannelHeroMedia,
+  publishChannelPackDrop
+} from '../telegram/screens/channelPost.js';
+import { isVideoBuffer } from '../media/convert.js';
+import { listVerifiedAdminChannels } from '../telegram/permissions.js';
 
 /**
  * Calculates the next run timestamp based on scheduled "HH:MM" slots or fallback interval.
@@ -281,149 +286,119 @@ export class AutonomousScheduler {
     if ((platform === 'telegram' || platform === 'both') && this.app.telegram?.api) {
       let tgChannelId = drop.tg_channel_id;
       if (!tgChannelId) {
-        const userChannels = this.db.getTelegramChannels?.(drop.user_id) ?? [];
+        const userChannels = await listVerifiedAdminChannels({
+          db: this.db,
+          api: this.app.telegram.api,
+          settings: this.app.settings,
+          controller: this.app.telegram.controller,
+          userId: drop.user_id
+        });
         if (userChannels.length > 0) tgChannelId = userChannels[0].channel_id;
       }
 
       if (tgChannelId && targetPack) {
         try {
           const botUser = this.app.telegram?.botUsername || 'Lancy_easy_bot';
-          const pName = targetPack.shortName || targetPack.tg_short_name || targetPack.name;
-          const pLink = targetPack.link || `https://t.me/addstickers/${pName}`;
+          const p = normalizePack({
+            ...targetPack,
+            title: packTitle,
+            count: stickerCount
+          });
+          const pName = p.shortName;
+          const pLink = p.link;
 
-          // Retrieve hero media (prioritizing video if pack contains video) & sample stickers
+          // Retrieve hero media (prioritizing video if pack contains video) & sample stickers/emojis
           let sampleStickers = [];
           let sampleBuf = null;
-          let heroVideoBuf = null;
+          let heroVideoRawBuf = null;
+          const downloadByFileId = async (fileId) => {
+            const fInfo = await this.app.telegram.api.getFile(fileId).catch(() => null);
+            if (!fInfo?.file_path) return null;
+            return await this.app.telegram.api.downloadFile(fInfo.file_path).catch(() => null);
+          };
+
           try {
             const set = await this.app.telegram.api.getStickerSet(pName);
             if (set?.stickers?.length) {
+              if (set.sticker_type === 'custom_emoji') {
+                p.stickerKind = 'custom_emoji';
+                p.sticker_kind = 'custom_emoji';
+                p.link = `https://t.me/addemoji/${set.name || pName}`;
+              }
               sampleStickers = set.stickers.slice(0, Math.min(5, Math.max(3, set.stickers.length)));
 
-              // If pack has video sticker, pick one of the videos as the hero preview!
-              const videoSticker = set.stickers.find((st) => st.is_video);
+              const videoSticker = set.stickers.find((st) => st.is_video && !st.is_animated);
               if (videoSticker?.file_id) {
-                const fInfo = await this.app.telegram.api.getFile(videoSticker.file_id).catch(() => null);
-                if (fInfo?.file_path) {
-                  const webm = await this.app.telegram.api.downloadFile(fInfo.file_path).catch(() => null);
-                  if (webm) {
-                    heroVideoBuf = await toLoopingPreviewVideo(webm, {
-                      configuredFfmpeg: this.app.settings?.get('media.ffmpegPath') ?? ''
-                    }).catch(() => null);
+                const vid = await downloadByFileId(videoSticker.file_id);
+                if (vid) {
+                  if (isVideoBuffer(vid)) {
+                    heroVideoRawBuf = vid;
+                  } else if (!sampleBuf) {
+                    sampleBuf = vid;
                   }
                 }
               }
 
-              if (sampleStickers[0]?.file_id) {
-                const fInfo = await this.app.telegram.api.getFile(sampleStickers[0].file_id).catch(() => null);
-                if (fInfo?.file_path) {
-                  sampleBuf = await this.app.telegram.api.downloadFile(fInfo.file_path).catch(() => null);
-                }
+              if (!heroVideoRawBuf && !sampleBuf && sampleStickers[0]?.file_id) {
+                sampleBuf = await downloadByFileId(sampleStickers[0].file_id);
               }
             }
           } catch {}
 
-          if (!heroVideoBuf && this.app.packs?.getPackHeroMedia) {
+          if (!heroVideoRawBuf && this.app.packs?.getPackHeroMedia) {
             const heroRes = await this.app.packs.getPackHeroMedia(targetPack, {
-              download: (fileId) => this.app.telegram.api.getFile(fileId).then((f) => this.app.telegram.api.downloadFile(f.file_path)).catch(() => null)
+              download: (fileId) => downloadByFileId(fileId)
             }).catch(() => null);
-            if (heroRes?.isVideo && heroRes?.buffer) {
-              heroVideoBuf = heroRes.buffer;
+            if (heroRes?.isVideo && heroRes?.buffer && isVideoBuffer(heroRes.buffer)) {
+              heroVideoRawBuf = heroRes.buffer;
             } else if (!sampleBuf && heroRes?.buffer) {
               sampleBuf = heroRes.buffer;
             }
           }
 
-          // A) Sticker drop media with lean blockquote caption
-          let photoBuf = null;
-          if (sampleBuf) {
-            photoBuf = await prepareStickerPhotoBuffer(sampleBuf).catch(() => null);
-          }
-          if (!photoBuf) {
-            photoBuf = await renderChannelBanner({
-              title: packTitle,
-              count: stickerCount,
-              stickerType: targetPack.sticker_type || 'static',
-              sampleBuffer: sampleBuf,
-              creator: botUser
-            }).catch(() => null);
-          }
+          const heroMedia = await prepareChannelHeroMedia({
+            pack: p,
+            heroVideoRawBuf,
+            sampleBuf,
+            botUser,
+            configuredFfmpeg: this.app.settings?.get?.('media.ffmpegPath') ?? ''
+          });
 
-          const captionStr = typeof caption === 'object' && caption !== null ? (caption.caption || caption.description || '') : String(caption || '');
-          const mediaPayload = {
-            caption: captionStr.startsWith('<blockquote>') ? captionStr : `<blockquote>${captionStr}</blockquote>`,
-            parse_mode: 'HTML'
-          };
-          if (pLink) {
-            mediaPayload.reply_markup = {
-              inline_keyboard: [
-                [{ text: '➕ Add Sticker Pack 🌸', url: pLink, style: 'success' }]
-              ]
-            };
-          }
+          const captionStr = typeof caption === 'object' && caption !== null
+            ? (caption.caption || caption.description || '')
+            : String(caption || '');
 
-          let heroSent = false;
-          if (heroVideoBuf) {
-            try {
-              if (typeof this.app.telegram.api.sendAnimation === 'function') {
-                await this.app.telegram.api.sendAnimation(tgChannelId, heroVideoBuf, {
-                  ...mediaPayload,
-                  filename: 'sticker_drop.mp4',
-                  contentType: 'video/mp4'
-                });
-                heroSent = true;
-              }
-            } catch {}
+          const hasRichApi = typeof this.app.telegram.api?.sendRichMessage === 'function';
+          const dropRes = await publishChannelPackDrop({
+            api: this.app.telegram.api,
+            channelId: tgChannelId,
+            pack: p,
+            heroMedia,
+            rawCaption: captionStr,
+            captionIsHtml: true,
+            quoteMode: 'quote',
+            includeSecondaryCta: hasRichApi,
+            sampleStickers,
+            maxSamples: p.stickerKind === 'custom_emoji' ? 2 : (hasRichApi ? 2 : 3),
+            interMessageDelayMs: 450,
+            sampleDelayMs: 350,
+            log: this.log
+          });
 
-            if (!heroSent && typeof this.app.telegram.api.sendVideo === 'function') {
-              try {
-                await this.app.telegram.api.sendVideo(tgChannelId, heroVideoBuf, {
-                  ...mediaPayload,
-                  filename: 'sticker_drop.mp4',
-                  contentType: 'video/mp4'
-                });
-                heroSent = true;
-              } catch {}
-            }
-          }
-
-          if (!heroSent) {
-            if (photoBuf) {
-              await this.app.telegram.api.sendPhoto(tgChannelId, photoBuf, {
-                ...mediaPayload,
-                filename: 'sticker.png',
-                contentType: 'image/png'
-              });
-            } else {
-              await this.app.telegram.api.sendMessage(tgChannelId, mediaPayload.caption, {
+          if (!dropRes.usedRichMessage && p.stickerKind !== 'custom_emoji' && typeof this.app.telegram.api?.sendMessage === 'function') {
+            await this.app.telegram.api.sendMessage(
+              tgChannelId,
+              `<blockquote>✨ <b>Click below to add the complete sticker pack to Telegram!</b>\n👉 <a href="${pLink}">${packTitle}</a>\n\n🌸 Created with @${botUser} ♡</blockquote>`,
+              {
                 parse_mode: 'HTML',
-                reply_markup: mediaPayload.reply_markup
-              });
-            }
-          }
-          await sleep(750);
-
-          // B) First 3 to 5 sample stickers
-          for (const s of sampleStickers) {
-            if (s?.file_id) {
-              await this.app.telegram.api.sendSticker(tgChannelId, s.file_id).catch(() => {});
-              await sleep(600);
-            }
-          }
-
-          // C) Pack card with green success button
-          await this.app.telegram.api.sendMessage(
-            tgChannelId,
-            `<blockquote>✨ <b>Click below to add the complete sticker pack to Telegram!</b>\n👉 <a href="${pLink}">${packTitle}</a>\n\n🌸 Created with @${botUser} ♡</blockquote>`,
-            {
-              parse_mode: 'HTML',
-              reply_markup: {
-                inline_keyboard: [
-                  [{ text: '➕ Add Sticker Pack 🌸', url: pLink, style: 'success' }]
-                ]
+                reply_markup: {
+                  inline_keyboard: [
+                    [{ text: '➕ Add Sticker Pack 🌸', url: pLink, style: 'success' }]
+                  ]
+                }
               }
-            }
-          );
+            );
+          }
 
           publishedTg = true;
           this.log.info({ dropId: drop.id, channelId: tgChannelId }, 'autopost delivered to telegram channel');

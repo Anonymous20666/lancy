@@ -64,9 +64,36 @@ export class TelegramAPI {
     this.timeoutMs = timeoutMs;
     this.log = log ?? logger().child({ module: 'telegram-api' });
     this.me = null;
+    this.lastChatAction = new Map(); // chatId -> { action, at }
+    this.chatFloodUntil = new Map(); // chatId -> epochMs
+    this.globalFloodUntil = 0;
   }
 
   async call(method, params = {}, { files = null, timeoutMs = this.timeoutMs, dropOnFloodWait = false } = {}) {
+    if (method === 'sendChatAction') {
+      dropOnFloodWait = true;
+    }
+    const isNonBlockingMethod = /^(answerCallbackQuery|answerInlineQuery|getChat|getChatMember|getChatAdministrators|getMe|getFile|deleteMessage|pinChatMessage|unpinChatMessage|exportChatInviteLink|createChatInviteLink)$/i.test(method);
+    const isEditMethod = /^editMessage/i.test(method);
+    const chatKey = params?.chat_id !== undefined && params?.chat_id !== null ? String(params.chat_id) : null;
+    const rateKey = isEditMethod && chatKey && params?.message_id
+      ? `edit:${chatKey}:${params.message_id}`
+      : chatKey;
+    const now = Date.now();
+    const floodUntil = isNonBlockingMethod
+      ? 0
+      : Math.max(this.globalFloodUntil, rateKey ? (this.chatFloodUntil.get(rateKey) || 0) : 0);
+    if (floodUntil > now) {
+      if (dropOnFloodWait) {
+        const err = new Error(`Telegram ${method}: skipped during active flood wait`);
+        err.code = 'FLOOD_WAIT';
+        err.retryAfter = Math.ceil((floodUntil - now) / 1000);
+        throw err;
+      }
+      const waitMs = Math.min(6000, floodUntil - now);
+      if (waitMs > 0) await sleep(waitMs);
+    }
+
     if (method === 'answerInlineQuery' && Array.isArray(params?.results)) {
       params = { ...params, results: sanitizeInlineResults(params.results) };
     }
@@ -142,14 +169,27 @@ export class TelegramAPI {
       err.retryable = data.error_code === 429 || (data.error_code >= 500 && data.error_code < 600);
       // Flood wait handling: if caller requests dropping on flood wait, immediately reject without blocking
       if (data.error_code === 429 && data.parameters?.retry_after) {
-        if (dropOnFloodWait) {
+        const rawRetry = Math.max(1, Number(data.parameters.retry_after) || 1);
+        const wait = Math.min(8, rawRetry);
+        const until = Date.now() + wait * 1000;
+        if (rateKey) {
+          this.chatFloodUntil.set(rateKey, Math.max(this.chatFloodUntil.get(rateKey) || 0, until));
+          if (this.chatFloodUntil.size > 500) {
+            const cur = Date.now();
+            for (const [k, exp] of this.chatFloodUntil) {
+              if (exp <= cur) this.chatFloodUntil.delete(k);
+            }
+          }
+        } else if (!isNonBlockingMethod) {
+          this.globalFloodUntil = Math.max(this.globalFloodUntil, until);
+        }
+        if (dropOnFloodWait || isNonBlockingMethod) {
           err.code = 'FLOOD_WAIT';
           err.retryAfter = data.parameters.retry_after;
           throw err;
         }
-        const wait = Math.min(30, Number(data.parameters.retry_after) + 1);
         err._floodAttempts = (params.__floodAttempts ?? 0);
-        if (err._floodAttempts >= 2) { throw err; }
+        if (err._floodAttempts >= 1 || rawRetry > 10) { throw err; }
         this.log.warn({ method, wait }, 'flood wait — backing off');
         await sleep(wait * 1000);
         return this.call(method, { ...params, __floodAttempts: err._floodAttempts + 1 }, { files, timeoutMs, dropOnFloodWait });
@@ -343,24 +383,55 @@ export class TelegramAPI {
   }
 
   sendSticker(chatId, sticker, extra = {}) {
-    if (Buffer.isBuffer(sticker) || (typeof sticker === 'object' && sticker !== null && sticker.buffer)) {
-      const buf = Buffer.isBuffer(sticker) ? sticker : sticker.buffer;
+    if (Buffer.isBuffer(sticker) || (typeof sticker === 'object' && sticker !== null && (sticker.buffer || sticker.filePath))) {
       const isVideo = extra.is_video || extra.isVideo;
-      const filename = isVideo ? 'sticker.webm' : 'sticker.webp';
-      const contentType = isVideo ? 'video/webm' : 'image/webp';
-      const { is_video, isVideo: _iv, ...cleanExtra } = extra;
-      return this.call('sendSticker', { chat_id: chatId, ...cleanExtra }, {
-        files: { sticker: { buffer: buf, filename, contentType } }
+      const isAnimated = extra.is_animated || extra.isAnimated;
+      const ext = isAnimated ? 'tgs' : (isVideo ? 'webm' : 'webp');
+      const contentType = isAnimated ? 'application/x-tgsticker' : (isVideo ? 'video/webm' : 'image/webp');
+      const filename = sticker?.filename ?? `sticker.${ext}`;
+      const fileSpec = Buffer.isBuffer(sticker)
+        ? { buffer: sticker, filename, contentType }
+        : { ...sticker, filename, contentType };
+      const { is_video, isVideo: _iv, is_animated, isAnimated: _ia, ...cleanExtra } = extra;
+      return this.call('sendSticker', { chat_id: chatId, sticker: 'attach://sticker', ...cleanExtra }, {
+        files: { sticker: fileSpec }
       });
     }
     return this.call('sendSticker', { chat_id: chatId, sticker, ...extra });
   }
 
-  sendChatAction(chatId, action = 'typing') {
-    return this.call('sendChatAction', { chat_id: chatId, action }).catch(() => {});
+  sendChatAction(chatId, action = 'typing', { minIntervalMs = 4000 } = {}) {
+    if (chatId === undefined || chatId === null) return Promise.resolve(null);
+    const key = String(chatId);
+    const now = Date.now();
+    const floodUntil = Math.max(this.globalFloodUntil, this.chatFloodUntil.get(key) || 0);
+    if (floodUntil > now) return Promise.resolve(null);
+    const prev = this.lastChatAction.get(key);
+    if (prev && (now - prev.at) < minIntervalMs && prev.action === action) {
+      return Promise.resolve(null);
+    }
+    if (prev && (now - prev.at) < 1800) {
+      return Promise.resolve(null);
+    }
+    this.lastChatAction.set(key, { action, at: now });
+    if (this.lastChatAction.size > 1000) {
+      for (const [k, v] of this.lastChatAction) {
+        if (now - v.at > 30000) this.lastChatAction.delete(k);
+      }
+    }
+    return this.call('sendChatAction', { chat_id: chatId, action }, { dropOnFloodWait: true }).catch(() => null);
   }
 
   answerCallbackQuery(id, { text, showAlert = false, show_alert = false, url, cacheTime = 0, cache_time = 0 } = {}) {
+    if (!id) return Promise.resolve();
+    if (!this.answeredCallbackIds) this.answeredCallbackIds = new Set();
+    const key = String(id);
+    if (this.answeredCallbackIds.has(key)) return Promise.resolve();
+    this.answeredCallbackIds.add(key);
+    if (this.answeredCallbackIds.size > 2000) {
+      const first = this.answeredCallbackIds.values().next().value;
+      if (first !== undefined) this.answeredCallbackIds.delete(first);
+    }
     const isAlert = Boolean(show_alert || showAlert);
     return this.call('answerCallbackQuery', {
       callback_query_id: id, text, show_alert: isAlert, url, cache_time: cache_time || cacheTime
@@ -429,9 +500,35 @@ export class TelegramAPI {
     return this.call('setMyCommands', { commands, ...extra });
   }
 
-  // ── Stickers ──────────────────────────────────────────────────────────
+  // ── Stickers & Custom Emojis ──────────────────────────────────────────
   getStickerSet(name) {
     return this.call('getStickerSet', { name });
+  }
+
+  getCustomEmojiStickers(customEmojiIds = []) {
+    const ids = Array.isArray(customEmojiIds) ? customEmojiIds.filter(Boolean).map(String) : [];
+    return this.call('getCustomEmojiStickers', { custom_emoji_ids: ids });
+  }
+
+  /** Normalize an InputSticker's file payload (buffer or filePath) into multipart attach. */
+  #attachInputSticker(sticker, fieldName, files) {
+    const out = { ...sticker };
+    const src = sticker?.sticker;
+    if (src && typeof src === 'object' && (src.buffer || src.filePath)) {
+      const format = out.format || 'static';
+      const defaultExt = format === 'video' ? 'webm' : (format === 'animated' ? 'tgs' : 'webp');
+      const filename = src.filename ?? `${fieldName}.${defaultExt}`;
+      const defaultMime = format === 'video'
+        ? 'video/webm'
+        : (format === 'animated' ? 'application/x-tgsticker' : (filename.endsWith('.png') ? 'image/png' : 'image/webp'));
+      files[fieldName] = {
+        ...(src.buffer ? { buffer: src.buffer } : { filePath: src.filePath }),
+        filename,
+        contentType: src.contentType ?? defaultMime
+      };
+      out.sticker = `attach://${fieldName}`;
+    }
+    return out;
   }
 
   /**
@@ -449,39 +546,64 @@ export class TelegramAPI {
     };
     if (needsRepainting !== undefined) params.needs_repainting = needsRepainting;
     const files = {};
-    const cleanStickers = stickers.map((sticker, index) => {
-      const out = { ...sticker };
-      if (sticker.sticker?.buffer) {
-        const field = `sticker_${index}`;
-        files[field] = { buffer: sticker.sticker.buffer, filename: sticker.sticker.filename ?? `${field}.webp` };
-        out.sticker = `attach://${field}`;
-      }
-      return out;
-    });
-    params.stickers = cleanStickers;
+    params.stickers = stickers.map((sticker, index) => this.#attachInputSticker(sticker, `sticker_${index}`, files));
     return this.call('createNewStickerSet', params, { files: Object.keys(files).length ? files : null });
   }
 
   addStickerToSet({ userId, name, sticker }) {
-    const params = { user_id: userId, name, sticker };
     const files = {};
-    if (sticker.sticker?.buffer) {
-      files.sticker_file = { buffer: sticker.sticker.buffer, filename: sticker.sticker.filename ?? 'sticker.webp' };
-      params.sticker = { ...sticker, sticker: 'attach://sticker_file' };
-    }
+    const params = {
+      user_id: userId,
+      name,
+      sticker: this.#attachInputSticker(sticker, 'sticker_file', files)
+    };
     return this.call('addStickerToSet', params, { files: Object.keys(files).length ? files : null });
   }
 
-  setStickerSetThumbnail({ name, userId, thumbnail }) {
-    const params = { name, user_id: userId };
+  replaceStickerInSet({ userId, name, oldSticker, sticker }) {
     const files = {};
-    if (thumbnail?.buffer) {
-      files.thumbnail = { buffer: thumbnail.buffer, filename: thumbnail.filename ?? 'thumb.webp' };
+    const params = {
+      user_id: userId,
+      name,
+      old_sticker: oldSticker,
+      sticker: this.#attachInputSticker(sticker, 'sticker_file', files)
+    };
+    return this.call('replaceStickerInSet', params, { files: Object.keys(files).length ? files : null });
+  }
+
+  deleteStickerFromSet(sticker) {
+    return this.call('deleteStickerFromSet', { sticker });
+  }
+
+  setStickerPositionInSet({ sticker, position }) {
+    return this.call('setStickerPositionInSet', { sticker, position: Number(position) });
+  }
+
+  setStickerSetTitle({ name, title }) {
+    return this.call('setStickerSetTitle', { name, title });
+  }
+
+  setStickerSetThumbnail({ name, userId, thumbnail, format }) {
+    const params = { name, user_id: userId };
+    if (format) params.format = format;
+    const files = {};
+    if (thumbnail && typeof thumbnail === 'object' && (thumbnail.buffer || thumbnail.filePath)) {
+      files.thumbnail = {
+        ...(thumbnail.buffer ? { buffer: thumbnail.buffer } : { filePath: thumbnail.filePath }),
+        filename: thumbnail.filename ?? 'thumb.webp',
+        contentType: thumbnail.contentType ?? (format === 'video' ? 'video/webm' : 'image/webp')
+      };
       params.thumbnail = 'attach://thumbnail';
     } else if (thumbnail) {
       params.thumbnail = thumbnail;
     }
     return this.call('setStickerSetThumbnail', params, { files: Object.keys(files).length ? files : null });
+  }
+
+  setCustomEmojiStickerSetThumbnail({ name, customEmojiId = '' } = {}) {
+    const params = { name };
+    if (customEmojiId) params.custom_emoji_id = String(customEmojiId);
+    return this.call('setCustomEmojiStickerSetThumbnail', params);
   }
 
   deleteStickerSet(name) {

@@ -337,30 +337,26 @@ test('ChannelPost screen: wizard flow and full publishing execution (pic, sample
   // 6. Confirm publish!
   await screen.handle(ctx, 'post_confirm');
 
-  // Verify Phase 1: Photo sent to channel with aesthetic card caption
+  // Verify Phase 1: Single unified card photo sent to channel with aesthetic bloom_crating caption & all buttons inside ONE card
   assert.equal(sentPhotos.length, 1);
   assert.equal(sentPhotos[0].cid, channelId);
-  assert.ok(sentPhotos[0].opts.caption.includes('╭━━━'));
-  assert.ok(sentPhotos[0].opts.caption.includes('💠'));
-  assert.ok(sentPhotos[0].opts.caption.includes('𝐂𝐑𝐄𝐀𝐓𝐄𝐃 & 𝐃𝐄𝐒𝐈𝐆𝐍𝐄𝐃 𝐁𝐘'));
-  assert.ok(sentPhotos[0].opts.caption.startsWith('<blockquote>'));
+  assert.ok(sentPhotos[0].opts.caption.includes('𝑪𝑼𝑻𝑬 𝑪𝑨𝑻𝑺'));
+  assert.ok(sentPhotos[0].opts.caption.includes('𝐓𝐀𝐏 • 𝐀𝐃𝐃 • 𝐄𝐍𝐉𝐎𝐘'));
+  assert.ok(sentPhotos[0].opts.caption.includes('crafted by •'));
+  assert.ok(sentPhotos[0].opts.caption.startsWith('<blockquote'));
   assert.ok(sentPhotos[0].opts.caption.endsWith('</blockquote>'));
   assert.equal(sentPhotos[0].opts.reply_markup.inline_keyboard[0][0].style, 'success');
+  assert.ok(sentPhotos[0].opts.reply_markup.inline_keyboard[0][0].url.includes('cute_cats_by_lancy'));
 
-  // Verify Phase 2: First 3 to 5 sample stickers sent
-  assert.ok(sentStickers.length >= 3);
+  // Verify Phase 2: Exactly 2 sample stickers dropped after the unified card
+  assert.equal(sentStickers.length, 2);
   assert.equal(sentStickers[0].cid, channelId);
   assert.equal(sentStickers[0].sticker, 'stk_file_1');
   assert.equal(sentStickers[1].sticker, 'stk_file_2');
-  assert.equal(sentStickers[2].sticker, 'stk_file_3');
 
-  // Verify Phase 3: Pack installation message with Add button
+  // Verify no redundant 2nd link-only channel message was emitted
   const channelFinalMsg = sentMessages.find((m) => m.cid === channelId);
-  assert.ok(channelFinalMsg);
-  assert.ok(channelFinalMsg.text.toLowerCase().includes('add the complete sticker pack'));
-  assert.ok(!channelFinalMsg.text.includes('👉 undefined'), 'must not contain 👉 undefined');
-  assert.ok(channelFinalMsg.opts.reply_markup.inline_keyboard[0][0].url.includes('cute_cats_by_lancy'));
-  assert.equal(channelFinalMsg.opts.reply_markup.inline_keyboard[0][0].style, 'success');
+  assert.equal(channelFinalMsg, undefined);
 
   db.close();
 });
@@ -770,13 +766,14 @@ test('StickerPackService.getPackHeroMedia: mixed pack picks video instead of def
   }
 });
 
-test('ChannelPost executeChannelPublish: sends sendAnimation/sendVideo when pack contains video', async () => {
+test('ChannelPost executeChannelPublish: sends unified RichMessage card with 720p HD video and inline styled buttons inside card', async () => {
   const { execFileSync } = await import('node:child_process');
-  const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+  const { mkdtempSync, rmSync, readFileSync, writeFileSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const { createChannelPostScreen } = await import('../src/telegram/screens/channelPost.js');
   const { StickerPackService } = await import('../src/stickers/packService.js');
+  const { richTextToString } = await import('../src/telegram/rich.js');
 
   const db = new Database(':memory:');
   const settings = new SettingsManager(db);
@@ -804,6 +801,7 @@ test('ChannelPost executeChannelPublish: sends sendAnimation/sendVideo when pack
     const sentAnimations = [];
     const sentPhotos = [];
     const sentMessages = [];
+    const sentRichMessages = [];
 
     const mockApi = {
       getMe: async () => ({ id: 99999, username: 'lancybot' }),
@@ -823,7 +821,10 @@ test('ChannelPost executeChannelPublish: sends sendAnimation/sendVideo when pack
         return { message_id: 113 };
       },
       sendSticker: async () => ({ message_id: 114 }),
-      sendRichMessage: async () => ({ message_id: 115 }),
+      sendRichMessage: async (chatId, rich, extra, files) => {
+        sentRichMessages.push({ chatId, rich, extra, files });
+        return { message_id: 115, rich_message: rich };
+      },
       editMessageRich: async () => ({ message_id: 116 })
     };
 
@@ -872,12 +873,46 @@ test('ChannelPost executeChannelPublish: sends sendAnimation/sendVideo when pack
     // 3. Confirm post!
     await screen.handle(ctx, 'post_confirm', []);
 
-    // Verify: sendAnimation was called with the looping video!
-    assert.equal(sentAnimations.length, 1, 'Should call sendAnimation because pack contains video');
-    assert.equal(sentAnimations[0].chatId, -100555444);
-    assert.ok(Buffer.isBuffer(sentAnimations[0].anim));
-    assert.ok(sentAnimations[0].extra.caption.includes('𝐒𝐓𝐈𝐂𝐊𝐄𝐑𝐒 𝐀𝐑𝐄 𝐎𝐔𝐓!'));
+    // Verify: channel received a single unified RichMessage card with HD video attachment + buttons inside
+    const channelCards = sentRichMessages.filter((m) => m.chatId === -100555444);
+    assert.equal(channelCards.length, 1, 'Channel should receive 1 unified RichMessage pack card');
+    assert.equal(sentAnimations.length, 0, 'Should not send detached legacy sendAnimation when sendRichMessage succeeds');
     assert.equal(sentPhotos.length, 0, 'Should not send photo as hero when pack contains video');
+
+    const card = channelCards[0];
+    assert.ok(card.files?.hero_video?.buffer, 'Hero video must be attached via files.hero_video');
+
+    // Probe attached hero video to confirm 720x720 HD upscale
+    const outVidPath = join(dir, 'hero_out.mp4');
+    writeFileSync(outVidPath, card.files.hero_video.buffer);
+    const probeOut = execFileSync('ffprobe', [
+      '-v', 'error',
+      '-select_streams', 'v:0',
+      '-show_entries', 'stream=width,height,codec_name',
+      '-of', 'json',
+      outVidPath
+    ], { encoding: 'utf8' });
+    const stream = JSON.parse(probeOut).streams[0];
+    assert.equal(stream.width, 720, 'Attached hero video width must be upscaled to 720px HD');
+    assert.equal(stream.height, 720, 'Attached hero video height must be upscaled to 720px HD');
+    assert.equal(stream.codec_name, 'h264');
+
+    const vidBlock = card.rich.blocks.find((b) => b.type === 'video');
+    assert.ok(vidBlock, 'RichMessage card must include video block');
+    assert.equal(vidBlock.video?.media, 'attach://hero_video');
+
+    const quoteBlock = card.rich.blocks.find((b) => b.type === 'blockquote');
+    assert.ok(quoteBlock, 'RichMessage card must include blockquote caption block');
+    const quoteText = quoteBlock.blocks.map((b) => richTextToString(b.text)).join('\n');
+    assert.ok(quoteText.includes('𝐓𝐀𝐏 • 𝐀𝐃𝐃 • 𝐄𝐍𝐉𝐎𝐘'));
+    assert.ok(quoteText.includes('crafted by •'));
+
+    const btnBlocks = card.rich.blocks.filter((b) => b.type === 'buttons');
+    assert.equal(btnBlocks.length, 2, 'Buttons must be inside the RichMessage card blocks');
+    assert.equal(btnBlocks[0].buttons[0].style, 'success');
+    assert.ok(btnBlocks[0].buttons[0].url.includes('https://t.me/addstickers/tanjiro_mixed'));
+    assert.equal(btnBlocks[1].buttons[0].style, 'primary');
+    assert.equal(btnBlocks[1].buttons[1].style, 'primary');
   } finally {
     rmSync(dir, { recursive: true, force: true });
     db.close();

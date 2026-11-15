@@ -52,6 +52,23 @@ export class Database {
       this.db.exec('ALTER TABLE scheduled_drops ADD COLUMN ai_prompt TEXT;');
     } catch {}
     try {
+      this.db.exec("ALTER TABLE sticker_packs ADD COLUMN sticker_kind TEXT NOT NULL DEFAULT 'regular';");
+    } catch {}
+    try {
+      this.db.exec('ALTER TABLE sticker_items ADD COLUMN custom_emoji_id TEXT;');
+    } catch {}
+    try {
+      this.db.exec("ALTER TABLE sticker_items ADD COLUMN item_format TEXT NOT NULL DEFAULT 'static';");
+    } catch {}
+    try {
+      this.db.exec('ALTER TABLE sticker_items ADD COLUMN source_sha256 TEXT;');
+    } catch {}
+    try {
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_sticker_packs_user_kind ON sticker_packs(user_id, sticker_kind, modified_at DESC);');
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_sticker_items_emoji ON sticker_items(emoji);');
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_sticker_items_ceid ON sticker_items(custom_emoji_id);');
+    } catch {}
+    try {
       this.db.exec(`
         CREATE TABLE IF NOT EXISTS cached_audio_tracks (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,6 +135,34 @@ export class Database {
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_tg_channels_user ON tg_channels(added_by);
+
+        CREATE TABLE IF NOT EXISTS tg_bot_channels (
+          bot_id TEXT NOT NULL,
+          channel_id INTEGER NOT NULL,
+          bot_username TEXT,
+          is_admin INTEGER NOT NULL DEFAULT 1,
+          can_post INTEGER NOT NULL DEFAULT 1,
+          verified_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (bot_id, channel_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_tg_bot_channels_cid ON tg_bot_channels(channel_id);
+
+        CREATE TABLE IF NOT EXISTS custom_emoji_catalog (
+          custom_emoji_id TEXT PRIMARY KEY,
+          unicode_emoji TEXT NOT NULL,
+          unicode_key TEXT NOT NULL,
+          set_name TEXT,
+          file_id TEXT,
+          is_video INTEGER NOT NULL DEFAULT 0,
+          is_animated INTEGER NOT NULL DEFAULT 0,
+          source TEXT NOT NULL DEFAULT 'discovered',
+          added_by INTEGER,
+          usage_count INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_ce_catalog_key ON custom_emoji_catalog(unicode_key, usage_count DESC, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_ce_catalog_set ON custom_emoji_catalog(set_name);
 
         CREATE TABLE IF NOT EXISTS game_seen_items (
           chat_id INTEGER NOT NULL,
@@ -257,6 +302,10 @@ export class Database {
       key,
       JSON.stringify(value)
     );
+  }
+
+  deleteUserSetting(userId, key) {
+    this.run('DELETE FROM user_settings WHERE user_id = ? AND key = ?', userId, key);
   }
 
   getAllUserSettings(userId) {
@@ -721,7 +770,49 @@ export class Database {
 
   removeTelegramChannel(channel_id) {
     if (!channel_id) return;
-    this.run('DELETE FROM tg_channels WHERE channel_id = ?', Number(channel_id));
+    const cid = Number(channel_id);
+    this.run('DELETE FROM tg_channels WHERE channel_id = ?', cid);
+    try { this.run('DELETE FROM tg_bot_channels WHERE channel_id = ?', cid); } catch {}
+  }
+
+  recordBotChannelVerification({ bot_id, channel_id, bot_username = null, is_admin = 1, can_post = 1 }) {
+    if (!bot_id || !channel_id) return;
+    this.run(
+      `INSERT INTO tg_bot_channels (bot_id, channel_id, bot_username, is_admin, can_post, verified_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(bot_id, channel_id) DO UPDATE SET
+         bot_username = COALESCE(excluded.bot_username, tg_bot_channels.bot_username),
+         is_admin = excluded.is_admin,
+         can_post = excluded.can_post,
+         verified_at = datetime('now')`,
+      String(bot_id),
+      Number(channel_id),
+      bot_username ? String(bot_username).replace(/^@/, '').trim() : null,
+      is_admin ? 1 : 0,
+      can_post ? 1 : 0
+    );
+  }
+
+  getBotChannelVerification(botId, channelId) {
+    if (!botId || !channelId) return null;
+    try {
+      return this.get(
+        'SELECT * FROM tg_bot_channels WHERE bot_id = ? AND channel_id = ?',
+        String(botId),
+        Number(channelId)
+      ) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  getBotChannelVerifications(botId) {
+    if (!botId) return [];
+    try {
+      return this.all('SELECT * FROM tg_bot_channels WHERE bot_id = ?', String(botId));
+    } catch {
+      return [];
+    }
   }
 
   getTelegramChannels(userId = null) {
