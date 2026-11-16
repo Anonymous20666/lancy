@@ -229,10 +229,14 @@ function normalizeCell(cell) {
 
 // ── RichMessageButton ─────────────────────────────────────────────────────
 
-const VALID_BUTTON_STYLES = new Set(['primary', 'success', 'danger']);
-export function normalizeButtonStyle(style) {
-  if (typeof style === 'string' && VALID_BUTTON_STYLES.has(style.toLowerCase())) {
-    return style.toLowerCase();
+const VALID_BUTTON_STYLES = new Set(['primary', 'success', 'danger', 'link']);
+export function normalizeButtonStyle(style, { allowLink = true } = {}) {
+  if (typeof style === 'string') {
+    const normalized = style.toLowerCase();
+    if (VALID_BUTTON_STYLES.has(normalized)) {
+      if (normalized === 'link' && !allowLink) return 'primary';
+      return normalized;
+    }
   }
   return 'primary';
 }
@@ -529,7 +533,7 @@ export function inlineKeyboard(rows) {
         if (btn.callback_data !== undefined) out.callback_data = btn.callback_data;
         if (btn.url !== undefined) out.url = btn.url;
         if (btn.copy_text !== undefined) out.copy_text = btn.copy_text;
-        out.style = normalizeButtonStyle(btn.style); // danger | success | primary
+        out.style = normalizeButtonStyle(btn.style, { allowLink: false }); // danger | success | primary
         if (btn.icon_custom_emoji_id || btn.emojiId) {
           out.icon_custom_emoji_id = String(btn.icon_custom_emoji_id || btn.emojiId);
         }

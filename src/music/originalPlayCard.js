@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import sharp from 'sharp';
 import { boundedFetchFile } from './library.js';
 import { richButton, encodeCallback } from '../telegram/rich.js';
+import { resolveAppScreen } from './accounts.js';
 
 /** Cover art only. No new search, source substitution, cookies or credentials.
  * DNS pinning, public-only HTTPS, bounded bytes, bounded pixels and an abortable
@@ -26,11 +27,11 @@ export async function recordingArtwork(track, { fetchFile = boundedFetchFile } =
 }
 
 export async function originalPlayDelivery({app,ctx,track,audio,lyrics,cardToken,allowArtwork=true,artworkLoader=recordingArtwork}) {
-  const original = app.screens.get('downloader');
+  const original = resolveAppScreen(app, 'downloader', { ctx });
   if (typeof original?.renderRecordingCard !== 'function') {
     // Compatibility for existing injected controllers/tests with no downloader.
     // The composition root always registers the original downloader screen.
-    return {rich:app.screens.get('music').renderListen(track,'attach://music_full_audio',{cardToken,lyrics}),files:{music_full_audio:audio}};
+    return {rich:resolveAppScreen(app, 'music', { ctx }).renderListen(track,'attach://music_full_audio',{cardToken,lyrics}),files:{music_full_audio:audio}};
   }
   const artwork = allowArtwork ? await artworkLoader(track) : null;
   return original.renderRecordingCard({ctx,track,audio,artwork,lyrics,

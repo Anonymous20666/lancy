@@ -13,18 +13,50 @@ import { isPermissionError, recordChatPermissionRestriction, formatMediaRestrict
  * ETA keep ticking even when the underlying job is quiet for a while.
  */
 const BENIGN_EDIT_ERRORS = /not modified|message to edit not found|canceled by new edit|too many requests|flood wait|skipped during active flood wait|FLOOD_WAIT/i;
-const activeTrackersByChat = new Map(); // String(chatId) -> Set<ProgressTracker>
+const activeTrackersByChat = new Map(); // `${botKey}:${chatId}` -> Set<ProgressTracker>
+const trackerApiIds = new WeakMap();
+let nextTrackerApiId = 1;
+
+function trackerBotKey(api) {
+  if (api?.me?.id) return String(api.me.id);
+  const tokenId = typeof api?.token === 'string' ? api.token.split(':')[0] : '';
+  if (/^\d+$/.test(tokenId)) return tokenId;
+  if (api && typeof api === 'object') {
+    let id = trackerApiIds.get(api);
+    if (!id) {
+      id = `api_${nextTrackerApiId++}`;
+      trackerApiIds.set(api, id);
+    }
+    return id;
+  }
+  return 'default';
+}
+
+function trackerChatKey(chatId, api = null) {
+  return `${trackerBotKey(api)}:${String(chatId)}`;
+}
 
 export class ProgressTracker {
-  static stopForChat(chatId) {
+  static stopForChat(chatId, api = null) {
     if (chatId === undefined || chatId === null) return;
-    const key = String(chatId);
-    const set = activeTrackersByChat.get(key);
-    if (!set) return;
-    for (const t of set) {
-      try { t.stop(); } catch {}
+    if (api) {
+      const key = trackerChatKey(chatId, api);
+      const set = activeTrackersByChat.get(key);
+      if (!set) return;
+      for (const t of set) {
+        try { t.stop(); } catch {}
+      }
+      activeTrackersByChat.delete(key);
+      return;
     }
-    activeTrackersByChat.delete(key);
+    const suffix = `:${String(chatId)}`;
+    for (const [key, set] of Array.from(activeTrackersByChat.entries())) {
+      if (!key.endsWith(suffix)) continue;
+      for (const t of set) {
+        try { t.stop(); } catch {}
+      }
+      activeTrackersByChat.delete(key);
+    }
   }
 
   constructor({ api, chatId, messageId = null, replyToMessageId = null, heartbeatMs = 3500, action = 'typing', log } = {}) {
@@ -54,7 +86,7 @@ export class ProgressTracker {
   /** Send the initial progress message or edit existing screen message (returns its id). */
   async start(richMessage) {
     if (this.chatId !== undefined && this.chatId !== null) {
-      const key = String(this.chatId);
+      const key = trackerChatKey(this.chatId, this.api);
       const existing = activeTrackersByChat.get(key);
       if (existing) {
         for (const prev of existing) {
@@ -159,10 +191,11 @@ export class ProgressTracker {
   #stop() {
     this.closed = true;
     if (this.chatId !== undefined && this.chatId !== null) {
-      const set = activeTrackersByChat.get(String(this.chatId));
+      const key = trackerChatKey(this.chatId, this.api);
+      const set = activeTrackersByChat.get(key);
       if (set) {
         set.delete(this);
-        if (set.size === 0) activeTrackersByChat.delete(String(this.chatId));
+        if (set.size === 0) activeTrackersByChat.delete(key);
       }
     }
     if (this.indicator) {
@@ -174,7 +207,7 @@ export class ProgressTracker {
   }
 
   async #handlePermissionDenied() {
-    recordChatPermissionRestriction(this.chatId, { canSendPhotos: false, canSendVideos: false });
+    recordChatPermissionRestriction(this.chatId, { canSendPhotos: false, canSendVideos: false }, this.api);
     if (this.messageId) {
       const prevId = this.messageId;
       this.messageId = null;

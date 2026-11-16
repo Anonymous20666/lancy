@@ -11,6 +11,7 @@ import { escapeHtml } from '../telegram/rich.js';
 import { ProgressTracker } from '../telegram/progress.js';
 import { durationText } from '../music/model.js';
 import { logger } from '../core/logger.js';
+import { normalizeLangCode, isDubAudioLabel } from './streamingServer.js';
 
 const execFileAsync = promisify(execFile);
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36';
@@ -62,6 +63,46 @@ async function probeVideoHeight(filePath, runner = execFileAsync) {
     return Number.isFinite(h) && h > 0 ? h : null;
   } catch {
     return null;
+  }
+}
+
+export async function selectOriginalAudioMapArgs(inputTarget, runner = execFileAsync, { headers = null, preferredAudioLang = '' } = {}) {
+  try {
+    const args = ['-v', 'quiet', '-print_format', 'json', '-select_streams', 'a', '-show_streams'];
+    if (headers && /^https?:\/\//i.test(String(inputTarget || ''))) {
+      args.push('-headers', buildFfmpegHeaders(headers));
+    }
+    args.push(String(inputTarget || ''));
+    const { stdout } = await runner('ffprobe', args, { timeout: 15000, maxBuffer: 1024 * 1024 });
+    const parsed = JSON.parse(stdout || '{}');
+    const audioStreams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+    if (audioStreams.length <= 1) return [];
+    const prefLang = normalizeLangCode(preferredAudioLang);
+    let bestAudioIdx = 0;
+    let bestScore = -Infinity;
+    for (let i = 0; i < audioStreams.length; i += 1) {
+      const s = audioStreams[i];
+      const lang = normalizeLangCode(s?.tags?.language || s?.tags?.lang || '');
+      const titleTag = [s?.tags?.title, s?.tags?.handler_name].filter(Boolean).join(' ');
+      const disp = s?.disposition || {};
+      const isDub = Boolean(disp.dub || isDubAudioLabel(titleTag));
+      let score = 0;
+      if (prefLang && lang) score += (lang === prefLang) ? 100 : -80;
+      if (isDub) score -= 120;
+      else {
+        score += 30;
+        if (disp.original || /\b(?:main|original|orig|raw|native)\b/i.test(titleTag)) score += 40;
+      }
+      if (disp.commentary || /\b(?:commentary|description|descriptive)\b/i.test(titleTag)) score -= 100;
+      if (disp.default) score += 4;
+      if (score > bestScore) {
+        bestScore = score;
+        bestAudioIdx = i;
+      }
+    }
+    return ['-map', '0:v:0', '-map', `0:a:${bestAudioIdx}`];
+  } catch {
+    return [];
   }
 }
 
@@ -162,7 +203,7 @@ export class MovieDownloader {
    * Resolve and materialize a single movie, TV episode, or already-playing track into an .mp4 on disk.
    * Caller must invoke `cleanup()` when upload finishes.
    */
-  async prepareVideoFile(item, { onProgress = null, skipCache = false, quality = '480p' } = {}) {
+  async prepareVideoFile(item, { onProgress = null, skipCache = false, quality = '480p', allowAdultFeatures = false } = {}) {
     const emit = (msg) => { if (typeof onProgress === 'function') void onProgress(msg); };
     const limitBytes = this.getLimitBytes();
     const targetQuality = normalizeDownloadQuality(quality);
@@ -219,6 +260,8 @@ export class MovieDownloader {
         const res = await this.app.movieResolver.resolve(item, {
           fetchSubtitles: false,
           preferredHeight: profile.height,
+          originalLanguage: item?.originalLanguage || item?.language || null,
+          allowAdultFeatures: Boolean(allowAdultFeatures),
           onProgress: emit
         });
         if (!res?.ok || !res.track) {
@@ -237,73 +280,135 @@ export class MovieDownloader {
       if (track.filePath && existsSync(track.filePath)) {
         outPath = track.filePath;
       } else {
-        let streamUrl = track.streamUrl || track.videoUrl || track.mediaUrl;
-        if (Array.isArray(track.variants) && track.variants.length > 0) {
-          const validVariants = track.variants.filter((v) => v?.url && /^https?:\/\//i.test(v.url));
-          if (validVariants.length > 0) {
-            const sorted = [...validVariants].sort((a, b) => {
-              const ah = Number(a.height) || 480;
-              const bh = Number(b.height) || 480;
-              return Math.abs(ah - profile.height) - Math.abs(bh - profile.height);
-            });
-            if (sorted[0]?.url) {
-              streamUrl = sorted[0].url;
+        const failedUrls = [];
+        const pickCandidateStreamUrl = (candObj) => {
+          let chosenUrl = candObj?.streamUrl || candObj?.videoUrl || candObj?.mediaUrl || candObj?.url || '';
+          if (Array.isArray(candObj?.variants) && candObj.variants.length > 0) {
+            const validVariants = candObj.variants.filter((v) => v?.url && /^https?:\/\//i.test(v.url) && !failedUrls.includes(v.url));
+            if (validVariants.length > 0) {
+              const sorted = [...validVariants].sort((a, b) => {
+                const ah = Number(a.height) || 480;
+                const bh = Number(b.height) || 480;
+                return Math.abs(ah - profile.height) - Math.abs(bh - profile.height);
+              });
+              if (sorted[0]?.url) chosenUrl = sorted[0].url;
             }
           }
-        }
-        if (!streamUrl) {
+          return chosenUrl;
+        };
+
+        const downloadCandidate = async (candObj) => {
+          const streamUrl = pickCandidateStreamUrl(candObj);
+          if (!streamUrl) throw new Error('Playable video URL was unavailable.');
+          if (existsSync(outPath)) {
+            try { rmSync(outPath, { force: true }); } catch {}
+          }
+          const headers = { 'User-Agent': UA, ...(candObj?.headers || track.streamHeaders || track.headers || {}) };
+          const fmt = String(candObj?.format || track.format || '').toLowerCase();
+          const isDash = Boolean(candObj?.isDash || fmt === 'dash' || /\.mpd(\?|$)/i.test(streamUrl));
+          const isHls = !isDash && Boolean(candObj?.isHls || fmt === 'hls' || /\.m3u8(\?|$)/i.test(streamUrl));
+          const needsRemux = isHls || isDash || /\.(mkv|webm|ts)(\?|$)/i.test(streamUrl) || ['mkv', 'dash', 'hls'].includes(fmt);
+          const prefAudioLang = candObj?.preferredAudioLang || track.preferredAudioLang || item?.originalLanguage || item?.language || candObj?.audioLanguage || track.audioLanguage || '';
+
+          if (needsRemux) {
+            emit(`⬇️ Remuxing HD stream to MP4 for ${safeName}…`);
+            const hdrStr = buildFfmpegHeaders(headers);
+            const audioMapArgs = await selectOriginalAudioMapArgs(streamUrl, this.runner, { headers, preferredAudioLang: prefAudioLang });
+            const inputFlags = [
+              '-nostdin', '-y',
+              '-headers', hdrStr,
+              ...(isHls ? ['-allowed_extensions', 'ALL'] : []),
+              '-i', streamUrl
+            ];
+            try {
+              await this.runner('ffmpeg', [
+                ...inputFlags,
+                ...audioMapArgs,
+                '-c', 'copy',
+                '-bsf:a', 'aac_adtstoasc',
+                '-movflags', '+faststart',
+                outPath
+              ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
+            } catch {
+              if (existsSync(outPath)) {
+                try { rmSync(outPath, { force: true }); } catch {}
+              }
+              // Re-encode audio to AAC if source had non-MP4 audio codec (AC3/DTS/Opus)
+              await this.runner('ffmpeg', [
+                ...inputFlags,
+                ...audioMapArgs,
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+                '-movflags', '+faststart',
+                outPath
+              ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
+            }
+          } else {
+            emit(`⬇️ Downloading MP4 (${safeName})…`);
+            const res = await this.fetch(streamUrl, {
+              headers,
+              signal: AbortSignal.timeout(300_000)
+            });
+            if (!res.ok || !res.body) {
+              throw new Error(`HTTP ${res.status} downloading video`);
+            }
+            const cl = Number(res.headers?.get?.('content-length') || 0);
+            // Abort overly massive multi-gigabyte raw files early if duration unknown and > 2.8x limit
+            if (cl > limitBytes * 2.8) {
+              try { await res.body.cancel(); } catch {}
+              throw new Error(`Source file is ${Math.round(cl / (1024 * 1024))} MB which exceeds Telegram compression budget.`);
+            }
+            await pipeline(Readable.fromWeb(res.body), createWriteStream(outPath));
+          }
+          if (!existsSync(outPath) || statSync(outPath).size < 1024) {
+            throw new Error('Downloaded file is missing or empty.');
+          }
+          return streamUrl;
+        };
+
+        const initialCandidates = [
+          track,
+          ...(Array.isArray(track.fallbackStreams) ? track.fallbackStreams : [])
+        ].filter((c) => Boolean(c?.streamUrl || c?.videoUrl || c?.mediaUrl || c?.url));
+        if (!initialCandidates.length) {
           cleanup();
           return { ok: false, reason: 'Playable video URL was unavailable.', cleanup: () => {} };
         }
-        const headers = { 'User-Agent': UA, ...(track.streamHeaders || track.headers || {}) };
-        const isDash = Boolean(track.isDash || track.format === 'dash' || /\.mpd(\?|$)/i.test(streamUrl));
-        const isHls = !isDash && Boolean(track.isHls || track.format === 'hls' || /\.m3u8(\?|$)/i.test(streamUrl));
-        const needsRemux = isHls || isDash || /\.(mkv|webm|ts)(\?|$)/i.test(streamUrl) || ['mkv', 'dash', 'hls'].includes(String(track.format || '').toLowerCase());
 
-        if (needsRemux) {
-          emit(`⬇️ Remuxing HD stream to MP4 for ${safeName}…`);
-          const hdrStr = buildFfmpegHeaders(headers);
-          const inputFlags = [
-            '-nostdin', '-y',
-            '-headers', hdrStr,
-            ...(isHls ? ['-allowed_extensions', 'ALL'] : []),
-            '-i', streamUrl
-          ];
+        let succeeded = false;
+        let lastErr = null;
+        for (const cand of initialCandidates) {
+          const candUrl = pickCandidateStreamUrl(cand);
+          if (!candUrl || failedUrls.includes(candUrl)) continue;
           try {
-            await this.runner('ffmpeg', [
-              ...inputFlags,
-              '-c', 'copy',
-              '-bsf:a', 'aac_adtstoasc',
-              '-movflags', '+faststart',
-              outPath
-            ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
-          } catch {
-            // Re-encode audio to AAC if source had non-MP4 audio codec (AC3/DTS/Opus)
-            await this.runner('ffmpeg', [
-              ...inputFlags,
-              '-c:v', 'copy',
-              '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
-              '-movflags', '+faststart',
-              outPath
-            ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
+            await downloadCandidate(cand);
+            succeeded = true;
+            break;
+          } catch (err) {
+            lastErr = err;
+            failedUrls.push(candUrl);
           }
-        } else {
-          emit(`⬇️ Downloading MP4 (${safeName})…`);
-          const res = await this.fetch(streamUrl, {
-            headers,
-            signal: AbortSignal.timeout(300_000)
-          });
-          if (!res.ok || !res.body) {
-            throw new Error(`HTTP ${res.status} downloading video`);
+        }
+
+        if (!succeeded && !item?.filePath && typeof this.app?.movieResolver?.resolve === 'function' && failedUrls.length > 0) {
+          emit(`🔁 Primary download mirror failed — switching source for ${safeName}…`);
+          const freshRes = await this.app.movieResolver.resolve(item, {
+            fetchSubtitles: false,
+            preferredHeight: profile.height,
+            originalLanguage: item?.originalLanguage || item?.language || null,
+            allowAdultFeatures: Boolean(allowAdultFeatures),
+            excludeUrls: failedUrls,
+            onProgress: emit
+          }).catch(() => null);
+          if (freshRes?.ok && freshRes.track?.streamUrl && !failedUrls.includes(freshRes.track.streamUrl)) {
+            track = freshRes.track;
+            await downloadCandidate(track);
+            succeeded = true;
           }
-          const cl = Number(res.headers?.get?.('content-length') || 0);
-          const limitBytes = this.getLimitBytes();
-          // Abort overly massive multi-gigabyte raw files early if duration unknown and > 2.8x limit
-          if (cl > limitBytes * 2.8) {
-            try { await res.body.cancel(); } catch {}
-            throw new Error(`Source file is ${Math.round(cl / (1024 * 1024))} MB which exceeds Telegram compression budget.`);
-          }
-          await pipeline(Readable.fromWeb(res.body), createWriteStream(outPath));
+        }
+
+        if (!succeeded) {
+          throw lastErr || new Error('All download mirrors failed.');
         }
       }
 
@@ -345,9 +450,12 @@ export class MovieDownloader {
           : profile.audioKbps;
         emit(`🗜 Optimizing ${Math.round(sizeBytes / (1024 * 1024))} MB video to ${profile.short} (${fitHeight}p)…`);
         const fitPath = join(workDir, `${safeName}_${profile.short}.mp4`);
+        const fitPrefLang = track.preferredAudioLang || item?.originalLanguage || item?.language || track.audioLanguage || '';
+        const fitAudioMapArgs = await selectOriginalAudioMapArgs(outPath, this.runner, { preferredAudioLang: fitPrefLang });
         await this.runner('ffmpeg', [
           '-nostdin', '-y',
           '-i', outPath,
+          ...fitAudioMapArgs,
           '-vf', `scale=-2:'min(${fitHeight},ih)'`,
           '-c:v', 'libx264', '-preset', 'veryfast',
           '-crf', String(profile.crf),
@@ -401,10 +509,18 @@ export class MovieDownloader {
     vcCallbackData = null,
     spoiler = false,
     onProgress = null,
-    quality = '480p'
+    quality = '480p',
+    allowAdultFeatures = null
   } = {}) {
     const targetQuality = normalizeDownloadQuality(quality);
-    const prepared = await this.prepareVideoFile(itemOrTrack, { onProgress, quality: targetQuality });
+    const effectiveAllowAdult = allowAdultFeatures !== null
+      ? Boolean(allowAdultFeatures)
+      : Number(ctx?.chatId || ctx?.chat?.id || 0) > 0;
+    const prepared = await this.prepareVideoFile(itemOrTrack, {
+      onProgress,
+      quality: targetQuality,
+      allowAdultFeatures: effectiveAllowAdult
+    });
     if (!prepared.ok) return prepared;
 
     const api = ctx.api || this.app?.telegram?.api;
@@ -772,7 +888,7 @@ export class MovieDownloader {
       }
       return { ok: true, messageId: navSent?.message_id, mediaMessageIds: newMediaIds, count: preparedList.length };
     } finally {
-      for (const p of preparedList) p.cleanup();
+      for (const p of preparedList) p.cleanup?.();
     }
   }
 }

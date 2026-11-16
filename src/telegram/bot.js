@@ -4016,7 +4016,9 @@ export class TelegramController extends EventEmitter {
           if (sent?.message_id) {
             this.setScreenMsg(chatId, tgId, sent.message_id);
             this.sm.update(tgId, { screenMessageId: sent.message_id });
-            this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+            if (!this.botContext?.isClone) {
+              this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+            }
           }
           return;
         }
@@ -4038,7 +4040,9 @@ export class TelegramController extends EventEmitter {
           if (sent?.message_id) {
             this.setScreenMsg(chatId, tgId, sent.message_id);
             this.sm.update(tgId, { screenMessageId: sent.message_id });
-            this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+            if (!this.botContext?.isClone) {
+              this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+            }
           }
           return;
         }
@@ -5081,6 +5085,9 @@ export class TelegramController extends EventEmitter {
       chatType,
       isChannel,
       isGroup,
+      directMessageId: directMessage?.message_id ?? null,
+      ephemeralMessageId: queryMessage?.ephemeral_message_id ?? directMessage?.ephemeral_message_id ?? null,
+      receiverUserId: Number(tgId) || null,
       replyTo: directMessage?.reply_to_message ?? queryMessage?.reply_to_message ?? null,
       bot: this.botContext,
       botName: this.botContext?.botName || 'Lancy',

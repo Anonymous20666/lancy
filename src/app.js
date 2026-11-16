@@ -72,7 +72,7 @@ export class LancyApp {
   constructor({ env = {}, dataDir: dataDirName, log } = {}) {
     this.env = env;
     this.version = '1.0.0';
-    this.root = dataDir(dataDirName);
+    this.root = dataDir(dataDirName ?? (env.LANCY_DATA_DIR || env.DATA_DIR));
     this.log = log ?? createLogger({ level: env.LOG_LEVEL ?? 'info', logDir: join(this.root, 'logs') });
 
     // ── Core ──
@@ -187,9 +187,14 @@ export class LancyApp {
     this.musicLibrary = new MediaLibrary({ root: join(this.root, 'cache', 'music'), providers: this.musicProviders, maxBytes: this.settings.get('music.maxFileMiB') * 1024 * 1024, videoMaxBytes: (this.settings.get('music.maxVideoMiB') || this.settings.get('music.maxFileMiB')) * 1024 * 1024, quotaBytes: this.settings.get('music.maxCacheMiB') * 1024 * 1024, ttlMs: this.settings.get('music.cacheTtlMinutes') * 60000 });
     this.movieApi = new MovieApiClient({ log: this.log });
     this.subtitles = new SubtitleService({ cacheDir: join(this.root, 'cache', 'music', 'subs'), log: this.log });
-    this.movieResolver = new MovieStreamResolver({ movieApi: this.movieApi, subtitles: this.subtitles, log: this.log });
-    this.movieSessions = new MovieSessions({ db: this.db });
     this.adultCatalog = defaultAdultCatalog;
+    this.movieResolver = new MovieStreamResolver({
+      movieApi: this.movieApi,
+      subtitles: this.subtitles,
+      adultCatalog: this.adultCatalog,
+      log: this.log
+    });
+    this.movieSessions = new MovieSessions({ db: this.db });
     this.commandProcessor = new CommandJobProcessor({ log: this.log });
     this.movieDownloader = new MovieDownloader({ app: this, log: this.log });
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });

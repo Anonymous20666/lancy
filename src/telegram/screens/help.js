@@ -31,6 +31,7 @@ export function createHelpScreen({ app }) {
 • /random <mood> — infinite radio from a mood or genre (up to 5 mixed).
 • /player — one live dashboard: pause, skip, previous, seek ±10s, volume, repeat, shuffle, queue, lyrics. It updates in place instead of sending new messages.
 • /stop — clears the queue and the assistant leaves right away. After 10 idle minutes it leaves on its own.
+• /moviecast <allow|disallow> — (Owner) allow or disallow broadcasting VC movies to all bot users.
 • Channels: /channel @name in DM gives you a private remote for a channel livestream.
 
 📏 LIMITS YOU SHOULD KNOW
@@ -87,6 +88,7 @@ export function createHelpScreen({ app }) {
       [{ text: rt.bold('/addq'), align: 'left', valign: 'middle' }, { text: 'Search and queue live-call audio', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/vplay'), align: 'left', valign: 'middle' }, { text: 'Queue live-call video + audio', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/player'), align: 'left', valign: 'middle' }, { text: 'Open the persistent player', align: 'left', valign: 'middle' }],
+      [{ text: rt.bold('/moviecast'), align: 'left', valign: 'middle' }, { text: 'Allow/disallow movie broadcasts to all users', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/grab'), align: 'left', valign: 'middle' }, { text: 'Universal media downloader', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/search'), align: 'left', valign: 'middle' }, { text: 'Pinterest HD aesthetic search', align: 'left', valign: 'middle' }],
       [{ text: rt.bold('/lyrics'), align: 'left', valign: 'middle' }, { text: 'Matched lyrics for the current track', align: 'left', valign: 'middle' }],

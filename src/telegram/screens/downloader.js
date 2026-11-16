@@ -2977,6 +2977,26 @@ export function createDownloaderScreen({ app }) {
             }
           };
 
+          if (trackObj.mediaType === 'video' && trackObj.filePath && typeof app.subtitles?.resolveForMedia === 'function') {
+            try {
+              const subRes = await app.subtitles.resolveForMedia({
+                title: trackObj.title,
+                streamUrl: trackObj.filePath,
+                durationSeconds: Number(item.durationSeconds) > 0 ? Number(item.durationSeconds) : null,
+                language: 'eng',
+                embeddedOnly: !(Number(item.durationSeconds) >= 900)
+              }).catch(() => null);
+              if (subRes?.filePath) {
+                trackObj.subtitlePath = subRes.filePath;
+                trackObj.subtitleLabel = subRes.label || 'Embedded Track';
+                trackObj.subtitleSameRoute = Boolean(subRes.sameRoute);
+                if (Array.isArray(subRes.tracks) && subRes.tracks.length) {
+                  trackObj.subtitleTracks = subRes.tracks;
+                }
+              }
+            } catch {}
+          }
+
           if (action === 'vc_stream') {
             if (vcActive) {
               if (ctx.query?.id) {

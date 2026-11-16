@@ -2,9 +2,30 @@ import { logger } from '../core/logger.js';
 
 const log = logger().child({ module: 'telegram-permissions' });
 
-// In-memory cache for chat media permissions (chatId -> { caps, expiresAt })
+// In-memory cache for chat media permissions (`${botKey}:${chatId}` -> { caps, expiresAt })
 const permissionsCache = new Map();
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
+const apiCacheIds = new WeakMap();
+let nextApiCacheId = 1;
+
+function permissionBotKey(api) {
+  if (api?.me?.id) return String(api.me.id);
+  const tokenId = typeof api?.token === 'string' ? api.token.split(':')[0] : '';
+  if (/^\d+$/.test(tokenId)) return tokenId;
+  if (api && typeof api === 'object') {
+    let id = apiCacheIds.get(api);
+    if (!id) {
+      id = `api_${nextApiCacheId++}`;
+      apiCacheIds.set(api, id);
+    }
+    return id;
+  }
+  return 'default';
+}
+
+function permissionCacheKey(api, chatId) {
+  return `${permissionBotKey(api)}:${Number(chatId)}`;
+}
 
 // Scoped per-API-instance cache for verified channel admins (45s allow cache; fail-closed on errors)
 const channelAdminCache = new WeakMap();
@@ -202,12 +223,13 @@ export function isPermissionError(err) {
 /**
  * Manually update/record chat restrictions when an error is caught.
  */
-export function recordChatPermissionRestriction(chatId, restrictions = {}) {
+export function recordChatPermissionRestriction(chatId, restrictions = {}, api = null) {
   if (!chatId) return;
   const numId = Number(chatId);
   if (numId > 0) return; // Private chat has full rights
 
-  const existing = permissionsCache.get(numId)?.caps || {
+  const key = permissionCacheKey(api, numId);
+  const existing = permissionsCache.get(key)?.caps || {
     isGroup: true,
     isAdmin: false,
     canSendMessages: true,
@@ -226,17 +248,37 @@ export function recordChatPermissionRestriction(chatId, restrictions = {}) {
     isAdmin: false
   };
 
-  permissionsCache.set(numId, {
+  permissionsCache.set(key, {
     caps: updated,
     expiresAt: Date.now() + CACHE_TTL_MS
   });
+
+  if (!api) {
+    const suffix = `:${numId}`;
+    for (const [entryKey, entryVal] of permissionsCache.entries()) {
+      if (!entryKey.endsWith(suffix) || entryKey === key) continue;
+      permissionsCache.set(entryKey, {
+        caps: { ...(entryVal?.caps || existing), ...restrictions, isGroup: true, isAdmin: false },
+        expiresAt: Date.now() + CACHE_TTL_MS
+      });
+    }
+  }
 }
 
 /**
  * Invalidate cached permissions for a chat.
  */
-export function invalidateChatPermissions(chatId) {
-  if (chatId) permissionsCache.delete(Number(chatId));
+export function invalidateChatPermissions(chatId, api = null) {
+  if (!chatId) return;
+  const numId = Number(chatId);
+  if (api) {
+    permissionsCache.delete(permissionCacheKey(api, numId));
+    return;
+  }
+  const suffix = `:${numId}`;
+  for (const key of Array.from(permissionsCache.keys())) {
+    if (key.endsWith(suffix)) permissionsCache.delete(key);
+  }
 }
 
 /**
@@ -274,8 +316,9 @@ export async function checkChatMediaPermissions(api, chatId) {
     };
   }
 
-  // Check in-memory cache
-  const cached = permissionsCache.get(numId);
+  // Check in-memory cache scoped by bot identity + chat
+  const cacheKey = permissionCacheKey(api, numId);
+  const cached = permissionsCache.get(cacheKey);
   if (cached && cached.expiresAt > Date.now()) {
     return cached.caps;
   }
@@ -321,7 +364,7 @@ export async function checkChatMediaPermissions(api, chatId) {
         canSendDocuments: true,
         canSendVoice: true
       };
-      permissionsCache.set(numId, { caps, expiresAt: Date.now() + CACHE_TTL_MS });
+      permissionsCache.set(cacheKey, { caps, expiresAt: Date.now() + CACHE_TTL_MS });
       return caps;
     }
 
@@ -337,7 +380,7 @@ export async function checkChatMediaPermissions(api, chatId) {
         canSendDocuments: false,
         canSendVoice: false
       };
-      permissionsCache.set(numId, { caps, expiresAt: Date.now() + CACHE_TTL_MS });
+      permissionsCache.set(cacheKey, { caps, expiresAt: Date.now() + CACHE_TTL_MS });
       return caps;
     }
 
@@ -356,7 +399,7 @@ export async function checkChatMediaPermissions(api, chatId) {
       canSendVoice: overallMedia && p.can_send_voice_notes !== false
     };
 
-    permissionsCache.set(numId, { caps, expiresAt: Date.now() + CACHE_TTL_MS });
+    permissionsCache.set(cacheKey, { caps, expiresAt: Date.now() + CACHE_TTL_MS });
     return caps;
   } catch (err) {
     log.debug({ err: err?.message, chatId }, 'failed to inspect chat permissions, defaulting to permissive');

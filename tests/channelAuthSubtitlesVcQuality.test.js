@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
 import { Database } from '../src/core/db.js';
 import { SettingsManager } from '../src/config/settings.js';
 import { StateMachine } from '../src/core/stateMachine.js';
@@ -935,4 +936,92 @@ test('Live Subtitle Sync Checker + Normalizer: drift mapping, subcheck action & 
   s.view = 'cinema';
   const cinemaText = JSON.stringify(screen.renderCinemaPlayer(s));
   assert.match(cinemaText, /Auto-Normalized/);
+});
+
+test('non-manual DB sub offsets do not lock manual override and extreme legacy plain entries self-heal', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'lancy-submanual-'));
+  t.after(async () => { await rm(dir, { recursive: true, force: true }); });
+  const db = new Database(join(dir, 'submanual.db'));
+  db.migrate();
+  t.after(() => db.close());
+
+  const srtA = join(dir, 'a.srt');
+  const srtB = join(dir, 'b.srt');
+  const fakeMp4 = join(dir, 'fake.mp4');
+  await writeFile(srtA, '1\n00:00:01,000 --> 00:00:03,000\nHello\n', 'utf8');
+  await writeFile(srtB, '1\n00:00:01,000 --> 00:00:03,000\nAlt\n', 'utf8');
+  await writeFile(fakeMp4, 'stub', 'utf8');
+
+  // Seed legacy poisoned extreme plain number (5.6) and auto-saved object ({ offset: 1.8, manual: false })
+  const keyA = `music.suboffset.v2.${createHash('sha1').update('movie:poison:a.srt').digest('hex').slice(0, 16)}`;
+  const keyB = `music.suboffset.v2.${createHash('sha1').update('movie:auto:b.srt').digest('hex').slice(0, 16)}`;
+  db.setSetting(keyA, 5.6);
+  db.setSetting(keyB, { offset: 1.8, manual: false });
+
+  const calls = [];
+  const voice = {
+    async play(chatId, url, opts = {}) { calls.push({ op: 'play', chatId, opts }); return { ok: true, account_alias: 'a1' }; },
+    async setSubtitle(chatId, path, opts = {}) { calls.push({ op: 'subtitle', chatId, path, opts }); return { ok: true }; },
+    async setVolume() { return { ok: true }; },
+    async checkSubtitleSync() {
+      return {
+        ok: true,
+        subtitle_offset: 1.8,
+        auto_subtitle_offset: 1.8,
+        subtitle_sync: { status: 'auto_normalized', auto_normalized: true, applied_offset_sec: 1.8, manual_override: false }
+      };
+    }
+  };
+  const subs = new SubtitleService({ cacheDir: dir });
+  const qm = new QueueManager({ app: { db, subtitles: subs }, voiceClient: voice, db, pollMs: 0 });
+  t.after(() => { qm.closed = true; });
+
+  // 1. Legacy extreme unflagged 5.6 self-heals to offset 0, manualOverride=false on playback start
+  const s = qm.getSession(-10088);
+  s.subtitleMode = 'screen';
+  await qm.addMovies(-10088, [{
+    id: 'movie:poison',
+    provider: 'movie',
+    mediaType: 'video',
+    title: 'Poison Test',
+    streamUrl: fakeMp4,
+    url: fakeMp4,
+    subtitlePath: srtA,
+    subtitleTracks: [
+      { filePath: srtA, label: 'A', source: 'opensubtitles', sameRoute: false },
+      { filePath: srtB, label: 'B', source: 'opensubtitles', sameRoute: false }
+    ]
+  }], { playNow: true });
+  const playCall1 = calls.find((c) => c.op === 'play');
+  assert.ok(playCall1);
+  assert.equal(playCall1.opts.subtitleOffset, 0);
+  assert.equal(playCall1.opts.subtitleManualOverride, false);
+  assert.equal(s.subtitleSyncOffset, 0);
+  assert.equal(s.subtitleManualOverride, false);
+
+  // 2. Auto-saved { offset: 1.8, manual: false } loads 1.8 WITHOUT locking manualOverride
+  s.currentTrack.id = 'movie:auto';
+  await qm.cycleSubtitleTrack(-10088, 1);
+  assert.equal(s.subtitleSyncOffset, 1.8);
+  assert.equal(s.subtitleManualOverride, false);
+  assert.equal(calls.at(-1).opts.manualOverride, false);
+
+  // 3. setSubtitleMode preserves manualOverride=false for non-manual offset, even when |offset| >= 0.05
+  await qm.setSubtitleMode(-10088, 'vc');
+  await qm.setSubtitleMode(-10088, 'screen');
+  assert.equal(calls.at(-1).opts.manualOverride, false);
+
+  // 4. checkSubtitleSync persists auto-normalized offset with manual: false
+  await qm.cycleSubtitleTrack(-10088, 0);
+  await qm.checkSubtitleSync(-10088, { autoFix: true });
+  const keyAutoA = `music.suboffset.v2.${createHash('sha1').update('movie:auto:a.srt').digest('hex').slice(0, 16)}`;
+  assert.deepEqual(db.getSetting(keyAutoA), { offset: 1.8, manual: false });
+  assert.equal(s.subtitleManualOverride, false);
+
+  // 5. Explicit setSubtitleOffset sets manual=true and persists { offset, manual: true }
+  await qm.cycleSubtitleTrack(-10088, 1);
+  await qm.setSubtitleOffset(-10088, 2.5, { absolute: true });
+  assert.equal(s.subtitleSyncOffset, 2.5);
+  assert.equal(s.subtitleManualOverride, true);
+  assert.deepEqual(db.getSetting(keyB), { offset: 2.5, manual: true });
 });

@@ -56,7 +56,7 @@ export function normalizeLangCode(raw) {
 }
 
 export function isDubAudioLabel(label = '') {
-  return /\b(?:dub(?:bed)?|english\s*dub|eng\s*dub|vff|vfq|latino\s*dub|castellano\s*dub)\b/i.test(String(label || ''));
+  return /\b(?:dub(?:s|bed|bing)?|fandub|dublado|doublage|vff|vfq|vf|truefrench|latino|castellano|voice\s*over|voiceover|(?:english|eng|french|fre|fra|spanish|spa|esp|hindi|hin|german|ger|deu|italian|ita|portuguese|por|russian|rus|arabic|ara|turkish|tur|korean|kor|japanese|jpn|chinese|chi|zho|thai|tha|indonesian|ind|vietnamese|vie|polish|pol|dutch|dut|nld)\s*(?:dub(?:s|bed|bing)?|voice\s*over|voiceover|version))\b/i.test(String(label || ''));
 }
 
 function classifyMpdResource(absUrl, mimeHint = '', isTextHint = false) {
@@ -879,8 +879,10 @@ export class VideoStreamingServer {
       score += (track.lang === prefLang) ? 100 : -80;
     }
     if (track.isDub) score -= 120;
-    else score += 30;
-    if (/\b(?:main|original)\b/i.test(track.name || '')) score += 15;
+    else {
+      score += 30;
+      if (/\b(?:main|original|orig|raw|native)\b/i.test(track.name || '')) score += 40;
+    }
     if (/\b(?:commentary|description|descriptive)\b/i.test(track.name || '')) score -= 100;
     if (track.isDefault) score += 4;
     if (track.isAutoSelect) score += 2;
@@ -1048,7 +1050,7 @@ export class VideoStreamingServer {
   async #computeAlignedHlsAudioSeek(absVideoUrl, absAudioUrl, parentEntry, targetSeek) {
     try {
       const vidCached = await this.#fetchHlsPlaylistText(absVideoUrl, parentEntry);
-      if (!vidCached?.text) return { alignedAudioSeek: null, videoSkippedSec: 0, audioSkippedSec: null };
+      if (!vidCached?.text) return { alignedAudioSeek: null, videoSkippedSec: 0, audioSkippedSec: null, audioTrimDelta: 0 };
       const vidSliced = this.#sliceHlsMediaLines(vidCached.text.split(/\r?\n/), targetSeek);
       const videoSkippedSec = Number(vidSliced.skippedSec || 0);
       let alignedAudioSeek = videoSkippedSec > 0.05 ? Math.max(0, videoSkippedSec - 0.05) : 0;
@@ -1060,23 +1062,28 @@ export class VideoStreamingServer {
           if (audCached?.text) {
             const audLines = audCached.text.split(/\r?\n/);
             let audSliced = this.#sliceHlsMediaLines(audLines, alignedAudioSeek);
-            // Guarantee audio never starts after video's first kept segment.
+            // Guarantee audio never starts after video's first kept segment without nuking seek to 0 on >6s segments.
             if (audSliced.skippedSec > videoSkippedSec + 0.005) {
-              const fallbackSeek = Math.max(0, videoSkippedSec - 0.25);
-              alignedAudioSeek = fallbackSeek;
-              audSliced = this.#sliceHlsMediaLines(audLines, alignedAudioSeek);
-              if (audSliced.skippedSec > videoSkippedSec + 0.005) {
-                alignedAudioSeek = 0;
-                audSliced = { skippedSec: 0 };
+              let bestSeek = alignedAudioSeek;
+              let bestSliced = audSliced;
+              for (const backSec of [0.25, 1.0, 3.0, 6.0, 12.0, 20.0]) {
+                const trySeek = Math.max(0, videoSkippedSec - backSec);
+                const trySliced = this.#sliceHlsMediaLines(audLines, trySeek);
+                bestSeek = trySeek;
+                bestSliced = trySliced;
+                if (trySliced.skippedSec <= videoSkippedSec + 0.005 || trySeek <= 0) break;
               }
+              alignedAudioSeek = bestSeek;
+              audSliced = bestSliced;
             }
             audioSkippedSec = Number(audSliced.skippedSec || 0);
           }
         } catch {}
       }
-      return { alignedAudioSeek, videoSkippedSec, audioSkippedSec };
+      const audioTrimDelta = audioSkippedSec != null ? Math.max(0, videoSkippedSec - audioSkippedSec) : 0;
+      return { alignedAudioSeek, videoSkippedSec, audioSkippedSec, audioTrimDelta };
     } catch {
-      return { alignedAudioSeek: null, videoSkippedSec: 0, audioSkippedSec: null };
+      return { alignedAudioSeek: null, videoSkippedSec: 0, audioSkippedSec: null, audioTrimDelta: 0 };
     }
   }
 
@@ -1090,6 +1097,7 @@ export class VideoStreamingServer {
     let alignedAudioSeek = null;
     let resolvedSkippedSec = 0;
     let resolvedAudioSkippedSec = null;
+    let resolvedAudioTrimDelta = 0;
 
     if (isMaster) {
       const pruned = this.#pruneHlsMasterLines(
@@ -1109,6 +1117,7 @@ export class VideoStreamingServer {
           if (absAud) {
             alignedAudioSeek = aligned.alignedAudioSeek;
             resolvedAudioSkippedSec = aligned.audioSkippedSec;
+            resolvedAudioTrimDelta = Number(aligned.audioTrimDelta || 0);
           }
         } catch {}
       }
@@ -1194,7 +1203,8 @@ export class VideoStreamingServer {
     return {
       text: out,
       skippedSec: resolvedSkippedSec,
-      audioSkippedSec: resolvedAudioSkippedSec
+      audioSkippedSec: resolvedAudioSkippedSec,
+      audioTrimDelta: resolvedAudioTrimDelta
     };
   }
 
@@ -1293,6 +1303,9 @@ export class VideoStreamingServer {
     }
     if (seekSeconds > 0.05 && Number.isFinite(rewritten.audioSkippedSec) && rewritten.audioSkippedSec >= 0) {
       hdrs['X-Lancy-Audio-Skipped-Sec'] = Number(rewritten.audioSkippedSec).toFixed(3);
+    }
+    if (seekSeconds > 0.05 && Number.isFinite(rewritten.audioTrimDelta) && rewritten.audioTrimDelta > 0) {
+      hdrs['X-Lancy-Audio-Trim-Delta'] = Number(rewritten.audioTrimDelta).toFixed(3);
     }
     res.writeHead(200, hdrs);
     res.end(outBuf);

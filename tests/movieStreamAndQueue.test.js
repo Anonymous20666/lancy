@@ -13,10 +13,10 @@ import { SearchSessions } from '../src/music/search.js';
 import { PANEL_ACTIONS } from '../src/music/channelPanels.js';
 import { MovieApiClient, normalizeSeasonsList } from '../src/media/movieApi.js';
 import { MovieSessions } from '../src/media/movieSessions.js';
-import { MovieDownloader } from '../src/media/movieDownloader.js';
+import { MovieDownloader, selectOriginalAudioMapArgs } from '../src/media/movieDownloader.js';
 import { SubtitleService, parseSrt, getCueAt, shiftSrtText } from '../src/media/subtitles.js';
-import { MovieStreamResolver, scoreTitleMatch } from '../src/media/movieResolver.js';
-import { VideoStreamingServer } from '../src/media/streamingServer.js';
+import { MovieStreamResolver, scoreTitleMatch, isDubbedCandidateText } from '../src/media/movieResolver.js';
+import { VideoStreamingServer, isDubAudioLabel } from '../src/media/streamingServer.js';
 import { MediaAiAgent } from '../src/ai/mediaAgent.js';
 import { createMusicScreen } from '../src/telegram/screens/music.js';
 import { TelegramController } from '../src/telegram/bot.js';
@@ -155,8 +155,8 @@ function buildTestHarness(t) {
     pause: async () => ({ ok: true }),
     resume: async () => ({ ok: true }),
     setVolume: async (_id, vol) => ({ ok: true, volume: vol }),
-    setSubtitle: async (id, subtitlePath) => {
-      voiceCalls.setSubtitle.push({ id, subtitlePath });
+    setSubtitle: async (id, subtitlePath, opts = {}) => {
+      voiceCalls.setSubtitle.push({ id, subtitlePath, ...opts, opts });
       return { ok: true };
     },
     getStatus: async () => ({ ok: true, active: false })
@@ -294,13 +294,13 @@ test('Movie UI opens Season 1 first with Bot API 10.3 checklists, multi-season s
   const searchCard = h.sentMessages.at(-1).rich;
   assert.match(JSON.stringify(searchCard), /Breaking Bad/);
 
-  // Pick Breaking Bad (index 0) -> MUST edit card in-place and show Season 1 first (page 1 of 2, 6 checkboxes)
+  // Pick Breaking Bad (index 0) -> photo-less search card upgrades to poster TV season card and shows Season 1 first (page 1 of 2, 6 checkboxes)
   const latest = h.app.movieSessions.getLatestForChat(-10050);
   await h.screen.handle({ ...ctx, query: { id: 'q1' }, messageId: latest.messageId }, 'mv', [latest.id, 'pk', '0']);
   assert.equal(latest.view, 'season');
   assert.equal(latest.seasonNumber, 1);
 
-  const s1Card = h.editedMessages.at(-1).rich;
+  const s1Card = h.sentMessages.at(-1).rich;
   const checklist = s1Card.blocks.find((b) => b.type === 'list');
   assert.ok(checklist, 'Must use Bot API 10.3 list block with checkboxes');
   assert.equal(checklist.items.length, 6);
@@ -619,7 +619,8 @@ test('Music & Cinema queues/cards remain strictly isolated, live loading log str
   const subDecoded = decodeCallback(subBtn.callback_data);
   await h.screen.handle({ ...ctx, query: { id: 'qsub' }, messageId: session.screenMessageId }, subDecoded.action, subDecoded.args);
   assert.equal(session.subtitleMode, 'live');
-  assert.equal(h.voiceCalls.setSubtitle.at(-1)?.subtitlePath, null);
+  assert.equal(h.voiceCalls.setSubtitle.at(-1)?.subtitlePath, srtFile);
+  assert.equal(h.voiceCalls.setSubtitle.at(-1)?.subtitleRenderScreen, false);
 
   let emittedCue = null;
   h.qm.once('subtitle_cue', (ev) => { emittedCue = ev; });
@@ -1654,6 +1655,13 @@ test('Restart auto-resume restores active movie playback from saved second, pres
     pinnedCalls.push({ chatId, msgId, opts });
     return true;
   };
+  h.api.call = async (method, params = {}) => {
+    if (method === 'pinChatMessage') {
+      pinnedCalls.push({ chatId: params.chat_id, msgId: params.message_id, opts: { disable_notification: params.disable_notification } });
+      return true;
+    }
+    return { ok: true };
+  };
   h.api.getChat = async (id) => ({ id, type: 'supergroup', title: 'Midnight Cinema VC' });
   const ctx = h.makeCtx(-100999);
 
@@ -1735,6 +1743,13 @@ test('Forward (+30s), Reverse (-30s), Next, Prev work rapidly without expiry err
   h.api.pinChatMessage = async (chatId, msgId, opts) => {
     pinnedCalls.push({ chatId, msgId, opts });
     return true;
+  };
+  h.api.call = async (method, params = {}) => {
+    if (method === 'pinChatMessage') {
+      pinnedCalls.push({ chatId: params.chat_id, msgId: params.message_id, opts: { disable_notification: params.disable_notification } });
+      return true;
+    }
+    return { ok: true };
   };
   h.api.getChat = async (id) => ({ id, type: 'supergroup', title: 'Cinema Room' });
 
@@ -2067,7 +2082,7 @@ test('MovieStreamResolver handles punkflix Referer + master HLS audio/VTT subs, 
             status: 200,
             url: u,
             headers: { get: () => 'application/vnd.apple.mpegurl' },
-            text: async () => '#EXTM3U\n#EXTINF:2400.0,\nseg0.m4s\n#EXTINF:2400.0,\nseg1.m4s\n#EXT-X-ENDLIST\n'
+            text: async () => '#EXTM3U\n#EXTINF:3600.0,\nseg0.m4s\n#EXTINF:3600.0,\nseg1.m4s\n#EXT-X-ENDLIST\n'
           };
         }
         if (u === 'https://media.punkflix.net/s/abc123/seg0.m4s') {
@@ -2308,7 +2323,7 @@ test('CinemaVcAnnouncer notifies scoped bot_users with existing/fallback links, 
     // 1. Public group -> sends rich DMs to 1001 & 1002 only
     await announcer.onTrackStart({ chatId: -1001, track: barbieTrack, session: { botId: 0, api: mainApi } });
     await announcer.flush();
-    assert.deepEqual(mainDms.map((d) => d.uid), [1001, 1002], 'Must deliver only to non-banned, non-muted users of bot_id=0');
+    assert.deepEqual(mainDms.map((d) => d.uid).sort((a, b) => a - b), [1001, 1002], 'Must deliver only to non-banned, non-muted users of bot_id=0');
     const dmJson = JSON.stringify(mainDms[0].rich);
     assert.match(dmJson, /Barbie and the Three Musketeers \(2009\)/);
     assert.match(dmJson, /Movie Night Lounge/);
@@ -2450,25 +2465,43 @@ test('movieUi.renderResults displays full untruncated movie names & details in c
     if (!blk) return '';
     if (Array.isArray(blk)) return blk.map(extractBlocksText).join('\n');
     if (blk.type === 'blockquote' || blk.type === 'details') return extractBlocksText(blk.blocks);
-    if (blk.text) return richTextToString(blk.text);
-    return '';
+    const parts = [];
+    if (blk.text) parts.push(richTextToString(blk.text));
+    if (blk.credit) parts.push(richTextToString(blk.credit));
+    return parts.join('\n');
   };
   const bodyText = extractBlocksText(card.blocks.filter((b) => b.type !== 'buttons'));
   assert.match(bodyText, /Barbie and the Three Musketeers — Extended Anniversary Collector Showcase Edition/);
   assert.match(bodyText, /2009 · ⭐ 7\.4 · Animation, Family/);
   assert.match(bodyText, /Corinne leaves her countryside home for Paris/);
+  assert.match(bodyText, /Breaking Bad/);
+  assert.match(bodyText, /Inception/);
   assert.match(bodyText, /The Lord of the Rings: The Return of the King/);
 
+  ms.resultPage = 1;
+  const page2Card = h.screen.movieUi.renderResults(h.makeCtx(-777), ms);
+  const page2Text = extractBlocksText(page2Card.blocks.filter((b) => b.type !== 'buttons'));
+  assert.match(page2Text, /Arcane/);
+  ms.resultPage = 0;
+
   const flatButtons = card.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
-  const pickButtons = flatButtons.filter((b) => {
+  const byOp = (op) => flatButtons.filter((b) => {
     const dec = decodeCallback(b.callback_data || '');
-    return dec?.action === 'mv' && dec?.args?.[1] === 'pk';
+    return dec?.action === 'mv' && dec?.args?.[1] === op;
   });
+  assert.equal(byOp('pmi').length, 4);
+  assert.equal(byOp('qmi').length, 4);
+  assert.equal(byOp('dmi').length, 4);
   assert.deepEqual(
-    pickButtons.map((b) => richTextToString(b.text)),
-    ['#1 🎬', '#2 📺', '#3 🎬', '#4 🎬', '#5 📺'],
-    'Result selection buttons must use clean numbered badges without long movie names'
+    byOp('pk').map((b) => richTextToString(b.text)),
+    ['ℹ️', '📺 Episodes', 'ℹ️', 'ℹ️'],
+    'Bot API 10.3 Rich Results card uses compact Play/Queue/Download + link Info / primary Episodes buttons per item (4 per page)'
   );
+  assert.deepEqual(byOp('pk').map((b) => b.style), ['link', 'primary', 'link', 'link']);
+  assert.ok(byOp('rp').some((b) => richTextToString(b.text).includes('More')));
+  assert.ok(byOp('ps').length >= 1);
+  assert.ok(byOp('xfu').length >= 1);
+  assert.ok(byOp('xca').length >= 1);
   for (const btn of flatButtons) {
     assert.doesNotMatch(richTextToString(btn.text), /Barbie|Musketeers|Inception|Breaking|Rings|Arcane/i);
   }
@@ -3225,4 +3258,510 @@ test('MovieStreamResolver enforces Original Audio (skips English Dub for non-Eng
   assert.equal(resDub.track.streamUrl, `http://127.0.0.1:${port}/dub.m3u8`);
   assert.equal(resDub.track.audioIsDub, true);
   assert.equal(resDub.track.dubOnlyWarning, '⚠️ Dub Only Available');
+});
+
+
+test('Player card pin button, broken remote poster fallback, and restart card recovery for active + ended sessions', async (t) => {
+  const h = buildTestHarness(t);
+  const pinnedCalls = [];
+  h.api.getChatMember = async () => ({ status: 'administrator', can_manage_voice_chats: true, can_post_messages: true, can_edit_messages: true, can_pin_messages: true });
+  h.api.pinChatMessage = async (chatId, msgId, opts) => {
+    pinnedCalls.push({ chatId, msgId, opts });
+    return true;
+  };
+  h.api.call = async (method, params = {}) => {
+    if (method === 'pinChatMessage') {
+      pinnedCalls.push({ chatId: params.chat_id, msgId: params.message_id, opts: { disable_notification: params.disable_notification } });
+      return true;
+    }
+    return { ok: true };
+  };
+  h.api.getChat = async (id) => ({ id, type: 'supergroup', title: 'Cinema Pin Group' });
+
+  // 1. Music & Cinema cards always render visible Pin button (switching to 📍 Pinned once pinned)
+  await h.qm.addMany(-10055, [{
+    provider: 'movie',
+    providerId: '27205:0:0',
+    title: 'Inception (2010)',
+    mediaType: 'video',
+    streamUrl: 'https://cdn.example.org/inc.mp4',
+    durationSeconds: 3600,
+    artwork: 'https://broken.example.invalid/poster.jpg',
+    capabilities: { seek: true, video: true }
+  }]);
+  const s = h.qm.getSession(-10055);
+  const ctx = h.makeCtx(-10055);
+  const unpinnedCard = h.screen.renderPlayer({ ...s, pinned: false, currentTrack: { provider: 'youtube', title: 'Track', artist: 'Artist', mediaType: 'audio', durationSeconds: 180, capabilities: {} } });
+  const unpinnedBtns = unpinnedCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  assert.ok(unpinnedBtns.some((b) => b.text === '📌 Pin' && decodeCallback(b.callback_data)?.action === 'pin'));
+
+  const pinnedCard = h.screen.renderPlayer({ ...s, pinned: true, currentTrack: { provider: 'youtube', title: 'Track', artist: 'Artist', mediaType: 'audio', durationSeconds: 180, capabilities: {} } });
+  const pinnedBtns = pinnedCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
+  assert.ok(pinnedBtns.some((b) => b.text === '📍 Pinned' && decodeCallback(b.callback_data)?.action === 'pin'));
+
+  // 2. Broken remote artwork triggers stripRemotePhotoBlocks fallback instead of silently dropping Player Card
+  let failRemotePhotos = true;
+  const origSendRich = h.api.sendRichMessage;
+  const origEditRich = h.api.editMessageRich;
+  h.api.sendRichMessage = async (chatId, rich) => {
+    if (failRemotePhotos && rich?.blocks?.some((b) => b.type === 'photo' && /^https?:\/\//i.test(String(b.photo?.media || b.photo?.url || b.url || b.media || '')))) {
+      const e = new Error('Bad Request: wrong file identifier/HTTP URL specified');
+      e.description = e.message;
+      throw e;
+    }
+    return origSendRich(chatId, rich);
+  };
+  h.api.editMessageRich = async (chatId, msgId, rich) => {
+    if (failRemotePhotos && rich?.blocks?.some((b) => b.type === 'photo' && /^https?:\/\//i.test(String(b.photo?.media || b.photo?.url || b.url || b.media || '')))) {
+      const e = new Error('Bad Request: wrong type of the web page content');
+      e.description = e.message;
+      throw e;
+    }
+    return origEditRich(chatId, msgId, rich);
+  };
+
+  s.screenMessageId = null;
+  await h.service.player(ctx, -10055);
+  assert.ok(s.screenMessageId, 'Player card must fall back without remote photo block instead of failing');
+  await h.service.control({ ...ctx, query: { id: 'q-pin-1' }, messageId: s.screenMessageId }, 'pin', []);
+  assert.equal(s.pinned, true);
+  assert.equal(s.pinnedMessageId, s.screenMessageId);
+  failRemotePhotos = false;
+
+  // 3. Restart recovery restores Player Cards for BOTH active restored sessions and callEnded sessions
+  s.positionSeconds = 300;
+  await h.qm.shutdown();
+  const qm2 = new QueueManager({ app: { ...h.app }, db: h.app.db, voiceClient: h.qm.voice, pollMs: 0 });
+  h.app.musicQueueManager = qm2;
+  t.after(() => qm2.shutdown());
+
+  // Also test a persisted callEnded snapshot in another group
+  const snaps = h.app.db.getSetting('music.activePlaybackSnapshots', {});
+  snaps['-10056'] = {
+    ...snaps['-10055'],
+    chatId: -10056,
+    destination: -10056,
+    callEnded: true,
+    status: 'paused',
+    screenMessageId: null,
+    playerChatId: -10056
+  };
+  h.app.db.setSetting('music.activePlaybackSnapshots', snaps);
+
+  const sentBeforeRestore = h.sentMessages.length;
+  const restored = await qm2.restoreActiveSessions({ api: h.api });
+  assert.ok(restored.includes(-10055));
+  assert.ok(qm2.getSession(-10055).screenMessageId, 'Active restored session must ensure visible Player Card');
+  assert.ok(qm2.getSession(-10056).screenMessageId, 'callEnded restored session must still establish Player Card');
+  assert.ok(h.sentMessages.length > sentBeforeRestore);
+});
+
+test('Resume recovers from expired movie URLs, dead paused calls, stopped sessions, and /resume establishes card', async (t) => {
+  const h = buildTestHarness(t);
+  let resolveCount = 0;
+  h.app.movieResolver = {
+    async resolve(desc) {
+      resolveCount += 1;
+      return {
+        ok: true,
+        track: {
+          provider: 'movie',
+          providerId: desc.providerId || '27205:0:0',
+          title: 'Inception (2010)',
+          mediaType: 'video',
+          streamUrl: `https://cdn.example.org/fresh-${resolveCount}.mp4`,
+          durationSeconds: 3600,
+          capabilities: { seek: true, video: true }
+        },
+        subtitles: null
+      };
+    }
+  };
+
+  await h.qm.addMany(-10066, [{
+    provider: 'movie',
+    providerId: '27205:0:0',
+    title: 'Inception (2010)',
+    mediaType: 'video',
+    streamUrl: 'https://cdn.example.org/stale-0.mp4',
+    streamResolvedAt: Date.now() - 60 * 60 * 1000,
+    durationSeconds: 3600,
+    capabilities: { seek: true, video: true }
+  }]);
+  const s = h.qm.getSession(-10066);
+  s.status = 'paused';
+  s.positionSeconds = 615;
+  s.lastKnownPositionSeconds = 615;
+
+  // Simulate voice.resume failing with MEDIA_INVALID -> must re-resolve URL & rebuild stream at 615s
+  h.qm.voice.getStatus = async () => ({ ok: true, active: true, paused: true });
+  h.qm.voice.resume = async () => {
+    const e = new Error('MEDIA_INVALID');
+    e.code = 'MEDIA_INVALID';
+    throw e;
+  };
+  await h.qm.resume(-10066);
+  assert.equal(s.status, 'playing');
+  assert.ok(resolveCount >= 1, 'MEDIA_INVALID resume failure must re-resolve movie stream');
+  assert.equal(h.voiceCalls.play.at(-1).opts.startSeconds, 615);
+
+  // Dead paused call (getStatus active: false) with stale stream also rebuilds cleanly
+  s.status = 'paused';
+  s.positionSeconds = 700;
+  s.lastKnownPositionSeconds = 700;
+  s.currentTrack.streamResolvedAt = Date.now() - 60 * 60 * 1000;
+  h.qm.voice.getStatus = async () => ({ ok: true, active: false });
+  await h.qm.resume(-10066);
+  assert.equal(s.status, 'playing');
+  assert.ok(resolveCount >= 2, 'Dead paused call with aged stream must refresh movie stream');
+  assert.equal(h.voiceCalls.play.at(-1).opts.startSeconds, 700);
+
+  // Stopped session recovers via /resume command and creates Player Card if missing
+  s.status = 'stopped';
+  s.screenMessageId = null;
+  s.movieHistory = [s.currentTrack];
+  s.currentTrack = null;
+  s.callEnded = true;
+  const ctx = h.makeCtx(-10066, { directMessageId: 888 });
+  await h.screen.handleCommand(ctx, '/resume', []);
+  assert.equal(s.status, 'playing');
+  assert.ok(s.screenMessageId, '/resume command must establish Player Card when missing');
+});
+
+test('vcquality control cycles 1080p -> 720p -> 480p -> 1080p, persists quality, and passes videoQuality to voice.play', async (t) => {
+  const h = buildTestHarness(t);
+  await h.qm.addMany(-10077, [{
+    provider: 'movie',
+    providerId: '27205:0:0',
+    title: 'Inception (2010)',
+    mediaType: 'video',
+    streamUrl: 'https://cdn.example.org/inc.mp4',
+    durationSeconds: 3600,
+    capabilities: { seek: true, video: true }
+  }]);
+  const s = h.qm.getSession(-10077);
+  const ctx = h.makeCtx(-10077);
+  await h.service.player(ctx, -10077);
+  assert.equal(h.qm.getVcQuality(-10077, { isMovieTrack: true }), 'FHD_1080p');
+
+  await h.service.control({ ...ctx, query: { id: 'q-vcq-1' }, messageId: s.screenMessageId }, 'vcquality', []);
+  assert.equal(s.vcQuality, 'HD_720p');
+  assert.equal(h.app.db.getSetting('music.vcQuality.-10077'), 'HD_720p');
+  assert.equal(h.voiceCalls.play.at(-1).opts.videoQuality, 'HD_720p');
+  assert.match(JSON.stringify(h.screen.renderCinemaPlayer(s)), /720p Smooth/);
+
+  await h.service.control({ ...ctx, query: { id: 'q-vcq-2' }, messageId: s.screenMessageId }, 'vcquality', []);
+  assert.equal(s.vcQuality, 'SD_480p');
+  assert.equal(h.app.db.getSetting('music.vcQuality.-10077'), 'SD_480p');
+  assert.equal(h.voiceCalls.play.at(-1).opts.videoQuality, 'SD_480p');
+  assert.match(JSON.stringify(h.screen.renderCinemaPlayer(s)), /480p Saver/);
+
+  await h.service.control({ ...ctx, query: { id: 'q-vcq-3' }, messageId: s.screenMessageId }, 'vcquality', []);
+  assert.equal(s.vcQuality, 'FHD_1080p');
+  assert.equal(h.app.db.getSetting('music.vcQuality.-10077'), 'FHD_1080p');
+  assert.equal(h.voiceCalls.play.at(-1).opts.videoQuality, 'FHD_1080p');
+});
+
+test('Zero-Wrong-Movie, Zero-Clips/Trailers & Original-Audio protections across title scoring, resolver, downloader & UI', async (t) => {
+  // 1. Title matching: block TV episodes & clips on movie queries, handle diacritics & codec specs cleanly
+  assert.ok(scoreTitleMatch('Fallout', 2024, 'Fallout Season 1 Episode 1', { isTv: false }) < 0);
+  assert.ok(scoreTitleMatch('Fallout', 2024, 'Fallout S01E01 1080p', { isTv: false }) < 0);
+  assert.ok(scoreTitleMatch('Fallout', 2024, 'Fallout TV Show 2024', { isTv: false }) < 0);
+  assert.ok(scoreTitleMatch('Fallout', 2024, 'Fallout S01E01 1080p', { isTv: true, season: 1, episode: 1 }) >= 24);
+  assert.ok(scoreTitleMatch('Amélie', 2001, 'Amelie 2001 1080p BluRay', { isTv: false }) >= 24);
+  assert.ok(scoreTitleMatch('Inception', 2010, 'Inception 2010 DD 5 1 8bit 60fps 1080p', { isTv: false }) >= 24);
+  assert.ok(scoreTitleMatch('Inception', 2010, 'Inception Opening Scene Clip', { isTv: false }) < 0);
+  assert.ok(scoreTitleMatch('Inception', 2010, 'Inception Part 1 of 2 Full Movie', { isTv: false }) < 0);
+  assert.ok(scoreTitleMatch('Inception', 2010, 'Inception Official Teasers and Clips', { isTv: false }) < 0);
+  assert.ok(scoreTitleMatch('Breakdown', 1997, 'Breakdown 1997 Full Movie HD', { isTv: false }) >= 24);
+  assert.ok(scoreTitleMatch('Breakdown', 1997, 'Breakdown 1997 Official Trailer', { isTv: false }) < 0);
+
+  // 2. Dub detection covers regional dub tags & preserves subtitles / dual audio
+  assert.equal(isDubAudioLabel('TrueFrench VFF Audio'), true);
+  assert.equal(isDubAudioLabel('Espanol Latino'), true);
+  assert.equal(isDubAudioLabel('Dublado PT-BR'), true);
+  assert.equal(isDubAudioLabel('Original Japanese'), false);
+  assert.equal(isDubbedCandidateText('Spirited Away (2001) English Dub 1080p', { preferredAudioLang: 'ja', targetTitle: 'Spirited Away' }), true);
+  assert.equal(isDubbedCandidateText('Inception (2010) Hindi Audio 720p', { preferredAudioLang: 'en', targetTitle: 'Inception' }), true);
+  assert.equal(isDubbedCandidateText('Parasite (2019) English Subbed 1080p', { preferredAudioLang: 'ko', targetTitle: 'Parasite' }), false);
+  assert.equal(isDubbedCandidateText('Spirited Away Dual Audio Japanese English', { preferredAudioLang: 'ja', targetTitle: 'Spirited Away' }), false);
+
+  // 3. Step 1 dub defers cleanly so Steps 2-5 can deliver original audio (and rejects conflicting t= slugs & short ffprobe MP4s)
+  const upstream = http.createServer((req, res) => {
+    const p = (req.url || '/').split('?')[0];
+    if (p === '/dub.m3u8' || p === '/trailer.m3u8') {
+      res.writeHead(200, { 'Content-Type': 'application/vnd.apple.mpegurl' });
+      const segDur = p === '/trailer.m3u8' ? '60.0' : '2400.0';
+      const count = p === '/trailer.m3u8' ? 2 : 3;
+      res.end('#EXTM3U\n#EXT-X-TARGETDURATION:2400\n' + Array.from({ length: count }, () => `#EXTINF:${segDur},\nseg0.ts`).join('\n') + '\n#EXT-X-ENDLIST\n');
+      return;
+    }
+    if (p === '/seg0.ts') {
+      res.writeHead(206, { 'Content-Type': 'video/mp2t' });
+      res.end(Buffer.alloc(1024));
+      return;
+    }
+    if (p === '/short_clip.mp4' || p === '/full_orig.mp4') {
+      res.writeHead(206, { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-1023/900000000' });
+      res.end(Buffer.alloc(1024));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => upstream.close(r)));
+  const port = upstream.address().port;
+
+  const badSlugCrow1994 = Buffer.from(JSON.stringify({ r: { slug: 'the-crow-1994-abc123' } })).toString('base64');
+  const resolverChain = new MovieStreamResolver({
+    movieApi: {
+      getMovie: async () => ({ id: '129', title: 'Spirited Away', year: 2001, originalLanguage: 'ja', runtimeSeconds: 7500 }),
+      getPlaybackInfo: async () => ({ rootStream: null, originalLanguage: 'ja', subtitles: [] })
+    },
+    subtitles: null,
+    enableYtDlp: true,
+    enableWebFallback: true,
+    thenkiri: {
+      thenkiriSearch: async () => ({
+        results: [
+          { title: 'Spirited Away (2001) Hindi Dubbed', url: 'https://tk.example/dub' },
+          { title: 'Spirited Away (2001)', url: 'https://tk.example/orig' }
+        ]
+      }),
+      thenkiriDetails: async (url) => ({
+        sources: url.endsWith('/orig')
+          ? [{ label: 'Download Movie 1080p', url: `http://127.0.0.1:${port}/full_orig.mp4` }]
+          : [{ label: 'Download Hindi Dub', url: `http://127.0.0.1:${port}/short_clip.mp4` }]
+      }),
+      thenkiriGetLink: async (u) => ({ url: u, format: 'mp4' })
+    },
+    ffprobeRunner: async (url) => {
+      if (String(url).includes('short_clip.mp4')) {
+        return { format: { duration: '95.0' }, streams: [{ codec_type: 'audio', tags: { language: 'hi' } }] };
+      }
+      return { format: { duration: '7500.0' }, streams: [{ codec_type: 'audio', tags: { language: 'jpn' }, disposition: { original: 1 } }] };
+    },
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.startsWith(`http://127.0.0.1:${port}`)) return fetch(u, opts);
+      if (u.includes('punkflix.net/movie/129.json')) {
+        return new Response(JSON.stringify({
+          title: 'Spirited Away',
+          source: { label: 'English Dub', lang: 'en', dub: true, hls: `http://127.0.0.1:${port}/dub.m3u8` }
+        }), { status: 200 });
+      }
+      return new Response('', { status: 404 });
+    }
+  });
+  const origWin = await resolverChain.resolve({ type: 'movie', id: '129', title: 'Spirited Away', year: 2001, originalLanguage: 'ja', durationSeconds: 7500, fetchSubtitles: false });
+  assert.equal(origWin.ok, true);
+  assert.equal(origWin.track.streamUrl, `http://127.0.0.1:${port}/full_orig.mp4`, 'Must not stop on Step 1 dub when Step 2 has Japanese Original');
+  assert.equal(origWin.track.audioIsDub, false);
+  assert.equal(origWin.track.audioLanguage, 'ja');
+
+  // Verify conflicting year slug in t= token AND 95s MP4 container are both rejected
+  const resolverBadSlugAndShortMp4 = new MovieStreamResolver({
+    movieApi: null,
+    subtitles: null,
+    enableYtDlp: false,
+    enableWebFallback: false,
+    ffprobeRunner: async () => ({ format: { duration: '95.0' }, streams: [{ codec_type: 'audio', tags: { language: 'en' } }] }),
+    fetchImpl: async (url, opts) => {
+      const u = String(url);
+      if (u.startsWith(`http://127.0.0.1:${port}`)) return fetch(u, opts);
+      if (u.includes('proxy1.flikhub.net')) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            meta: { id: 401123, title: 'The Crow', release_date: '2024-08-23' },
+            sources: [
+              { source: 'zendaya', url: `http://127.0.0.1:${port}/dub.m3u8?t=${encodeURIComponent(badSlugCrow1994)}`, type: 'hls' },
+              { source: 'berlin', url: `http://127.0.0.1:${port}/short_clip.mp4`, type: 'mp4' }
+            ]
+          })
+        };
+      }
+      return { ok: false, status: 404 };
+    }
+  });
+  const crowBlocked = await resolverBadSlugAndShortMp4.resolve({ type: 'movie', id: '401123', title: 'The Crow', year: 2024, durationSeconds: 6600, fetchSubtitles: false });
+  assert.equal(crowBlocked.ok, false, 'Conflicting year t= slug and 95s MP4 trailer must both be rejected');
+
+  // 4. MovieDownloader selectOriginalAudioMapArgs chooses original language audio stream over default dub
+  const mapArgs = await selectOriginalAudioMapArgs('https://cdn.example/dual.mkv', async () => ({
+    stdout: JSON.stringify({
+      streams: [
+        { codec_type: 'audio', tags: { language: 'eng', title: 'English Dub' }, disposition: { default: 1 } },
+        { codec_type: 'audio', tags: { language: 'jpn', title: 'Japanese' }, disposition: { original: 1 } }
+      ]
+    })
+  }), { preferredAudioLang: 'ja' });
+  assert.deepEqual(mapArgs, ['-map', '0:v:0', '-map', '0:a:1']);
+
+  // 5. MovieApiClient Cinemeta language propagation & WordPress/Archive trailer filtering
+  const apiLangClient = new MovieApiClient({
+    baseUrl: 'https://example.test/api',
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.includes('v3-cinemeta.strem.io/meta/movie/tt0245429.json')) {
+        return { ok: true, json: async () => ({ meta: { id: 'tt0245429', name: 'Spirited Away', releaseInfo: '2001', runtime: '125 min', language: 'Japanese' } }) };
+      }
+      if (u.includes('archive.org/advancedsearch.php')) {
+        return {
+          ok: true,
+          json: async () => ({
+            response: {
+              docs: [
+                { identifier: 'clip_id', title: 'Inception Official Trailer Clip', year: '2010', runtime: '2 min' },
+                { identifier: 'full_id', title: 'Inception Full Film', year: '2010', runtime: '148 min' }
+              ]
+            }
+          })
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({}) };
+    }
+  });
+  const cmMovie = await apiLangClient.getMovie('tt0245429');
+  assert.equal(cmMovie.originalLanguage, 'Japanese');
+
+  // 6. MovieUi enrichTrack preserves string dubOnlyWarning (instead of coercing Boolean(true))
+  const h = buildTestHarness(t);
+  h.app.voiceClient.accounts = async () => ({ accounts: [{ alias: 'acc1', enabled: true, status: 'available' }] });
+  h.app.movieResolver.resolve = async () => ({
+    ok: true,
+    track: {
+      id: 'mv:129:0:0',
+      provider: 'movie',
+      title: 'Spirited Away (2001)',
+      artist: '2001 · Feature Film · 1080p',
+      mediaType: 'video',
+      streamUrl: `http://127.0.0.1:${port}/dub.m3u8`,
+      durationSeconds: 7200,
+      audioLanguage: 'en',
+      audioIsDub: true,
+      dubOnly: true,
+      dubOnlyWarning: '⚠️ Dub Only Available',
+      capabilities: { seek: true, video: true }
+    },
+    subtitles: null
+  });
+  const ctxGc = h.makeCtx(-10088);
+  await h.screen.movieUi.openMovieSearch(ctxGc, 'Inception');
+  const sessState = h.app.movieSessions.getLatestForChat(-10088);
+  sessState.results = [{ id: '129', type: 'movie', title: 'Spirited Away', year: 2001, originalLanguage: 'ja' }];
+  await h.screen.handle({ ...ctxGc, query: { id: 'q-dub-ui' }, messageId: sessState.messageId }, 'mv', [sessState.id, 'pmi', '0']);
+  const vcSess = h.qm.getSession(-10088);
+  const playedTrack = vcSess.movieCurrentTrack || vcSess.currentTrack;
+  assert.equal(playedTrack?.dubOnlyWarning, '⚠️ Dub Only Available');
+});
+
+test('/moviecast allow/disallow gates global & group movie DM broadcasts and /vc renders expandable blockquote VC & button instructions', async (t) => {
+  const h = buildTestHarness(t);
+  h.app.voiceClient.accounts = async () => ({ accounts: [{ alias: 'acc1', enabled: true, status: 'available' }] });
+
+  // Use a writable settings wrapper backed by SettingsManager / SQLite just like app.js
+  let globalSetting = true;
+  h.app.settings = {
+    get: (k) => (k === 'general.ownerIds' ? [10] : k === 'music.cinemaAnnounceEnabled' ? globalSetting : undefined),
+    set: (k, v) => { if (k === 'music.cinemaAnnounceEnabled') globalSetting = Boolean(v); }
+  };
+
+  h.app.db.run(
+    'INSERT OR REPLACE INTO bot_users (bot_id, tg_id, username, first_name, is_banned, last_seen) VALUES (?, ?, ?, ?, 0, ?)',
+    0, 2001, 'viewer1', 'ViewerOne', Math.floor(Date.now() / 1000)
+  );
+  const dmAlerts = [];
+  const announceApi = {
+    async getChat(cid) { return { id: Number(cid), title: 'Movie Night GC', type: 'supergroup', invite_link: 'https://t.me/+MovieGcLink' }; },
+    async sendRichMessage(uid, rich) { dmAlerts.push({ uid, rich }); return { message_id: dmAlerts.length + 1 }; }
+  };
+  const announcer = new CinemaVcAnnouncer({ app: h.app, db: h.app.db, cooldownMs: 0, pacingMs: 0 });
+  h.app.cinemaAnnouncer = announcer;
+
+  // 1. Non-owner cannot disallow/allow global movie broadcast
+  const randomUserCtx = h.makeCtx(-10050, { tgId: 999, user: { id: 999, first_name: 'Member' } });
+  await h.screen.handleCommand(randomUserCtx, '/moviecast', ['disallow']);
+  assert.equal(announcer.isGlobalEnabled(), true, 'Non-owner must not change global broadcast setting');
+  assert.match(JSON.stringify(h.sentMessages.at(-1)), /Owner/i);
+
+  // 2. Owner runs /moviecast (status card) & /moviecast disallow -> announcer skips globally
+  const ownerDmCtx = h.makeCtx(10, { tgId: 10, user: { id: 10, first_name: 'Owner' } });
+  await h.screen.handleCommand(ownerDmCtx, '/moviecast', []);
+  const statusCard = h.sentMessages.at(-1).rich;
+  assert.match(JSON.stringify(statusCard), /Allowed \(ON\)/);
+  assert.ok(statusCard.blocks.some((bl) => bl.type === 'expandable_blockquote'), 'Broadcast control card should have expandable usage guide');
+
+  await h.screen.handleCommand(ownerDmCtx, '/moviecast', ['disallow']);
+  assert.equal(announcer.isGlobalEnabled(), false);
+  assert.equal(globalSetting, false);
+  const skippedGlobal = await announcer.onTrackStart({
+    chatId: -10050,
+    track: { provider: 'movie', title: 'Inception (2010)', mediaType: 'video' },
+    session: { botId: 0, api: announceApi }
+  });
+  assert.equal(skippedGlobal?.skipped, 'disabled_globally');
+  assert.equal(dmAlerts.length, 0);
+
+  // 3. Re-enable via 1-tap callback mcast:on (or /moviebroadcast allow) -> movie broadcasts resume to all users
+  const cbCtx = h.makeCtx(10, {
+    tgId: 10,
+    user: { id: 10, first_name: 'Owner' },
+    query: { id: 'cb_mcast_on' },
+    messageId: h.sentMessages.at(-1).message_id
+  });
+  await h.screen.handle(cbCtx, 'mcast', ['on']);
+  assert.equal(announcer.isGlobalEnabled(), true);
+  assert.equal(globalSetting, true);
+
+  await announcer.onTrackStart({
+    chatId: -10050,
+    track: { provider: 'movie', title: 'Inception (2010)', mediaType: 'video' },
+    session: { botId: 0, api: announceApi }
+  });
+  await announcer.flush();
+  assert.equal(dmAlerts.length, 1, 'Enabled broadcast should notify active users');
+  assert.equal(dmAlerts[0].uid, 2001);
+
+  // 4. Per-group toggle (/moviecast group disallow -> /moviecast group allow)
+  const gcOwnerCtx = h.makeCtx(-10050);
+  await h.screen.handleCommand(gcOwnerCtx, '/moviecast', ['group', 'disallow']);
+  assert.equal(announcer.isGroupEnabled(-10050), false);
+  const skippedGroup = await announcer.onTrackStart({
+    chatId: -10050,
+    track: { provider: 'movie', title: 'Interstellar (2014)', mediaType: 'video' },
+    session: { botId: 0, api: announceApi }
+  });
+  assert.equal(skippedGroup?.skipped, 'disabled_for_group');
+  await h.screen.handleCommand(gcOwnerCtx, '/moviecast', ['group', 'allow']);
+  assert.equal(announcer.isGroupEnabled(-10050), true);
+
+  // 5. /vc command opens player card with expandable_blockquote covering all VC commands & button instructions in bold font & clean spacing
+  const msgsBeforeVc = h.sentMessages.length;
+  await h.screen.handleCommand(gcOwnerCtx, '/vc', []);
+  const vcCard = h.sentMessages[msgsBeforeVc]?.rich || h.editedMessages.at(-1)?.rich;
+  assert.ok(vcCard && Array.isArray(vcCard.blocks), '/vc must render a Rich player card');
+  const vcExpandable = vcCard.blocks.find((bl) => bl.type === 'expandable_blockquote');
+  assert.ok(vcExpandable, '/vc player card must contain an expandable_blockquote guide block');
+  assert.ok(Array.isArray(vcExpandable.text) && vcExpandable.text.some((node) => node?.type === 'bold'), 'Guide must use RichText bold formatting');
+  const vcGuideStr = richTextToString(vcExpandable.text);
+  assert.match(vcGuideStr, /\/vc/);
+  assert.match(vcGuideStr, /\/moviecast/);
+  assert.match(vcGuideStr, /𝗣𝗟𝗔𝗬𝗘𝗥 𝗕𝗨𝗧𝗧𝗢𝗡𝗦|PLAYER BUTTONS/i);
+  assert.match(vcGuideStr, /Join VC/i);
+
+  // 6. Cinema deck /vc (/player) card ALSO contains the bold spaced expandable_blockquote VC & button instructions without Music leaks
+  const vcSess = h.qm.getSession(-10050);
+  vcSess.activeDeck = 'movie';
+  vcSess.view = 'cinema';
+  const cinemaCard = h.screen.renderPlayer(vcSess);
+  const cinemaExpandable = cinemaCard.blocks.find((bl) => bl.type === 'expandable_blockquote');
+  assert.ok(cinemaExpandable, 'Cinema /vc player card must also contain an expandable_blockquote guide block');
+  assert.ok(Array.isArray(cinemaExpandable.text) && cinemaExpandable.text.some((node) => node?.type === 'bold'), 'Cinema guide must use RichText bold formatting');
+  const cinemaGuideStr = richTextToString(cinemaExpandable.text);
+  assert.match(cinemaGuideStr, /RTMP Live/);
+  assert.match(cinemaGuideStr, /Source 1\/N|Alt Source/i);
+  assert.match(cinemaGuideStr, /\/vcmsg/);
+  assert.doesNotMatch(cinemaGuideStr, /Spotify|Lyrics|Bass|AI DJ|Infinite/i);
 });

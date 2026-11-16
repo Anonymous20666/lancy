@@ -6,8 +6,8 @@ import { AiDjEngine } from './aiDj.js';
 import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { originalPlayDelivery } from './originalPlayCard.js';
-import { isMusicOwner, isMusicSuperAdmin } from './accounts.js';
-import { KeyedLock, MusicError } from './model.js';
+import { isMusicOwner, isMusicSuperAdmin, resolveAppScreen, isSameMusicBot } from './accounts.js';
+import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError } from './model.js';
 import { checkChatMediaPermissions, isGroupSuperAdminMember, isAnonymousGroupAdmin } from '../telegram/permissions.js';
 import { ProgressTracker } from '../telegram/progress.js';
 import { RichMessageBuilder, rt } from '../telegram/rich.js';
@@ -162,7 +162,7 @@ export class MusicService {
     const job=Promise.resolve(this.lyrics.get(track,{force})).then(result=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:result?.found?'ready':'unavailable',result};}).catch(()=>{if(root.currentTrack?.id===track.id&&root.playbackId===playback)root.cardLyrics={trackId:track.id,status:'unavailable'};}).finally(()=>{this.lyricJobs.delete(root.chatId);if(!this.app.musicQueueManager.closed)void this.app.musicQueueManager.updatePlayerCard(root.chatId).catch(()=>{});});this.lyricJobs.set(root.chatId,job);
   }
   owner(ctx) { return isMusicOwner(this.app,ctx?.tgId); }
-  superAdmin(ctx) { return isMusicSuperAdmin(this.app,ctx?.tgId); }
+  superAdmin(ctx) { return isMusicSuperAdmin(this.app, ctx?.tgId, { controller: ctx?.controller }); }
   async #isChatSuperAdmin(ctx, id = null) {
     if (!ctx || id == null || Number(id) >= 0) return false;
     if (isAnonymousGroupAdmin(ctx.message, id)) return true;
@@ -234,6 +234,68 @@ export class MusicService {
     if (global.length > 0 || chat.length > 0) return true;
     if (Boolean(this.app?.env?.BOT_TOKEN)) return true;
     return false;
+  }
+  getMovieBroadcastStatus(chatId = null, botId = 0) {
+    const dbGlobal = this.app?.db?.getSetting?.('cinema.announceEnabled', null);
+    const settingsGlobal = this.app?.settings?.get?.('music.cinemaAnnounceEnabled');
+    const globalEnabled = typeof dbGlobal === 'boolean' ? dbGlobal : (settingsGlobal !== false);
+    const cid = Number(chatId);
+    const groupEnabled = (Number.isFinite(cid) && cid < 0)
+      ? (this.app?.db?.getSetting?.(`cinema.announceGroup.${cid}`, true) !== false)
+      : true;
+    const eligibleUsersCount = typeof this.app?.cinemaAnnouncer?.getEligibleUserIds === 'function'
+      ? this.app.cinemaAnnouncer.getEligibleUserIds(Number(botId) || 0).length
+      : null;
+    return { globalEnabled, groupEnabled, chatId: Number.isFinite(cid) ? cid : null, eligibleUsersCount };
+  }
+  async setMovieBroadcast(ctx, { scope = 'global', enable, chatId = null } = {}) {
+    const targetChatId = Number(chatId ?? ctx?.chatId);
+    const botId = Number(ctx?.botId ?? ctx?.controller?.botContext?.botId ?? 0) || 0;
+    const val = Boolean(enable);
+    if (scope === 'group') {
+      if (!Number.isFinite(targetChatId) || targetChatId >= 0) {
+        throw new MusicError('GROUP_ONLY', 'Per-group broadcast toggle applies inside a group chat.');
+      }
+      if (!this.owner(ctx) && !this.superAdmin(ctx) && !this.isVcSudo(ctx, targetChatId) && !(await this.#isChatSuperAdmin(ctx, targetChatId))) {
+        throw new MusicError('ADMIN_ONLY', 'Only Bot Owner, VC Sudo, or Group Admins can change this group\'s movie broadcast setting.');
+      }
+      this.app?.db?.setSetting?.(`cinema.announceGroup.${targetChatId}`, val);
+    } else {
+      if (!this.owner(ctx) && !this.superAdmin(ctx)) {
+        throw new MusicError('OWNER_ONLY', 'Only the Bot Owner can allow or disallow broadcasting movies to all users.');
+      }
+      this.app?.db?.setSetting?.('cinema.announceEnabled', val);
+      try { this.app?.settings?.set?.('music.cinemaAnnounceEnabled', val); } catch {}
+    }
+    return { scope, enabled: val, ...this.getMovieBroadcastStatus(targetChatId, botId) };
+  }
+  async movieBroadcastCommand(ctx, args = []) {
+    const tokens = (Array.isArray(args) ? args : String(args || '').split(/\s+/))
+      .map(s => String(s || '').trim().toLowerCase())
+      .filter(Boolean);
+    const cid = Number(ctx?.chatId);
+    const botId = Number(ctx?.botId ?? ctx?.controller?.botContext?.botId ?? 0) || 0;
+    const isGroupScope = ['group', 'gc', 'chat', 'here'].includes(tokens[0]);
+    const verb = isGroupScope ? (tokens[1] || '') : (tokens[0] || '');
+
+    const onWords = new Set(['on', 'allow', 'enable', 'enabled', 'true', 'yes', '1', 'all', 'start']);
+    const offWords = new Set(['off', 'disallow', 'disable', 'disabled', 'false', 'no', '0', 'mute', 'stop']);
+
+    if (!verb || verb === 'status' || verb === 'info') {
+      if (!this.owner(ctx) && !this.superAdmin(ctx) && !(Number.isFinite(cid) && cid < 0 && (this.isVcSudo(ctx, cid) || await this.#isChatSuperAdmin(ctx, cid)))) {
+        throw new MusicError('OWNER_ONLY', 'Only the Bot Owner can manage movie broadcast settings.');
+      }
+      return { action: 'status', scope: isGroupScope ? 'group' : 'global', ...this.getMovieBroadcastStatus(cid, botId) };
+    }
+    if (onWords.has(verb)) {
+      const res = await this.setMovieBroadcast(ctx, { scope: isGroupScope ? 'group' : 'global', enable: true, chatId: cid });
+      return { action: 'set', ...res };
+    }
+    if (offWords.has(verb)) {
+      const res = await this.setMovieBroadcast(ctx, { scope: isGroupScope ? 'group' : 'global', enable: false, chatId: cid });
+      return { action: 'set', ...res };
+    }
+    throw new MusicError('INVALID_ARG', 'Use /moviecast allow, /moviecast disallow, or /moviecast group on|off.');
   }
   async vcsudoCommand(ctx, args = []) {
     return this.#manageVcSudo(ctx, args, { defaultAction: null });
@@ -622,47 +684,73 @@ export class MusicService {
       const linkRes = await this.app.voiceClient.getCallInviteLink(id).catch(() => null);
       if (linkRes?.call_invite_link) bridgeInviteLink = linkRes.call_invite_link;
     }
+    const prevPlayerChatId = s.playerChatId;
+    const sameBot = isSameMusicBot(s, ctx);
+    const sessionIsChannel = Boolean(s.isChannel || chat?.type === 'channel');
+    const activeSession = Boolean(s.connected || ['playing', 'paused', 'buffering'].includes(s.status));
+    if(s.screenMessageId && !sessionIsChannel && activeSession && (s.playerChatId!==Number(ctx.chatId) || !sameBot)) {
+      throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
+    }
     await this.syncSessionIdentity(s,ctx,chat,{bridgeInviteLink}); this.syncEqSettings(s,id);
     if(s.status==='stopped'){s.status='idle';s.lastError=null;}
     const isCinemaDeck = s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie';
     if(s.currentTrack && !isCinemaDeck)this.requestCardLyrics(s);
     if(s.isChannel && Number(ctx.chatId) > 0)return this.channelPanels.open(ctx,s,{forceNew:Boolean(ctx.forceNew)});
-    if(s.screenMessageId && !s.isChannel && (s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('PLAYER_ELSEWHERE','This destination already has its player dashboard in another control chat/bot. Use that dashboard.');
     s.view=isCinemaDeck?'cinema':'player';
     s.overlayView=null;
     s.overlayAt=0;
     const sendFreshPlayerCard = async () => {
       const oldMessageId = s.screenMessageId;
-      const oldPlayerChatId = s.playerChatId || Number(ctx.chatId);
-      const screen = this.app.screens.get('music');
+      const oldPlayerChatId = prevPlayerChatId || Number(ctx.chatId);
+      const screen = resolveAppScreen(this.app, 'music', { ctx, session: s });
       const rich = isCinemaDeck && typeof screen.renderCinemaPlayer === 'function' ? screen.renderCinemaPlayer(s) : screen.renderPlayer(s);
+      const noPhotoRich = stripRemotePhotoBlocks(rich);
       let sent=null;
       if(ctx.reuseMessageId && Number(ctx.chatId)===Number(id) && typeof ctx.api.editMessageRich==='function'){
         try{
           const edited=await ctx.api.editMessageRich(ctx.chatId,ctx.reuseMessageId,rich);
           sent=edited?.message_id ? edited : {message_id:ctx.reuseMessageId};
-        }catch{}
+        }catch(editErr){
+          if (noPhotoRich && isRemotePhotoError(editErr)) {
+            try{
+              const edited=await ctx.api.editMessageRich(ctx.chatId,ctx.reuseMessageId,noPhotoRich);
+              sent=edited?.message_id ? edited : {message_id:ctx.reuseMessageId};
+            }catch{}
+          }
+        }
       }
       if(!sent){
-        sent=await ctx.api.sendRichMessage(ctx.chatId,rich);
+        try{
+          sent=await ctx.api.sendRichMessage(ctx.chatId,rich);
+        }catch(sendErr){
+          if (noPhotoRich && isRemotePhotoError(sendErr)) {
+            sent=await ctx.api.sendRichMessage(ctx.chatId,noPhotoRich);
+          } else {
+            throw sendErr;
+          }
+        }
         if(sent?.message_id && ctx.reuseMessageId && sent.message_id!==ctx.reuseMessageId && typeof ctx.api.deleteMessage==='function'){
           await ctx.api.deleteMessage(ctx.chatId,ctx.reuseMessageId).catch(()=>{});
         }
       }
+      if(sent?.message_id && sent.message_id !== oldMessageId){
+        s.pinned = false;
+        s.pinnedMessageId = null;
+      }
       qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);
       s.lastRender=JSON.stringify(rich);
       s.editAfter=0;
-      if(oldMessageId && oldMessageId !== sent.message_id && typeof ctx.api?.deleteMessage === 'function'){
+      if(oldMessageId && oldMessageId !== sent.message_id && sameBot && typeof ctx.api?.deleteMessage === 'function'){
         await ctx.api.deleteMessage(oldPlayerChatId, oldMessageId).catch(()=>{});
       }
       await qm.autoPinPlayerCard?.(id, sent.message_id, Number(ctx.chatId), ctx.api);
     };
-    let created=Boolean(!s.screenMessageId || ctx.forceNew || (s.isChannel && s.playerChatId !== Number(ctx.chatId)));
+    let created=Boolean(!s.screenMessageId || ctx.forceNew || !sameBot || (prevPlayerChatId && prevPlayerChatId !== Number(ctx.chatId)));
     if(created){
       await sendFreshPlayerCard();
     } else {
       const updated = await qm.updatePlayerCard(id, { forceEdit: true });
-      if(!updated && !s.screenMessageId){
+      if(!updated){
         created = true;
         await sendFreshPlayerCard();
       }
@@ -672,7 +760,7 @@ export class MusicService {
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
@@ -849,7 +937,7 @@ export class MusicService {
     })();
   }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isViewerVote=['voteskip','votequeue'].includes(action);
     const isDownloadAct=['downloadnow','downloadq','dlq'].includes(action);
     const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh'].includes(action);
@@ -865,7 +953,7 @@ export class MusicService {
       const expectedRev = s.panelToken?Number(s.controlRevision||0).toString(36):String(s.controlRevision||0);
       if(strictRevisionActions.has(action) && revArg !== expectedRev)throw new MusicError('STALE_PLAYER','Use the latest player controls.');
     }
-    if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || (s.api && s.api!==ctx.api))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');
+    if(ctx.messageId && s.screenMessageId && (s.screenMessageId!==ctx.messageId || s.playerChatId!==Number(ctx.chatId) || !isSameMusicBot(s, ctx))) throw new MusicError('STALE_PLAYER','Use the current player dashboard for this destination.');
     if(['pause','resume','skip','previous'].includes(action)){
       const rootSession=qm.getSession(id);
       const deckQueue = rootSession.activeDeck === 'movie' ? (rootSession.movieUpcoming || []) : (rootSession.upcoming || []);
@@ -1291,6 +1379,19 @@ export class MusicService {
       const nextEngine=await qm.setStreamMode(id,req);
       s.streamMode=nextEngine;
     }
+    else if(action==='vcquality'){
+      const rawQ=String(args[0]||'').trim();
+      const mapQ={ '1080p':'FHD_1080p', '720p':'HD_720p', '480p':'SD_480p', 'FHD_1080p':'FHD_1080p', 'HD_720p':'HD_720p', 'SD_480p':'SD_480p' };
+      const req=mapQ[rawQ]||null;
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🎞 Adjusting VC stream quality…'}).catch(()=>{});
+      const nextQ=await qm.setVcQuality(id,req);
+      s.vcQuality=nextQ;
+    }
+    else if(action==='switchsource'){
+      const idxArg=args[0]!==undefined&&args[0]!==''&&Number.isFinite(Number(args[0]))?Math.max(0,Math.floor(Number(args[0]))):null;
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'📡 Switching movie source…'}).catch(()=>{});
+      await qm.switchMovieSource(id,idxArg);
+    }
     else if(action==='vcmsg'){
       const msgText=args.join(' ').trim();
       const sendRes=await qm.sendVcChatMessage(id,msgText);
@@ -1339,10 +1440,16 @@ export class MusicService {
     }
     else if(action==='pin'&&s.panelToken)await this.channelPanels.pin(s.panelToken,{force:true});
     else if(action==='pin'){
+      if(!s.screenMessageId)throw new MusicError('STALE_PLAYER','No active player card found yet. Run /player first.');
       const me=ctx.api.me?.id || (await ctx.api.getMe?.().catch(()=>null))?.id;if(!me)throw new MusicError('PERMISSION_DENIED','Bot identity unavailable.');
       const member=await ctx.api.getChatMember(ctx.chatId,me);
       if(!['creator','administrator'].includes(member.status)||(member.status!=='creator'&&!member.can_pin_messages&&!(s.isChannel&&member.can_edit_messages)))throw new MusicError('PIN_PERMISSION','Grant only the pin permission if you want a pinned player. Playback does not require it.');
-      if(!s.pinned){const result=await ctx.api.call('pinChatMessage',{chat_id:ctx.chatId,message_id:s.screenMessageId,disable_notification:true});if(!result)throw new MusicError('PIN_FAILED','Telegram did not confirm pinning.');s.pinned=true;}
+      const targetMsgId = s.screenMessageId;
+      const result=await ctx.api.call('pinChatMessage',{chat_id:ctx.chatId,message_id:targetMsgId,disable_notification:true});
+      if(!result)throw new MusicError('PIN_FAILED','Telegram did not confirm pinning.');
+      s.pinned=true;
+      s.pinnedMessageId=targetMsgId;
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'📌 Player card pinned'}).catch(()=>{});
     }
     s.overlayView=null;s.overlayAt=0;
     const isCinema=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')&&s.view!=='queue';

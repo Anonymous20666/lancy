@@ -793,6 +793,444 @@ while True:
         # Reject 2-point noisy drift fit and short-span fits (<140s)
         self.assertIsNone(sub_align.fit_linear_drift([(10.0, 0.0), (90.0, 3.2)]))
         self.assertIsNone(sub_align.fit_linear_drift([(10.0, 0.2), (40.0, 0.5), (70.0, 0.8), (100.0, 1.1)]))
+        # Reject noisy 4-point residual/low-R^2 jitter even over >=180s
+        self.assertIsNone(sub_align.fit_linear_drift([(10.0, 0.0), (70.0, 0.25), (130.0, -0.05), (190.0, 0.35)]))
+
+    def test_unaligned_pcm_carryover_zero_drift(self):
+        # 8000B (24fps), 8008B (23.976fps), and 4460B (NUT AAC) all have non-zero len % 24.
+        # Carryover must prevent cumulative timestamp compression (-120..-242 ms/min).
+        with tempfile.TemporaryDirectory() as td:
+            for chunk_bytes, n_chunks in ((8000, 4500), (8008, 4500), (4460, 8100)):
+                cfg_p = Path(td) / f'cfg_{chunk_bytes}.json'
+                mon = sub_align.LiveSubSyncMonitor(
+                    sync_id=f'carry_{chunk_bytes}',
+                    config_path=cfg_p,
+                    sample_rate=48000,
+                    channels=2,
+                    max_window_sec=240.0,
+                )
+                mon._stop.set()
+                mon._force_ev.set()
+                if mon._thread is not None:
+                    mon._thread.join(timeout=1.0)
+                mon._stop.clear()
+                try:
+                    chunk_dur = chunk_bytes / 192000.0
+                    silence_chunk = b'\x00' * chunk_bytes
+                    t = 0.0
+                    for _ in range(n_chunks):
+                        mon.feed_pcm(t, silence_chunk)
+                        t += chunk_dur
+                        if len(mon._raw_inbox) >= 1500:
+                            mon._ingest_inbox()
+                    mon._ingest_inbox()
+                    expected_end = (n_chunks * chunk_bytes) / 192000.0
+                    self.assertIsNotNone(mon._ring_start_pts)
+                    ring_span = len(mon._ring) / 16000.0
+                    self.assertLessEqual(abs((mon._ring_end_pts - mon._ring_start_pts) - ring_span), 1e-4)
+                    rem_sec = len(mon._pcm_rem) / 192000.0
+                    self.assertLessEqual(abs((mon._ring_end_pts + rem_sec) - expected_end), 1e-4)
+                finally:
+                    mon.close()
+
+    def test_bridge_play_non_manual_sub_offset_does_not_lock_manual_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            srt1 = str(Path(td) / 's1.srt')
+            srt2 = str(Path(td) / 's2.srt')
+            mp4 = str(Path(td) / 'm.mp4')
+            _write_srt(srt1, [1.0, 4.0], prefix='A')
+            _write_srt(srt2, [1.0, 4.0], prefix='B')
+            _run_ffmpeg([
+                '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=10:d=1',
+                '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo:d=1',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-shortest', mp4,
+            ])
+            bridge, _eng = self._make_bridge(td)
+            r1 = asyncio.run(bridge.play({
+                'chat_id': -10201,
+                'playback_id': 'pm_nonmanual',
+                'stream_url': mp4,
+                'title': 'Movie NonManual',
+                'video': True,
+                'duration_seconds': 300.0,
+                'subtitle_path': srt1,
+                'subtitle_offset': 5.6,
+            }))
+            self.assertTrue(r1['ok'])
+            self.assertFalse(bridge.calls[-10201]['manual_sub_override'])
+
+            r2 = asyncio.run(bridge.play({
+                'chat_id': -10202,
+                'playback_id': 'pm_manual',
+                'stream_url': mp4,
+                'title': 'Movie Manual',
+                'video': True,
+                'duration_seconds': 300.0,
+                'subtitle_path': srt1,
+                'subtitle_offset': 2.5,
+                'subtitle_manual_override': True,
+            }))
+            self.assertTrue(r2['ok'])
+            self.assertTrue(bridge.calls[-10202]['manual_sub_override'])
+
+            # Swapping subtitle track via control('subtitle') without explicit manual_override clears lock
+            ctrl = asyncio.run(bridge.control('subtitle', {
+                'chat_id': -10202,
+                'subtitle_path': srt2,
+                'subtitle_offset': 0.0,
+            }))
+            self.assertTrue(ctrl['ok'])
+            self.assertFalse(bridge.calls[-10202]['manual_sub_override'])
+
+    def test_av_sync_100ms_burst_consumer_no_drop_and_pipe_size(self):
+        self.assertGreaterEqual(av_sync.TARGET_AUDIO_PIPE_BYTES, 19200)
+        self.assertGreaterEqual(av_sync.AUDIO_MAX_LEAD_SEC, 0.14)
+        self.assertLessEqual(av_sync.AUDIO_RESUME_LEAD_SEC, 0.055)
+        events = [0.8, 2.0]
+        w, h, fps = 320, 180, 24
+        fb = w * h * 3 // 2
+        with tempfile.TemporaryDirectory(prefix='lancy_burst100_') as td:
+            mp4 = os.path.join(td, 'burst.mp4')
+            expr = '+'.join(f'between(t,{t:.3f},{t + 0.16:.3f})' for t in events)
+            _run_ffmpeg([
+                '-f', 'lavfi', '-i', f'color=c=black:s={w}x{h}:r={fps}:d=3.2',
+                '-f', 'lavfi', '-i', f"aevalsrc='if({expr},0.8*sin(2*PI*1000*t),0)':s=48000:d=3.2",
+                '-vf', f"drawbox=x=80:y=40:w=160:h=100:color=white:t=fill:enable='{expr}'",
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-shortest', mp4,
+            ])
+            raw_a = f"ffmpeg -v quiet -i {shlex.quote(mp4)} -vn -f s16le -ac 2 -ar 48000 pipe:1"
+            raw_v = f"ffmpeg -v quiet -i {shlex.quote(mp4)} -an -f rawvideo -r {fps} -pix_fmt yuv420p pipe:1"
+            wa, wv = voice_main.wrap_av_sync_pair(raw_a, raw_v, frame_bytes=fb, fps=fps, sync_id='test_burst100')
+            pa = subprocess.Popen(shlex.split(wa), stdout=subprocess.PIPE)
+            pv = subprocess.Popen(shlex.split(wv), stdout=subprocess.PIPE)
+            a_buf = bytearray()
+            v_frames = []
+            a_wall, v_wall = [], []
+            t0 = time.monotonic()
+
+            def ra():
+                chunk_target = 19200  # 100ms ntgcalls burst
+                while time.monotonic() - t0 < 8.0:
+                    cur = bytearray()
+                    while len(cur) < chunk_target:
+                        b = pa.stdout.read(chunk_target - len(cur))
+                        if not b:
+                            break
+                        cur.extend(b)
+                    if not cur:
+                        break
+                    a_buf.extend(cur)
+                    now = time.monotonic() - t0
+                    vals = struct.unpack(f'<{len(cur) // 2}h', cur)[::2]
+                    if vals and math.sqrt(sum(x * x for x in vals) / len(vals)) > 2000:
+                        if not a_wall or now - a_wall[-1] > 0.6:
+                            a_wall.append(now)
+                    time.sleep(0.10)
+
+            def rv():
+                frame_pair = fb * 2  # 2-frame (83.3ms) ntgcalls burst
+                while time.monotonic() - t0 < 8.0:
+                    cur = bytearray()
+                    while len(cur) < frame_pair:
+                        c = pv.stdout.read(frame_pair - len(cur))
+                        if not c:
+                            break
+                        cur.extend(c)
+                    if not cur:
+                        break
+                    for off in range(0, len(cur) - fb + 1, fb):
+                        v_frames.append(cur[off:off + fb])
+                        now = time.monotonic() - t0
+                        acc = 0
+                        cnt = 0
+                        for row in range(50, 130, 10):
+                            ro = off + row * w
+                            for col in range(100, 220, 10):
+                                acc += cur[ro + col]
+                                cnt += 1
+                        if (acc / cnt) > 160 and (not v_wall or now - v_wall[-1] > 0.6):
+                            v_wall.append(now)
+                    time.sleep(2.0 / fps)
+
+            ta = threading.Thread(target=ra, daemon=True)
+            tv = threading.Thread(target=rv, daemon=True)
+            ta.start()
+            tv.start()
+            ta.join(9.0)
+            tv.join(9.0)
+            for p in (pa, pv):
+                try:
+                    p.terminate()
+                    p.wait(timeout=2)
+                except Exception:
+                    p.kill()
+            self.assertEqual(len(a_wall), 2, f'Expected 2 intact beeps under 100ms bursts: {a_wall}')
+            self.assertEqual(len(v_wall), 2, f'Expected 2 intact flashes under 2-frame bursts: {v_wall}')
+            for aw, vw in zip(a_wall, v_wall):
+                self.assertLessEqual(abs(aw - vw), 0.11, f'Burst skew too high: {aw - vw:.3f}s')
+
+    def test_rtmp_staggered_start_time_23976fps_preserves_av_sync(self):
+        import json
+        import rtmp_hub
+        import rtmp_streamer
+
+        with tempfile.TemporaryDirectory(prefix='lancy_rtmp_stag_') as td:
+            src_mp4 = os.path.join(td, 'src.mp4')
+            in_mkv = os.path.join(td, 'staggered.mkv')
+            out_flv = os.path.join(td, 'out.flv')
+            _run_ffmpeg([
+                '-f', 'lavfi', '-i', 'color=c=black:s=320x240:r=24000/1001:d=5.0',
+                '-f', 'lavfi', '-i', "aevalsrc=exprs='0.5*sin(2*PI*1000*t)*(between(t,1.5,1.64)+between(t,3.5,3.64))|0.5*sin(2*PI*1000*t)*(between(t,1.5,1.64)+between(t,3.5,3.64))':s=48000:d=5.0",
+                '-vf', "drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill:enable='between(t,1.5,1.65)+between(t,3.5,3.65)'",
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', src_mp4,
+            ])
+            _run_ffmpeg([
+                '-i', src_mp4,
+                '-vf', 'trim=start=0.50', '-af', 'atrim=start=0.08',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-b:a', '128k', in_mkv,
+            ])
+            dec_cmd = rtmp_streamer.build_rtmp_decoder_args(
+                in_mkv, width=320, height=240, fps=24000 / 1001, pre_seek=0.0, realtime=False, container='nut'
+            )
+            rtmp_hub.run_rtmp_hub(
+                sync_id='test_rtmp_staggered_23976',
+                rtmp_target=out_flv,
+                width=320,
+                height=240,
+                fps=24000 / 1001,
+                dec_cmd=dec_cmd,
+                preset='ultrafast',
+                realtime=False,
+            )
+            pcm = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', out_flv, '-vn', '-f', 's16le', '-ac', '2', '-ar', '48000', 'pipe:1'])
+            beeps = _measure_pcm_beeps(pcm)
+            raw_v = subprocess.check_output(['ffmpeg', '-v', 'error', '-i', out_flv, '-an', '-vf', 'scale=32x32,format=gray', '-f', 'rawvideo', 'pipe:1'])
+            pkt_json = subprocess.check_output(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_frames', '-show_entries', 'frame=pts_time', '-of', 'json', out_flv], text=True)
+            frame_pts = [float(f['pts_time']) for f in json.loads(pkt_json)['frames'] if 'pts_time' in f]
+            flashes = []
+            in_f = False
+            for fi in range(min(len(frame_pts), len(raw_v) // 1024)):
+                avg = sum(raw_v[fi * 1024:(fi + 1) * 1024]) / 1024.0
+                if avg > 160 and not in_f:
+                    flashes.append(frame_pts[fi])
+                    in_f = True
+                elif avg < 60:
+                    in_f = False
+            self.assertEqual(len(beeps), 2, beeps)
+            self.assertEqual(len(flashes), 2, flashes)
+            for b, f in zip(beeps, flashes):
+                self.assertLessEqual(abs(b - f), 0.045, f'Staggered RTMP A/V skew too large: beep={b}, flash={f}')
+
+    def test_syncstate_epoch_pts_sec_subtraction_no_offset_double_count(self):
+        import json
+        import av_hub
+        with tempfile.TemporaryDirectory(prefix='lancy_epoch_pts_') as td:
+            srt_path = os.path.join(td, 'subs.srt')
+            cfg_path = os.path.join(td, 'sub_cfg.json')
+            _write_srt(srt_path, [10.0, 20.0], prefix='EPOCH')
+            cfg_path_p = Path(cfg_path)
+            cfg_path_p.write_text(json.dumps({
+                'enabled': True,
+                'render_screen': True,
+                'subtitle_path': srt_path,
+                'subtitle_offset': 2.5,
+                'base_sec': 100.0,
+                'cfg_rev': 1,
+            }), encoding='utf-8')
+            sid = f'test_epoch_{os.getpid()}'
+            fd, mm, state = av_sync._open_sync_state(av_sync.shm_path_for(sid))
+            try:
+                state.paused = 0
+                state.audio_state = 1
+                state.video_state = 1
+                state.epoch_pts_sec = 5.0
+                state.audio_sec = 17.5
+                state.video_sec = 17.4
+                overlay = av_sync.SubOverlay(cfg_path_p, state, 320, 180, 320 * 180 * 3 // 2)
+                try:
+                    # rel_pts=17.4 minus epoch_pts_sec=5.0 => 12.4s (never subtracts offset twice)
+                    self.assertAlmostEqual(overlay._rel_pts_adjusted(17.4), 12.4, places=3)
+                    pts_ms = sub_align.map_media_sec_to_sub_ms(
+                        overlay._base_sec + overlay._rel_pts_adjusted(17.4),
+                        subtitle_offset=overlay._sub_offset,
+                    )
+                    self.assertEqual(pts_ms, 109900)
+                finally:
+                    overlay.close()
+
+                metrics = voice_main._read_sync_metrics(sid)
+                self.assertIsNotNone(metrics)
+                # min(17.5-5.0=12.5, 17.4-5.0=12.4) == 12.4, independent of seek base or sub offset
+                self.assertAlmostEqual(metrics['media_pts_sec'], 12.4, places=2)
+
+                # Monitor uses epoch_pts_sec subtraction when turning ring_start_pts into abs timeline
+                mon = sub_align.LiveSubSyncMonitor(sync_id=sid, config_path=cfg_path_p, state=state)
+                mon._ring = bytearray(8000 * 2 * 35)
+                mon._ring_start_pts = 15.0
+                seen_starts = []
+                with mock.patch.object(
+                    sub_align,
+                    'correlate_speech_and_cues',
+                    side_effect=lambda pcm, cues, abs_s, **_kw: (
+                        seen_starts.append(abs_s),
+                        {'ok': True, 'offset': 0.0, 'confident': True, 'in_sync': True, 'z_score': 4.0, 'half_consensus': True, 'used_cues': 6},
+                    )[-1],
+                ):
+                    mon._run_one_check(json.loads(cfg_path_p.read_text(encoding='utf-8')))
+                self.assertGreaterEqual(len(seen_starts), 1)
+                self.assertEqual(set(seen_starts), {110.0})  # 100.0 + (15.0 - 5.0)
+            finally:
+                state = None
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+                os.close(fd)
+                av_hub.cleanup_hub_files(sid)
+
+    def test_hls_two_window_linear_drift_probe_and_apply(self):
+        with tempfile.TemporaryDirectory(prefix='lancy_hls_drift_') as td:
+            srt_path = os.path.join(td, 'long.srt')
+            _write_srt(srt_path, [25.0, 45.0, 90.0, 200.0, 320.0, 500.0, 620.0, 900.0], prefix='DRIFT')
+            pcm_dummy = b'\x01\x00' * (8000 * 65)
+            windows = []
+
+            def fake_cor(_pcm, _cues, win_start, **_kw):
+                windows.append(win_start)
+                if len(windows) == 1:
+                    return {'ok': True, 'offset': 1.0, 'confident': True, 'in_sync': False, 'z_score': 4.2, 'half_consensus': True, 'used_cues': 8}
+                return {'ok': True, 'offset': 2.5, 'confident': True, 'in_sync': False, 'z_score': 4.1, 'half_consensus': True, 'used_cues': 8}
+
+            def fake_hdr(probe_url):
+                from urllib.parse import parse_qs, urlparse
+                q = parse_qs(urlparse(probe_url).query)
+                s = float((q.get('start') or ['20'])[0])
+                return s, s
+
+            with mock.patch.object(sub_align, '_fetch_hls_skipped_hdrs', side_effect=fake_hdr), \
+                 mock.patch.object(sub_align, '_probe_hls_packet_start_sec', return_value=None), \
+                 mock.patch.object(sub_align.subprocess, 'run', return_value=subprocess.CompletedProcess(['ffmpeg'], 0, stdout=pcm_dummy, stderr=b'')), \
+                 mock.patch.object(sub_align, 'correlate_speech_and_cues', side_effect=fake_cor):
+                res = sub_align.probe_audio_and_align(
+                    'http://127.0.0.1:3055/movie-proxy/abc123.m3u8',
+                    srt_path,
+                    seek_offset=20.0,
+                    is_hls_proxy=True,
+                )
+            self.assertEqual(len(windows), 2)
+            self.assertGreaterEqual(windows[1] - windows[0], 360.0)
+            expected_rate = round(1.5 / (windows[1] - windows[0]), 6)
+            self.assertAlmostEqual(res['drift_sec_per_sec'], expected_rate, places=5)
+            self.assertEqual(res['drift_anchor_sec'], round(windows[0], 3))
+            self.assertEqual(res['status'], 'drifted')
+
+    def test_live_sub_sync_monitor_cas_cfg_rev_race_guard(self):
+        import json
+        import av_hub
+        with tempfile.TemporaryDirectory(prefix='lancy_cas_rev_') as td:
+            srt_path = os.path.join(td, 'subs.srt')
+            cfg_path = Path(td) / 'sub_cfg.json'
+            _write_srt(srt_path, [10.0, 20.0], prefix='CAS')
+            stale_cfg = {
+                'enabled': True,
+                'render_screen': True,
+                'subtitle_path': srt_path,
+                'subtitle_offset': 0.0,
+                'base_sec': 100.0,
+                'manual_override': False,
+                'cfg_rev': 3,
+            }
+            cfg_path.write_text(json.dumps(stale_cfg), encoding='utf-8')
+            sid = f'test_cas_{os.getpid()}'
+            fd, mm, state = av_sync._open_sync_state(av_sync.shm_path_for(sid))
+            try:
+                mon = sub_align.LiveSubSyncMonitor(sync_id=sid, config_path=cfg_path, state=state)
+                mon._last_cfg_mtime_ns = cfg_path.stat().st_mtime_ns
+                # Simulate user editing subtitle offset on disk before monitor commits
+                newer_cfg = dict(stale_cfg, subtitle_offset=4.5, manual_override=True, cfg_rev=4)
+                cfg_path.write_text(json.dumps(newer_cfg), encoding='utf-8')
+                applied = mon._apply_normalization(stale_cfg, new_offset=1.2, new_drift=0.001, new_anchor=120.0)
+                self.assertFalse(applied)
+                persisted = json.loads(cfg_path.read_text(encoding='utf-8'))
+                self.assertEqual(persisted['cfg_rev'], 4)
+                self.assertEqual(persisted['subtitle_offset'], 4.5)
+                self.assertTrue(persisted['manual_override'])
+            finally:
+                state = None
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+                os.close(fd)
+                av_hub.cleanup_hub_files(sid)
+
+    def test_rtmp_silence_padding_and_audio_sec_monotonic_non_negative(self):
+        import av_hub
+        import rtmp_hub
+        import rtmp_streamer
+        w, h, fps = 320, 180, 24
+        with tempfile.TemporaryDirectory(prefix='lancy_rtmp_silence_') as td:
+            src_mp4 = os.path.join(td, 'late_aud.mp4')
+            out_flv = os.path.join(td, 'out.flv')
+            # Audio starts 0.8s after video so startup silence padding runs
+            _run_ffmpeg([
+                '-f', 'lavfi', '-i', f'color=c=black:s={w}x{h}:r={fps}:d=2.2',
+                '-f', 'lavfi', '-i', 'sine=frequency=660:sample_rate=48000:duration=1.4',
+                '-filter_complex', '[1:a]adelay=800|800,apad=whole_dur=2.2[a]',
+                '-map', '0:v:0', '-map', '[a]',
+                '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+                '-c:a', 'aac', '-shortest', src_mp4,
+            ])
+            dec_cmd = rtmp_streamer.build_rtmp_decoder_args(
+                src_mp4, width=w, height=h, fps=fps, container='nut',
+            )
+            sid = f'test_sil_{os.getpid()}'
+            samples = []
+            stop_obs = threading.Event()
+
+            def _observe():
+                fd_obs = mm_obs = st_obs = None
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline and not stop_obs.is_set():
+                    try:
+                        if st_obs is None:
+                            fd_obs, mm_obs, st_obs = av_sync._open_sync_state(av_sync.shm_path_for(sid))
+                        samples.append(float(st_obs.audio_sec))
+                    except FileNotFoundError:
+                        pass
+                    time.sleep(0.02)
+                st_obs = None
+                if mm_obs is not None:
+                    mm_obs.close()
+                if fd_obs is not None:
+                    os.close(fd_obs)
+
+            t_obs = threading.Thread(target=_observe, daemon=True)
+            t_obs.start()
+            try:
+                rc = rtmp_hub.run_rtmp_hub(
+                    dec_cmd=dec_cmd,
+                    rtmp_target=out_flv,
+                    sync_id=sid,
+                    width=w,
+                    height=h,
+                    fps=fps,
+                    preset='ultrafast',
+                    realtime=False,
+                )
+            finally:
+                stop_obs.set()
+                t_obs.join(timeout=2.0)
+                av_hub.cleanup_hub_files(sid)
+            self.assertEqual(rc, 0)
+            self.assertGreater(len(samples), 3)
+            self.assertTrue(all(x >= 0.0 for x in samples), samples)
+            self.assertGreater(samples[-1], 0.5)
+            for a, b in zip(samples, samples[1:]):
+                self.assertGreaterEqual(b + 1e-6, a, f'Non-monotonic audio_sec: {a} -> {b}')
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ import { progressBar } from '../../utils/text.js';
 import { States } from '../../core/stateMachine.js';
 import { durationText, MusicError } from '../../music/model.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, uploadLimitBytes } from '../../media/telegramLimits.js';
+import { toSansBold } from '../../captions/engine.js';
 import { createMovieUi } from './movieUi.js';
 
 const cut = (s, n = 65) => [...String(s || '')].slice(0, n).join('');
@@ -262,6 +263,148 @@ export function createMusicScreen({ app }) {
     return finish(b);
   }
 
+  function buildBoldGuideRichText(title, subtitle, sections = []) {
+    const parts = [
+      '📖 ',
+      rt.bold(toSansBold(title)),
+      ...(subtitle ? ['\n', rt.italic(subtitle)] : [])
+    ];
+    for (const sec of sections) {
+      parts.push('\n\n\n', `${sec.icon || '✦'} `, rt.bold(toSansBold(sec.heading)));
+      for (const item of sec.items) {
+        parts.push('\n\n▸ ');
+        item.labels.forEach((lbl, idx) => {
+          if (idx > 0) parts.push('  ·  ');
+          parts.push(rt.bold(lbl));
+        });
+        parts.push(`\n   ${item.desc}`);
+      }
+    }
+    return rt.concat(...parts);
+  }
+
+  function renderMovieBroadcastCard(status, { notice = null, chatId = null, canGlobal = true } = {}) {
+    const cid = Number(chatId);
+    const inGroup = Number.isFinite(cid) && cid < 0;
+    const globalOn = status?.globalEnabled !== false;
+    const groupOn = status?.groupEnabled !== false;
+    const b = card(
+      '📢 MOVIE BROADCAST · ALL USERS',
+      'Watch-Party DM Alerts When Streaming Movies in VC'
+    );
+    const rows = [
+      ['🌐 All Users Broadcast', globalOn ? '🔔 Allowed (ON)' : '🔕 Disallowed (OFF)'],
+      ...(inGroup ? [['👥 This Group Broadcast', groupOn ? '🔔 Allowed (ON)' : '🔕 Disallowed (OFF)']] : [])
+    ];
+    if (status?.eligibleUsersCount != null) {
+      rows.push(['📬 Reachable Users', `${status.eligibleUsersCount} active user(s)`]);
+    }
+    b.table(rows, { striped: true, bordered: true, compact: true });
+    if (notice) {
+      b.blockquote(rt.text(notice));
+    }
+    b.expandableBlockquote(buildBoldGuideRichText(
+      'MOVIE BROADCAST GUIDE',
+      'Tap to view all alert controls ♡',
+      [
+        {
+          icon: '📢',
+          heading: 'BROADCAST COMMANDS',
+          items: [
+            { labels: ['/moviecast allow', '/moviecast on'], desc: 'Broadcast VC movie watch-parties to all bot users.' },
+            { labels: ['/moviecast disallow', '/moviecast off'], desc: 'Stop broadcasting movies to users while VC keeps playing.' },
+            { labels: ['/moviecast group allow', '/moviecast group disallow'], desc: 'Allow or mute movie alerts only for the current group chat.' },
+            { labels: ['/moviebroadcast', '/moviealert', '/cinemaalert'], desc: 'Command aliases that open or toggle this same control panel.' }
+          ]
+        }
+      ]
+    ));
+    if (canGlobal) {
+      b.buttons([
+        richButton.callback('🔔 Allow All Users', encodeCallback('music', 'mcast', 'on'), { style: globalOn ? 'success' : 'primary' }),
+        richButton.callback('🔕 Disallow All Users', encodeCallback('music', 'mcast', 'off'), { style: globalOn ? 'link' : 'danger' })
+      ]);
+    }
+    if (inGroup) {
+      b.buttons([
+        richButton.callback('👥 Group: Allow', encodeCallback('music', 'mcast', 'gon'), { style: groupOn ? 'success' : 'link' }),
+        richButton.callback('🔕 Group: Off', encodeCallback('music', 'mcast', 'goff'), { style: groupOn ? 'link' : 'danger' })
+      ]);
+    }
+    return finish(b);
+  }
+
+  function buildVcInstructionsGuide(s = null, { cinema = false } = {}) {
+    const scopeHint = s?.isChannel ? 'CHANNEL LIVESTREAM GUIDE' : 'VOICE CHAT GUIDE';
+    if (cinema) {
+      return buildBoldGuideRichText(
+        `CINEMA ${scopeHint}`,
+        'Tap to view all Cinema VC commands & button instructions ♡',
+        [
+          {
+            icon: '🎛',
+            heading: 'VOICE CHAT COMMANDS',
+            items: [
+              { labels: ['/vc', '/player'], desc: 'Prepare assistant in VC and open this live dashboard (or reply /vc to any video file).' },
+              { labels: ['/movie <title>', '/movieai <ask>'], desc: 'Search & stream full HD movies or multi-season TV series, or ask Media AI.' },
+              { labels: ['/pause', '/resume', '/skip', '/previous'], desc: 'Pause, resume playback, skip forward, or return to the previous title.' },
+              { labels: ['/seek <sec>', '/vol <0-200>', '/loop'], desc: 'Jump to an exact second, adjust call volume, or cycle repeat mode.' },
+              { labels: ['/rtmp on', '/rtmp off', '/stop', '/leave'], desc: 'Switch locked A/V RTMP vs Interactive VC, or clear queue & leave call.' },
+              { labels: ['/vcmsg <text>', '!np', '!queue', '!skip'], desc: 'Chat inside VC or let viewers inspect/skip live directly from call chat.' },
+              { labels: ['/vcsudo', '/rmsudo', '/accounts'], desc: 'Approve or revoke VC controllers and manage assistant accounts.' },
+              { labels: ['/moviecast allow', '/moviecast disallow'], desc: 'Owner toggle to allow or stop broadcasting VC movies to all bot users.' }
+            ]
+          },
+          {
+            icon: '🔘',
+            heading: 'PLAYER BUTTONS',
+            items: [
+              { labels: ['▶ Resume / ⏸ Pause', '-30s / +30s', '⏱ Custom s'], desc: 'Control playback live, nudge playback forward/back, or seek any second.' },
+              { labels: ['⏮ Prev / ⏭ Next', '🗳 Queue', '🎬 Movies'], desc: 'Navigate episodes/films, edit or vote on queue items, or browse titles.' },
+              { labels: ['💬 Subs', '⏱ Sync'], desc: 'Toggle Screen Burn / Live Chat / VC Chat / Off subtitles and fix timing.' },
+              { labels: ['🎞 Quality (1080p/720p/480p)', '🔒 RTMP Live / 🎙 Interactive VC'], desc: 'Adjust stream clarity or switch between locked A/V broadcast and WebRTC.' },
+              { labels: ['📡 Source 1/N', '📡 Alt Source'], desc: 'Switch between working stream sources seamlessly without losing your spot.' },
+              { labels: ['Vote', '📊 Poll', '⬇ Download'], desc: 'Vote to skip, run a group poll for next movie, or download MP4 to chat.' },
+              { labels: ['🎙️ Join VC', '📌 Pin', '🎵 Music Player', '⚙ Options', '⏹ Stop'], desc: 'Open call, pin dashboard, switch deck, adjust VC settings, or end stream.' }
+            ]
+          }
+        ]
+      );
+    }
+    return buildBoldGuideRichText(
+      scopeHint,
+      'Tap to view all Voice Chat commands & button instructions ♡',
+      [
+        {
+          icon: '🎛',
+          heading: 'VOICE CHAT COMMANDS',
+          items: [
+            { labels: ['/vc', '/player'], desc: 'Prepare assistant in Voice Chat and open this live dashboard card.' },
+            { labels: ['/vc <song>', '/addq <song>', '/vidc <song>', '/vplay <song>'], desc: 'Search & queue audio tracks or HD music videos into the live call.' },
+            { labels: ['Reply /vc', '/stream'], desc: 'Reply directly to any audio file, voice note, or video in chat to stream it.' },
+            { labels: ['/movie <title>', '/movieai <ask>'], desc: 'Search & stream full HD movies or multi-season TV series, or ask AI.' },
+            { labels: ['/pause', '/resume', '/skip', '/previous', '/stop', '/leave'], desc: 'Control playback, skip tracks, clear queue, or disconnect assistant.' },
+            { labels: ['/seek <sec>', '/vol <0-200>', '/eq <preset>', '/bass', '/loop', '/shuffle'], desc: 'Seek timestamp, set volume, apply Studio EQ or clean bass, and repeat.' },
+            { labels: ['/random <mood>', '/aidj', '/dj', '/rtmp on|off'], desc: 'Start infinite mood radio, chat with AI DJ, or toggle locked RTMP mode.' },
+            { labels: ['/vcmsg <text>', '/vcsudo', '/rmsudo', '/moviecast allow|disallow'], desc: 'Message inside VC, manage VC permissions, or toggle movie broadcasts.' }
+          ]
+        },
+        {
+          icon: '🔘',
+          heading: 'PLAYER BUTTONS',
+          items: [
+            { labels: ['▶ Resume / ⏸ Pause', '⏮ Prev / ⏭ Skip', '-10s / +10s', '⏱ Custom s'], desc: 'Instant transport controls and fast timestamp seeking.' },
+            { labels: ['Add tracks', '🎬 Video / vidc', '🎬 Movie Stream'], desc: 'Queue audio tracks, HD music videos, or open Cinema movies/series.' },
+            { labels: ['🎙 Chat DJ', '🤖 AI DJ', '♾️ Infinite & Genres'], desc: 'Launch conversational DJ or pick non-stop genre mixes.' },
+            { labels: ['🔊 VC volume', '🎛 Bass', 'Lyrics', 'Vote skip'], desc: 'Tune call volume, toggle Bass boost, view synced lyrics, or vote skip.' },
+            { labels: ['💬 Subs & ⏱ Sync', '🎞 Quality', '🔒 RTMP / 🎙 VC'], desc: 'Switch video subtitle mode, 1080p/720p/480p tier, or stream engine.' },
+            { labels: ['Listen / download', '🎙️ Join VC', '📌 Pin', 'More (⚙)'], desc: 'Download audio/video, jump into call, pin dashboard, or open settings.' }
+          ]
+        }
+      ]
+    );
+  }
+
   function renderHome(ctx = null) {
     const isDm = Boolean(ctx && Number(ctx.chatId) > 0 && !isChannelCtx(ctx));
     if (isDm) {
@@ -364,17 +507,31 @@ export function createMusicScreen({ app }) {
     return finish(b);
   }
 
+  function formatVcQualityShort(s) {
+    const q = s.vcQuality || app.musicQueueManager?.getVcQuality?.(s.destination || s.chatId, {
+      isMovieTrack: s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie',
+      streamMode: s.streamMode || 'interactive'
+    }) || ((s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie' || s.streamMode === 'rtmp') ? 'FHD_1080p' : 'HD_720p');
+    if (q === 'SD_480p') return '480p Saver';
+    if (q === 'HD_720p') return '720p Smooth';
+    return '1080p HD';
+  }
+
   function renderPlayer(s) {
     const badge = STATUS_BADGE[s.status] || s.status;
     const eqPreset = s.eqPreset || (s.bass ? 'bass' : 'off');
+    const qShort = formatVcQualityShort(s);
+    const streamLabel = s.streamMode === 'rtmp' ? '🔒 RTMP Live' : '🎙 Interactive VC';
     const b = card(
       s.isChannel ? 'Lancy · CHANNEL LIVE BROADCAST' : 'Lancy · Spotify X Player',
-      `${s.isChannel ? 'CHANNEL LIVE BROADCAST · Spotify X' : 'Spotify X Voice Chat'} · ${s.destinationTitle || (s.isChannel ? 'Channel' : 'Group')} · ${s.status} (${badge})`
+      `${s.isChannel ? 'CHANNEL LIVE BROADCAST · Spotify X' : 'Spotify X Voice Chat'} · ${cut(s.destinationTitle || (s.isChannel ? 'Channel' : 'Group'), 36)} · ${badge}`
     );
     if (s.status === 'stopped') {
-      b.quote(rt.text('Playback service stopped. Open the current player after restart.'));
-      if (s.lastError) b.paragraph(rt.text(s.lastError));
-      b.buttons([s.panelToken ? controls(s, 'Open current player', 'player', { style: 'success' }) : button('Open current player', 'openplayer', { style: 'success' })]);
+      b.pullquote(s.lastError ? cut(s.lastError, 220) : 'Playback service stopped. Open the current player after restart to restore your session.', '⏹ Session Stopped');
+      b.buttons([
+        s.panelToken ? controls(s, 'Open current player', 'player', { style: 'success' }) : button('Open current player', 'openplayer', { style: 'success' }),
+        controls(s, s.pinned ? '📍 Pinned' : '📌 Pin', 'pin', { style: s.pinned ? 'link' : 'primary' })
+      ]);
       return finish(b);
     }
 
@@ -402,19 +559,19 @@ export function createMusicScreen({ app }) {
       b.paragraph(rt.text(`VC · ${durationText(s.positionSeconds)} / ${durationText(t.durationSeconds)} · ${t.mediaType === 'video' ? 'HD Video + audio' : 'Audio'}${eqLabel}`));
       if (Number.isFinite(s.positionSeconds) && t.durationSeconds) {
         const ratio = safeProgressRatio(s.positionSeconds, t.durationSeconds);
-        b.paragraph(rt.code(progressBar(ratio, { width: 12, filled: '█', empty: '░' })));
+        const remSec = Math.max(0, Math.round(Number(t.durationSeconds) - Number(s.positionSeconds)));
+        b.paragraph(rt.code(`${progressBar(ratio, { width: 12, filled: '█', empty: '░' })}  ${remSec > 0 ? `-${durationText(remSec)}` : 'Done'}`));
       }
       const volText = s.volumeConfirmed === false ? 'unconfirmed' : `${s.volume}%`;
       const subMode = ['screen', 'live', 'vc', 'off'].includes(s.subtitleMode) ? s.subtitleMode : 'screen';
       const hasMovieOrVideo = Boolean(t.mediaType === 'video' || t.provider === 'movie' || t.subtitlePath);
       const subDisplay = subMode === 'screen' ? 'Screen Burn' : subMode === 'live' ? 'Live Cues' : subMode === 'vc' ? 'Burn + VC Chat' : 'Off';
       const metaRows = [
-        ['Volume', volText],
-        ['Repeat', s.loopMode],
-        ['Audio EQ', eqPreset === 'bass' ? 'Clean Bass ON' : eqPreset === 'studio' ? 'Studio EQ' : eqPreset],
-        ...(hasMovieOrVideo ? [['Subtitles', subDisplay]] : []),
-        ['Queue', `${s.upcoming?.length || 0} upcoming`],
-        ['AI DJ', aiDjActive ? `ON · ${cut(s.aiDj?.vibe || 'Studio Mix', 26)}` : 'Off']
+        ['🔊 Volume', `${volText} · 🔁 ${s.loopMode}`],
+        ['🎛 Audio EQ', eqPreset === 'bass' ? 'Clean Bass ON' : eqPreset === 'studio' ? 'Studio EQ' : eqPreset],
+        ...(hasMovieOrVideo ? [['🎞 Video / Subs', `${qShort} · ${subDisplay}`]] : []),
+        ['📡 Stream & Queue', `${streamLabel} · ${s.upcoming?.length || 0} upcoming`],
+        ['🤖 AI DJ', aiDjActive ? `ON · ${cut(s.aiDj?.vibe || 'Studio Mix', 26)}` : 'Off']
       ];
       b.table(metaRows, { striped: true, bordered: true, compact: true });
       b.paragraph(rt.text(`VC volume ${volText} · Repeat ${s.loopMode} · ${s.upcoming?.length || 0} queued`));
@@ -424,15 +581,19 @@ export function createMusicScreen({ app }) {
       }
       if (aiDjActive && s.aiDj?.introNote) {
         b.pullquote(cut(s.aiDj.introNote, 180), `🤖 AI DJ · ${cut(s.aiDj.vibe || 'Studio Mix', 30)}`);
-      }
-      if (s.upcoming?.[0]) {
-        b.paragraph(rt.text(`Up next · ${cut(s.upcoming[0].title)}${s.prefetched?.entryId === s.upcoming[0].entryId && s.prefetched?.media ? ' · ⚡ Ready' : ''}`));
+      } else if (s.upcoming?.[0]) {
+        b.pullquote(
+          `${cut(s.upcoming[0].title, 68)}${s.prefetched?.entryId === s.upcoming[0].entryId && s.prefetched?.media ? ' · ⚡ Buffered Ready' : ''}`,
+          '⏭ Up Next'
+        );
+      } else {
+        b.pullquote(`${badge} · ${cut(t.title, 54)}`, t.mediaType === 'video' ? '🎬 Video VC' : '🎧 Audio VC');
       }
       if (['playing', 'paused'].includes(s.status)) {
         b.buttons([
-          controls(s, '⏮ Previous', 'previous'),
+          controls(s, '⏮ Previous', 'previous', { style: 'link' }),
           controls(s, s.status === 'paused' ? 'Resume VC' : 'Pause VC', s.status === 'paused' ? 'resume' : 'pause', { style: s.status === 'paused' ? 'success' : 'primary' }),
-          controls(s, '⏭ Skip', 'skip'),
+          controls(s, '⏭ Skip', 'skip', { style: 'link' }),
           controls(s, '⏹ Stop', 'stop', { style: 'danger' })
         ]);
       }
@@ -440,23 +601,40 @@ export function createMusicScreen({ app }) {
       const musicSeekStep = Number(s.seekStepSeconds) >= 5 ? Math.round(Number(s.seekStepSeconds)) : 10;
       if (t.capabilities?.seek && Number.isFinite(s.positionSeconds)) {
         extraRow.push(
-          controls(s, `−${musicSeekStep} sec`, 'seekby', -musicSeekStep),
-          controls(s, `+${musicSeekStep} sec`, 'seekby', musicSeekStep),
-          controls(s, '⏱ Custom s', 'seekmenu', { style: 'primary' })
+          controls(s, `−${musicSeekStep} sec`, 'seekby', -musicSeekStep, { style: 'link' }),
+          controls(s, `+${musicSeekStep} sec`, 'seekby', musicSeekStep, { style: 'link' }),
+          controls(s, '⏱ Custom s', 'seekmenu', { style: 'link' })
         );
       }
       if (hasMovieOrVideo) {
-        extraRow.push(controls(s, `💬 Subs · ${subMode === 'screen' ? 'Screen' : subMode === 'live' ? 'Live' : subMode === 'vc' ? 'VC Chat' : 'Off'}`, 'subsync'));
+        extraRow.push(controls(s, `💬 Subs · ${subMode === 'screen' ? 'Screen' : subMode === 'live' ? 'Live' : subMode === 'vc' ? 'VC Chat' : 'Off'}`, 'subsync', { style: 'link' }));
+        extraRow.push(controls(s, `🎞 ${qShort.split(' ')[0]}`, 'vcquality', { style: s.vcQuality === 'HD_720p' ? 'success' : 'link' }));
       }
       if (['playing', 'paused'].includes(s.status) && !s.isChannel) {
-        extraRow.push(controls(s, s.skipVotes?.length ? `Vote skip (${s.skipVotes.length})` : 'Vote skip', 'voteskip'));
+        extraRow.push(controls(s, s.skipVotes?.length ? `Vote skip (${s.skipVotes.length})` : 'Vote skip', 'voteskip', { style: 'link' }));
       }
       if (extraRow.length) b.buttons(extraRow);
     }
 
-    if (!t && s.upcoming?.length) {
-      if (s.status === 'error') b.buttons([controls(s, '🔄 Retry queued track', 'retry', { style: 'success' }), controls(s, '⏹ Stop & clear', 'stop', { style: 'danger' })]);
-      else b.buttons([controls(s, '▶ Resume playback', 'resume', { style: 'success' }), controls(s, '⏹ Stop & clear', 'stop', { style: 'danger' })]);
+    const canResumeIdle = Boolean(
+      !t && (
+        s.upcoming?.length ||
+        ((s.callEnded || s.status === 'error' || (Number(s.lastKnownPositionSeconds) || 0) > 0) && s.history?.length)
+      )
+    );
+    if (canResumeIdle) {
+      if (s.status === 'error' && s.upcoming?.length) {
+        b.buttons([
+          controls(s, '🔄 Retry queued track', 'retry', { style: 'success' }),
+          controls(s, '▶ Resume', 'resume', { style: 'primary' }),
+          controls(s, '⏹ Stop & clear', 'stop', { style: 'danger' })
+        ]);
+      } else {
+        b.buttons([
+          controls(s, '▶ Resume playback', 'resume', { style: 'success' }),
+          controls(s, '⏹ Stop & clear', 'stop', { style: 'danger' })
+        ]);
+      }
     } else if (!t && !s.upcoming?.length && (s.connected || s.prepared || s.status === 'buffering')) {
       b.buttons([controls(s, s.isChannel ? '⏹ Stop & leave call' : '⏹ Stop & leave group', 'stop', { style: 'danger' })]);
     }
@@ -470,36 +648,30 @@ export function createMusicScreen({ app }) {
     const bassOn = eqPreset === 'bass' || Boolean(s.bass);
     const defaultMode = defaultMediaMode(s);
     b.buttons([
-      controls(s, `Queue · ${s.upcoming?.length || 0}`, 'queue'),
-      controls(s, 'Lyrics', 'lyrics'),
-      controls(s, 'VC volume', 'volume'),
-      controls(s, aiDjActive ? '🤖 AI DJ · ON' : '🤖 AI DJ · OFF', 'aidj', { style: aiDjActive ? 'success' : 'primary' })
+      controls(s, `Queue · ${s.upcoming?.length || 0}`, 'queue', { style: 'link' }),
+      controls(s, 'Lyrics', 'lyrics', { style: 'link' }),
+      controls(s, 'VC volume', 'volume', { style: 'link' }),
+      controls(s, aiDjActive ? '🤖 AI DJ · ON' : '🤖 AI DJ · OFF', 'aidj', { style: aiDjActive ? 'success' : 'link' })
     ]);
     b.buttons([
       s.panelToken ? controls(s, 'Add tracks', 'prompt', defaultMode, { style: 'success' }) : button('Add tracks', 'prompt', defaultMode, { style: 'success' }),
       controls(s, '🎬 Movie Stream', 'movie', 'hub', { style: 'primary' }),
       s.panelToken ? controls(s, '🎙 Chat DJ', 'prompt', 'dj', { style: 'primary' }) : button('🎙 Chat DJ', 'prompt', 'dj', { style: 'primary' }),
-      controls(s, bassOn ? '🎛 Bass · ON' : '🎛 Bass · OFF', 'bass', { style: bassOn ? 'success' : 'primary' })
+      controls(s, bassOn ? '🎛 Bass · ON' : '🎛 Bass · OFF', 'bass', { style: bassOn ? 'success' : 'link' })
     ]);
     b.buttons([
-      s.panelToken ? controls(s, '🎬 Video / vidc', 'prompt', 'video') : button('🎬 Video / vidc', 'prompt', 'video'),
-      controls(s, '♾️ Infinite & Genres', 'catmenu', defaultMode),
-      s.panelToken ? controls(s, 'Listen / download', 'prompt', 'download') : button('Listen / download', 'prompt', 'download'),
-      controls(s, 'More', 'options')
+      s.panelToken ? controls(s, '🎬 Video / vidc', 'prompt', 'video', { style: 'link' }) : button('🎬 Video / vidc', 'prompt', 'video', { style: 'link' }),
+      controls(s, '♾️ Infinite & Genres', 'catmenu', defaultMode, { style: 'link' }),
+      s.panelToken ? controls(s, 'Listen / download', 'prompt', 'download', { style: 'link' }) : button('Listen / download', 'prompt', 'download', { style: 'link' }),
+      controls(s, 'More', 'options', { style: 'link' })
     ]);
     const playerJoinBtn = joinCallButton(s);
-    if (playerJoinBtn || s.panelToken) {
-      const tailRow = [];
-      if (playerJoinBtn) tailRow.push(playerJoinBtn);
-      if (s.panelToken) tailRow.push(controls(s, 'My channels', 'channels'));
-      b.buttons(tailRow);
-    }
+    const tailRow = [];
+    if (playerJoinBtn) tailRow.push(playerJoinBtn);
+    tailRow.push(controls(s, s.pinned ? '📍 Pinned' : '📌 Pin', 'pin', { style: s.pinned ? 'link' : 'primary' }));
+    if (s.panelToken) tailRow.push(controls(s, 'My channels', 'channels', { style: 'link' }));
+    if (tailRow.length) b.buttons(tailRow);
 
-    const shortcutBlocks = [
-      block.paragraph(rt.text(s.panelToken
-        ? 'Tap 🎙 Chat DJ or use /dj <ask anything> (e.g. "what\'s trending", "play Afrobeats", "more bass"). /play stays listen/download only.'
-        : 'Spotify X Commands: /dj <ask AI DJ> · /vplay <song> · /aidj vibe <mood> · /eq studio · /bass · /random'))
-    ];
     const shortcutBtns = [];
     if (t) {
       shortcutBtns.push(richButton.copy('📋 Copy Track', `${cut(t.title, 60)}${t.artist ? ` - ${cut(t.artist, 40)}` : ''}`));
@@ -507,8 +679,10 @@ export function createMusicScreen({ app }) {
     if (!s.isChannel && !s.panelToken) {
       shortcutBtns.push(richButton.switchInlineCurrent('🔍 Inline Search', t ? cut(t.title, 30) : ''));
     }
-    if (shortcutBtns.length) shortcutBlocks.push(block.buttons(shortcutBtns));
-    b.details('⌨ Studio Tips & Copy', shortcutBlocks, false);
+    if (shortcutBtns.length) {
+      b.details('⌨ Quick Copy & Inline Search', [block.buttons(shortcutBtns)], false);
+    }
+    b.expandableBlockquote(buildVcInstructionsGuide(s, { cinema: false }));
 
     return finish(b);
   }
@@ -518,6 +692,7 @@ export function createMusicScreen({ app }) {
     const aiDjActive = Boolean(s.aiDj?.enabled);
     const subMode = ['screen', 'live', 'vc', 'off'].includes(s.subtitleMode) ? s.subtitleMode : 'screen';
     const streamMode = s.streamMode === 'rtmp' ? 'rtmp' : 'interactive';
+    const qShort = formatVcQualityShort(s);
     const b = card('Lancy · voice-chat settings', 'Changes stay in this dashboard');
     b.table([
       ['Account', s.accountAlias || s.preferredAccount || 'Not connected'],
@@ -526,18 +701,19 @@ export function createMusicScreen({ app }) {
       ['Audio EQ', eq],
       ['Subtitles', subMode],
       ['Stream Engine', streamMode === 'rtmp' ? '🔒 RTMP Live (Locked A/V)' : '🎙 Interactive VC (WebRTC)'],
+      ['Video Quality', qShort],
       ['AI DJ', aiDjActive ? `ON · ${cut(s.aiDj?.vibe || 'Studio Mix', 28)}` : 'off'],
-      ['Video Output', 'HD 720p + Studio Canvas']
+      ['Video Output', `${qShort} + Studio Canvas`]
     ], { striped: true, bordered: true, compact: true });
     b.buttons([controls(s, `Repeat · ${s.loopMode}`, 'loop'), controls(s, 'Shuffle', 'shuffle'), controls(s, `💬 Subs · ${subMode}`, 'submode'), controls(s, '⏱ Sub Sync', 'subsync')]);
     b.buttons([
       controls(s, s.bass ? 'Bass · on' : 'Bass · off', 'bass', { style: s.bass ? 'success' : 'primary' }),
       controls(s, `EQ · ${eq}`, 'eq'),
       controls(s, streamMode === 'rtmp' ? '🔒 Mode · RTMP Live' : '🎙 Mode · Interactive VC', 'streammode', { style: streamMode === 'rtmp' ? 'success' : 'primary' }),
-      controls(s, aiDjActive ? '🤖 AI DJ · ON' : '🤖 AI DJ · OFF', 'aidj', { style: aiDjActive ? 'success' : 'primary' })
+      controls(s, `🎞 ${qShort}`, 'vcquality', { style: s.vcQuality === 'HD_720p' ? 'success' : 'primary' })
     ]);
-    b.buttons([controls(s, '🎬 Movie Stream', 'movie', 'hub', { style: 'primary' }), controls(s, '🗳 Vote Settings', 'voteset', { style: 'primary' }), controls(s, 'Accounts', 'accounts'), controls(s, 'Pin player', 'pin')]);
-    b.buttons([controls(s, 'Retry full preview', 'preview'), controls(s, s.isChannel ? 'Stop & leave call' : 'Stop & leave group', 'stop', { style: 'danger' })]);
+    b.buttons([controls(s, aiDjActive ? '🤖 AI DJ · ON' : '🤖 AI DJ · OFF', 'aidj', { style: aiDjActive ? 'success' : 'primary' }), controls(s, '🎬 Movie Stream', 'movie', 'hub', { style: 'primary' }), controls(s, '🗳 Vote Settings', 'voteset', { style: 'primary' }), controls(s, s.pinned ? '📍 Pinned' : '📌 Pin player', 'pin')]);
+    b.buttons([controls(s, 'Accounts', 'accounts'), controls(s, 'Retry full preview', 'preview'), controls(s, s.isChannel ? 'Stop & leave call' : 'Stop & leave group', 'stop', { style: 'danger' })]);
     b.buttons([controls(s, 'Back to player', 'player')]);
     b.paragraph(rt.italic('VC settings do not control the audio player above. Bass & EQ apply on next track/seek; RTMP Mode locks audio & video into one broadcast stream. /movie · /seek <seconds> · /rtmp · /eq studio'));
     return finish(b);
@@ -1502,6 +1678,26 @@ export function createMusicScreen({ app }) {
         await app.music.authorize(ctx, true, Number(ctx.chatId), { allowDj: false });
         ctx = { ...ctx, channelAdminVerified: true };
       }
+      if (action === 'mcast') {
+        const sub = String(args[0] || '').toLowerCase();
+        const isGroupScope = sub === 'gon' || sub === 'goff';
+        const enable = sub === 'on' || sub === 'gon';
+        const res = await app.music.setMovieBroadcast(ctx, { scope: isGroupScope ? 'group' : 'global', enable, chatId: ctx.chatId });
+        const notice = isGroupScope
+          ? (enable ? '👥 Movie broadcasts are now ALLOWED for this group.' : '🔕 Movie broadcasts are now DISABLED for this group.')
+          : (enable ? '✅ Movie broadcasts to all users are now ALLOWED.' : '🔕 Movie broadcasts to all users are now DISALLOWED.');
+        if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+          await ctx.api.answerCallbackQuery(ctx.query.id, { text: cut(notice, 90), show_alert: false }).catch(() => {});
+        }
+        if (ctx.messageId) {
+          const canGlobal = Boolean(app.music.owner(ctx) || app.music.superAdmin(ctx));
+          const updated = renderMovieBroadcastCard(res, { notice, chatId: ctx.chatId, canGlobal });
+          if (ctx.api?.editMessageRich) {
+            await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, updated).catch(() => {});
+          }
+        }
+        return true;
+      }
       if (action === 'calert') {
         const enable = args[0] === 'on';
         app.db?.setUserSetting?.(Number(ctx.tgId), 'cinema.vcNotifications', enable);
@@ -1949,6 +2145,7 @@ export function createMusicScreen({ app }) {
       '/stop', '/end', '/leave', '/queue', '/q', '/volume', '/vol', '/loop', '/repeat',
       '/shuffle', '/seek', '/eq', '/bass', '/streammode', '/rtmp', '/vcmsg', '/aidj', '/dj', '/movie', '/movies', '/moviesearch', '/movieai', '/mediaai',
       '/vcsudo', '/rmsudo', '/accounts', '/destination',
+      '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce',
       '/channel', '/session', '/gensession', '/authassistant', '/linkassistant', '/playlist', '/lyrics'
     ];
     if (!commands.includes(command)) return false;
@@ -1995,15 +2192,31 @@ export function createMusicScreen({ app }) {
         }
         return true;
       }
+      if (['/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce'].includes(command)) {
+        const res = await app.music.movieBroadcastCommand(ctx, args);
+        const canGlobal = Boolean(app.music.owner(ctx) || app.music.superAdmin(ctx));
+        const notice = res.action === 'set'
+          ? (res.scope === 'group'
+              ? (res.enabled ? '👥 Movie broadcasts are now ALLOWED for this group.' : '🔕 Movie broadcasts are now DISABLED for this group.')
+              : (res.enabled ? '✅ Movies will now broadcast to all eligible bot users when VC streaming starts.' : '🔕 Movie broadcasts to all users are now DISALLOWED. Playback continues quietly.'))
+          : null;
+        await sendOrEditMenu(ctx, renderMovieBroadcastCard(res, { notice, chatId: ctx.chatId, canGlobal }));
+        return true;
+      }
       if (command === '/movie' || command === '/movies' || command === '/moviesearch') {
-        const movieCtx = isChan ? channelPlayerCtx() : ctx;
+        const movieCtx = isChan ? channelPlayerCtx() : { ...ctx, directMessageId: ctx.directMessageId ?? ctx.message?.message_id ?? null };
         const firstArg = String(args[0] || '').toLowerCase();
         if (['x', 'xv', 'xvideos'].includes(firstArg)) {
           const xvArgs = args.slice(1);
-          if (xvArgs.length) await movieUi.openMovieSearch(movieCtx, xvArgs.join(' '), { sourceMode: 'xvideos' });
+          if (xvArgs.length) await movieUi.openMovieSearch(movieCtx, xvArgs.join(' '), { sourceMode: 'xvideos', originMessageId: movieCtx.directMessageId, forceNewCard: true });
           else await movieUi.openHub(movieCtx, { sourceMode: 'xvideos' });
+        } else if (['18', '18+', 'adult', 'full', 'uncut', 'xxx'].includes(firstArg)) {
+          const adultArgs = args.slice(1);
+          const adultOpts = { sourceMode: 'xvideos', xvSource: 'adult_movies', xvDur: 'movie' };
+          if (adultArgs.length) await movieUi.openMovieSearch(movieCtx, adultArgs.join(' '), { ...adultOpts, originMessageId: movieCtx.directMessageId, forceNewCard: true });
+          else await movieUi.openHub(movieCtx, adultOpts);
         } else if (args.length) {
-          await movieUi.openMovieSearch(movieCtx, args.join(' '));
+          await movieUi.openMovieSearch(movieCtx, args.join(' '), { originMessageId: movieCtx.directMessageId, forceNewCard: true });
         } else {
           await movieUi.openHub(movieCtx);
         }
@@ -2157,9 +2370,6 @@ export function createMusicScreen({ app }) {
           await app.music.control({ ...ctx, messageId: null, query: null }, 'voteskip', args);
           return true;
         }
-        const playerSession = await app.music.player(channelPlayerCtx());
-        await adoptChannelPlayerResult(ctx, playerSession);
-        ctx = { ...ctx, messageId: null, query: null };
         const action = (!args.length && ['/volume', '/vol'].includes(command))
           ? 'volume'
           : ({ '/next': 'skip', '/q': 'queue', '/end': 'stop', '/vol': 'setvol', '/volume': 'setvol', '/repeat': 'loop', '/vc': 'player', '/rtmp': 'streammode' }[command] || command.slice(1));
@@ -2172,7 +2382,25 @@ export function createMusicScreen({ app }) {
           else if (['off', 'vc', 'interactive', 'webrtc', 'mic'].includes(arg0)) ctrlArgs = ['interactive'];
           else if (command === '/rtmp' && !arg0) ctrlArgs = [];
         }
-        if (action !== 'player') await app.music.control(ctx, action, ctrlArgs);
+        const controlFirstActions = new Set(['resume', 'pause', 'skip', 'previous', 'seek', 'vcquality']);
+        if (!isChan && controlFirstActions.has(action)) {
+          const destId = await app.music.authorize(ctx, true, null, { allowDj: true });
+          const preSess = app.musicQueueManager?.getSession?.(destId);
+          const hadEndedOrMissing = Boolean(!preSess?.screenMessageId || preSess?.callEnded || !preSess?.connected);
+          await app.music.control({ ...ctx, messageId: null, query: null }, action, ctrlArgs);
+          const postSess = app.musicQueueManager?.getSession?.(destId);
+          if (!postSess?.screenMessageId || hadEndedOrMissing) {
+            const freshSess = await app.music.player({ ...channelPlayerCtx(), ...(hadEndedOrMissing ? { forceNew: true } : {}) });
+            await adoptChannelPlayerResult(ctx, freshSess);
+          } else {
+            await app.musicQueueManager?.updatePlayerCard?.(destId, { forceEdit: true });
+          }
+        } else {
+          const playerSession = await app.music.player(channelPlayerCtx());
+          await adoptChannelPlayerResult(ctx, playerSession);
+          ctx = { ...ctx, messageId: null, query: null };
+          if (action !== 'player') await app.music.control(ctx, action, ctrlArgs);
+        }
       }
     } catch (e) {
       const errCtx = (sentStatus?.message_id && !ctx.messageId)
@@ -2339,7 +2567,8 @@ export function createMusicScreen({ app }) {
     '/vc', '/stream', '/pause', '/resume', '/skip', '/voteskip', '/next', '/previous',
     '/stop', '/end', '/leave', '/queue', '/q', '/volume', '/vol', '/seek', '/eq', '/bass', '/streammode', '/rtmp', '/vcmsg',
     '/aidj', '/dj', '/movie', '/movies', '/moviesearch', '/movieai', '/mediaai',
-    '/vcsudo', '/rmsudo', '/repeat', '/loop', '/shuffle', '/playlist', '/lyrics', '/play', '/song',
+    '/vcsudo', '/rmsudo', '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce',
+    '/repeat', '/loop', '/shuffle', '/playlist', '/lyrics', '/play', '/song',
     '/music', '/cancel'
   ]);
 
@@ -2348,7 +2577,7 @@ export function createMusicScreen({ app }) {
     if (!source.data && app.music.channelPanels?.replyPanel(ctx, source)) return true;
     if (source.data) {
       const d = decodeCallback(source.data);
-      return d?.screen === 'music' && (['pc', 'listenq', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose', 'calert'].includes(d.action) || app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`));
+      return d?.screen === 'music' && (['pc', 'listenq', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose', 'calert', 'mcast'].includes(d.action) || app.music.destinations?.has(`${app.music.botKey(ctx)}:${ctx.tgId}`));
     }
     const pending = app.sm?.get?.(ctx.tgId);
     if (pending?.state === States.MUSIC_QUEUE_INPUT && pending.context.panelToken && pending.context.botKey === app.music.botKey(ctx) && Number(pending.chatId) === Number(ctx.chatId)) return true;
@@ -2362,7 +2591,7 @@ export function createMusicScreen({ app }) {
     if (!source.data && await handlePlayerReply(ctx, source)) return true;
     if (source.data) {
       const d = decodeCallback(source.data);
-      if (!['pc', 'channels', 'ch', 'listenq', 'listennow', 'listenadd', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose', 'calert'].includes(d.action)) {
+      if (!['pc', 'channels', 'ch', 'listenq', 'listennow', 'listenadd', 'mv', 'movie', 'moviehub', 'aichat', 'aiclose', 'calert', 'mcast'].includes(d.action)) {
         try {
           const session = ['pick', 'spage', 'sclear', 'submit', 'playnow_s', 'qnow'].includes(d.action) ? app.music.search.get(d.args[0], ctx) : null;
           await app.music.authorize(ctx, true, session && ['queue', 'video'].includes(session.mode) ? session.destination : null);
@@ -2497,7 +2726,10 @@ export function createMusicScreen({ app }) {
               : (isChan && savedContext.promptMessageId ? { ...ctx, reuseMessageId: savedContext.promptMessageId } : ctx);
             await movieUi.openMovieSearch(searchTargetCtx, message.text, {
               movieSid: savedContext.movieSid || null,
-              sourceMode: savedContext.sourceMode || null
+              sourceMode: savedContext.sourceMode || null,
+              promptKind: savedContext.promptKind || null,
+              originMessageId: message?.message_id ?? ctx.directMessageId ?? null,
+              forceNewCard: Boolean(!isChan && !panel)
             });
           } else {
             if (isChan) record.context.reusedInChannel = true;
@@ -2574,6 +2806,7 @@ export function createMusicScreen({ app }) {
     const botUsername = String(s.botUsername || app.telegram?.botUsername || 'Lancy_easy_bot').replace(/^@/, '');
     const badge = STATUS_BADGE[s.status] || '⚪ IDLE';
     const loopSuffix = s.loopMode === 'track' ? ' · 🔁 Repeat One' : s.loopMode === 'queue' ? ' · 🔁 Loop Queue' : '';
+    const qShort = formatVcQualityShort({ ...s, activeDeck: 'movie' });
     const b = card(`🎬 LANCY MUSIC · ${s.isChannel ? 'CHANNEL CINEMA VC' : 'CINEMA VC'}`, `${badge} · ${destLabel}${loopSuffix}`);
     const t = s.currentTrack?.provider === 'movie' ? s.currentTrack : null;
     const movieQ = Array.isArray(s.movieUpcoming) ? s.movieUpcoming : [];
@@ -2584,8 +2817,10 @@ export function createMusicScreen({ app }) {
     const skipNeed = app.music?.getSkipVoteThreshold?.(destId) ?? 2;
     const skipCount = Array.isArray(s.skipVotes) ? s.skipVotes.length : 0;
 
-    const resumeSec = !t ? Number(movieQ[0]?.resumePositionSeconds || movieQ[0]?.startOffsetSeconds || s.lastKnownPositionSeconds || 0) : 0;
-    const previewTrack = t || ((s.status === 'buffering' || resumeSec > 0) ? movieQ[0] : null);
+    const lastHist = (!t && !movieQ.length && (s.callEnded || (Number(s.lastKnownPositionSeconds) || 0) > 0) && movieHist.length) ? movieHist.at(-1) : null;
+    const resumableItem = movieQ[0] || lastHist || null;
+    const resumeSec = !t ? Number(resumableItem?.resumePositionSeconds || resumableItem?.startOffsetSeconds || s.lastKnownPositionSeconds || 0) : 0;
+    const previewTrack = t || ((s.status === 'buffering' || resumeSec > 0 || movieQ.length > 0) ? resumableItem : null);
     const previewArt = previewTrack?.artwork || previewTrack?.poster || previewTrack?.backdrop || previewTrack?.thumbnailUrl || previewTrack?.thumb || null;
     const suppressGroupAdultArt = Boolean(previewTrack?.isAdult && Number(destId) < 0);
     attachSafeArtworkPhoto(b, suppressGroupAdultArt ? null : previewArt, previewTrack?.title || 'Cinema Artwork');
@@ -2596,11 +2831,13 @@ export function createMusicScreen({ app }) {
       const pos = Math.max(0, Number(s.positionSeconds || 0));
       if (dur > 0) {
         const ratio = safeProgressRatio(pos, dur);
-        b.paragraph(rt.text(`${progressBar(ratio, { width: 12, filled: '█', empty: '░' })}  ${durationText(pos)} / ${durationText(dur)}`));
+        const remSec = Math.max(0, Math.round(dur - pos));
+        const remLabel = remSec > 0 ? `  ·  -${durationText(remSec)}` : '  ·  Ending';
+        b.paragraph(rt.text(`${progressBar(ratio, { width: 12, filled: '█', empty: '░' })}  ${durationText(pos)} / ${durationText(dur)}${remLabel}`));
       } else {
         b.paragraph(rt.text(`🔴 Live Cinema Stream${pos > 0 ? ` · ${durationText(pos)} elapsed` : ''}`));
       }
-      const fallbackFormat = dur > 0 ? `${durationText(dur)} · Full HD Cinema` : 'Full HD 1080p Cinema';
+      const fallbackFormat = dur > 0 ? `${durationText(dur)} · Cinema` : 'Cinema HD';
       const cleanArtistMeta = t.artist && !/thenkiri|downloadwella|holaflix|archive|dramafren|ok\.ru|yt-dlp|web cinema|source/i.test(t.artist)
         ? t.artist
         : fallbackFormat;
@@ -2641,32 +2878,36 @@ export function createMusicScreen({ app }) {
         ['🎬 Now Playing', cut(t.title || 'Movie Stream', 44)],
         ['🎙️ Voice Chat', vcDisplay],
         ['🤖 Bot', `Lancy Music (@${botUsername})`],
-        ['🎞 Quality', `${cut(cleanArtistMeta, 34)}${s.streamMode === 'rtmp' ? ' · 🔒 RTMP Locked A/V' : ' · 🎙 Interactive VC'}${syncStateTag}`],
+        ['🎞 Quality', `${qShort} · ${cut(cleanArtistMeta, 24)}${s.streamMode === 'rtmp' ? ' · 🔒 RTMP Locked A/V' : ' · 🎙 Interactive VC'}${syncStateTag}`],
         ...(audioDisplay ? [['🔊 Audio', audioDisplay]] : []),
         ['💬 Subtitles', `${subText}${trackBadge}${syncTag}${liveSyncBadge}${offsetStr}`],
-        ['🎞 Cinema Queue', `${movieQ.length} upcoming · ⏭ Skip ${skipCount}/${skipNeed}`]
+        ['🎞 Cinema Queue', `${movieQ.length} up next · ⏭ Vote ${skipCount}/${skipNeed}`]
       ];
       if (t.requester) metaRows.push(['🙋 Requested by', cut(t.requester, 32)]);
       b.table(metaRows, { striped: true, bordered: true, compact: true });
       if (subMode === 'live' && s.liveSubCue) {
-        b.blockquote(rt.text(`💬 ${cut(s.liveSubCue, 260)}`));
+        b.pullquote(cut(s.liveSubCue, 240), '💬 Live Subtitle');
+      } else if (movieQ[0]?.title) {
+        b.pullquote(cut(movieQ[0].title, 68), `⏭ Up Next (#1/${movieQ.length})`);
       }
     } else {
-      const vcIdleDisplay = (resumeSec > 0 && movieQ[0]?.title)
-        ? `${cut(movieQ[0].title, 28)} · ${cut(destLabel, 20)}`
+      const vcIdleDisplay = (resumeSec > 0 && resumableItem?.title)
+        ? `${cut(resumableItem.title, 28)} · ${cut(destLabel, 20)}`
         : destLabel;
       b.table([
         ['🎙️ Voice Chat', vcIdleDisplay],
         ['🤖 Bot', `Lancy Music (@${botUsername})`],
+        ['🎞 Quality & Mode', `${qShort} · ${s.streamMode === 'rtmp' ? '🔒 RTMP Locked A/V' : '🎙 Interactive VC'}`],
         ['🎞 Cinema Queue', `${movieQ.length} up next`]
       ], { striped: true, bordered: true, compact: true });
-      b.paragraph(rt.text(
-        movieQ.length
+      b.pullquote(
+        resumableItem
           ? (resumeSec > 0
-              ? `Saved at ${durationText(resumeSec)} · ${cut(movieQ[0]?.title || 'Current item', 40)}. Tap ▶ Resume to continue where it stopped.`
-              : `Cinema deck is ready (${movieQ.length} queued). Tap ▶ Resume to start streaming in Voice Chat.`)
-          : 'No movie or episode is currently playing in Cinema VC. Tap 🎬 Movies to search & stream.'
-      ));
+              ? `Saved at ${durationText(resumeSec)} · ${cut(resumableItem?.title || 'Current item', 40)}. Tap ▶ Resume to continue where it stopped.`
+              : `Cinema deck is ready (${movieQ.length || 1} ready). Tap ▶ Resume to start streaming in Voice Chat.`)
+          : 'No movie or episode is currently playing in Cinema VC. Tap 🎬 Movies to search & stream.',
+        resumeSec > 0 ? '⏸ Saved Position' : '🍿 Cinema Standby'
+      );
     }
 
     if (s.lastError) b.blockquote(rt.text(`⚠ ${cut(s.lastError, 240)}`));
@@ -2678,61 +2919,81 @@ export function createMusicScreen({ app }) {
     // Row 1: Dedicated Seek & Pause/Resume Row (isolated at top — far away from ⏭ Next & ⏹ Stop to prevent misclicks on rapid tap)
     const row1 = [];
     if (t?.capabilities?.seek) {
-      row1.push(controls(s, `-${stepLabel}`, 'seekby', -seekStep));
+      row1.push(controls(s, `-${stepLabel}`, 'seekby', -seekStep, { style: 'link' }));
     }
-    if (t || movieQ.length) {
-      row1.push(controls(s, (s.status === 'paused' || (!t && resumeSec > 0)) ? '▶ Resume' : t ? '⏸ Pause' : '▶ Start Next', (s.status === 'paused' || !t) ? 'resume' : 'pause', { style: 'primary' }));
+    if (t || resumableItem) {
+      row1.push(controls(s, (s.status === 'paused' || (!t && resumeSec > 0)) ? '▶ Resume' : t ? '⏸ Pause' : '▶ Start Next', (s.status === 'paused' || !t) ? 'resume' : 'pause', { style: (!t || s.status === 'paused') ? 'success' : 'primary' }));
     }
     if (t?.capabilities?.seek) {
-      row1.push(controls(s, `+${stepLabel}`, 'seekby', seekStep));
-      row1.push(controls(s, '⏱ Custom s', 'seekmenu'));
+      row1.push(controls(s, `+${stepLabel}`, 'seekby', seekStep, { style: 'link' }));
+      row1.push(controls(s, '⏱ Custom s', 'seekmenu', { style: 'link' }));
     }
     if (row1.length) b.buttons(row1);
 
     // Row 2: Track Navigation, Volume & Download
     const row2 = [];
-    if (movieHist.length) row2.push(controls(s, '⏮ Prev', 'previous'));
-    if (movieQ.length) row2.push(controls(s, '⏭ Next', 'skip'));
-    row2.push(controls(s, `🔊 ${s.volume ?? 100}%`, 'volume'));
+    if (movieHist.length) row2.push(controls(s, '⏮ Prev', 'previous', { style: 'link' }));
+    if (movieQ.length) row2.push(controls(s, '⏭ Next', 'skip', { style: 'link' }));
+    row2.push(controls(s, `🔊 ${s.volume ?? 100}%`, 'volume', { style: 'link' }));
     if (t) {
       row2.push(controls(s, '⬇ Download', 'downloadnow', { style: 'success' }));
     }
     b.buttons(row2);
 
-    // Row 3: Vote, Queue, Movies & Subtitle Sync
-    const row3 = [];
-    if (t && ['playing', 'paused'].includes(s.status)) {
-      row3.push(controls(s, `⏭ Vote (${skipCount}/${skipNeed})`, 'voteskip'));
-    }
-    row3.push(controls(s, `🗳 Queue (${movieQ.length})`, 'mqueue', 0, { style: 'primary' }));
-    row3.push(controls(s, '🎬 Movies', 'movie'));
-    if (t) row3.push(controls(s, '⏱ Sync', 'subsync'));
+    // Row 3: Queue, Movies, Subtitle Sync & Poll
+    const row3 = [
+      controls(s, `🗳 Queue (${movieQ.length})`, 'mqueue', 0, { style: 'primary' }),
+      controls(s, '🎬 Movies', 'movie', { style: 'primary' })
+    ];
+    if (t) row3.push(controls(s, '⏱ Sync', 'subsync', { style: 'link' }));
+    row3.push(controls(s, '📊 Poll', 'launchpoll', { style: 'link' }));
     b.buttons(row3);
 
-    // Row 4: Poll, SubMode, Loop & Options
+    // Row 4: SubMode, Anti-Lag Quality Tier & Neutral Source Switch
     const row4 = [
-      controls(s, '📊 Poll', 'launchpoll'),
-      controls(s, `💬 ${subText}`, 'submode'),
-      controls(s, `🔁 ${s.loopMode === 'off' ? 'Loop' : s.loopMode === 'track' ? 'One' : 'All'}`, 'loop'),
-      controls(s, '⚙ Options', 'options')
+      controls(s, `💬 ${subText}`, 'submode', { style: 'link' }),
+      controls(s, `🎞 ${qShort}`, 'vcquality', { style: s.vcQuality === 'HD_720p' ? 'success' : 'primary' })
     ];
+    if (t && ['playing', 'paused', 'buffering'].includes(s.status)) {
+      const srcPool = Array.isArray(t._sourcePool) && t._sourcePool.length ? t._sourcePool : null;
+      const srcPoolIdx = srcPool ? srcPool.findIndex((p) => p?.url && p.url === t.streamUrl) : -1;
+      const labelMatch = String(t.sourceLabel || '').match(/Source\s+(\d+)/i);
+      const srcTotal = srcPool
+        ? srcPool.length
+        : ((t.streamUrl ? 1 : 0) + (Array.isArray(t.fallbackStreams) ? t.fallbackStreams.filter((x) => x?.url && x.url !== t.streamUrl).length : 0));
+      const srcNum = srcPoolIdx >= 0
+        ? (srcPoolIdx + 1)
+        : (labelMatch ? Number(labelMatch[1]) : (Number.isInteger(t.activeSourceIndex) ? (t.activeSourceIndex + 1) : 1));
+      const srcBtnLabel = srcTotal > 1 ? `📡 Source ${srcNum}/${srcTotal}` : '📡 Alt Source';
+      row4.push(controls(s, srcBtnLabel, 'switchsource', { style: 'link' }));
+    }
     b.buttons(row4);
+
+    // Row 5: Vote, Loop & Options
+    const row5 = [];
+    if (t && ['playing', 'paused'].includes(s.status)) {
+      row5.push(controls(s, `⏭ Vote (${skipCount}/${skipNeed})`, 'voteskip', { style: 'link' }));
+    }
+    row5.push(controls(s, `🔁 ${s.loopMode === 'off' ? 'Loop' : s.loopMode === 'track' ? 'One' : 'All'}`, 'loop', { style: 'link' }));
+    row5.push(controls(s, '⚙ Options', 'options', { style: 'link' }));
+    b.buttons(row5);
 
     const identityRow = [];
     const vcBtn = joinCallButton(s);
     if (vcBtn) identityRow.push(vcBtn);
-    identityRow.push(richButton.url('🤖 Lancy Music', `https://t.me/${botUsername}`, { style: 'primary' }));
+    identityRow.push(richButton.url('🤖 Lancy Music', `https://t.me/${botUsername}`, { style: 'link' }));
     b.buttons(identityRow);
 
-    // Bottom Row: Deck Switch, Stream Engine Toggle, Pin & Stop (safely isolated at bottom corner away from +30s)
+    // Bottom Row: Deck Switch, Stream Engine Toggle, Always-Visible Pin & Stop
     const deckRow = [
-      controls(s, `🎵 Music Player${musicQCount ? ` (${musicQCount})` : ''}`, 'switchdeck', 'music'),
-      controls(s, s.streamMode === 'rtmp' ? '🔒 RTMP Live' : '🎙 Interactive VC', 'streammode', { style: s.streamMode === 'rtmp' ? 'success' : 'primary' })
+      controls(s, `🎵 Music Player${musicQCount ? ` (${musicQCount})` : ''}`, 'switchdeck', 'music', { style: 'link' }),
+      controls(s, s.streamMode === 'rtmp' ? '🔒 RTMP Live' : '🎙 Interactive VC', 'streammode', { style: s.streamMode === 'rtmp' ? 'success' : 'primary' }),
+      controls(s, s.pinned ? '📍 Pinned' : '📌 Pin', 'pin', { style: s.pinned ? 'link' : 'primary' })
     ];
-    if (!s.pinned) deckRow.push(controls(s, '📌 Pin', 'pin'));
-    if (s.isChannel && s.panelToken) deckRow.push(controls(s, '🔀 Channels', 'channels'));
+    if (s.isChannel && s.panelToken) deckRow.push(controls(s, '🔀 Channels', 'channels', { style: 'link' }));
     if (t || s.connected) deckRow.push(controls(s, '⏹ Stop', 'stop', { style: 'danger' }));
     b.buttons(deckRow);
+    b.expandableBlockquote(buildVcInstructionsGuide(s, { cinema: true }));
 
     return finish(b);
   }

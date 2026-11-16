@@ -10,8 +10,38 @@ export function isMusicOwner(app, id) {
   return Number.isSafeInteger(uid) && uid > 0 && getBotOwnerIds(app).has(uid);
 }
 
-export function isMusicSuperAdmin(app, id) {
-  return isBotSuperAdmin(app, id);
+export function isMusicSuperAdmin(app, id, { controller = null } = {}) {
+  return isBotSuperAdmin(app, id, { controller });
+}
+
+/**
+ * Resolve a screen from the initiating bot/controller context first, then by session botId
+ * on multiBotManager, falling back to the primary app screens map.
+ */
+export function resolveAppScreen(app, screenId, { ctx = null, session = null } = {}) {
+  const fromCtx = ctx?.screens?.get?.(screenId) ?? ctx?.controller?.screens?.get?.(screenId);
+  if (fromCtx) return fromCtx;
+  const botId = Number(session?.botId ?? ctx?.botId ?? ctx?.controller?.botContext?.botId ?? 0);
+  if (botId > 0) {
+    const fromClone = app?.multiBotManager?.getRunningBot?.(botId)?.controller?.screens?.get?.(screenId);
+    if (fromClone) return fromClone;
+  }
+  return app?.screens?.get?.(screenId) ?? null;
+}
+
+/**
+ * True when ctx represents the same bot instance (or restarted clone botId/token) as the session.
+ */
+export function isSameMusicBot(session, ctx) {
+  if (!session?.api) return true;
+  if (session.api === ctx?.api) return true;
+  const sessApiBotId = Number(session.api?.me?.id || 0);
+  const ctxApiBotId = Number(ctx?.api?.me?.id || 0);
+  if (sessApiBotId > 0 && ctxApiBotId > 0) return sessApiBotId === ctxApiBotId;
+  if (session.api?.token && ctx?.api?.token) return session.api.token === ctx.api.token;
+  const sessBotId = Number(session.botId ?? 0);
+  const ctxBotId = Number(ctx?.botId ?? ctx?.controller?.botContext?.botId ?? 0);
+  return sessBotId > 0 && ctxBotId > 0 && sessBotId === ctxBotId;
 }
 export class AccountStore {
   constructor({ db, root, voice, allowExistingMemberGroups=false }) { this.allowExistingMemberGroups=Boolean(allowExistingMemberGroups);this.db = db; this.root = root; this.voice = voice; this.lock = new KeyedLock(); this.initialized = false; }

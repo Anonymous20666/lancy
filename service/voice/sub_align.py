@@ -749,7 +749,7 @@ def probe_audio_and_align(
 
     base_url = re.sub(r'[?&]start=[0-9.]+', '', str(media_url or ''))
 
-    def _run_probe_window(req_start, req_sec):
+    def _run_probe_window(req_start, req_sec, win_max_shift=None):
         nonlocal actual_start
         eff_actual = req_start
         if is_hls_proxy and req_start > 0.05:
@@ -804,7 +804,7 @@ def probe_audio_and_align(
             proc.stdout,
             cues,
             eff_actual,
-            max_shift_sec=max_shift_sec,
+            max_shift_sec=max_shift_sec if win_max_shift is None else float(win_max_shift),
             same_route=same_route,
         )
         cor['window_start'] = round(eff_actual, 3)
@@ -813,20 +813,21 @@ def probe_audio_and_align(
 
     res, actual_start = _run_probe_window(win_start, win_sec)
     last_cue_sec = max((e / 1000.0 for _, e, _ in cues), default=0.0)
-    # Multi-window FPS/linear drift check for long streams (or HLS/external subtitles when seekable)
+    # Multi-window FPS/linear drift check for long streams across both HTTP & seekable HLS proxies
     if (
         res.get('ok')
         and (res.get('confident') or res.get('in_sync'))
-        and not is_hls_proxy
-        and seek_offset <= 60.0
-        and (last_cue_sec - actual_start) >= 1200.0
+        and (last_cue_sec - actual_start) >= 600.0
     ):
-        late_target = max(actual_start + 700.0, min(last_cue_sec - 150.0, last_cue_sec * 0.65))
+        rem_span = last_cue_sec - actual_start
+        late_target = max(actual_start + 450.0, min(last_cue_sec - 120.0, actual_start + (rem_span * 0.65)))
         w2_start, w2_sec = choose_probe_window(cues, seek_offset=late_target, window_sec=65.0)
-        if (w2_start - actual_start) >= 480.0:
-            res2, actual_w2 = _run_probe_window(w2_start, w2_sec)
+        if (w2_start - actual_start) >= 360.0:
+            est_dt = w2_start - actual_start
+            w2_max_shift = max(float(max_shift_sec), min(180.0, (est_dt * 0.065) + abs(float(res.get('offset') or 0.0)) + 15.0))
+            res2, actual_w2 = _run_probe_window(w2_start, w2_sec, win_max_shift=w2_max_shift)
             dt_win = actual_w2 - actual_start
-            if res2.get('ok') and (res2.get('confident') or res2.get('in_sync')) and dt_win >= 480.0:
+            if res2.get('ok') and (res2.get('confident') or res2.get('in_sync')) and dt_win >= 360.0:
                 drift = float(res2.get('offset') or 0.0) - float(res.get('offset') or 0.0)
                 rate = drift / dt_win
                 # Only treat statistically meaningful drift (> 30 ms/min and <= 8% speed delta)
@@ -949,17 +950,26 @@ def fit_linear_drift(samples):
     if denom <= 1e-6:
         return None
     slope = sum((t - t_mean) * (o - o_mean) for t, o in zip(ts, offs)) / denom
-    if abs(slope) < 0.0005 or abs(slope) > 0.08:
+    if abs(slope) < 0.0005 or abs(slope) > 0.06:
         return None
     mid_idx = len(ordered) // 2
     first_half_mean = sum(offs[:mid_idx]) / float(mid_idx)
     second_half_mean = sum(offs[mid_idx:]) / float(len(offs) - mid_idx)
     half_delta = second_half_mean - first_half_mean
-    if (half_delta * slope) <= 0.0 or abs(half_delta) < 0.12:
+    is_short_or_sparse = (len(ordered) < 6 or span < 240.0)
+    min_half_delta = 0.18 if is_short_or_sparse else 0.14
+    if (half_delta * slope) <= 0.0 or abs(half_delta) < min_half_delta:
         return None
-    # Verify residuals stay tightly linear (< 0.45s max residual)
+    # Verify residuals and R^2 stay tightly linear across checkpoints
     residuals = [abs(o - (o_mean + slope * (t - t_mean))) for t, o in zip(ts, offs)]
-    if max(residuals) > 0.45:
+    max_res_limit = 0.25 if is_short_or_sparse else 0.35
+    if max(residuals) > max_res_limit:
+        return None
+    ss_tot = sum((o - o_mean) ** 2 for o in offs)
+    ss_res = sum(r * r for r in residuals)
+    r2 = 1.0 - (ss_res / max(ss_tot, 1e-9))
+    min_r2 = 0.88 if is_short_or_sparse else 0.82
+    if r2 < min_r2:
         return None
     return {
         'drift_sec_per_sec': round(slope, 6),
@@ -1017,11 +1027,13 @@ class LiveSubSyncMonitor:
         self._stop = threading.Event()
         self._force_ev = threading.Event()
         self._inbox_lock = threading.Lock()
-        self._raw_inbox = deque(maxlen=160)
+        self._raw_inbox = deque(maxlen=2048)
 
         self._ring = bytearray()
+        self._pcm_rem = bytearray()
         self._ring_start_pts = None
         self._ring_end_pts = None
+        self._next_raw_pts = None
         self._last_check_mono = 0.0
         self._loaded_sub_path = ''
         self._loaded_sub_mtime = None
@@ -1077,7 +1089,10 @@ class LiveSubSyncMonitor:
         if self.config_path is None or not self.config_path.is_file():
             return None
         try:
-            return json.loads(self.config_path.read_text(encoding='utf-8'))
+            st = self.config_path.stat()
+            cfg = json.loads(self.config_path.read_text(encoding='utf-8'))
+            self._last_cfg_mtime_ns = st.st_mtime_ns
+            return cfg
         except Exception:
             return None
 
@@ -1115,25 +1130,70 @@ class LiveSubSyncMonitor:
         if not batch:
             return
         bytes_per_8k_sec = 8000 * 2
+        sr = max(8000, int(self.sample_rate or 48000))
+        ch = max(1, int(self.channels or 2))
+        step_frames = max(1, int(round(sr / 8000.0)))
+        raw_frame_bytes = ch * 2
+        block_bytes = step_frames * raw_frame_bytes
+        raw_bps = float(sr * raw_frame_bytes)
         max_bytes = int(self.max_window_sec * bytes_per_8k_sec)
         for pts_sec, raw_pcm in batch:
-            pcm8k = pcm_to_8k_mono(raw_pcm, sample_rate=self.sample_rate, channels=self.channels)
-            if not pcm8k:
+            if not raw_pcm:
                 continue
-            chunk_dur = len(pcm8k) / float(bytes_per_8k_sec)
-            if self._ring_start_pts is None or abs(pts_sec - (self._ring_end_pts or 0.0)) > 2.0:
+            if (
+                self._ring_start_pts is None
+                or self._next_raw_pts is None
+                or abs(pts_sec - self._next_raw_pts) > 2.0
+            ):
                 self._ring.clear()
+                self._pcm_rem.clear()
                 self._ring_start_pts = pts_sec
-                self._ring_end_pts = pts_sec + chunk_dur
+                self._ring_end_pts = pts_sec
+                self._next_raw_pts = pts_sec
             else:
-                self._ring_end_pts += chunk_dur
-            self._ring.extend(pcm8k)
-            if len(self._ring) > max_bytes:
-                trim = len(self._ring) - max_bytes
-                trim -= (trim % 2)
-                if trim > 0:
-                    del self._ring[:trim]
-                    self._ring_start_pts += trim / float(bytes_per_8k_sec)
+                gap = pts_sec - self._next_raw_pts
+                if gap > 0.025:
+                    pad_bytes = int(round(gap * raw_bps))
+                    pad_bytes -= (pad_bytes % raw_frame_bytes)
+                    if pad_bytes > 0:
+                        self._pcm_rem.extend(b'\x00' * pad_bytes)
+                        self._next_raw_pts += pad_bytes / raw_bps
+                elif gap < -0.025:
+                    ring_raw_end = self._next_raw_pts - (len(self._pcm_rem) / raw_bps)
+                    self._pcm_rem.clear()
+                    skip_bytes = int(round(max(0.0, ring_raw_end - pts_sec) * raw_bps))
+                    skip_bytes -= (skip_bytes % raw_frame_bytes)
+                    if skip_bytes >= len(raw_pcm):
+                        continue
+                    if skip_bytes > 0:
+                        raw_pcm = raw_pcm[skip_bytes:]
+                        pts_sec += skip_bytes / raw_bps
+
+            if self._pcm_rem:
+                self._pcm_rem.extend(raw_pcm)
+                buf = bytes(self._pcm_rem)
+                usable = len(buf) - (len(buf) % block_bytes)
+                if usable > 0:
+                    pcm8k = pcm_to_8k_mono(buf[:usable], sample_rate=sr, channels=ch)
+                    self._pcm_rem = bytearray(buf[usable:])
+                else:
+                    pcm8k = b''
+            else:
+                usable = len(raw_pcm) - (len(raw_pcm) % block_bytes)
+                pcm8k = pcm_to_8k_mono(raw_pcm[:usable], sample_rate=sr, channels=ch) if usable > 0 else b''
+                if usable < len(raw_pcm):
+                    self._pcm_rem = bytearray(raw_pcm[usable:])
+
+            self._next_raw_pts = pts_sec + (len(raw_pcm) / raw_bps)
+            if pcm8k:
+                self._ring.extend(pcm8k)
+                self._ring_end_pts = self._next_raw_pts - (len(self._pcm_rem) / raw_bps)
+                if len(self._ring) > max_bytes:
+                    trim = len(self._ring) - max_bytes
+                    trim -= (trim % 2)
+                    if trim > 0:
+                        del self._ring[:trim]
+                        self._ring_start_pts += trim / float(bytes_per_8k_sec)
 
     def _write_status(self, payload):
         self._last_status = payload
@@ -1144,14 +1204,33 @@ class LiveSubSyncMonitor:
                 pass
 
     def _apply_normalization(self, cfg, *, new_offset, new_drift, new_anchor):
-        if self.config_path is None:
+        if self.config_path is None or not self.config_path.is_file():
             return False
-        updated = dict(cfg)
+        try:
+            cur_st = self.config_path.stat()
+            disk_cfg = json.loads(self.config_path.read_text(encoding='utf-8'))
+        except Exception:
+            return False
+        expected_mtime = getattr(self, '_last_cfg_mtime_ns', None)
+        if (
+            str(disk_cfg.get('subtitle_path') or '').strip() != str(cfg.get('subtitle_path') or '').strip()
+            or int(disk_cfg.get('cfg_rev') or 0) != int(cfg.get('cfg_rev') or 0)
+            or abs(float(disk_cfg.get('base_sec') or 0.0) - float(cfg.get('base_sec') or 0.0)) >= 0.05
+            or bool(disk_cfg.get('manual_override'))
+            or (expected_mtime is not None and cur_st.st_mtime_ns != expected_mtime)
+        ):
+            return False
+        updated = dict(disk_cfg)
         updated['subtitle_offset'] = round(max(-30.0, min(30.0, float(new_offset))), 2)
         updated['drift_sec_per_sec'] = round(clamp_drift_rate(new_drift), 6)
         updated['drift_anchor_sec'] = round(float(new_anchor or 0.0), 3)
+        updated['cfg_rev'] = int(disk_cfg.get('cfg_rev') or 0) + 1
         try:
             _atomic_write_json(self.config_path, updated)
+            try:
+                self._last_cfg_mtime_ns = self.config_path.stat().st_mtime_ns
+            except Exception:
+                pass
             if self.state is not None:
                 self.state.sub_gen = int(self.state.sub_gen) + 1
             return True
@@ -1177,7 +1256,8 @@ class LiveSubSyncMonitor:
         same_route = bool(cfg.get('same_route'))
         auto_normalize = bool(cfg.get('auto_normalize', True))
 
-        abs_start_sec = base_sec + float(self._ring_start_pts)
+        epoch_off = max(0.0, float(getattr(self.state, 'epoch_pts_sec', 0.0) or 0.0)) if self.state is not None else 0.0
+        abs_start_sec = base_sec + max(0.0, float(self._ring_start_pts) - epoch_off)
         abs_mid_sec = abs_start_sec + (dur * 0.5)
         disp_cues = shift_cues_by_transform(
             cues,
@@ -1328,11 +1408,11 @@ class LiveSubSyncMonitor:
             self._consec_desync_count = 0
             self._last_desync_residual = 0.0
 
-        min_auto_thresh = 1.1 if same_route else 0.7
+        min_auto_thresh = 0.65 if same_route else 0.6
         strong_peak = (
             z_val >= 3.3
             and bool(cor.get('half_consensus', False))
-            and abs(residual) >= 0.9
+            and abs(residual) >= 0.75
         )
         consistent_desync = (self._consec_desync_count >= 2 and abs(residual) >= min_auto_thresh)
         should_normalize = (

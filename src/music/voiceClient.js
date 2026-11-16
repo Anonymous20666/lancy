@@ -64,7 +64,7 @@ export class VoiceClient {
   }
   waitEvent(signal) { return this.request('/events',{timeoutMs:25000,signal}); }
   checkHealth() { return this.request('/health', { timeoutMs: 1500 }); }
-  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, remote_proxy:Boolean(opts.remoteProxy), subtitle_path:opts.subtitlePath || null, subtitle_offset:Number.isFinite(Number(opts.subtitleOffset)) ? Number(opts.subtitleOffset) : 0, subtitle_same_route:Boolean(opts.subtitleSameRoute), is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), video_quality:String(opts.videoQuality || process.env.VOICE_VIDEO_QUALITY || 'HD_720p'), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, start_seconds:Number.isFinite(Number(opts.startSeconds)) && Number(opts.startSeconds) > 0 ? Number(opts.startSeconds) : 0, vc_title:opts.vcTitle ? String(opts.vcTitle).slice(0, 64) : undefined, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')), volume:Number.isFinite(Number(opts.volume)) ? Number(opts.volume) : 100, ...(opts.streamMode ? { stream_mode: String(opts.streamMode) } : {}), ...(opts.preferredAudioLang ? { preferred_audio_lang: String(opts.preferredAudioLang) } : {}), ...(opts.rejectDub !== undefined ? { reject_dub: Boolean(opts.rejectDub) } : {}), ...(opts.messagesEnabled !== undefined ? { messages_enabled: Boolean(opts.messagesEnabled) } : {}) }, timeoutMs:110000 }); }
+  async play(chatId, streamUrl, opts = {}) { await this.ensureDaemon(); return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, remote_proxy:Boolean(opts.remoteProxy), subtitle_path:opts.subtitlePath || null, subtitle_offset:Number.isFinite(Number(opts.subtitleOffset)) ? Number(opts.subtitleOffset) : 0, subtitle_same_route:Boolean(opts.subtitleSameRoute), ...(opts.subtitleRenderScreen !== undefined ? { subtitle_render_screen: Boolean(opts.subtitleRenderScreen) } : {}), ...(Number.isFinite(Number(opts.subDriftSecPerSec)) && Number(opts.subDriftSecPerSec) !== 0 ? { sub_drift_sec_per_sec: Number(opts.subDriftSecPerSec) } : {}), ...(Number.isFinite(Number(opts.subDriftAnchorSec)) && Number(opts.subDriftAnchorSec) > 0 ? { sub_drift_anchor_sec: Number(opts.subDriftAnchorSec) } : {}), ...(opts.subtitleManualOverride !== undefined ? { subtitle_manual_override: Boolean(opts.subtitleManualOverride) } : {}), is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), video_quality:String(opts.videoQuality || process.env.VOICE_VIDEO_QUALITY || 'HD_720p'), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, start_seconds:Number.isFinite(Number(opts.startSeconds)) && Number(opts.startSeconds) > 0 ? Number(opts.startSeconds) : 0, vc_title:opts.vcTitle ? String(opts.vcTitle).slice(0, 64) : undefined, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')), volume:Number.isFinite(Number(opts.volume)) ? Number(opts.volume) : 100, ...(opts.streamMode ? { stream_mode: String(opts.streamMode) } : {}), ...(opts.preferredAudioLang ? { preferred_audio_lang: String(opts.preferredAudioLang) } : {}), ...(opts.rejectDub !== undefined ? { reject_dub: Boolean(opts.rejectDub) } : {}), ...(opts.messages_enabled !== undefined ? { messages_enabled: Boolean(opts.messages_enabled) } : (opts.messagesEnabled !== undefined ? { messages_enabled: Boolean(opts.messagesEnabled) } : {})) }, timeoutMs:110000 }); }
   control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 65000 : op === 'resume' ? 35000 : op === 'subcheck' ? 30000 : 20000 }); }
   sendCallMessage(id, text, more = {}) { return this.request('/call/message', { method:'POST', body:{ chat_id:Number(id), text:String(text || ''), ...more }, timeoutMs:12000 }); }
   updateCallSettings(id, settings = {}) { return this.request('/call/settings', { method:'POST', body:{ chat_id:Number(id), ...settings }, timeoutMs:12000 }); }
@@ -76,7 +76,14 @@ export class VoiceClient {
   async setup(id, stage, options = {}) { await this.ensureDaemon();return this.request('/destination/setup',{method:'POST',body:{chat_id:Number(id),stage,...options},timeoutMs:65000}); }
   idle(id) { return this.control('idle', id); }
   setVolume(id, volume) { return this.control('volume', id, { volume:Number(volume) }); }
-  setSubtitle(id, subtitlePath, { subtitleOffset = null, subtitleSameRoute = null, manualOverride = null } = {}) {
+  setSubtitle(id, subtitlePath, {
+    subtitleOffset = null,
+    subtitleSameRoute = null,
+    manualOverride = null,
+    subtitleRenderScreen = null,
+    driftRate = null,
+    driftAnchor = null
+  } = {}) {
     const payload = { subtitle_path: subtitlePath || null };
     if (subtitleOffset !== null && subtitleOffset !== undefined && Number.isFinite(Number(subtitleOffset))) {
       payload.subtitle_offset = Number(subtitleOffset);
@@ -86,6 +93,15 @@ export class VoiceClient {
     }
     if (manualOverride !== null && manualOverride !== undefined) {
       payload.subtitle_manual_override = Boolean(manualOverride);
+    }
+    if (subtitleRenderScreen !== null && subtitleRenderScreen !== undefined) {
+      payload.subtitle_render_screen = Boolean(subtitleRenderScreen);
+    }
+    if (driftRate !== null && driftRate !== undefined && Number.isFinite(Number(driftRate))) {
+      payload.sub_drift_sec_per_sec = Number(driftRate);
+    }
+    if (driftAnchor !== null && driftAnchor !== undefined && Number.isFinite(Number(driftAnchor))) {
+      payload.sub_drift_anchor_sec = Number(driftAnchor);
     }
     return this.control('subtitle', id, payload);
   }

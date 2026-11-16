@@ -646,7 +646,7 @@ export function createNsfwScreen({ app }) {
       [NSFW_CATEGORIES.REAL_WALLPAPERS]: ['asian model', 'brunette', 'blonde', 'latina', 'glamour', 'boudoir', 'baddie'],
       [NSFW_CATEGORIES.REAL_CLIPS]: ['asian', 'latina', 'brunette', 'teaser', 'glamour'],
       [NSFW_CATEGORIES.REAL_FULL_VIDEOS]: ['asian', 'latina', 'blonde', 'baddie', 'brunette'],
-      [NSFW_CATEGORIES.ADULT_MOVIES]: ['romantic', 'passionate', 'couples', 'full movie', 'brunette'],
+      [NSFW_CATEGORIES.ADULT_MOVIES]: ['romantic', 'passionate', 'couples', 'full movie', 'pirates stagnetti', 'erotic thriller', 'femalien', 'machine gunner', 'jesse jane'],
       [NSFW_CATEGORIES.XVIDEOS_VIDEO]: ['trending', 'asian', 'latina', 'brunette', 'blonde', 'amateur'],
       [NSFW_CATEGORIES.PORNHUB_VIDEO]: ['trending', 'asian', 'latina', 'milf', 'lesbian', 'pov', '4k'],
       [NSFW_CATEGORIES.HENTAI_UNCENSORED]: ['tifa', 'tsunade', 'genshin', 'makima', 'yor forger', '2b', 'marin'],
@@ -1328,16 +1328,16 @@ export function createNsfwScreen({ app }) {
     ]);
     b.divider();
 
-    b.paragraph(rt.bold('🍿 Popular 18+ Feature Tags:'));
+    b.paragraph(rt.bold('🍿 Popular 18+ Feature Tags & Parodies:'));
     b.buttons([
-      richButton.callback('❤️ Romantic 18+', encodeCallback(id, 'amRun', 'romantic'), { style: 'primary' }),
-      richButton.callback('🔥 Passionate', encodeCallback(id, 'amRun', 'passionate'), { style: 'primary' }),
-      richButton.callback('💑 Couples', encodeCallback(id, 'amRun', 'couples'), { style: 'primary' })
+      richButton.callback('🏴‍☠️ Pirates / Parody', encodeCallback(id, 'amRun', 'pirates stagnetti'), { style: 'primary' }),
+      richButton.callback('🔥 Erotic Indie', encodeCallback(id, 'amRun', 'erotic thriller'), { style: 'primary' }),
+      richButton.callback('👽 Femalien / Sci-Fi', encodeCallback(id, 'amRun', 'femalien'), { style: 'primary' })
     ]);
     b.buttons([
       richButton.callback('🎬 Full Storyline', encodeCallback(id, 'amRun', 'full movie'), { style: 'primary' }),
-      richButton.callback('💋 Brunette HD', encodeCallback(id, 'amRun', 'brunette'), { style: 'primary' }),
-      richButton.callback('💋 Asian HD', encodeCallback(id, 'amRun', 'asian'), { style: 'primary' })
+      richButton.callback('❤️ Romantic 18+', encodeCallback(id, 'amRun', 'romantic'), { style: 'primary' }),
+      richButton.callback('💑 Couples HD', encodeCallback(id, 'amRun', 'couples'), { style: 'primary' })
     ]);
     b.divider();
 
@@ -1696,7 +1696,11 @@ export function createNsfwScreen({ app }) {
       const more = await searchAdultMovies({
         query: session.query,
         page: targetApiPage,
-        limit: 15
+        limit: 15,
+        sort: session.sort || 'relevance',
+        artist: session.artist || null,
+        minMinutes: 15,
+        lazy: true
       }).catch(() => ({ results: [] }));
       moreResults = more?.results || [];
     }
@@ -1749,7 +1753,13 @@ export function createNsfwScreen({ app }) {
     const rows = slice.map((item, i) => {
       const absIdx = start + i;
       const checked = session.selectedIds.has(absIdx) ? '☑' : '☐';
-      const srcTag = item.sourceKey === 'pornhub' ? '🟠' : item.sourceKey === 'xvideos' ? '🔥' : '🎬';
+      const srcTag = item.sourceKey === 'pornhub' ? '🟠'
+        : item.sourceKey === 'xvideos' ? '🔥'
+        : item.sourceKey === 'fullxcinema' ? '🎞'
+        : item.sourceKey === 'pandamovies' ? '🐼'
+        : item.sourceKey === 'xhamster' ? '🐹'
+        : item.sourceKey === 'porntrex' ? '🦖'
+        : '🎬';
       return [
         `${checked} ${absIdx + 1}.`,
         `${srcTag} ${truncate(item.fullTitle || item.title || '18+ Video', 36)}`,
@@ -2082,7 +2092,7 @@ export function createNsfwScreen({ app }) {
         lazy: true
       });
     } else {
-      res = await searchAdultMovies({ query: cleanQ, page, limit: 15 });
+      res = await searchAdultMovies({ query: cleanQ, page, limit: 15, artist, minMinutes: 15, lazy: true });
     }
 
     const items = res?.results || [];

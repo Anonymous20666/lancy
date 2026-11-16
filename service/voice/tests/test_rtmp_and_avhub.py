@@ -556,6 +556,41 @@ class BridgeRtmpLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(discard_after, discard_before + 1)
         self.assertEqual(self.bridge.accounts['main']['leases'], set())
 
+    async def test_paused_rtmp_seek_option_a_restarts_decoder_at_target_and_keeps_paused(self):
+        chat = -100123
+        await self.bridge.setup({
+            'chat_id': chat,
+            'stage': 'start',
+            'create': True,
+            'stream_mode': 'rtmp',
+            'title': 'Paused Seek Check',
+        })
+        await self.bridge.play({
+            'chat_id': chat,
+            'stream_url': str(self.mp4),
+            'playback_id': 'pb-rtmp-paused-seek',
+            'duration_seconds': 60,
+            'video': True,
+            'stream_mode': 'rtmp',
+            'subtitle_path': str(self.srt),
+        })
+        pause_res = await self.bridge.control('pause', {'chat_id': chat})
+        self.assertEqual(pause_res['status'], 'paused')
+
+        spawns_before = len(self.spawned)
+        seek_res = await self.bridge.control('seek', {'chat_id': chat, 'seconds': 35})
+        self.assertTrue(seek_res['ok'])
+        self.assertEqual(seek_res['status'], 'paused')
+        self.assertAlmostEqual(float(seek_res['position_seconds']), 35.0, places=2)
+        self.assertGreater(len(self.spawned), spawns_before)
+        last_cmd = ' '.join(self.spawned[-1][1])
+        self.assertIn('35.000', last_cmd)
+        call = self.bridge.calls[chat]
+        self.assertAlmostEqual(float(call['offset']), 35.0, places=2)
+        metrics = MODULE._read_sync_metrics(call['av_sync_id'])
+        self.assertIsNotNone(metrics)
+        self.assertTrue(metrics['paused'])
+
 
 class RtmpHubRealFlvE2ETests(unittest.TestCase):
     def test_rtmp_hub_real_flv_hd_no_clipping_and_live_sub_hot_reload(self):
@@ -767,10 +802,12 @@ class RtmpHubRealFlvE2ETests(unittest.TestCase):
                     return sum(vals) / max(1, len(vals))
 
                 unpaused_y = _mean_center_y(0.4)
-                paused_samples = [_mean_center_y(t) for t in (2.1, 2.4, 2.7, 3.0, 3.3) if t < total_dur - 0.2]
+                paused_samples = [_mean_center_y(t) for t in (0.9, 1.15, 1.4, 1.65, 1.9, 2.15, 2.4, 2.7, 3.0, 3.3) if t < total_dur - 0.2]
+                resumed_y = _mean_center_y(max(0.5, total_dur - 0.5))
                 min_paused_y = min(paused_samples)
                 self.assertGreater(unpaused_y, 150.0)
                 self.assertLess(min_paused_y, unpaused_y - 30.0, msg=f'Expected Pause HUD dim vs live: unpaused={unpaused_y:.1f} samples={paused_samples}')
+                self.assertGreater(resumed_y, 150.0, msg=f'Expected resume back to live brightness: resumed={resumed_y:.1f}')
             finally:
                 cfg_path.unlink(missing_ok=True)
                 shm_path.unlink(missing_ok=True)
@@ -787,6 +824,72 @@ class RtmpHubRealFlvE2ETests(unittest.TestCase):
         finally:
             MODULE._EXPECTED_PPID = orig_expected
             MODULE._ENV_PARENT_PID = orig_env
+
+    def test_video_optimization_flags_and_interactive_resume_recovery(self):
+        # 1. rewrite_video_ffmpeg_command updates output -r after -i to matched cinema fps & skips scale when dimensions match
+        rewritten = MODULE.rewrite_video_ffmpeg_command(
+            'ffmpeg -r 25 -i /tmp/movie.mp4 -f rawvideo -r 30 -pix_fmt yuv420p pipe:1',
+            width=1280,
+            height=720,
+            fps=24,
+            skip_scale=True,
+        )
+        tokens = shlex.split(rewritten)
+        i_idx = tokens.index('-i')
+        in_r_idx = tokens.index('-r')
+        self.assertLess(in_r_idx, i_idx)
+        self.assertEqual(tokens[in_r_idx + 1], '25')
+        out_r_idx = tokens.index('-r', i_idx + 2)
+        self.assertEqual(tokens[out_r_idx + 1], '24')
+        self.assertIn('setsar=1', rewritten)
+        self.assertNotIn('scale=1280:720', rewritten)
+
+        # 2. rtmp_streamer skips redundant scale when scale_needed=False & uses superfast for 1080p
+        dec_args = rtmp_streamer.build_rtmp_decoder_args('/tmp/movie.mp4', width=1920, height=1080, fps=24, scale_needed=False)
+        vf_val = dec_args[dec_args.index('-vf') + 1]
+        self.assertNotIn('scale=', vf_val)
+        self.assertIn('setsar=1', vf_val)
+        enc_1080 = rtmp_streamer.build_rtmp_encoder_args('LANCY_RTMP_TARGET', width=1920, height=1080, fps=24, video_quality='FHD_1080p')
+        self.assertEqual(enc_1080[enc_1080.index('-preset') + 1], 'superfast')
+
+        # 3. Interactive VC resume transparently rebuilds stream when _hub_proc exited or engine.resume fails
+        async def _run():
+            with tempfile.TemporaryDirectory() as td:
+                bridge = MODULE.Bridge(td, factory=lambda alias, sess: None)
+                bridge.ensure_publisher = AsyncMock(return_value=True)
+                rebuilt = []
+
+                async def _fake_stream(a, chat, call):
+                    rebuilt.append((chat, call.get('offset'), call.get('status')))
+                    call['_hub_proc'] = types.SimpleNamespace(returncode=None)
+
+                bridge.stream = _fake_stream
+                engine = types.SimpleNamespace(resume=AsyncMock(side_effect=RuntimeError('MEDIA_INVALID')))
+                acct = {'alias': 'main', 'engine': engine, 'client': None}
+                bridge.accounts['main'] = acct
+                call_dead_hub = {
+                    'alias': 'main',
+                    'status': 'paused',
+                    'path': '/tmp/movie.mp4',
+                    'offset': 10.0,
+                    'last_known_position': 425.0,
+                    'last_progress': time.monotonic(),
+                    'stream_mode': 'interactive',
+                    '_hub_proc': types.SimpleNamespace(returncode=1),
+                }
+                bridge.calls[-10077] = call_dead_hub
+                res1 = await bridge.control('resume', {'chat_id': -10077})
+                self.assertTrue(res1['ok'])
+                self.assertEqual(rebuilt[-1], (-10077, 425.0, 'playing'))
+
+                call_dead_hub['_hub_proc'] = None
+                call_dead_hub['status'] = 'paused'
+                call_dead_hub['last_known_position'] = 512.0
+                res2 = await bridge.control('resume', {'chat_id': -10077})
+                self.assertTrue(res2['ok'])
+                self.assertEqual(rebuilt[-1], (-10077, 512.0, 'playing'))
+
+        asyncio.run(_run())
 
 
 if __name__ == '__main__':

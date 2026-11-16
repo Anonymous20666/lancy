@@ -27,17 +27,17 @@ SHM_DIR = Path('/dev/shm') if Path('/dev/shm').is_dir() else Path('/tmp')
 PCM_BYTES_PER_SEC = 48000 * 2 * 2  # 192,000 B/s (48kHz stereo s16le)
 AUDIO_PREBUFFER_BYTES = 7680       # 40ms of PCM before startup release
 BARRIER_TIMEOUT_SEC = 20.0
-VIDEO_CATCHUP_LAG_SEC = 0.160
+VIDEO_CATCHUP_LAG_SEC = 0.280
 VIDEO_TARGET_LAG_SEC = 0.050
-AUDIO_MAX_LEAD_SEC = 0.100
+AUDIO_MAX_LEAD_SEC = 0.165
 AUDIO_RESUME_LEAD_SEC = 0.045
-VIDEO_MAX_LEAD_SEC = 0.100
+VIDEO_MAX_LEAD_SEC = 0.155
 VIDEO_RESUME_LEAD_SEC = 0.045
 PTS_DISCONTINUITY_SEC = 0.035
 SYNC_STARVATION_SEC = 0.280
 STALL_HEARTBEAT_TIMEOUT_SEC = 12.0
 F_SETPIPE_SZ = 1031
-TARGET_AUDIO_PIPE_BYTES = 8192     # 2 pages (~42ms PCM) for minimal WebRTC audio buffering
+TARGET_AUDIO_PIPE_BYTES = 32768    # ~170ms PCM (>1x 100ms ntgcalls burst) without starving readers
 TIMED_PKT_MAGIC = b'LNF1'
 TIMED_PKT_STRUCT = struct.Struct('<4sqQI')
 _FIONREAD_BUF = ctypes.c_int(0)
@@ -68,6 +68,7 @@ class SyncState(ctypes.Structure):
         ('epoch_mono', ctypes.c_double),
         ('sync_flags', ctypes.c_int32),    # bit 1=audio_syncing, bit 2=video_syncing, bit 4=paused_hud_once
         ('skew_ms', ctypes.c_int32),       # signed (audio_sec - video_sec) in milliseconds
+        ('pipeline_delay_sec', ctypes.c_double),
     ]
 
 
@@ -345,13 +346,24 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
     t_reader.start()
 
     try:
+        silence_since_last_real = 0
+
+        def _update_audio_clock(end_sec):
+            unread_b = _pipe_unread_bytes(out_fd)
+            real_unread_b = max(0, unread_b - silence_since_last_real)
+            val = max(0.0, end_sec - (real_unread_b / float(bps)))
+            if val >= float(state.audio_sec or 0.0):
+                state.audio_sec = val
+            return float(state.audio_sec)
+
         last_emitted_end = first_pts
         for seg_pts, seg_body in init_chunks:
             _write_all(out, seg_body)
+            silence_since_last_real = 0
             if sub_monitor is not None:
                 sub_monitor.feed_pcm(seg_pts, seg_body)
             last_emitted_end = seg_pts + (len(seg_body) / float(bps))
-        state.audio_sec = max(0.0, last_emitted_end - (_pipe_unread_bytes(out_fd) / float(bps)))
+        _update_audio_clock(last_emitted_end)
         state.audio_hb_mono = time.monotonic()
 
         while not stop_ev.is_set():
@@ -375,8 +387,8 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                                 dq_wait_started = now_m
                             if proc.poll() is None:
                                 state.audio_hb_mono = now_m
-                            state.audio_sec = max(0.0, last_emitted_end - (_pipe_unread_bytes(out_fd) / float(bps)))
-                            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
+                            cur_a_clk = _update_audio_clock(last_emitted_end)
+                            state.skew_ms = int(round((cur_a_clk - float(state.video_sec)) * 1000.0))
                             need_starve_hold = (
                                 int(state.video_state) == 1
                                 and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC
@@ -393,7 +405,9 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                     if int(state.video_state) == 1 and dq_wait_started is not None and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC:
                         state.sync_flags = int(state.sync_flags) | 1
                         if (now_m - last_sync_silence) >= 0.020:
+                            pre_unread = _pipe_unread_bytes(out_fd)
                             _write_all(out, silence_buf)
+                            silence_since_last_real = min(silence_since_last_real, pre_unread) + len(silence_buf)
                             last_sync_silence = time.monotonic()
                             state.audio_hb_mono = last_sync_silence
                 with cond:
@@ -420,13 +434,12 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                         _wait_if_paused(state, stop_ev)
                         wait_started = None
                         continue
-                    unread_s = _pipe_unread_bytes(out_fd) / float(bps)
-                    consumed_a = max(0.0, last_emitted_end - unread_s)
-                    state.audio_sec = consumed_a
+                    consumed_a = _update_audio_clock(last_emitted_end)
                     now_m = time.monotonic()
                     if proc.poll() is None:
                         state.audio_hb_mono = now_m
-                    cur_a = max(consumed_a, pkt_end - unread_s)
+                    unread_real_s = max(0, _pipe_unread_bytes(out_fd) - silence_since_last_real) / float(bps)
+                    cur_a = max(consumed_a, pkt_end - unread_real_s)
                     cur_v = float(state.video_sec)
                     state.skew_ms = int(round((cur_a - cur_v) * 1000.0))
                     limit = AUDIO_MAX_LEAD_SEC if wait_started is None else AUDIO_RESUME_LEAD_SEC
@@ -438,7 +451,9 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                         wait_started = now_m
                     if v_syncing or (now_m - wait_started) >= SYNC_STARVATION_SEC:
                         if (now_m - last_sync_silence) >= 0.020:
+                            pre_unread = _pipe_unread_bytes(out_fd)
                             _write_all(out, silence_buf)
+                            silence_since_last_real = min(silence_since_last_real, pre_unread) + len(silence_buf)
                             last_sync_silence = time.monotonic()
                             state.audio_hb_mono = last_sync_silence
                     time.sleep(0.005)
@@ -450,12 +465,13 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
             if stop_ev.is_set():
                 break
             _write_all(out, pkt_body)
+            silence_since_last_real = 0
             if sub_monitor is not None:
                 sub_monitor.feed_pcm(pkt_pts, pkt_body)
             last_emitted_end = pkt_end
-            state.audio_sec = max(0.0, last_emitted_end - (_pipe_unread_bytes(out_fd) / float(bps)))
+            cur_a_clk = _update_audio_clock(last_emitted_end)
             state.audio_hb_mono = time.monotonic()
-            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
+            state.skew_ms = int(round((cur_a_clk - float(state.video_sec)) * 1000.0))
     except BrokenPipeError:
         stop_ev.set()
         with cond:
@@ -714,6 +730,7 @@ class SubOverlay:
         self._sub_offset = 0.0
         self._drift_rate = 0.0
         self._drift_anchor = 0.0
+        self._render_screen = True
         self._hud_key = None
         self._refresh(force=True)
 
@@ -752,7 +769,8 @@ class SubOverlay:
         self._sub_offset = float(cfg.get('subtitle_offset') or 0.0)
         self._drift_rate = self._sa.clamp_drift_rate(cfg.get('drift_sec_per_sec') or 0.0)
         self._drift_anchor = float(cfg.get('drift_anchor_sec') or 0.0)
-        enabled = bool(cfg.get('enabled', False))
+        self._render_screen = bool(cfg.get('render_screen', True))
+        enabled = bool(cfg.get('enabled', False)) and self._render_screen
         sub_path = str(cfg.get('subtitle_path') or '').strip()
         if not enabled or not sub_path:
             self._active = False
@@ -780,12 +798,17 @@ class SubOverlay:
 
         self._active = bool(self._loaded_spans)
 
+    def _rel_pts_adjusted(self, rel_pts_sec):
+        epoch = max(0.0, float(getattr(self.state, 'epoch_pts_sec', 0.0) or 0.0)) if self.state is not None else 0.0
+        return max(0.0, float(rel_pts_sec) - epoch)
+
     def render(self, frame_buf, rel_pts_sec):
         self._refresh()
         if not self._active or not self._ctx or self._c_buf is None:
             return frame_buf
+        eff_rel = self._rel_pts_adjusted(rel_pts_sec)
         pts_ms = self._sa.map_media_sec_to_sub_ms(
-            self._base_sec + float(rel_pts_sec),
+            self._base_sec + eff_rel,
             subtitle_offset=self._sub_offset,
             drift_sec_per_sec=self._drift_rate,
             drift_anchor_sec=self._drift_anchor,
@@ -815,6 +838,7 @@ class SubOverlay:
         if hud_load is None or hud_render is None:
             return self.render(frame_buf, rel_pts_sec)
 
+        eff_rel = self._rel_pts_adjusted(rel_pts_sec)
         ctypes.memmove(self._c_buf, frame_buf, self.frame_bytes)
         c_ptr = ctypes.cast(self._c_buf, ctypes.c_void_p)
         if dim_fn is not None:
@@ -822,7 +846,7 @@ class SubOverlay:
             dim_fn(c_ptr, self.width, self.height, eff_dim)
         if self._active and self._sa is not None:
             pts_ms = self._sa.map_media_sec_to_sub_ms(
-                self._base_sec + float(rel_pts_sec),
+                self._base_sec + eff_rel,
                 subtitle_offset=self._sub_offset,
                 drift_sec_per_sec=self._drift_rate,
                 drift_anchor_sec=self._drift_anchor,
@@ -830,7 +854,7 @@ class SubOverlay:
             if pts_ms >= 0 and self._sa.has_active_cue_near(self._loaded_spans, pts_ms, margin_ms=40):
                 self._lib.sub_render_yuv420(self._ctx, c_ptr, self.width, self.height, pts_ms)
 
-        shown_sec = max(0.0, self._base_sec + float(rel_pts_sec))
+        shown_sec = max(0.0, self._base_sec + eff_rel)
         cache_key = (mode, int(shown_sec) if mode == 'paused' else 0, self.width, self.height)
         if cache_key != self._hud_key:
             ass_bytes, _ = _build_hud_ass_bytes(self.width, self.height, mode=mode, pos_sec=shown_sec)
@@ -845,6 +869,8 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
     default_dur = 1.0 / eff_fps
     first_pts, first_dur, first_frame = first_pkt if first_pkt is not None else (0.0, default_dur, b'')
     has_full = (len(first_frame) == frame_bytes)
+    if has_full:
+        state.epoch_pts_sec = max(0.0, float(first_pts)) if float(first_pts) >= 0.05 else 0.0
     state.video_hb_mono = time.monotonic()
     state.video_state = 1 if has_full else 2
 
@@ -854,6 +880,10 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
 
     out = sys.stdout.buffer
     out_fd = out.fileno()
+    try:
+        fcntl.fcntl(out_fd, F_SETPIPE_SZ, max(65536, min(524288, frame_bytes // 2)))
+    except Exception:
+        pass
     dq_maxlen = max(10, min(32, int(round(eff_fps))))
     dq = deque()
     cond = threading.Condition()
@@ -890,7 +920,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
     try:
         last_raw_frame = bytes(first_frame)
         last_raw_pts = max(0.0, first_pts)
-        hud_tick_interval = max(0.033, min(0.10, default_dur))
+        hud_tick_interval = max(0.025, min(0.10, default_dur))
 
         def _maybe_emit_paused_hud():
             if (int(state.sync_flags) & 4) == 0:
@@ -989,6 +1019,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
             if item_pts is None or stop_ev.is_set():
                 break
 
+            state.video_target_sec = item_pts
             wait_started = None
             try:
                 while not stop_ev.is_set() and int(state.audio_state) == 1:
@@ -1004,7 +1035,6 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                     a_starved = (int(state.sync_flags) & 1) != 0
                     if (item_pts - a_live) <= limit and not a_starved:
                         break
-                    state.video_target_sec = item_pts
                     state.waiting_mask = int(state.waiting_mask) | 2
                     now_m = time.monotonic()
                     if wait_started is None:
@@ -1083,6 +1113,10 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
 
     out = sys.stdout.buffer
     out_fd = out.fileno()
+    try:
+        fcntl.fcntl(out_fd, F_SETPIPE_SZ, max(65536, min(524288, frame_bytes // 2)))
+    except Exception:
+        pass
     frames_decoded = 1
     dq_maxlen = max(12, min(48, int(round(eff_fps * 1.5))))
     dq = deque()
@@ -1152,6 +1186,7 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
                 cond.notify_all()
 
             # Bidirectional lead clamp: if audio stalled or lagged behind, hold video until audio catches up
+            state.video_target_sec = item_sec
             wait_started = None
             try:
                 while not stop_ev.is_set() and int(state.audio_state) == 1:
@@ -1165,7 +1200,6 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
                     limit = VIDEO_MAX_LEAD_SEC if wait_started is None else VIDEO_RESUME_LEAD_SEC
                     if (item_sec - a_live) <= limit and (int(state.sync_flags) & 1) == 0:
                         break
-                    state.video_target_sec = item_sec
                     state.waiting_mask = int(state.waiting_mask) | 2
                     now_m = time.monotonic()
                     if wait_started is None:

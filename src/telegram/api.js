@@ -242,6 +242,59 @@ export class TelegramAPI {
     return this.call('sendRichMessage', { chat_id: chatId, rich_message: payload, ...extra }, { files });
   }
 
+  /** Bot API 10.3+: send an ephemeral rich notice/card to a single user inside a group/chat. */
+  sendEphemeralRichNotice(chatId, { receiverUserId, callbackQueryId = null, replaceCallbackQueryMessage = false } = {}, richMessage, extra = {}, files = null) {
+    const ephemeralParams = {};
+    if (receiverUserId !== undefined && receiverUserId !== null) {
+      ephemeralParams.receiver_user_id = Number(receiverUserId);
+    }
+    if (callbackQueryId) {
+      ephemeralParams.callback_query_id = String(callbackQueryId);
+    }
+    if (replaceCallbackQueryMessage) {
+      ephemeralParams.replace_callback_query_message = true;
+    }
+    return this.sendRichMessage(
+      chatId,
+      richMessage,
+      {
+        ephemeral_message_parameters: ephemeralParams,
+        ...extra
+      },
+      files
+    );
+  }
+
+  /** Bot API 10.3+: edit an ephemeral rich message for a single user. */
+  editEphemeralMessageText(chatId, receiverUserId, ephemeralMessageId, richMessage, extra = {}, files = null) {
+    let payload = richMessage;
+    if (typeof richMessage === 'string') {
+      payload = RichMessageBuilder.fromHtml(richMessage).toJSON();
+    } else if (richMessage && typeof richMessage.html === 'string') {
+      payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
+    }
+    return this.call(
+      'editEphemeralMessageText',
+      {
+        chat_id: chatId,
+        receiver_user_id: Number(receiverUserId),
+        ephemeral_message_id: Number(ephemeralMessageId),
+        rich_message: payload,
+        ...extra
+      },
+      { files }
+    );
+  }
+
+  /** Bot API 10.3+: delete an ephemeral message for a single user. */
+  deleteEphemeralMessage(chatId, receiverUserId, ephemeralMessageId) {
+    return this.call('deleteEphemeralMessage', {
+      chat_id: chatId,
+      receiver_user_id: Number(receiverUserId),
+      ephemeral_message_id: Number(ephemeralMessageId)
+    });
+  }
+
   /** Edit a message's rich content (Bot API 10.1+ rich_message param). */
   editMessageRich(chatId, messageId, richMessage, extra = {}, files = null) {
     let payload = richMessage;

@@ -303,6 +303,19 @@ export class CinemaVcAnnouncer {
     }
   }
 
+  isGlobalEnabled() {
+    const dbExplicit = this.db?.getSetting?.('cinema.announceEnabled', null);
+    if (typeof dbExplicit === 'boolean') return dbExplicit;
+    if (this.app?.settings?.get?.('music.cinemaAnnounceEnabled') === false) return false;
+    return true;
+  }
+
+  isGroupEnabled(chatId) {
+    const cid = Number(chatId);
+    if (!Number.isFinite(cid)) return true;
+    return this.db?.getSetting?.(`cinema.announceGroup.${cid}`, true) !== false;
+  }
+
   async onTrackStart({ chatId, track, session } = {}) {
     const cid = Number(chatId);
     if (!Number.isFinite(cid) || cid >= 0) return null;
@@ -314,10 +327,10 @@ export class CinemaVcAnnouncer {
       return { skipped: 'suppressed_resume' };
     }
 
-    if (this.app?.settings?.get?.('music.cinemaAnnounceEnabled') === false) {
+    if (!this.isGlobalEnabled()) {
       return { skipped: 'disabled_globally' };
     }
-    if (this.db?.getSetting?.(`cinema.announceGroup.${cid}`, true) === false) {
+    if (!this.isGroupEnabled(cid)) {
       return { skipped: 'disabled_for_group' };
     }
 

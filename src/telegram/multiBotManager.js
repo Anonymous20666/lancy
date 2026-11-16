@@ -20,6 +20,7 @@ import { createCloneScreen } from './screens/clone.js';
 import { createChannelPostScreen } from './screens/channelPost.js';
 import { createAutoPostScreen } from './screens/autoPost.js';
 import { createNsfwScreen } from './screens/nsfw.js';
+import { createMusicScreen } from './screens/music.js';
 
 const SCREEN_FACTORIES = [
   createDashboardScreen,
@@ -34,7 +35,8 @@ const SCREEN_FACTORIES = [
   createCloneScreen,
   createChannelPostScreen,
   createAutoPostScreen,
-  createNsfwScreen
+  createNsfwScreen,
+  createMusicScreen
 ];
 
 /**
@@ -166,7 +168,10 @@ export class MultiBotManager {
     cloneApp.telegram = {
       api,
       controller: null,
+      get sm() { return sm; },
       get botUsername() { return me.username || api.botUsername; },
+      get userScreenMessage() { return controller?.userScreenMessage; },
+      createContext: (...args) => controller?.createContext?.(...args),
       markMediaDeliveryMessage: (id) => controller?.markMediaDeliveryMessage?.(id),
       isMediaDeliveryMessage: (msg) => controller?.isMediaDeliveryMessage?.(msg),
       isMediaDeliveryMessageId: (id) => controller?.isMediaDeliveryMessageId?.(id)
@@ -210,6 +215,7 @@ export class MultiBotManager {
       screen.registerStateHandlers?.(sm);
       screen.registerStates?.(sm);
     }
+    cloneApp.screens = cloneScreens;
 
     controller = new TelegramController({
       api,
@@ -222,6 +228,7 @@ export class MultiBotManager {
       log: this.log.child({ clone: `@${me.username}` })
     });
     cloneApp.telegram.controller = controller;
+    controller.onAction('noop', () => {});
 
     await controller.start();
     this.runningBots.set(botRecord.id, { controller, api, botRecord });

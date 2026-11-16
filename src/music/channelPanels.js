@@ -1,8 +1,9 @@
 import { randomBytes } from 'node:crypto';
 import { KeyedLock, MusicError } from './model.js';
+import { resolveAppScreen } from './accounts.js';
 
 // Compact wire actions keep scoped callbacks below Telegram's 64-byte bound.
-export const PANEL_ACTIONS = ['player','previous','pause','resume','skip','seekby','queue','lyrics','volume','options','loop','shuffle','bass','accounts','pin','preview','stop','leave','qpage','lypage','clear','remove','setvol','selectaccount','seek','prompt','playnow','radio','rpage','rpick','rstart','roff','channels','retry','eq','voteskip','catmenu','catpick','genresub','infinact','aidj','submode','streammode','vcmsg','movie','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','voteset','setvotethresh','votequeue','launchpoll','downloadnow','downloadq','subsync','subtrack','subcheck','dlq','seekmenu','setseekstep'];
+export const PANEL_ACTIONS = ['player','previous','pause','resume','skip','seekby','queue','lyrics','volume','options','loop','shuffle','bass','accounts','pin','preview','stop','leave','qpage','lypage','clear','remove','setvol','selectaccount','seek','prompt','playnow','radio','rpage','rpick','rstart','roff','channels','retry','eq','voteskip','catmenu','catpick','genresub','infinact','aidj','submode','streammode','vcquality','vcmsg','movie','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','voteset','setvotethresh','votequeue','launchpoll','downloadnow','downloadq','subsync','subtrack','subcheck','dlq','seekmenu','setseekstep','switchsource'];
 const LOCAL = new Set(['destination','userId','botKey','screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom','overlayView','overlayAt','dlqTarget']);
 
 /** Many verified administrators' private views; one authoritative destination queue.
@@ -100,7 +101,7 @@ export class ChannelPanels {
       const shouldSendNew = Boolean(!p.screenMessageId || forceNew || ctx.forceNew || (ctx.message && !ctx.query));
       if (shouldSendNew) {
         const oldMsgId = p.screenMessageId;
-        const rich = this.app.screens.get('music').renderPlayer(state);
+        const rich = resolveAppScreen(this.app, 'music', { ctx, session: state }).renderPlayer(state);
         try {
           const sent = await api.sendRichMessage(p.playerChatId, rich);
           this.registerMessage(p.panelToken, sent.message_id);
@@ -120,7 +121,7 @@ export class ChannelPanels {
       if (!shouldSendNew) {
         const updated = await this.app.musicQueueManager.updatePlayerView(state, { forceEdit: true });
         if (!updated && !p.screenMessageId) {
-          const rich = this.app.screens.get('music').renderPlayer(state);
+          const rich = resolveAppScreen(this.app, 'music', { ctx, session: state }).renderPlayer(state);
           const sent = await api.sendRichMessage(p.playerChatId, rich);
           this.registerMessage(p.panelToken, sent.message_id);
           p.lastRender = JSON.stringify(rich);

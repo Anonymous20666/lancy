@@ -40,7 +40,7 @@ export class MovieSessions {
       mediaItem: s.mediaItem || null,
       playback: s.playback || null,
       seasons: Array.isArray(s.seasons) ? s.seasons : [],
-      seasonNumber: Number(s.seasonNumber || 1),
+      seasonNumber: s.seasonNumber == null ? 1 : Number(s.seasonNumber),
       seasonName: s.seasonName || 'Season 1',
       seasonOverview: s.seasonOverview || '',
       seasonPage: s.seasonPage || 0,
@@ -58,10 +58,12 @@ export class MovieSessions {
       dlKeptMessageIds: Array.isArray(s.dlKeptMessageIds) ? [...new Set(s.dlKeptMessageIds.map(Number))].slice(-80) : [],
       adultMode: s.adultMode || null,
       sourceMode: s.sourceMode === 'xvideos' ? 'xvideos' : 'movie',
+      xvSource: s.xvSource || 'xvideos',
       xvMode: s.xvMode || null,
       xvQuery: s.xvQuery || '',
       xvCat: s.xvCat || '',
       xvArtist: s.xvArtist || '',
+      xvStudio: s.xvStudio || '',
       xvSort: s.xvSort || 'relevance',
       xvDur: s.xvDur || 'all',
       xvQuality: s.xvQuality || '480p',
@@ -76,10 +78,15 @@ export class MovieSessions {
       xvTotalPages: Math.max(1, Number(s.xvTotalPages || 1)),
       xvCatPage: Number(s.xvCatPage || 0),
       xvArtistPage: Number(s.xvArtistPage || 0),
+      xvStudioPage: Number(s.xvStudioPage || 0),
       notice: s.notice || null,
       messageId: s.messageId || null,
       activeCardIds: Array.isArray(s.activeCardIds) ? s.activeCardIds.slice(-10) : [],
       promptMessageId: s.promptMessageId || null,
+      originMessageId: s.originMessageId || null,
+      replyToMessageId: s.replyToMessageId || null,
+      ephemeralMessageId: s.ephemeralMessageId || null,
+      receiverUserId: s.receiverUserId != null ? Number(s.receiverUserId) : null,
       createdAt: s.createdAt || Date.now(),
       updatedAt: s.updatedAt || Date.now()
     };
@@ -104,11 +111,17 @@ export class MovieSessions {
       ...raw,
       chatId: Number(raw.chatId),
       userId: raw.userId != null ? Number(raw.userId) : null,
+      originMessageId: raw.originMessageId || null,
+      replyToMessageId: raw.replyToMessageId || null,
+      ephemeralMessageId: raw.ephemeralMessageId || null,
+      receiverUserId: raw.receiverUserId != null ? Number(raw.receiverUserId) : null,
       sourceMode: raw.sourceMode === 'xvideos' ? 'xvideos' : 'movie',
+      xvSource: raw.xvSource || 'xvideos',
       xvMode: raw.xvMode || null,
       xvQuery: raw.xvQuery || '',
       xvCat: raw.xvCat || '',
       xvArtist: raw.xvArtist || '',
+      xvStudio: raw.xvStudio || '',
       xvSort: raw.xvSort || 'relevance',
       xvDur: raw.xvDur || 'all',
       xvQuality: raw.xvQuality || '480p',
@@ -121,6 +134,7 @@ export class MovieSessions {
       xvTotalPages: Math.max(1, Number(raw.xvTotalPages || 1)),
       xvCatPage: Number(raw.xvCatPage || 0),
       xvArtistPage: Number(raw.xvArtistPage || 0),
+      xvStudioPage: Number(raw.xvStudioPage || 0),
       episodeCache: epCache,
       selectedBySeason: selMap,
       dlMediaMessageIds: Array.isArray(raw.dlMediaMessageIds) ? raw.dlMediaMessageIds.map(Number).filter(Number.isFinite) : [],
@@ -224,7 +238,7 @@ export class MovieSessions {
     return sid ? this.get(sid) : null;
   }
 
-  create({ chatId, userId = null, botKey = null, destination = null, panelToken = null, view = 'hub', query = '', results = [], channelMode = false, adultMode = null, sourceMode = 'movie' } = {}) {
+  create({ chatId, userId = null, botKey = null, destination = null, panelToken = null, view = 'hub', query = '', results = [], channelMode = false, adultMode = null, sourceMode = 'movie', xvSource = 'xvideos', xvStudio = '', xvDur = 'all', originMessageId = null, replyToMessageId = null, ephemeralMessageId = null, receiverUserId = null } = {}) {
     this.#sweep();
     const id = randomBytes(3).toString('hex'); // 6 chars
     const session = {
@@ -238,12 +252,14 @@ export class MovieSessions {
       channelMode: Boolean(channelMode),
       adultMode,
       sourceMode: sourceMode === 'xvideos' ? 'xvideos' : 'movie',
+      xvSource: xvSource || 'xvideos',
       xvMode: null,
       xvQuery: '',
       xvCat: '',
       xvArtist: '',
+      xvStudio: xvStudio || '',
       xvSort: 'relevance',
-      xvDur: 'all',
+      xvDur: xvDur || 'all',
       xvQuality: '480p',
       xvResults: [],
       xvSelected: new Set(),
@@ -254,6 +270,7 @@ export class MovieSessions {
       xvTotalPages: 1,
       xvCatPage: 0,
       xvArtistPage: 0,
+      xvStudioPage: 0,
       view, // 'hub' | 'results' | 'movie' | 'season' | 'seasons' | 'categories' | 'dl' | 'xv_results' | 'xv_detail' | 'xv_cats' | 'xv_artists'
       query: String(query || ''),
       categoryLabel: '',
@@ -283,6 +300,10 @@ export class MovieSessions {
       messageId: null,
       activeCardIds: [],
       promptMessageId: null,
+      originMessageId: originMessageId || null,
+      replyToMessageId: replyToMessageId || null,
+      ephemeralMessageId: ephemeralMessageId || null,
+      receiverUserId: receiverUserId != null ? Number(receiverUserId) : (userId != null ? Number(userId) : null),
       temporaryToken: null,
       createdAt: Date.now(),
       updatedAt: Date.now()

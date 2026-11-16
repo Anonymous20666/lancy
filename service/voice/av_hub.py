@@ -229,7 +229,7 @@ def _run_hub(sync_id, cmd_args, startup_timeout=25.0):
                                 dur_us = 33333
                             prev_v_pts_us = pts_us
                             with q_cond:
-                                while len(v_q) >= 12 and not stop_event.is_set() and not broken_event.is_set():
+                                while len(v_q) >= 45 and not stop_event.is_set() and not broken_event.is_set():
                                     q_cond.wait(timeout=0.04)
                                 if stop_event.is_set() or broken_event.is_set():
                                     break
@@ -238,7 +238,7 @@ def _run_hub(sync_id, cmd_args, startup_timeout=25.0):
                         elif sclass == 1:
                             dur_us = max(1000, int(round((len(payload) / 4.0) * (1_000_000.0 / 48000.0))))
                             with q_cond:
-                                while len(a_q) >= 48 and not stop_event.is_set() and not broken_event.is_set():
+                                while len(a_q) >= 120 and not stop_event.is_set() and not broken_event.is_set():
                                     q_cond.wait(timeout=0.04)
                                 if stop_event.is_set() or broken_event.is_set():
                                     break

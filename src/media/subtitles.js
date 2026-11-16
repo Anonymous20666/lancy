@@ -129,16 +129,19 @@ function decodeTtmlEntities(text = '') {
     .replace(/&amp;/g, '&');
 }
 
-function parseTtmlTimestampMs(raw, tickRate = 10000000) {
+function parseTtmlTimestampMs(raw, tickRate = 10000000, frameRate = 24) {
   const s = String(raw || '').trim();
   if (!s) return null;
   const standard = parseTimestampMs(s);
   if (standard !== null) return standard;
+  const effFps = (Number.isFinite(Number(frameRate)) && Number(frameRate) > 0) ? Number(frameRate) : 24;
   const colonFrames = s.match(/^(\d{1,3}):(\d{2}):(\d{2})[:.](\d{1,2})$/);
   if (colonFrames) {
     const h = Number(colonFrames[1]), m = Number(colonFrames[2]), sec = Number(colonFrames[3]), f = Number(colonFrames[4]);
-    return (((h * 60 + m) * 60 + sec) * 1000) + Math.round((f / 24) * 1000);
+    return (((h * 60 + m) * 60 + sec) * 1000) + Math.round((f / effFps) * 1000);
   }
+  const frameM = s.match(/^(\d+(?:\.\d+)?)f$/i);
+  if (frameM) return Math.round((Number(frameM[1]) / effFps) * 1000);
   const tickM = s.match(/^(\d+(?:\.\d+)?)t$/i);
   if (tickM && tickRate > 0) return Math.round((Number(tickM[1]) / tickRate) * 1000);
   const msM = s.match(/^(\d+(?:\.\d+)?)ms$/i);
@@ -156,6 +159,12 @@ export function parseTtml(xmlText) {
   const src = String(xmlText || '').replace(/^\uFEFF/, '');
   const tickMatch = src.match(/\b(?:ttp:)?tickRate\s*=\s*["'](\d+)["']/i);
   const tickRate = tickMatch ? Number(tickMatch[1]) || 10000000 : 10000000;
+  const fpsMatch = src.match(/\b(?:ttp:)?frameRate\s*=\s*["'](\d+(?:\.\d+)?)["']/i);
+  const multMatch = src.match(/\b(?:ttp:)?frameRateMultiplier\s*=\s*["'](\d+)\s+(\d+)["']/i);
+  let frameRate = fpsMatch ? (Number(fpsMatch[1]) || 24) : 24;
+  if (multMatch && Number(multMatch[2]) > 0) {
+    frameRate *= Number(multMatch[1]) / Number(multMatch[2]);
+  }
   const cues = [];
   for (const m of src.matchAll(/<(?:[a-z0-9]+:)?p\b([^>]*)>([\s\S]*?)<\/(?:[a-z0-9]+:)?p>/gi)) {
     const attrs = m[1] || '';
@@ -163,10 +172,10 @@ export function parseTtml(xmlText) {
     const beginRaw = attrs.match(/\bbegin\s*=\s*["']([^"']+)["']/i)?.[1];
     const endRaw = attrs.match(/\bend\s*=\s*["']([^"']+)["']/i)?.[1];
     const durRaw = attrs.match(/\bdur\s*=\s*["']([^"']+)["']/i)?.[1];
-    const startMs = parseTtmlTimestampMs(beginRaw, tickRate);
-    let endMs = parseTtmlTimestampMs(endRaw, tickRate);
+    const startMs = parseTtmlTimestampMs(beginRaw, tickRate, frameRate);
+    let endMs = parseTtmlTimestampMs(endRaw, tickRate, frameRate);
     if (startMs !== null && endMs === null && durRaw) {
-      const durMs = parseTtmlTimestampMs(durRaw, tickRate);
+      const durMs = parseTtmlTimestampMs(durRaw, tickRate, frameRate);
       if (durMs !== null && durMs > 0) endMs = startMs + durMs;
     }
     if (startMs === null || endMs === null || endMs <= startMs) continue;
@@ -437,7 +446,15 @@ function cuesFitDuration(cues, durationSeconds, { strictMinRatio = true } = {}) 
   if (!lastEndSec) return false;
   const ratio = lastEndSec / dur;
   if (!strictMinRatio || cues.length < 20) return ratio <= 1.5;
-  return ratio >= 0.35 && ratio <= 1.35;
+  const minRatio = dur >= 1200 ? 0.62 : 0.50;
+  const maxRatio = dur >= 1200 ? 1.25 : 1.32;
+  if (ratio < minRatio || ratio > maxRatio) return false;
+  if (dur >= 1200 && cues.length >= 40) {
+    const midSec = (Number(cues[Math.floor(cues.length / 2)]?.startMs) || 0) / 1000;
+    const midRatio = midSec / dur;
+    if (midRatio < 0.12 || midRatio > 0.90) return false;
+  }
+  return true;
 }
 
 function dedupeOverlappingCues(cues = []) {
@@ -498,7 +515,15 @@ export class SubtitleService {
     if (streamUrl) {
       try {
         const u = new URL(String(streamUrl));
-        urlPart = `${u.origin}${u.pathname}`;
+        const volatileParams = new Set(['token', 'sig', 'expires', 'exp', 'hdnea', 'hmac', 'ip', 'ts', '_t', 'auth', 'key', 'signature', 'policy', 'st', 'e_ts']);
+        const stableQuery = [];
+        for (const [k, v] of u.searchParams.entries()) {
+          if (!v || volatileParams.has(String(k).toLowerCase())) continue;
+          stableQuery.push([k, v]);
+        }
+        stableQuery.sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+        const qs = stableQuery.map(([k, v]) => `${k}=${v}`).join('&');
+        urlPart = qs ? `${u.origin}${u.pathname}?${qs}` : `${u.origin}${u.pathname}`;
       } catch {
         urlPart = String(streamUrl);
       }
@@ -535,15 +560,17 @@ export class SubtitleService {
     language = 'eng',
     subtitleHints = [],
     durationSeconds = null,
-    releaseHint = ''
+    releaseHint = '',
+    embeddedOnly = false
   } = {}) {
     const metaKey = `${title || ''}|${year || ''}|${imdbId || ''}|${season || ''}|${episode || ''}|${language}`;
     const allHints = Array.isArray(subtitleHints) ? subtitleHints.filter((h) => h && (h.url || h.file)) : [];
     const sameRouteHints = allHints.filter((h) => !h.tier || h.tier === 'same_route');
     const metaHints = allHints.filter((h) => h.tier === 'meta_match');
     const streamSig = this.#streamSignature({ streamUrl, subtitleHints: sameRouteHints.length ? sameRouteHints : allHints });
-    const streamFilePath = this.#cacheFilePath(`${metaKey}|${streamSig}|v4`);
-    const altHintPath = this.#cacheFilePath(`${metaKey}|${streamSig}|alt_hint_v4`);
+    const baseTrackKey = `${metaKey}|${streamSig}`;
+    const streamFilePath = this.#cacheFilePath(`${baseTrackKey}|v4`);
+    const altHintPath = this.#cacheFilePath(`${baseTrackKey}|alt_hint_v4`);
     const fallbackFilePath = this.#cacheFilePath(`${metaKey}|${streamSig === 'meta' ? '' : `${streamSig}|`}os_v4`);
     const tracksFilePath = `${streamFilePath}.tracks.json`;
 
@@ -587,7 +614,27 @@ export class SubtitleService {
     };
 
     const isContainerStream = Boolean(streamUrl) && !/\.(?:m3u8|mpd)(\?|$)/i.test(String(streamUrl));
-    const baseTrackKey = `${metaKey}|${streamSig}`;
+
+    if (embeddedOnly) {
+      if (streamUrl && isContainerStream && this.#canProbeMediaSource(streamUrl)) {
+        const emb = await this.#extractEmbeddedSubtitle(streamUrl, headers, streamFilePath, { language }).catch(() => null);
+        if (emb && cuesFitDuration(emb.cues, durationSeconds, { strictMinRatio: false })) {
+          return {
+            ...emb,
+            sameRoute: true,
+            tracks: [{
+              filePath: emb.filePath,
+              language: emb.language || language,
+              label: emb.label || 'Embedded Track',
+              source: 'embedded',
+              sameRoute: true,
+              cuesCount: emb.cues?.length || 0
+            }]
+          };
+        }
+      }
+      return null;
+    }
 
     // 1. ALL same-route subtitle hints attached to the exact resolved stream (.vtt/.srt/.ttml/.ass / full HLS VTT)
     if (sameRouteHints.length) {
@@ -826,6 +873,17 @@ export class SubtitleService {
             }
           }
         }
+      } else if (segCues.length && segStartMs >= 2000) {
+        // Segment-local WebVTT cues without X-TIMESTAMP-MAP restart near 00:00 per segment
+        const firstCueMs = segCues[0].startMs;
+        const lastCueMs = segCues[segCues.length - 1].endMs;
+        if (lastCueMs <= Math.max(segDurMs + 8000, 45000) && firstCueMs < segStartMs * 0.5) {
+          segCues = segCues.map((c) => ({
+            startMs: Math.round(c.startMs + segStartMs),
+            endMs: Math.round(Math.max(c.startMs + 250, c.endMs) + segStartMs),
+            text: c.text
+          }));
+        }
       }
       for (const c of segCues) mergedCues.push(c);
     }
@@ -961,7 +1019,7 @@ export class SubtitleService {
     }
   }
 
-  async #fetchFromStremioOpenSubtitles({ title, imdbId, season, episode, language = 'eng', durationSeconds = null }, outPath) {
+  async #fetchFromStremioOpenSubtitles({ title, imdbId, season, episode, language = 'eng', durationSeconds = null, releaseHint = '' }, outPath) {
     const normImdb = String(imdbId || '').trim();
     if (!/^tt\d+$/i.test(normImdb)) return null;
     const isSeries = Boolean(season && episode);
@@ -977,22 +1035,44 @@ export class SubtitleService {
 
       const wantLang = String(language || 'eng').toLowerCase();
       const wantPrefix = wantLang.slice(0, 2);
+      const relLower = String(releaseHint || '').toLowerCase();
+      const relSource = relLower.match(/\b(web-?dl|webrip|bluray|bdrip|brrip|hdtv|dvdrip)\b/i)?.[1]?.replace('-', '') || '';
+      const targetTag = isSeries ? `s${String(Number(season)).padStart(2, '0')}e${String(Number(episode)).padStart(2, '0')}` : '';
+
       const candidates = subs
         .filter((s) => s?.url && typeof s.url === 'string')
         .map((s) => {
           const sl = String(s?.lang || '').toLowerCase();
           const urlL = s.url.toLowerCase();
+          const nameL = String(s?.MovieReleaseName || s?.SubFileName || s?.label || s?.id || '').toLowerCase();
           let score = 0;
           if (sl === wantLang || (wantPrefix === 'en' && /^(?:en|eng|english)$/.test(sl))) score += 50;
           else if (wantPrefix && sl.startsWith(wantPrefix)) score += 35;
           else if (/^(?:en|eng)/.test(sl)) score += 5;
           else return { s, score: -100 };
+
+          if (targetTag) {
+            const seM = nameL.match(/\bs(\d{1,2})e(\d{1,3})\b/i);
+            if (seM && (Number(seM[1]) !== Number(season) || Number(seM[2]) !== Number(episode))) {
+              return { s, score: -100 };
+            }
+            if (nameL.includes(targetTag)) score += 16;
+          }
           if (urlL.includes('.srt')) score += 10;
           else if (urlL.includes('.vtt')) score += 6;
           if (String(s?.SubEncoding || '').toUpperCase().includes('UTF')) score += 4;
+          if (relSource && nameL.replace(/-/g, '').includes(relSource)) score += 14;
+          if (/\b(?:web-?dl|webrip|bluray|bdrip|brrip)\b/i.test(nameL)) score += 6;
+          if (/\b(?:cam|hdcam|telesync|telecine|\bts\b|hdts)\b/i.test(nameL)) score -= 32;
+          if (/\b(?:auto.?translat|machine.?translat)\b/i.test(nameL)) score -= 24;
+          if (/\b(?:forced|signs)\b/i.test(nameL)) score -= 22;
+          else if (/\b(?:sdh|hi|hearing)\b/i.test(nameL) || String(s?.SubHearingImpaired || '') === '1') score -= 4;
+          if (Number(s?.SubDownloadsCnt) > 0) {
+            score += Math.min(10, Math.log10(Number(s.SubDownloadsCnt) + 1) * 2.5);
+          }
           return { s, score };
         })
-        .filter((x) => x.score >= 30)
+        .filter((x) => x.score >= 25)
         .sort((a, b) => b.score - a.score);
 
       for (const { s } of candidates.slice(0, 4)) {
@@ -1022,6 +1102,101 @@ export class SubtitleService {
     return null;
   }
 
+  async #fetchFromWyzieSubtitles({ imdbId, season, episode, language = 'eng', durationSeconds = null, title = '' }, outPath) {
+    const apiKey = String(process.env.WYZIE_API_KEY || '').trim();
+    const normImdb = String(imdbId || '').trim();
+    if (!apiKey || !/^tt\d+$/i.test(normImdb)) return null;
+    try {
+      const params = new URLSearchParams({
+        id: normImdb,
+        language: /^en/i.test(String(language || 'eng')) ? 'en' : String(language).slice(0, 2).toLowerCase(),
+        format: 'srt',
+        key: apiKey
+      });
+      if (season && episode) {
+        params.set('season', String(Number(season)));
+        params.set('episode', String(Number(episode)));
+      }
+      const res = await this.fetch(`https://sub.wyzie.ru/search?${params.toString()}`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(6500)
+      });
+      if (!res?.ok) return null;
+      const rows = await res.json().catch(() => null);
+      const list = Array.isArray(rows) ? rows : [];
+      for (const item of list.slice(0, 4)) {
+        if (!item?.url) continue;
+        const dlRes = await this.fetch(item.url, { headers: { Accept: 'text/plain,*/*' }, signal: AbortSignal.timeout(8000) }).catch(() => null);
+        if (!dlRes?.ok) continue;
+        const rawText = await dlRes.text();
+        const cues = dedupeOverlappingCues(parseAnySubtitleText(rawText).filter((c) => !isPromoCueText(c.text)));
+        if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
+        writeFileSync(outPath, serializeSrt(cues), 'utf8');
+        this.cueCache.set(outPath, cues);
+        return {
+          found: true,
+          filePath: outPath,
+          cues,
+          language,
+          label: item.display || `${title} (${String(language || 'ENG').toUpperCase()})`,
+          source: 'opensubtitles'
+        };
+      }
+    } catch {}
+    return null;
+  }
+
+  async #fetchFromSubdlSubtitles({ title, imdbId, season, episode, language = 'eng', durationSeconds = null }, outPath) {
+    const apiKey = String(process.env.SUBDL_API_KEY || '').trim();
+    if (!apiKey) return null;
+    const normImdb = String(imdbId || '').trim();
+    try {
+      const params = new URLSearchParams({
+        api_key: apiKey,
+        languages: /^en/i.test(String(language || 'eng')) ? 'EN' : String(language).slice(0, 2).toUpperCase(),
+        subs_per_page: '10'
+      });
+      if (/^tt\d+$/i.test(normImdb)) params.set('imdb_id', normImdb);
+      else if (title) params.set('film_name', cleanTitleForSearch(title));
+      else return null;
+      if (season && episode) {
+        params.set('type', 'tv');
+        params.set('season_number', String(Number(season)));
+        params.set('episode_number', String(Number(episode)));
+      }
+      const res = await this.fetch(`https://api.subdl.com/api/v1/subtitles?${params.toString()}`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(6500)
+      });
+      if (!res?.ok) return null;
+      const data = await res.json().catch(() => null);
+      const list = Array.isArray(data?.subtitles) ? data.subtitles : [];
+      for (const item of list.slice(0, 4)) {
+        const subUrl = String(item?.url || '').trim();
+        if (!subUrl || /\.zip(\?|$)/i.test(subUrl)) continue;
+        const absUrl = subUrl.startsWith('http') ? subUrl : `https://dl.subdl.com${subUrl.startsWith('/') ? '' : '/'}${subUrl}`;
+        const dlRes = await this.fetch(absUrl, { headers: { Accept: 'text/plain,*/*' }, signal: AbortSignal.timeout(8000) }).catch(() => null);
+        if (!dlRes?.ok) continue;
+        const buf = Buffer.from(await dlRes.arrayBuffer());
+        const rawText = (buf[0] === 0x1f && buf[1] === 0x8b) ? gunzipSync(buf).toString('utf8') : buf.toString('utf8');
+        if (buf[0] === 0x50 && buf[1] === 0x4b) continue;
+        const cues = dedupeOverlappingCues(parseAnySubtitleText(rawText).filter((c) => !isPromoCueText(c.text)));
+        if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
+        writeFileSync(outPath, serializeSrt(cues), 'utf8');
+        this.cueCache.set(outPath, cues);
+        return {
+          found: true,
+          filePath: outPath,
+          cues,
+          language,
+          label: item.release_name || `${title} (${String(language || 'ENG').toUpperCase()})`,
+          source: 'opensubtitles'
+        };
+      }
+    } catch {}
+    return null;
+  }
+
   async #fetchFromOpenSubtitles({ title, year, imdbId, season, episode, language = 'eng', durationSeconds = null, releaseHint = '' }, outPath) {
     let effImdb = imdbId ? (String(imdbId).startsWith('tt') ? String(imdbId) : `tt${String(imdbId).replace(/[^\d]/g, '')}`) : '';
     if (!/^tt\d+$/i.test(effImdb)) {
@@ -1029,7 +1204,7 @@ export class SubtitleService {
     }
     if (effImdb) {
       const stremioHit = await this.#fetchFromStremioOpenSubtitles(
-        { title, imdbId: effImdb, season, episode, language, durationSeconds },
+        { title, imdbId: effImdb, season, episode, language, durationSeconds, releaseHint },
         outPath
       );
       if (stremioHit) return stremioHit;
@@ -1054,42 +1229,48 @@ export class SubtitleService {
 
     const url = `https://rest.opensubtitles.org/search/${parts.join('/')}`;
     const res = await this.fetch(url, { headers: OPENSUBTITLES_HEADERS, signal: AbortSignal.timeout(7000) });
-    if (!res.ok) return null;
-    const rows = await res.json().catch(() => null);
-    if (!Array.isArray(rows) || !rows.length) return null;
+    if (res?.ok) {
+      const rows = await res.json().catch(() => null);
+      const ranked = (Array.isArray(rows) ? rows : [])
+        .filter((r) => r?.SubDownloadLink && ['srt', 'vtt', ''].includes(String(r?.SubFormat || '').toLowerCase()))
+        .map((r) => ({ item: r, score: scoreSubtitleCandidate(r, { title, year, season, episode, releaseHint }) }))
+        .filter((r) => r.score >= 28)
+        .sort((a, b) => b.score - a.score);
 
-    const ranked = rows
-      .filter((r) => r?.SubDownloadLink && ['srt', 'vtt', ''].includes(String(r?.SubFormat || '').toLowerCase()))
-      .map((r) => ({ item: r, score: scoreSubtitleCandidate(r, { title, year, season, episode, releaseHint }) }))
-      .filter((r) => r.score >= 28)
-      .sort((a, b) => b.score - a.score);
-
-    for (const { item } of ranked.slice(0, 4)) {
-      try {
-        const dlRes = await this.fetch(item.SubDownloadLink, {
-          headers: { 'User-Agent': 'TemporaryUserAgent' },
-          signal: AbortSignal.timeout(8000)
-        });
-        if (!dlRes.ok) continue;
-        const buf = Buffer.from(await dlRes.arrayBuffer());
-        const srtText = (item.SubDownloadLink.endsWith('.gz') || (buf[0] === 0x1f && buf[1] === 0x8b))
-          ? gunzipSync(buf).toString('utf8')
-          : buf.toString('utf8');
-        const cues = dedupeOverlappingCues(parseAnySubtitleText(srtText).filter((c) => !isPromoCueText(c.text)));
-        if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
-        const canonicalSrt = serializeSrt(cues);
-        writeFileSync(outPath, canonicalSrt, 'utf8');
-        this.cueCache.set(outPath, cues);
-        return {
-          found: true,
-          filePath: outPath,
-          cues,
-          language,
-          label: item.SubFileName || `${title} (${language.toUpperCase()})`,
-          source: 'opensubtitles'
-        };
-      } catch {}
+      for (const { item } of ranked.slice(0, 4)) {
+        try {
+          const dlRes = await this.fetch(item.SubDownloadLink, {
+            headers: { 'User-Agent': 'TemporaryUserAgent' },
+            signal: AbortSignal.timeout(8000)
+          });
+          if (!dlRes.ok) continue;
+          const buf = Buffer.from(await dlRes.arrayBuffer());
+          const srtText = (item.SubDownloadLink.endsWith('.gz') || (buf[0] === 0x1f && buf[1] === 0x8b))
+            ? gunzipSync(buf).toString('utf8')
+            : buf.toString('utf8');
+          const cues = dedupeOverlappingCues(parseAnySubtitleText(srtText).filter((c) => !isPromoCueText(c.text)));
+          if (cues.length < 10 || !cuesFitDuration(cues, durationSeconds)) continue;
+          const canonicalSrt = serializeSrt(cues);
+          writeFileSync(outPath, canonicalSrt, 'utf8');
+          this.cueCache.set(outPath, cues);
+          return {
+            found: true,
+            filePath: outPath,
+            cues,
+            language,
+            label: item.SubFileName || `${title} (${language.toUpperCase()})`,
+            source: 'opensubtitles'
+          };
+        } catch {}
+      }
     }
+
+    const wyzieHit = await this.#fetchFromWyzieSubtitles({ title, imdbId: effImdb, season, episode, language, durationSeconds }, outPath).catch(() => null);
+    if (wyzieHit) return wyzieHit;
+
+    const subdlHit = await this.#fetchFromSubdlSubtitles({ title, imdbId: effImdb, season, episode, language, durationSeconds }, outPath).catch(() => null);
+    if (subdlHit) return subdlHit;
+
     return null;
   }
 

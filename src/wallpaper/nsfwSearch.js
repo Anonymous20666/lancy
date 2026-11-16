@@ -1477,130 +1477,32 @@ export async function searchAdultMovies({
   query = '',
   page = 0,
   limit = 12,
+  sort = 'relevance',
+  artist = null,
+  studio = null,
   minMinutes = 12,
+  lazy = false,
   signal = null
 } = {}) {
   const cleanQuery = String(query || '').trim();
   if (isBlockedNsfwQuery(cleanQuery)) {
     return { results: [], category: NSFW_CATEGORIES.ADULT_MOVIES, total: 0, page, blocked: true };
   }
-  const pageNum = Math.max(0, Number(page) || 0);
-  const maxItems = Math.max(1, Math.min(20, Number(limit) || 12));
-  const minSec = Math.max(60, (Number(minMinutes) || 12) * 60);
-  const cacheKey = `adult_movies_${cleanQuery.toLowerCase()}_${pageNum}_${maxItems}_${minSec}`;
-
-  const cached = searchCache.get(cacheKey);
-  if (cached && (Date.now() - cached.timestamp < CACHE_TTL_MS)) {
-    return cached.data;
-  }
-  if (inFlightRequests.has(cacheKey)) {
-    try { return await inFlightRequests.get(cacheKey); } catch {}
-  }
-
-  const job = (async () => {
-    const results = [];
-    try {
-      const searchQ = cleanQuery
-        ? (/movie|film|full/i.test(cleanQuery) ? cleanQuery : `${cleanQuery} full`)
-        : 'full movie';
-      const apiUrl = `https://www.eporner.com/api/v2/video/search/?query=${encodeURIComponent(searchQ)}&per_page=30&page=${pageNum + 1}&thumbsize=big&order=top-weekly&format=json`;
-      const res = await fetch(apiUrl, {
-        headers: { 'User-Agent': USER_AGENT },
-        signal: signal || AbortSignal.timeout(7000)
-      });
-      if (res.ok) {
-        const data = await res.json();
-        const rawVideos = Array.isArray(data?.videos) ? data.videos : [];
-        const safe = rawVideos.filter(v => v?.id && v?.embed && !isBlockedNsfwQuery(`${v.title || ''} ${v.keywords || ''}`));
-        let longForm = safe.filter(v => Number(v.length_sec) >= minSec);
-        if (longForm.length < 3) {
-          longForm = safe.filter(v => Number(v.length_sec) >= 300);
-        }
-        if (longForm.length === 0) longForm = safe;
-
-        const candidates = longForm
-          .sort((a, b) => (Number(b.length_sec) || 0) - (Number(a.length_sec) || 0))
-          .slice(0, maxItems);
-
-        const resolved = await Promise.all(candidates.map(async (v) => {
-          try {
-            const embedRes = await fetch(v.embed, {
-              headers: { 'User-Agent': USER_AGENT },
-              signal: signal || AbortSignal.timeout(5000)
-            });
-            if (!embedRes.ok) return null;
-            const embedHtml = await embedRes.text();
-            const hashMatch = embedHtml.match(/hash\s*[:=]\s*['"]([a-f0-9]{32})['"]/i);
-            if (!hashMatch) return null;
-
-            const h36 = epornerHexToBase36(hashMatch[1]);
-            const xhrUrl = `https://www.eporner.com/xhr/video/${v.id}?hash=${h36}&domain=www.eporner.com&fallback=false&embed=true&supportedFormats=mp4`;
-            const xhrRes = await fetch(xhrUrl, {
-              headers: { 'User-Agent': USER_AGENT, 'Referer': v.embed },
-              signal: signal || AbortSignal.timeout(5000)
-            });
-            if (!xhrRes.ok) return null;
-            const xhrData = await xhrRes.json();
-            const mp4Sources = xhrData?.sources?.mp4 || {};
-            const ordered = [
-              mp4Sources['720p HD']?.src || mp4Sources['720p']?.src,
-              mp4Sources['1080p HD']?.src || mp4Sources['1080p']?.src,
-              mp4Sources['480p']?.src,
-              mp4Sources['360p']?.src,
-              mp4Sources['240p']?.src
-            ].filter(Boolean);
-            const primaryUrl = ordered[0];
-            if (!primaryUrl) return null;
-
-            return {
-              id: `am_${v.id}`,
-              title: String(v.title || cleanQuery || '18+ Feature Film').slice(0, 80),
-              type: 'video',
-              mediaType: 'video',
-              isAdult: true,
-              mediaUrl: primaryUrl,
-              videoUrl: primaryUrl,
-              fallbackUrls: ordered,
-              thumbUrl: v.default_thumb?.src || v.thumbs?.[0]?.src || null,
-              pageUrl: v.url || v.embed,
-              width: 1920,
-              height: 1080,
-              durationSec: Number(v.length_sec) || 0,
-              duration: `${v.length_min || 'Full HD'}`,
-              headers: { Referer: v.embed, 'User-Agent': USER_AGENT },
-              streamHeaders: { Referer: v.embed, 'User-Agent': USER_AGENT },
-              category: NSFW_CATEGORIES.ADULT_MOVIES,
-              source: '18+ Adult Cinema'
-            };
-          } catch {
-            return null;
-          }
-        }));
-
-        for (const item of resolved) {
-          if (item) results.push(item);
-        }
-      }
-    } catch (err) {
-      log.debug({ err: err?.message, query: cleanQuery }, 'adult movies search failed');
-    }
-
-    const payload = {
-      results,
-      category: NSFW_CATEGORIES.ADULT_MOVIES,
-      total: results.length,
-      page: pageNum
-    };
-    searchCache.set(cacheKey, { data: payload, timestamp: Date.now() });
-    return payload;
-  })();
-
-  inFlightRequests.set(cacheKey, job);
-  try {
-    return await job;
-  } finally {
-    inFlightRequests.delete(cacheKey);
-  }
+  const res = await defaultAdultCatalog.searchAdultMovies({
+    query: cleanQuery,
+    page,
+    limit,
+    sort,
+    artist,
+    studio,
+    minMinutes,
+    lazy,
+    signal
+  });
+  return {
+    ...res,
+    category: NSFW_CATEGORIES.ADULT_MOVIES
+  };
 }
 
 export async function searchPornhub(opts = {}) {

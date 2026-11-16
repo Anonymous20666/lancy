@@ -1398,3 +1398,52 @@ class ChannelAuthSubSyncAndCallInviteTests(unittest.IsolatedAsyncioTestCase):
             else:
                 self.assertTrue(res['confident'], f'Expected confident match for shift={true_shift}: {res}')
                 self.assertLessEqual(abs(res['offset'] - true_shift), 0.3)
+
+    async def test_probe_prefers_original_language_over_default_dub_and_flags_dub_only(self):
+        import shutil
+        import subprocess
+        if not shutil.which('ffmpeg') or not shutil.which('ffprobe'):
+            self.skipTest('ffmpeg/ffprobe binary unavailable')
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+            dual_mkv = tmp_dir / 'dual_dub_orig.mkv'
+            mk_proc = subprocess.run(
+                [
+                    'ffmpeg', '-y',
+                    '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=24',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+                    '-f', 'lavfi', '-i', 'sine=frequency=880:duration=1',
+                    '-map', '0:v:0', '-map', '1:a:0', '-map', '2:a:0',
+                    '-metadata:s:a:0', 'language=eng', '-metadata:s:a:0', 'title=English Dub',
+                    '-metadata:s:a:1', 'language=jpn', '-metadata:s:a:1', 'title=Japanese Original',
+                    '-disposition:a:0', 'default', '-disposition:a:1', 'original',
+                    str(dual_mkv),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(mk_proc.returncode, 0, mk_proc.stderr)
+            orig_info = await MODULE.probe_media_stream_info(str(dual_mkv), preferred_lang='ja')
+            self.assertEqual(orig_info['audio_stream_index'], 2)
+            self.assertEqual(orig_info['audio_language'], 'ja')
+            self.assertFalse(orig_info['audio_is_dub'])
+
+            dub_only_mkv = tmp_dir / 'vff_dub.mkv'
+            dub_proc = subprocess.run(
+                [
+                    'ffmpeg', '-y',
+                    '-f', 'lavfi', '-i', 'testsrc=duration=1:size=320x240:rate=24',
+                    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=1',
+                    '-map', '0:v:0', '-map', '1:a:0',
+                    '-metadata:s:a:0', 'language=fre', '-metadata:s:a:0', 'title=TrueFrench VFF',
+                    '-disposition:a:0', 'default',
+                    str(dub_only_mkv),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(dub_proc.returncode, 0, dub_proc.stderr)
+            dub_info = await MODULE.probe_media_stream_info(str(dub_only_mkv), preferred_lang='en')
+            self.assertEqual(dub_info['audio_language'], 'fr')
+            self.assertTrue(dub_info['audio_is_dub'])

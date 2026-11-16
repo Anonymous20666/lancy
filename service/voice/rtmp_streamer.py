@@ -118,11 +118,14 @@ def _build_video_demux_parts(
     video_trim_start=None,
     audio_trim_start=None,
     pts_anchor=None,
+    normalize_pts=False,
+    strip_first_pts_zero=True,
     eq='off',
     bass=False,
     volume=100,
     is_hls_proxy=False,
     realtime=True,
+    scale_needed=True,
     preserve_nut_pts=False,
 ):
     w = max(2, int(width) - (int(width) % 2))
@@ -152,12 +155,16 @@ def _build_video_demux_parts(
 
     vf_parts = []
     af_parts = []
+    should_reset_pts = bool(
+        pts_anchor is None
+        and (normalize_pts or copyts or video_trim_start is not None or audio_trim_start is not None)
+    )
 
     if video_trim_start is not None:
         vf_parts.append(f'trim=start={float(video_trim_start):.3f}')
     if pts_anchor is not None:
         vf_parts.append(f'setpts=PTS-{float(pts_anchor):.3f}/TB')
-    elif video_trim_start is not None or copyts:
+    elif should_reset_pts:
         vf_parts.append('setpts=PTS-STARTPTS')
 
     if has_audio_stream:
@@ -165,14 +172,17 @@ def _build_video_demux_parts(
             af_parts.append(f'atrim=start={float(audio_trim_start):.3f}')
         if pts_anchor is not None:
             af_parts.append(f'asetpts=PTS-{float(pts_anchor):.3f}/TB')
-        elif audio_trim_start is not None or copyts:
+        elif should_reset_pts:
             af_parts.append('asetpts=PTS-STARTPTS')
 
-    vf_parts.append(f'fps=fps={fps_str}' + (':start_time=0' if pts_anchor is not None else ''))
-    vf_parts.extend([f'scale={w}:{h}:flags=lanczos', 'setsar=1'])
+    vf_parts.append(f'fps=fps={fps_str}' + (':start_time=0' if (pts_anchor is not None or should_reset_pts) else ''))
+    if scale_needed:
+        vf_parts.extend([f'scale={w}:{h}:flags=bicubic', 'setsar=1'])
+    else:
+        vf_parts.append('setsar=1')
 
     af_parts.extend(build_eq_af_filters(eq, bass=bass, volume=volume, video_active=True))
-    if preserve_nut_pts:
+    if preserve_nut_pts and strip_first_pts_zero and pts_anchor is None:
         af_parts.append('aresample=48000:async=1')
     else:
         af_parts.append('aresample=48000:async=1:first_pts=0')
@@ -202,6 +212,8 @@ def build_rtmp_decoder_args(
     video_trim_start=None,
     audio_trim_start=None,
     pts_anchor=None,
+    normalize_pts=False,
+    strip_first_pts_zero=True,
     eq='off',
     bass=False,
     volume=100,
@@ -209,6 +221,7 @@ def build_rtmp_decoder_args(
     realtime=True,
     audio_pipe=AUDIO_PIPE_PLACEHOLDER,
     container='nut',
+    scale_needed=True,
     preserve_nut_pts=None,
 ):
     """Build single-demuxer FFmpeg decoder emitting interleaved NUT (default) or legacy dual raw pipes."""
@@ -229,11 +242,14 @@ def build_rtmp_decoder_args(
         video_trim_start=video_trim_start,
         audio_trim_start=audio_trim_start,
         pts_anchor=pts_anchor,
+        normalize_pts=normalize_pts,
+        strip_first_pts_zero=strip_first_pts_zero,
         eq=eq,
         bass=bass,
         volume=volume,
         is_hls_proxy=is_hls_proxy,
         realtime=realtime,
+        scale_needed=scale_needed,
         preserve_nut_pts=eff_preserve_pts,
     )
     vf_full = [*vf_parts, 'format=yuv420p']
@@ -273,7 +289,7 @@ def build_rtmp_encoder_args(
     vmax=None,
     vbuf=None,
     audio_input='pipe:3',
-    preset='veryfast',
+    preset=None,
     threads=4,
     input_format='nut',
     realtime=False,
@@ -286,7 +302,7 @@ def build_rtmp_encoder_args(
     w = max(2, int(width) - (int(width) % 2))
     h = max(2, int(height) - (int(height) % 2))
     eff_fps, fps_int, fps_str = _format_fps(fps)
-    eff_preset = str(preset or 'veryfast')
+    eff_preset = str(preset or ('superfast' if str(video_quality or '') == 'FHD_1080p' else 'veryfast'))
 
     if str(input_format or 'nut').lower() == 'nut':
         in_args = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin']
@@ -302,8 +318,10 @@ def build_rtmp_encoder_args(
     else:
         in_args = [
             'ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
+            '-analyzeduration', '0', '-probesize', '32768',
             '-thread_queue_size', '64',
             '-f', 'rawvideo', '-pix_fmt', 'yuv420p', '-s', f'{w}x{h}', '-r', fps_str, '-i', 'pipe:0',
+            '-analyzeduration', '0', '-probesize', '32768',
             '-thread_queue_size', '64',
             '-f', 's16le', '-ac', '2', '-ar', '48000', '-i', str(audio_input),
             '-map', '0:v:0',
@@ -312,7 +330,7 @@ def build_rtmp_encoder_args(
 
     return [
         *in_args,
-        '-c:v', 'libx264', '-preset', eff_preset, '-bf', '0', '-threads', str(int(threads or 4)),
+        '-c:v', 'libx264', '-preset', eff_preset, '-tune', 'zerolatency', '-bf', '0', '-threads', str(int(threads or 4)),
         '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p',
         '-r', fps_str, '-g', str(max(15, fps_int * 2)), '-keyint_min', str(max(10, fps_int)), '-sc_threshold', '0',
         '-b:v', eff_vb, '-maxrate', eff_vmax, '-bufsize', eff_vbuf,
@@ -346,6 +364,8 @@ def build_rtmp_ffmpeg_args(
     video_trim_start=None,
     audio_trim_start=None,
     pts_anchor=None,
+    normalize_pts=False,
+    strip_first_pts_zero=True,
     eq='off',
     bass=False,
     volume=100,
@@ -416,6 +436,8 @@ def build_rtmp_ffmpeg_args(
         video_trim_start=video_trim_start,
         audio_trim_start=audio_trim_start,
         pts_anchor=pts_anchor,
+        normalize_pts=normalize_pts,
+        strip_first_pts_zero=strip_first_pts_zero,
         eq=eq,
         bass=bass,
         volume=volume,
@@ -437,7 +459,7 @@ def build_rtmp_ffmpeg_args(
         '-sn', '-dn',
         '-vf', ','.join(vf_parts),
         '-af', ','.join(af_parts),
-        '-c:v', 'libx264', '-preset', 'veryfast', '-bf', '0', '-threads', '4',
+        '-c:v', 'libx264', '-preset', ('superfast' if str(video_quality or '') == 'FHD_1080p' else 'veryfast'), '-bf', '0', '-threads', '4',
         '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p',
         '-r', fps_str, '-g', str(max(15, fps_int * 2)), '-keyint_min', str(max(10, fps_int)), '-sc_threshold', '0',
         '-b:v', vb, '-maxrate', vmax, '-bufsize', vbuf,

@@ -25,3 +25,17 @@ export { KeyedLock } from '../utils/asyncLock.js';
 export class MusicError extends Error {
   constructor(code, message) { super(message); this.name = 'MusicError'; this.code = code; }
 }
+export function stripRemotePhotoBlocks(rich) {
+  if (!rich || !Array.isArray(rich.blocks)) return null;
+  const filtered = rich.blocks.filter((b) => {
+    if (b?.type !== 'photo') return true;
+    const ref = String(b.photo?.media || b.photo?.url || b.url || b.media || '');
+    return !/^https?:\/\//i.test(ref);
+  });
+  return filtered.length < rich.blocks.length ? { ...rich, blocks: filtered } : null;
+}
+export function isRemotePhotoError(err) {
+  return /wrong type of the web page|failed to get http url|photo_invalid|webpage_curl|wrong file identifier|media_empty|invalid file id|photo_ext_invalid/i.test(
+    String(err?.description || err?.message || '')
+  );
+}
