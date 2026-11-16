@@ -106,7 +106,7 @@ class _PipeByteSource:
 
     def read_s_recorded(self, raw_out):
         v = self.read_v_recorded(raw_out)
-        return -((v + 1) >> 1) if (v & 1) else (v >> 1)
+        return ((v + 1) >> 1) if (v & 1) else -(v >> 1)
 
     def read_bytes_recorded(self, n, raw_out):
         data = self.read_exact(n)
@@ -134,7 +134,7 @@ def _read_v_mem(buf, pos):
 
 def _read_s_mem(buf, pos):
     v, pos = _read_v_mem(buf, pos)
-    return (-((v + 1) >> 1) if (v & 1) else (v >> 1)), pos
+    return (((v + 1) >> 1) if (v & 1) else -(v >> 1)), pos
 
 
 def _skip_sm_data(src, raw_out):
@@ -493,3 +493,169 @@ def recv_timed_frame(sock):
     if payload is None:
         return None
     return int(pts_us), int(dur_us), payload
+
+
+def _build_nut_crc32_table():
+    tbl = []
+    for i in range(256):
+        c = i << 24
+        for _ in range(8):
+            c = ((c << 1) ^ 0x04C11DB7) & 0xFFFFFFFF if (c & 0x80000000) else ((c << 1) & 0xFFFFFFFF)
+        tbl.append(c)
+    return tuple(tbl)
+
+
+_NUT_CRC32_TABLE = _build_nut_crc32_table()
+
+
+def _nut_crc32(data):
+    """NUT standard non-reflected IEEE 802.3 CRC-32 (poly 0x04c11db7, init 0)."""
+    crc = 0
+    tbl = _NUT_CRC32_TABLE
+    for b in data:
+        crc = ((crc << 8) ^ tbl[((crc >> 24) ^ b) & 0xFF]) & 0xFFFFFFFF
+    return crc
+
+
+def _enc_v(val):
+    v = int(val)
+    if v == 0:
+        return b'\x00'
+    out = bytearray()
+    while v:
+        out.append(v & 0x7F)
+        v >>= 7
+    out.reverse()
+    for i in range(len(out) - 1):
+        out[i] |= 0x80
+    return bytes(out)
+
+
+def _enc_s(val):
+    s = int(val)
+    return _enc_v((2 * s - 1) if s > 0 else (-2 * s))
+
+
+def _pack_nut_packet(startcode, payload):
+    fwd = len(payload) + 4
+    hdr = startcode + _enc_v(fwd)
+    if fwd > 4096:
+        hdr += struct.pack('>I', _nut_crc32(hdr))
+    crc = _nut_crc32(payload)
+    return hdr + payload + struct.pack('>I', crc)
+
+
+class NutStreamWriter:
+    """Writes a compliant NUT v3 stream with exact per-frame 1us timestamps for rawvideo + pcm_s16le.
+
+    Feeds `ffmpeg -f nut -i pipe:0` over ONE pipe so encoder video and audio
+    can never drift out of phase due to independent OS pipe buffering.
+    """
+
+    def __init__(self, *, width, height, sample_rate=48000, channels=2, tb_num=1, tb_den=1_000_000):
+        self.width = int(width)
+        self.height = int(height)
+        self.sample_rate = int(sample_rate or 48000)
+        self.channels = int(channels or 2)
+        self.tb_num = int(tb_num or 1)
+        self.tb_den = int(tb_den or 1_000_000)
+        self._msb_shift = 7
+        self._header_emitted = False
+
+    def build_headers(self):
+        # Main header: version=3, stream_count=2, max_distance=16MB (larger than 1080p raw frames), 1 timebase (1/1_000_000)
+        main = bytearray()
+        main.extend(_enc_v(3))
+        main.extend(_enc_v(2))
+        main.extend(_enc_v(16_777_216))
+        main.extend(_enc_v(1))
+        main.extend(_enc_v(self.tb_num))
+        main.extend(_enc_v(self.tb_den))
+
+        # Frame table: code 1 is FLAG_KEY|FLAG_CODED_PTS|FLAG_STREAM_ID|FLAG_SIZE_MSB (mul=1, size_lsb=0)
+        # Note: parser inserts FLAG_INVALID at fc == ord('N') (78) BEFORE consuming count items in loop,
+        # so total explicit slots before/after excluding 'N' is 255.
+        # Slot fc=0: invalid count=1
+        main.extend(_enc_v(FLAG_INVALID))
+        main.extend(_enc_v(6))
+        main.extend(_enc_s(0))
+        main.extend(_enc_v(1))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(1))
+
+        # Slot fc=1: valid frame code (includes FLAG_CHECKSUM over frame header for large frames)
+        main.extend(_enc_v(FLAG_KEY | FLAG_CODED_PTS | FLAG_STREAM_ID | FLAG_SIZE_MSB | FLAG_CHECKSUM))
+        main.extend(_enc_v(6))
+        main.extend(_enc_s(0))
+        main.extend(_enc_v(1))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(1))
+
+        # Remaining slots fc=2..255 excluding 'N' (253 slots -> total 256 table entries)
+        main.extend(_enc_v(FLAG_INVALID))
+        main.extend(_enc_v(6))
+        main.extend(_enc_s(0))
+        main.extend(_enc_v(1))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(0))
+        main.extend(_enc_v(253))
+        main.extend(_enc_v(0))  # header_count_minus1 = 0
+
+        # Stream 0: video I420 (rawvideo yuv420p)
+        st0 = bytearray()
+        st0.extend(_enc_v(0))
+        st0.extend(_enc_v(0))
+        st0.extend(_enc_v(4))
+        st0.extend(b'I420')
+        st0.extend(_enc_v(0))
+        st0.extend(_enc_v(self._msb_shift))
+        st0.extend(_enc_v(60_000_000))
+        st0.extend(_enc_v(0))  # decode_delay
+        st0.extend(_enc_v(0))  # stream_flags
+        st0.extend(_enc_v(0))  # codec_specific_data len
+        st0.extend(_enc_v(self.width))
+        st0.extend(_enc_v(self.height))
+        st0.extend(_enc_v(1))  # sample_width
+        st0.extend(_enc_v(1))  # sample_height
+        st0.extend(_enc_v(18))  # csp = YUV420
+
+        # Stream 1: audio PSD\x10 (pcm_s16le)
+        st1 = bytearray()
+        st1.extend(_enc_v(1))
+        st1.extend(_enc_v(1))
+        st1.extend(_enc_v(4))
+        st1.extend(b'PSD\x10')
+        st1.extend(_enc_v(0))
+        st1.extend(_enc_v(self._msb_shift))
+        st1.extend(_enc_v(60_000_000))
+        st1.extend(_enc_v(0))
+        st1.extend(_enc_v(0))
+        st1.extend(_enc_v(0))
+        st1.extend(_enc_v(self.sample_rate))
+        st1.extend(_enc_v(1))  # samplerate_den
+        st1.extend(_enc_v(self.channels))
+
+        return (
+            NUT_MAGIC
+            + _pack_nut_packet(MAIN_SC, bytes(main))
+            + _pack_nut_packet(STREAM_SC, bytes(st0))
+            + _pack_nut_packet(STREAM_SC, bytes(st1))
+        )
+
+    def pack_syncpoint(self, pts_ticks, back_ptr_div16=0):
+        payload = _enc_v(max(0, int(pts_ticks))) + _enc_v(max(0, int(back_ptr_div16)))
+        return _pack_nut_packet(SYNC_SC, payload)
+
+    def pack_frame(self, stream_id, pts_ticks, payload):
+        coded_pts = (1 << self._msb_shift) + max(0, int(pts_ticks))
+        hdr = bytearray(b'\x01')
+        hdr.extend(_enc_v(int(stream_id)))
+        hdr.extend(_enc_v(coded_pts))
+        hdr.extend(_enc_v(len(payload)))
+        hdr.extend(struct.pack('>I', _nut_crc32(hdr)))
+        return bytes(hdr), payload

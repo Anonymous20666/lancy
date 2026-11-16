@@ -5,7 +5,7 @@ const FAST_COMMANDS = new Set([
   '/stop', '/end', '/leave', '/player', '/vc', '/vidc',
   '/queue', '/q', '/mqueue', '/volume', '/vol', '/loop', '/repeat',
   '/shuffle', '/seek', '/eq', '/bass', '/streammode', '/rtmp', '/vcsudo', '/rmsudo', '/accounts',
-  '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce',
+  '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce', '/autopoll', '/votes',
   '/destination', '/channel', '/start', '/help', '/menu', '/settings',
   '/cancel', '/setprefix', '/prefix', '/rmbot', '/forcejoin', '/fsub', '/forcesub'
 ]);

@@ -27,7 +27,22 @@ export class VoiceClient {
     if (!existsSync(python) || !existsSync(script)) throw new MusicError('BRIDGE_UNAVAILABLE', 'Voice runtime is missing. The owner must install service/voice/requirements.txt in its venv.');
     if (!this.process) {
       if (this.closed) throw new MusicError('SHUTTING_DOWN', 'Music is shutting down.');
-      this.process = spawn(python, [script], { env: { ...process.env, VOICE_BRIDGE_TOKEN: this.token, VOICE_BRIDGE_PORT: String(this.port), VOICE_BRIDGE_HOST: this.host, VOICE_BRIDGE_PARENT_PID: String(process.pid), MUSIC_CACHE_DIR: this.app.musicLibrary.root }, stdio: ['ignore','ignore','ignore'] });
+      this.process = spawn(python, [script], { env: { ...process.env, VOICE_BRIDGE_TOKEN: this.token, VOICE_BRIDGE_PORT: String(this.port), VOICE_BRIDGE_HOST: this.host, VOICE_BRIDGE_PARENT_PID: String(process.pid), MUSIC_CACHE_DIR: this.app.musicLibrary.root }, stdio: ['ignore','ignore','pipe'] });
+      if (this.process.stderr) {
+        let stderrBuf = '';
+        this.process.stderr.setEncoding('utf8');
+        this.process.stderr.on('data', (chunk) => {
+          stderrBuf += chunk;
+          const lines = stderrBuf.split(/\r?\n/);
+          stderrBuf = lines.pop() || '';
+          for (const rawLine of lines) {
+            const line = rawLine.trim();
+            if (!line) continue;
+            if (/warning|error|stalled|resync|drift/i.test(line)) this.log.warn({ voiceLog: line.slice(0, 260) }, 'Voice engine monitor');
+            else this.log.debug({ voiceLog: line.slice(0, 220) }, 'Voice engine log');
+          }
+        });
+      }
       this.process.once('error', () => { this.process = null; this.log.warn('Voice engine spawn failed'); });
       this.process.once('exit', code => { this.process = null; this.log.warn({ code }, 'Voice engine exited'); });
     }

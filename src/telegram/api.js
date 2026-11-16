@@ -506,7 +506,7 @@ export class TelegramAPI {
     return this.call('sendPoll', {
       chat_id: chatId,
       question,
-      options: JSON.stringify(opts),
+      options: opts,
       ...extra
     });
   }

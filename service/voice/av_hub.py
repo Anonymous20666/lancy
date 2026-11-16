@@ -149,6 +149,10 @@ def _run_hub(sync_id, cmd_args, startup_timeout=25.0):
             a_conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, AUDIO_SOCK_SNDBUF)
         except OSError:
             pass
+        try:
+            v_conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, PIPE_BYTES)
+        except OSError:
+            pass
 
         is_nut = (AUDIO_PIPE_PLACEHOLDER not in cmd_args)
         if is_nut:
@@ -167,10 +171,30 @@ def _run_hub(sync_id, cmd_args, startup_timeout=25.0):
                 list(cmd_args),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 bufsize=0,
             )
             _enlarge_pipe(proc.stdout.fileno())
+            err_tail = deque(maxlen=20)
+
+            def _drain_hub_err():
+                try:
+                    while proc.stderr is not None:
+                        ln = proc.stderr.readline()
+                        if not ln:
+                            break
+                        txt = ln.decode('utf-8', 'replace').rstrip()
+                        if txt:
+                            err_tail.append(txt[:220])
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        proc.stderr.close()
+                    except OSError:
+                        pass
+
+            threading.Thread(target=_drain_hub_err, daemon=True).start()
 
             v_q = deque()
             a_q = deque()
@@ -229,7 +253,7 @@ def _run_hub(sync_id, cmd_args, startup_timeout=25.0):
                                 dur_us = 33333
                             prev_v_pts_us = pts_us
                             with q_cond:
-                                while len(v_q) >= 45 and not stop_event.is_set() and not broken_event.is_set():
+                                while ((len(v_q) >= 45 and len(a_q) >= 24) or len(v_q) >= 240) and not stop_event.is_set() and not broken_event.is_set():
                                     q_cond.wait(timeout=0.04)
                                 if stop_event.is_set() or broken_event.is_set():
                                     break
@@ -238,7 +262,7 @@ def _run_hub(sync_id, cmd_args, startup_timeout=25.0):
                         elif sclass == 1:
                             dur_us = max(1000, int(round((len(payload) / 4.0) * (1_000_000.0 / 48000.0))))
                             with q_cond:
-                                while len(a_q) >= 120 and not stop_event.is_set() and not broken_event.is_set():
+                                while ((len(a_q) >= 120 and len(v_q) >= 12) or len(a_q) >= 600) and not stop_event.is_set() and not broken_event.is_set():
                                     q_cond.wait(timeout=0.04)
                                 if stop_event.is_set() or broken_event.is_set():
                                     break

@@ -313,7 +313,6 @@ def build_rtmp_encoder_args(
             '-f', 'nut', '-i', 'pipe:0',
             '-map', '0:v:0',
             '-map', '0:a:0',
-            '-af', 'aresample=async=1',
         ])
     else:
         in_args = [

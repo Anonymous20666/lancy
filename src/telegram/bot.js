@@ -532,9 +532,11 @@ export class TelegramController extends EventEmitter {
   async #handleUpdate(update) {
     this.log.info({
       updateId: update.update_id,
-      from: update.message?.from?.id ?? update.callback_query?.from?.id,
+      from: update.message?.from?.id ?? update.callback_query?.from?.id ?? update.poll_answer?.user?.id ?? update.poll_answer?.voter_chat?.id,
       hasText: Boolean(update.message?.text),
-      hasCallback: Boolean(update.callback_query?.data)
+      hasCallback: Boolean(update.callback_query?.data),
+      hasPoll: Boolean(update.poll),
+      hasPollAnswer: Boolean(update.poll_answer)
     }, 'received update');
     if (update.inline_query) return this.#handleInlineQuery(update.inline_query);
     if (update.chosen_inline_result) {
@@ -544,8 +546,8 @@ export class TelegramController extends EventEmitter {
     if (update.chat_member) return this.#handleChatMemberUpdated(update.chat_member);
     if (update.my_chat_member) return this.#handleMyChatMemberUpdated(update.my_chat_member);
     if (update.chat_join_request) return this.#handleChatJoinRequest(update.chat_join_request);
-    if (update.poll) return this.app?.music?.handlePollUpdate?.(update.poll);
-    if (update.poll_answer) return this.app?.music?.handlePollAnswer?.(update.poll_answer);
+    if (update.poll) return this.app?.music?.handlePollUpdate?.(update.poll, { api: this.api, botId: Number(this.botContext?.botId || 0) || 0 });
+    if (update.poll_answer) return this.app?.music?.handlePollAnswer?.(update.poll_answer, { api: this.api, botId: Number(this.botContext?.botId || 0) || 0 });
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });

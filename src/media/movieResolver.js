@@ -3692,8 +3692,9 @@ export class MovieStreamResolver {
         ...extraApiSubs
       ];
       subtitleInfo = await this.subtitles.resolveForMedia({
-        type,
+        type: isTv ? 'tv' : (type || 'movie'),
         id,
+        tmdbId: subTmdbId,
         imdbId: effectiveImdbId,
         title,
         year: effectiveYear,

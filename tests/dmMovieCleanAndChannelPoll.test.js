@@ -514,3 +514,146 @@ test('Channels isolate DM-only commands, inspect can_post_messages, prioritize c
   await musicScreen.movieUi.handleAiTurn({ tgId: '100', chatId: -100888, isChannel: true, channelAdminVerified: true, api: rec.api }, 'Suggest a sci-fi movie');
   assert.equal(rec.sentMessages.length, rawCountBeforeAi, 'Channel AI reply should use rich card rather than raw text message');
 });
+
+test('TelegramAPI.sendPoll sends native array options and Movie Auto-Poll enforces 1 poll per movie, clone votes, and auto-delete', async t => {
+  const { TelegramAPI } = await import('../src/telegram/api.js');
+  let sentBody = null;
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, init = {}) => {
+    sentBody = JSON.parse(init.body || '{}');
+    return {
+      ok: true,
+      async json() {
+        return { ok: true, result: { message_id: 777, poll: { id: 'p_live_1' } } };
+      }
+    };
+  };
+  t.after(() => { globalThis.fetch = origFetch; });
+  const liveApi = new TelegramAPI('123:ABC');
+  await liveApi.sendPoll(-100999, 'Next Movie?', ['Skip', 'Movie 2']);
+  assert.ok(Array.isArray(sentBody.options), 'sendPoll must send options as a raw JSON array, not stringified string');
+  assert.deepEqual(sentBody.options, [{ text: 'Skip' }, { text: 'Movie 2' }]);
+
+  const db = new Database(':memory:');
+  db.migrate();
+  t.after(() => db.close());
+  const settings = new SettingsManager(db, { env: { OWNER_IDS: '100' } });
+  const sm = new StateMachine();
+  const cloneRec = makeRecordingApi();
+  cloneRec.api.me = { id: 8888, username: 'clone_cine_bot', first_name: 'CloneCine' };
+  cloneRec.api.botUsername = 'clone_cine_bot';
+  const mainRec = makeRecordingApi();
+  const plays = [];
+
+  const app = {
+    db,
+    settings,
+    sm,
+    telegram: { api: mainRec.api, botUsername: 'Lancy_easy_bot' },
+    multiBotManager: {
+      runningBots: new Map([[1, { api: cloneRec.api }]])
+    },
+    voiceClient: {
+      isSetup: () => true,
+      async setup() { return { ok: true, status: 'ready' }; },
+      async play(chatId, src, opts = {}) {
+        plays.push({ chatId, src, opts });
+        return { ok: true, account_alias: 'acc1', status: 'playing', position_seconds: 0, av_sync: { monitored: true, sync_health: 'locked', skew_ms: 8, syncing: false } };
+      },
+      async setVolume() { return { ok: true }; },
+      async stop() { return { ok: true }; },
+      async idle() { return { ok: true }; }
+    }
+  };
+  app.musicQueueManager = new QueueManager({ app, db, voiceClient: app.voiceClient, pollMs: 0, log: { info() {}, warn() {}, error() {}, debug() {} } });
+  app.music = new MusicService({ app, search: {}, lyrics: null, accounts: { sync: async () => {} } });
+  app.music.authorize = async () => -100555;
+  app.musicQueueManager.updatePlayerCard = async () => true;
+  const screen = createMusicScreen({ app });
+  app.screens = new Map([['music', screen]]);
+  t.after(async () => {
+    await screen.cleanup();
+    await app.music.previews.shutdown();
+    await app.musicQueueManager.shutdown();
+  });
+
+  const groupId = -100555;
+  const s = app.musicQueueManager.getSession(groupId);
+  s.prepared = true;
+  s.api = cloneRec.api;
+  s.botId = 1;
+  s.playerChatId = groupId;
+  s.screenMessageId = 500;
+
+  // Verify Cinema Player shows A/V sync lock + Vote Settings shows Auto-Poll toggle
+  assert.equal(app.music.isAutoPollEnabled(groupId), true);
+  await app.music.control({ tgId: '100', chatId: groupId, messageId: 500, botId: 1, api: cloneRec.api, query: { id: 'q_vs' } }, 'voteset', []);
+  const vsRich = screen.renderVoteSettings(s);
+  const vsLabels = collectButtons(vsRich).map(btnText);
+  assert.ok(vsLabels.some((t2) => /Auto-Poll · ON/i.test(t2)), 'Vote Settings should display Auto-Poll toggle');
+
+  // Toggle Auto-Poll OFF and verify queuing multiple movies does NOT auto-post a poll
+  await app.music.control({ tgId: '100', chatId: groupId, messageId: 500, botId: 1, api: cloneRec.api, query: { id: 'q_off' } }, 'setvotethresh', ['autopoll', 'off']);
+  assert.equal(app.music.isAutoPollEnabled(groupId), false);
+  await app.musicQueueManager.addMovies(groupId, [
+    { id: 'm1', title: 'Movie One', streamUrl: 'https://example.com/1.mp4', durationSeconds: 5000, capabilities: { seek: true, video: true } },
+    { id: 'm2', title: 'Movie Two', streamUrl: 'https://example.com/2.mp4', durationSeconds: 5000, capabilities: { seek: true, video: true } },
+    { id: 'm3', title: 'Movie Three', streamUrl: 'https://example.com/3.mp4', durationSeconds: 5000, capabilities: { seek: true, video: true } }
+  ]);
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(cloneRec.sentPolls.length, 0, 'No auto-poll when Auto-Poll is OFF');
+
+  // Turn Auto-Poll back ON via /autopoll command with vote limit 2 & verify Cinema card shows A/V Synced
+  const cardTxt = JSON.stringify(screen.renderCinemaPlayer(s));
+  assert.match(cardTxt, /A\/V Synced/);
+
+  await app.music.autopollCommand({ tgId: '100', chatId: groupId, botId: 1, api: cloneRec.api }, ['on', '2']);
+  assert.equal(app.music.isAutoPollEnabled(groupId), true);
+  assert.equal(app.music.getQueueVoteThreshold(groupId), 2);
+  await new Promise((r) => setTimeout(r, 350));
+  assert.equal(cloneRec.sentPolls.length, 1, 'Auto-poll posts once for Movie One when ON with queued movies');
+  const firstPoll = cloneRec.sentPolls[0];
+  assert.equal(firstPoll.extra.is_anonymous, false);
+
+  // Enqueueing additional movies while Movie One is playing MUST NOT spawn a 2nd poll
+  await app.musicQueueManager.addMovies(groupId, [
+    { id: 'm4', title: 'Movie Four', streamUrl: 'https://example.com/4.mp4', durationSeconds: 5000, capabilities: { seek: true, video: true } }
+  ]);
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(cloneRec.sentPolls.length, 1, 'Must stay strictly 1 poll during the same playing movie');
+
+  // Cloned bot receives Viewer 1 poll_answer, survives restart, Viewer 2 completes vote -> winner Movie Three plays AND old poll is DELETED!
+  const cloneBot = new TelegramController({
+    api: cloneRec.api,
+    db,
+    settings,
+    sm,
+    screens: new Map([['music', screen]]),
+    app,
+    botContext: { botId: 1, isClone: true, botUsername: 'clone_cine_bot' }
+  });
+
+  await cloneBot.handleUpdate({ poll_answer: { poll_id: firstPoll.pollId, user: { id: 701 }, option_ids: [2] } });
+  assert.equal(cloneRec.deleted.length, 0);
+  // Simulate restart clearing in-memory activePolls Map; votesByUser must reload from DB!
+  app.music.activePolls.clear();
+  await cloneBot.handleUpdate({ poll_answer: { poll_id: firstPoll.pollId, user: { id: 702 }, option_ids: [2] } });
+
+  assert.equal(cloneRec.stoppedPolls.length, 1);
+  assert.ok(cloneRec.deleted.some((d) => d.message_id === firstPoll.message_id), 'Decided poll message must be deleted automatically');
+  assert.equal(s.currentTrack.title, 'Movie Three');
+
+  // Next movie (Movie Three) automatically gets 1 fresh poll since queue still has upcoming items!
+  await new Promise((r) => setTimeout(r, 600));
+  assert.equal(cloneRec.sentPolls.length, 2, 'Next playing movie gets its own fresh poll when queue still has items');
+  const secondPoll = cloneRec.sentPolls[1];
+
+  // If queue action is Boost to #1 ('top'), deciding poll keeps Movie Three playing, deletes poll, and DOES NOT create another poll until next movie plays!
+  db.setSetting(`music.queueVoteAction.${groupId}`, 'top');
+  await cloneBot.handleUpdate({ poll_answer: { poll_id: secondPoll.pollId, user: { id: 701 }, option_ids: [1] } });
+  await cloneBot.handleUpdate({ poll_answer: { poll_id: secondPoll.pollId, user: { id: 702 }, option_ids: [1] } });
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(cloneRec.deleted.some((d) => d.message_id === secondPoll.message_id), true);
+  assert.equal(s.currentTrack.title, 'Movie Three');
+  assert.equal(cloneRec.sentPolls.length, 2, 'Must NOT create another poll for the same movie once poll is decided');
+});

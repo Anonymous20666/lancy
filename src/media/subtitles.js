@@ -353,11 +353,42 @@ export function shiftSrtText(srtText, offsetSeconds = 0) {
 
 function cleanTitleForSearch(title) {
   return String(title || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/\([^)]*\)/g, ' ')
     .replace(/\[[^\]]*\]/g, ' ')
     .replace(/[^a-zA-Z0-9\s:'-]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+const TMDB_SUB_CDN = 'https://cache.vdrk.site/v1/vtt';
+const CDN_LANG_NAMES = {
+  en: 'English', eng: 'English', es: 'Spanish', spa: 'Spanish', fr: 'French', fre: 'French', fra: 'French',
+  de: 'German', ger: 'German', deu: 'German', pt: 'Portuguese', por: 'Portuguese', it: 'Italian', ita: 'Italian',
+  ar: 'Arabic', ara: 'Arabic', hi: 'Hindi', hin: 'Hindi', tr: 'Turkish', tur: 'Turkish', ru: 'Russian', rus: 'Russian'
+};
+
+export function buildTmdbCdnSubtitleHints({ tmdbId, type = '', season = null, episode = null, language = 'eng' } = {}) {
+  const idStr = String(tmdbId || '').trim();
+  if (!/^\d+$/.test(idStr)) return [];
+  const isTv = String(type || '').toLowerCase() === 'tv' || Boolean(season && episode);
+  if (isTv && !(Number(season) > 0 && Number(episode) > 0)) return [];
+  const base = isTv
+    ? `${TMDB_SUB_CDN}/tv/${idStr}/${Number(season)}/${Number(episode)}`
+    : `${TMDB_SUB_CDN}/movie/${idStr}`;
+  const wantKey = String(language || 'eng').toLowerCase();
+  const names = [];
+  const wantName = CDN_LANG_NAMES[wantKey] || CDN_LANG_NAMES[wantKey.slice(0, 2)];
+  if (wantName) names.push(wantName);
+  if (!names.includes('English')) names.push('English');
+  return names.map((n) => ({
+    url: `${base}/${n}.vtt`,
+    language: n,
+    label: `${n} Subtitles`,
+    type: 'vtt',
+    tier: 'meta_match'
+  }));
 }
 
 const PROMO_SUB_RE = /\b(?:opensubtitles\.(?:org|com)|osdb\.link|subscene\.com|yify-?subtitles|addic7ed\.com|podnapisi\.net|hoofoot\.ru|advertise\s+your\s+product|api\.opensubtitles|ai\.opensubtitles|getray\.app)\b/i;
@@ -561,13 +592,20 @@ export class SubtitleService {
     subtitleHints = [],
     durationSeconds = null,
     releaseHint = '',
-    embeddedOnly = false
+    embeddedOnly = false,
+    tmdbId = null,
+    type = ''
   } = {}) {
     const metaKey = `${title || ''}|${year || ''}|${imdbId || ''}|${season || ''}|${episode || ''}|${language}`;
     const allHints = Array.isArray(subtitleHints) ? subtitleHints.filter((h) => h && (h.url || h.file)) : [];
     const sameRouteHints = allHints.filter((h) => !h.tier || h.tier === 'same_route');
     const metaHints = allHints.filter((h) => h.tier === 'meta_match');
     const streamSig = this.#streamSignature({ streamUrl, subtitleHints: sameRouteHints.length ? sameRouteHints : allHints });
+    // Backup tier: TMDB-keyed subtitle CDN so every resolved title gets a track even when
+    // the DASH/HLS manifest carries no text adaptation sets.
+    for (const h of buildTmdbCdnSubtitleHints({ tmdbId, type, season, episode, language })) {
+      if (!metaHints.some((m) => (m.url || m.file) === h.url)) metaHints.push(h);
+    }
     const baseTrackKey = `${metaKey}|${streamSig}`;
     const streamFilePath = this.#cacheFilePath(`${baseTrackKey}|v4`);
     const altHintPath = this.#cacheFilePath(`${baseTrackKey}|alt_hint_v4`);

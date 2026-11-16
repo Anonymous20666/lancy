@@ -75,7 +75,29 @@ export function parseSeekInput(raw, currentPos = 0, duration = 0) {
 }
 
 export class MusicService {
-  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.userDownloads=new Map(); this.maxDownloads=16; this.maxUserDownloads=2; this.channelPanels=new ChannelPanels({service:this});this.setup=new CallSetup({service:this});this.channels=new SavedChannels({service:this});this.radio=new InfiniteRadio({app});this.aiDj=new AiDjEngine({app});this.listenCards=new Map();this.cardLocks=new KeyedLock();this.lyricJobs=new Map();this.activePolls=new Map();this.pendingSeeks=new Map(); }
+  constructor({ app, search, lyrics, accounts }) { this.app=app; this.search=search; this.lyrics=lyrics; this.accounts=accounts; this.rates=new Map(); this.destinations=new Map(); this.controlLock=new KeyedLock(); this.panelLock=new KeyedLock(); this.pollLock=new KeyedLock(); this.previews=new FullTrackPreviews({app}); this.downloads=0; this.userDownloads=new Map(); this.maxDownloads=16; this.maxUserDownloads=2; this.channelPanels=new ChannelPanels({service:this});this.setup=new CallSetup({service:this});this.channels=new SavedChannels({service:this});this.radio=new InfiniteRadio({app});this.aiDj=new AiDjEngine({app});this.listenCards=new Map();this.cardLocks=new KeyedLock();this.lyricJobs=new Map();this.activePolls=new Map();this.autoPollTimers=new Map();this._boundQm=null;this.pendingSeeks=new Map(); this.#hydratePersistedPolls(); this.bindQueuePollLifecycle(); }
+  isAutoPollEnabled(chatId){
+    const perChat=chatId!=null?this.app?.db?.getSetting?.(`music.autoPoll.${chatId}`,null):null;
+    if(typeof perChat==='boolean')return perChat;
+    const globalVal=this.app?.db?.getSetting?.('music.autoPoll.global',null);
+    if(typeof globalVal==='boolean')return globalVal;
+    const cfgVal=this.app?.settings?.get?.('music.autoPoll');
+    return typeof cfgVal==='boolean'?cfgVal:true;
+  }
+  setAutoPollEnabled(chatId, enabled){
+    const val=Boolean(enabled);
+    const id=Number(chatId);
+    if(Number.isSafeInteger(id)&&id!==0){
+      this.app?.db?.setSetting?.(`music.autoPoll.${id}`,val);
+      if(!val){
+        const t=this.autoPollTimers.get(id);
+        if(t){clearTimeout(t);this.autoPollTimers.delete(id);}
+      }
+    }else{
+      this.app?.db?.setSetting?.('music.autoPoll.global',val);
+    }
+    return val;
+  }
   getSkipVoteThreshold(chatId){
     const perChat=chatId!=null?this.app?.db?.getSetting?.(`music.skipVoteThreshold.${chatId}`,null):null;
     const raw=perChat!==null&&perChat!==undefined?perChat:this.app?.settings?.get?.('music.skipVoteThreshold');
@@ -760,7 +782,7 @@ export class MusicService {
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
@@ -937,10 +959,11 @@ export class MusicService {
     })();
   }
   async _control(ctx,action,args=[]) {
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    this.bindQueuePollLifecycle();
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isViewerVote=['voteskip','votequeue'].includes(action);
     const isDownloadAct=['downloadnow','downloadq','dlq'].includes(action);
-    const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh'].includes(action);
+    const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh','autopoll'].includes(action);
     const id=await this.authorize(ctx,!(isViewerVote||isDownloadAct),null,{allowDj});
     const qm=this.app.musicQueueManager;
     const panel=ctx.musicPanel || ((qm.getSession(id).isChannel && Number(ctx.chatId) > 0) ? this.channelPanels.find(ctx,id) : null);
@@ -1056,6 +1079,9 @@ export class MusicService {
         }else if(s.activeDeck==='movie'||targetEntry.provider==='movie'){
           qm.promoteMovieTrack(id,targetEntry.entryId);
           s.view='mqueue';
+        }else{
+          qm.promoteTrack(id,targetEntry.entryId);
+          s.view='queue';
         }
       }else{
         s.lastNotice=`🗳 Queue vote for ${targetEntry.title}: ${targetEntry.votes.length}/${needed}`;
@@ -1066,53 +1092,42 @@ export class MusicService {
       s.view='voteset';
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🗳 Viewer Vote Settings'}).catch(()=>{});
     }
+    else if(action==='autopoll'){
+      const want=args[0]==='on'?true:args[0]==='off'?false:!this.isAutoPollEnabled(id);
+      this.setAutoPollEnabled(id,want);
+      s.lastNotice=want
+        ?'🤖 Auto-Poll is now ON · One poll posts per playing movie when queue has upcoming movies, and deletes once decided.'
+        :'⚪ Auto-Poll is now OFF · Use 📊 Poll whenever you want to post a manual poll.';
+      if(want)this.#scheduleAutoPoll(id,null,{delayMs:150});
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:want?'🤖 Auto-Poll: ON':'⚪ Auto-Poll: OFF'}).catch(()=>{});
+    }
     else if(action==='setvotethresh'){
       const [kind,valRaw]=args;
-      if(kind==='mode'){
+      if(kind==='autopoll'){
+        const want=valRaw==='on'?true:valRaw==='off'?false:!this.isAutoPollEnabled(id);
+        this.setAutoPollEnabled(id,want);
+        s.lastNotice=want
+          ?'🤖 Auto-Poll is now ON · One poll per playing movie.'
+          :'⚪ Auto-Poll is now OFF · Manual polls only.';
+        if(want)this.#scheduleAutoPoll(id,null,{delayMs:150});
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:want?'🤖 Auto-Poll: ON':'⚪ Auto-Poll: OFF'}).catch(()=>{});
+      }else if(kind==='mode'){
         const nextMode=valRaw==='top'?'top':'playnow';
         this.app.db?.setSetting?.(`music.queueVoteAction.${id}`,nextMode);
+        s.lastNotice=`⚡ Winning Poll Action: ${nextMode==='playnow'?'Play Immediately':'Boost to #1'}`;
         if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`Queue action: ${nextMode==='playnow'?'Play Immediately':'Boost to #1'}`}).catch(()=>{});
       }else{
         const count=Math.max(1,Math.min(25,Number(valRaw)||2));
         const key=kind==='skip'?`music.skipVoteThreshold.${id}`:`music.queueVoteThreshold.${id}`;
         this.app.db?.setSetting?.(key,count);
+        s.lastNotice=`🗳 ${kind==='skip'?'Skip':'Movie Queue'} vote limit set to ${count} vote(s).`;
         if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`${kind==='skip'?'Skip':'Queue'} vote limit: ${count}`}).catch(()=>{});
       }
       s.view='voteset';
     }
     else if(action==='launchpoll'){
-      if(typeof ctx.api?.sendPoll!=='function')throw new MusicError('POLL_UNAVAILABLE','Telegram Poll API is unavailable.');
-      const rootSession=qm.getSession(id);
-      const deck=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie'||(!(rootSession.upcoming||[]).length&&(rootSession.movieUpcoming||[]).length>0))?'movie':'music';
-      const q=deck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
-      if(!q.length&&!s.currentTrack)throw new MusicError('NOTHING_QUEUED','Queue at least one movie or track before launching a poll.');
-      const icon=deck==='movie'?'🎬':'🎵';
-      const optionTargets=[];
-      const optionLabels=[];
-      if(s.currentTrack){
-        optionTargets.push({kind:'skip',title:s.currentTrack.title});
-        optionLabels.push(`⏭ Skip: ${String(s.currentTrack.title||'Current').slice(0,80)}`);
-      }
-      for(const item of q.slice(0,9)){
-        optionTargets.push({kind:'play',entryId:item.entryId,title:item.title});
-        optionLabels.push(`${icon} ${String(item.title||'Queued Item').slice(0,90)}`);
-      }
-      if(optionLabels.length<2){
-        optionTargets.push({kind:'keep',title:'Keep playing'});
-        optionLabels.push('🔁 Keep Current Order');
-      }
-      const targetChatId=Number(id)<0?Number(id):(s.playerChatId||id);
-      const isChanPoll=Boolean(rootSession?.isChannel||s.isChannel||ctx.isChannel);
-      const needed=deck==='movie'?this.getQueueVoteThreshold(id):this.getSkipVoteThreshold(id);
-      const sentPoll=await ctx.api.sendPoll(targetChatId,`🗳 Lancy Viewer Poll (${needed} votes wins!)`,optionLabels,{is_anonymous:isChanPoll,allows_multiple_answers:false});
-      const pollId=sentPoll?.poll?.id;
-      if(pollId){
-        const pollRec={pollId:String(pollId),chatId:targetChatId,destination:id,messageId:sentPoll.message_id,deck,optionTargets,needed,votesByUser:new Map(),api:ctx.api};
-        this.activePolls.set(String(pollId),pollRec);
-        this.app?.db?.setSetting?.(`music.activePoll.${pollId}`,{pollId:String(pollId),chatId:targetChatId,destination:id,messageId:sentPoll.message_id,deck,optionTargets,needed});
-        rootSession.activePoll={pollId:String(pollId),messageId:sentPoll.message_id,needed};
-      }
-      s.lastNotice=`📊 Live Viewer Poll posted! First option to hit ${needed} vote(s) wins automatically.`;
+      const posted=await this.createViewerPoll(id,{api:ctx.api,botId:Number(ctx.botId??ctx.controller?.botContext?.botId??0)||0,isChannel:ctx.isChannel,auto:false,sessionView:s});
+      s.lastNotice=`📊 Live Viewer Poll posted! First option to hit its vote limit (${posted.needed}v) wins & auto-deletes the poll.`;
       if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'📊 Live Viewer Poll posted!'}).catch(()=>{});
     }
     else if(action==='downloadnow'||action==='downloadq'){
@@ -1458,7 +1473,326 @@ export class MusicService {
     if(action==='player'&&s.status==='stopped'){s.status='idle';s.lastError=null;}
     s.controlRevision=(s.controlRevision||0)+1; await qm.updatePlayerCard(id,{forceEdit:Boolean(ctx.query)});return s;
   }
-  #resolveActivePoll(pollId){
+  #resolvePollApi(poll, s = null, meta = null){
+    if(meta?.api)return meta.api;
+    const bId=Number(meta?.botId??poll?.botId??s?.botId??0);
+    if(bId>0){
+      const cloneRec=this.app?.multiBotManager?.runningBots?.get?.(bId);
+      if(cloneRec?.api)return cloneRec.api;
+    }
+    if(poll?.api)return poll.api;
+    if(s?.api)return s.api;
+    return this.app?.telegram?.api||null;
+  }
+  #persistActivePoll(poll){
+    if(!poll?.pollId||!this.app?.db?.setSetting)return;
+    const votesObj=poll.votesByUser instanceof Map?Object.fromEntries(poll.votesByUser.entries()):(poll.votesByUser&&typeof poll.votesByUser==='object'?poll.votesByUser:{});
+    this.app.db.setSetting(`music.activePoll.${poll.pollId}`,{
+      pollId:String(poll.pollId),
+      chatId:poll.chatId,
+      destination:poll.destination,
+      messageId:poll.messageId,
+      deck:poll.deck,
+      trackEntryId:poll.trackEntryId||null,
+      playbackId:poll.playbackId||null,
+      botId:Number(poll.botId||0)||0,
+      optionTargets:poll.optionTargets,
+      optionCounts:Array.isArray(poll.optionCounts)?poll.optionCounts:[],
+      needed:poll.needed,
+      skipNeeded:poll.skipNeeded,
+      queueNeeded:poll.queueNeeded,
+      auto:Boolean(poll.auto),
+      votesByUser:votesObj
+    });
+  }
+  #deletePersistedPoll(pollId){
+    const key=`music.activePoll.${pollId}`;
+    try{
+      if(typeof this.app?.db?.run==='function'){
+        this.app.db.run('DELETE FROM bot_settings WHERE key = ?',key);
+        return;
+      }
+    }catch{}
+    this.app?.db?.setSetting?.(key,null);
+  }
+  #hydratePersistedPolls(){
+    try{
+      if(typeof this.app?.db?.all!=='function')return;
+      const rows=this.app.db.all("SELECT key, value_json FROM bot_settings WHERE key LIKE 'music.activePoll.%'");
+      for(const row of (rows||[])){
+        let data=null;
+        try{data=JSON.parse(row.value_json);}catch{}
+        if(!data||typeof data!=='object'||!data.pollId)continue;
+        const pollId=String(data.pollId);
+        const votesMap=new Map(Object.entries(data.votesByUser&&typeof data.votesByUser==='object'?data.votesByUser:{}));
+        const poll={
+          ...data,
+          pollId,
+          completed:false,
+          votesByUser:votesMap,
+          api:this.#resolvePollApi(data,null,null)
+        };
+        this.activePolls.set(pollId,poll);
+        const sess=this.app?.musicQueueManager?.sessions?.get?.(Number(data.destination));
+        if(sess&&!sess.activePoll){
+          sess.activePoll={
+            pollId,
+            messageId:poll.messageId,
+            chatId:poll.chatId,
+            needed:poll.needed,
+            skipNeeded:poll.skipNeeded,
+            queueNeeded:poll.queueNeeded,
+            trackEntryId:poll.trackEntryId||null,
+            counts:Array.isArray(poll.optionCounts)?poll.optionCounts:[],
+            totalVoters:votesMap.size
+          };
+          if(poll.trackEntryId)sess.pollDoneEntryId=poll.trackEntryId;
+        }
+      }
+    }catch{}
+  }
+  bindQueuePollLifecycle(){
+    const qm=this.app?.musicQueueManager;
+    if(!qm||this._boundQm===qm||typeof qm.on!=='function')return;
+    this._boundQm=qm;
+    qm.on('track_start',({chatId,track,session})=>{
+      const id=Number(chatId);
+      const s=session||qm.getSession?.(id);
+      if(!s)return;
+      if(track?.provider!=='movie'){
+        if(s.activePoll||[...this.activePolls.values()].some(p=>Number(p.destination)===id)){
+          void this.cleanupDestinationPolls(id,{reason:'non_movie'}).catch(()=>{});
+        }
+        return;
+      }
+      if(s.pollDoneEntryId&&track.entryId&&s.pollDoneEntryId===track.entryId){
+        return;
+      }
+      void this.cleanupDestinationPolls(id,{reason:'next_movie'}).then(()=>{
+        const cur=qm.getSession?.(id);
+        if(!cur||cur.status!=='playing'||cur.currentTrack?.entryId!==track.entryId)return;
+        cur.pollDoneEntryId=null;
+        if(this.isAutoPollEnabled(id)&&(cur.movieUpcoming?.length||0)>=1){
+          this.#scheduleAutoPoll(id,track.entryId,{delayMs:450});
+        }
+      }).catch(()=>{});
+    });
+    qm.on('queue_updated',({chatId,session})=>{
+      const id=Number(chatId);
+      const s=session||qm.getSession?.(id);
+      if(!s||s.status!=='playing'||s.currentTrack?.provider!=='movie')return;
+      if((s.movieUpcoming?.length||0)<1)return;
+      if(s.activePoll||s.pollDoneEntryId===s.currentTrack.entryId)return;
+      if(this.isAutoPollEnabled(id)){
+        this.#scheduleAutoPoll(id,s.currentTrack.entryId,{delayMs:550});
+      }
+    });
+    const onStopLike=({chatId})=>{
+      const id=Number(chatId);
+      const t=this.autoPollTimers.get(id);
+      if(t){clearTimeout(t);this.autoPollTimers.delete(id);}
+      void this.cleanupDestinationPolls(id,{reason:'stopped'}).catch(()=>{});
+    };
+    qm.on('playback_stopped',onStopLike);
+    qm.on('queue_empty',onStopLike);
+    qm.on('movie_queue_cleared',({chatId})=>{
+      const id=Number(chatId);
+      const s=qm.getSession?.(id);
+      if(s?.activePoll&&!s.activePoll.decided){
+        void this.cleanupDestinationPolls(id,{reason:'queue_cleared'}).catch(()=>{});
+      }
+    });
+  }
+  #scheduleAutoPoll(chatId,expectedEntryId=null,{delayMs=450}={}){
+    const id=Number(chatId);
+    if(!Number.isSafeInteger(id)||id>=0)return;
+    const prev=this.autoPollTimers.get(id);
+    if(prev)clearTimeout(prev);
+    const timer=setTimeout(()=>{
+      this.autoPollTimers.delete(id);
+      void this.maybeAutoLaunchPoll(id,{expectedEntryId}).catch(()=>{});
+    },Math.max(0,Number(delayMs)||0));
+    timer.unref?.();
+    this.autoPollTimers.set(id,timer);
+  }
+  async maybeAutoLaunchPoll(chatId,{expectedEntryId=null}={}){
+    const id=Number(chatId);
+    const qm=this.app?.musicQueueManager;
+    const s=qm?.getSession?.(id);
+    if(!s||s.status!=='playing'||s.currentTrack?.provider!=='movie')return null;
+    if(expectedEntryId&&s.currentTrack.entryId!==expectedEntryId)return null;
+    if(!this.isAutoPollEnabled(id))return null;
+    if((s.movieUpcoming?.length||0)<1)return null;
+    if(s.activePoll||s.pollDoneEntryId===s.currentTrack.entryId)return null;
+    const api=this.#resolvePollApi(null,s,null);
+    if(typeof api?.sendPoll!=='function')return null;
+    // Lock single-poll-per-movie immediately before awaiting sendPoll to avoid duplicate posts
+    s.pollDoneEntryId=s.currentTrack.entryId;
+    try{
+      return await this.createViewerPoll(id,{api,botId:Number(s.botId||0)||0,isChannel:Boolean(s.isChannel),auto:true,sessionView:s});
+    }catch(err){
+      s.pollDoneEntryId=null;
+      qm?.log?.warn?.({chatId:id,err:err?.message},'Auto-poll post failed');
+      return null;
+    }
+  }
+  async cleanupDestinationPolls(chatId,{reason='cleanup'}={}){
+    const id=Number(chatId);
+    const qm=this.app?.musicQueueManager;
+    const s=qm?.sessions?.get?.(id)||null;
+    const matches=[...this.activePolls.values()].filter(p=>Number(p.destination)===id||Number(p.chatId)===id);
+    if(s?.activePoll?.pollId&&!matches.some(m=>m.pollId===s.activePoll.pollId)){
+      const extra=this.#resolveActivePoll(s.activePoll.pollId);
+      if(extra)matches.push(extra);
+    }
+    for(const poll of matches){
+      const pid=String(poll.pollId||'');
+      poll.completed=true;
+      this.activePolls.delete(pid);
+      this.#deletePersistedPoll(pid);
+      const api=this.#resolvePollApi(poll,s,null);
+      if(poll.messageId){
+        if(typeof api?.stopPoll==='function')await api.stopPoll(poll.chatId,poll.messageId).catch(()=>{});
+        if(typeof api?.deleteMessage==='function')await api.deleteMessage(poll.chatId,poll.messageId).catch(()=>{});
+      }
+    }
+    if(s){
+      s.activePoll=null;
+      if(reason==='stopped'||reason==='non_movie')s.pollDoneEntryId=null;
+    }
+    return matches.length;
+  }
+  async createViewerPoll(id,{api=null,botId=0,isChannel=null,auto=false,sessionView=null}={}){
+    const qm=this.app.musicQueueManager;
+    const rootSession=qm.getSession(id);
+    const viewSess=sessionView||rootSession;
+    const effApi=this.#resolvePollApi(null,rootSession,{api,botId});
+    if(typeof effApi?.sendPoll!=='function')throw new MusicError('POLL_UNAVAILABLE','Telegram Poll API is unavailable.');
+    const deck=(viewSess.activeDeck==='movie'||rootSession.currentTrack?.provider==='movie'||(!(rootSession.upcoming||[]).length&&(rootSession.movieUpcoming||[]).length>0))?'movie':'music';
+    const q=deck==='movie'?(rootSession.movieUpcoming||[]):(rootSession.upcoming||[]);
+    if(!q.length&&!rootSession.currentTrack)throw new MusicError('NOTHING_QUEUED','Queue at least one movie or track before launching a poll.');
+    await this.cleanupDestinationPolls(id,{reason:'replaced'});
+
+    const icon=deck==='movie'?'🎬':'🎵';
+    const optionTargets=[];
+    const optionLabels=[];
+    if(rootSession.currentTrack){
+      optionTargets.push({kind:'skip',title:rootSession.currentTrack.title});
+      optionLabels.push(`⏭ Skip: ${String(rootSession.currentTrack.title||'Current').slice(0,82)}`);
+    }
+    const maxItems=rootSession.currentTrack?8:9;
+    for(const item of q.slice(0,maxItems)){
+      optionTargets.push({kind:'play',entryId:item.entryId,title:item.title});
+      optionLabels.push(`${icon} ${String(item.title||'Queued Item').slice(0,90)}`);
+    }
+    if(optionLabels.length<2){
+      optionTargets.push({kind:'keep',title:'Keep playing'});
+      optionLabels.push('🔁 Keep Current Order');
+    }
+
+    const targetChatId=Number(id)<0?Number(id):(rootSession.playerChatId||id);
+    const isChanPoll=Boolean(rootSession?.isChannel||viewSess?.isChannel||isChannel);
+    const skipNeeded=this.getSkipVoteThreshold(id);
+    const queueNeeded=this.getQueueVoteThreshold(id);
+    const needed=deck==='movie'?queueNeeded:skipNeeded;
+    const nowTitle=rootSession.currentTrack?.title?` · Now: ${String(rootSession.currentTrack.title).slice(0,70)}`:'';
+    const question=`🗳 Up Next Poll${nowTitle} (${needed} vote${needed===1?'':'s'} wins!)`.slice(0,255);
+
+    let sentPoll;
+    try{
+      sentPoll=await effApi.sendPoll(targetChatId,question,optionLabels,{is_anonymous:isChanPoll,allows_multiple_answers:false});
+    }catch(err){
+      const desc=String(err?.description||err?.message||'');
+      if(!isChanPoll&&/non-anonymous|channel/i.test(desc)){
+        rootSession.isChannel=true;
+        sentPoll=await effApi.sendPoll(targetChatId,question,optionLabels,{is_anonymous:true,allows_multiple_answers:false});
+      }else{
+        throw err;
+      }
+    }
+    const pollId=sentPoll?.poll?.id;
+    const effBotId=Number(botId||rootSession.botId||effApi?.me?.id||0)||0;
+    const trackEntryId=rootSession.currentTrack?.entryId||null;
+    if(pollId){
+      const pollRec={
+        pollId:String(pollId),
+        chatId:targetChatId,
+        destination:id,
+        messageId:sentPoll.message_id,
+        deck,
+        trackEntryId,
+        playbackId:rootSession.playbackId||null,
+        botId:effBotId,
+        optionTargets,
+        optionCounts:optionLabels.map(()=>0),
+        needed,
+        skipNeeded,
+        queueNeeded,
+        auto:Boolean(auto),
+        completed:false,
+        votesByUser:new Map(),
+        api:effApi
+      };
+      this.activePolls.set(String(pollId),pollRec);
+      this.#persistActivePoll(pollRec);
+      rootSession.activePoll={
+        pollId:String(pollId),
+        messageId:sentPoll.message_id,
+        chatId:targetChatId,
+        needed,
+        skipNeeded,
+        queueNeeded,
+        trackEntryId,
+        counts:optionLabels.map(()=>0),
+        totalVoters:0
+      };
+      if(trackEntryId)rootSession.pollDoneEntryId=trackEntryId;
+    }
+    qm?.log?.info?.({chatId:id,pollId:String(pollId||''),auto:Boolean(auto),options:optionLabels.length,needed,skipNeeded,queueNeeded},'Viewer poll posted');
+    return {pollId:pollId?String(pollId):null,needed,skipNeeded,queueNeeded,messageId:sentPoll?.message_id||null};
+  }
+  #thresholdForOption(poll,target){
+    if(target?.kind==='skip')return Math.max(1,Number(poll?.skipNeeded??poll?.needed??2));
+    return Math.max(1,Number(poll?.queueNeeded??poll?.needed??2));
+  }
+  async autopollCommand(ctx,args=[]){
+    const id=await this.authorize(ctx,false,null,{allowDj:false});
+    const tokens=(Array.isArray(args)?args:String(args||'').split(/\s+/)).map(s=>String(s||'').trim().toLowerCase()).filter(Boolean);
+    const onWords=new Set(['on','enable','enabled','allow','true','yes','1','start']);
+    const offWords=new Set(['off','disable','disabled','disallow','false','no','0','stop']);
+    const qm=this.app?.musicQueueManager;
+    const s=qm?.getSession?.(id);
+    if(!tokens.length||tokens[0]==='status'){
+      const enabled=this.isAutoPollEnabled(id);
+      const qNeed=this.getQueueVoteThreshold(id);
+      const sNeed=this.getSkipVoteThreshold(id);
+      if(s)s.view='voteset';
+      return {enabled,queueNeed:qNeed,skipNeed:sNeed,activePoll:s?.activePoll||null};
+    }
+    let nextEnabled=this.isAutoPollEnabled(id);
+    let updatedThresh=null;
+    for(const tok of tokens){
+      if(onWords.has(tok))nextEnabled=this.setAutoPollEnabled(id,true);
+      else if(offWords.has(tok))nextEnabled=this.setAutoPollEnabled(id,false);
+      else if(/^\d+$/.test(tok)){
+        const count=Math.max(1,Math.min(25,Number(tok)));
+        this.app?.db?.setSetting?.(`music.queueVoteThreshold.${id}`,count);
+        this.app?.db?.setSetting?.(`music.skipVoteThreshold.${id}`,count);
+        updatedThresh=count;
+      }
+    }
+    if(nextEnabled&&s)this.#scheduleAutoPoll(id,null,{delayMs:200});
+    const qNeed=this.getQueueVoteThreshold(id);
+    const sNeed=this.getSkipVoteThreshold(id);
+    if(s){
+      s.lastNotice=updatedThresh
+        ?`🤖 Auto-Poll ${nextEnabled?'ON':'OFF'} · Vote limit set to ${updatedThresh}v.`
+        :`🤖 Auto-Poll is now ${nextEnabled?'ON':'OFF'} (${qNeed}v to decide).`;
+      await qm.updatePlayerCard(id,{forceEdit:true}).catch(()=>{});
+    }
+    return {enabled:nextEnabled,queueNeed:qNeed,skipNeed:sNeed,updatedThresh,activePoll:s?.activePoll||null};
+  }
+  #resolveActivePoll(pollId,meta=null){
     const key=String(pollId||'');
     if(!key)return null;
     let poll=this.activePolls.get(key);
@@ -1466,101 +1800,171 @@ export class MusicService {
       const persisted=this.app?.db?.getSetting?.(`music.activePoll.${key}`,null);
       if(persisted&&typeof persisted==='object'){
         const session=this.app?.musicQueueManager?.sessions?.get?.(Number(persisted.destination))||null;
+        const votesMap=new Map(Object.entries(persisted.votesByUser&&typeof persisted.votesByUser==='object'?persisted.votesByUser:{}));
         poll={
           ...persisted,
           pollId:key,
-          votesByUser:new Map(),
-          api:session?.api||this.app?.telegram?.api||null
+          completed:false,
+          votesByUser:votesMap,
+          api:this.#resolvePollApi(persisted,session,meta)
         };
         this.activePolls.set(key,poll);
       }
+    }else if(meta?.api&&!poll.api){
+      poll.api=meta.api;
     }
     return poll||null;
   }
   async #completePollVote(poll,winnerIndex,votesCount){
+    if(poll.completed)return false;
     const winner=poll.optionTargets?.[winnerIndex];
     if(!winner)return false;
+    poll.completed=true;
     const pollId=String(poll.pollId||'');
     this.activePolls.delete(pollId);
-    this.app?.db?.setSetting?.(`music.activePoll.${pollId}`,null);
+    this.#deletePersistedPoll(pollId);
     const qm=this.app?.musicQueueManager;
     const s=qm?.getSession?.(poll.destination);
-    if(s)s.activePoll=null;
-    const api=poll.api||s?.api||this.app?.telegram?.api;
-    if(poll.messageId&&typeof api?.stopPoll==='function'){
-      await api.stopPoll(poll.chatId,poll.messageId).catch(()=>{});
+    if(s){
+      if(s.activePoll?.pollId===pollId)s.activePoll=null;
+      if(poll.trackEntryId)s.pollDoneEntryId=poll.trackEntryId;
     }
+    const api=this.#resolvePollApi(poll,s,null);
+    if(poll.messageId){
+      if(typeof api?.stopPoll==='function'){
+        await api.stopPoll(poll.chatId,poll.messageId).catch(()=>{});
+      }
+      if(typeof api?.deleteMessage==='function'){
+        await api.deleteMessage(poll.chatId,poll.messageId).catch(()=>{});
+      }
+    }
+    qm?.log?.info?.({chatId:poll.destination,pollId,winnerKind:winner.kind,winnerTitle:winner.title,votes:votesCount},'Viewer poll decided & deleted');
+    let resultNotice=null;
     if(qm&&s){
       if(winner.kind==='skip'){
-        s.lastNotice=`📊 Viewer Poll passed (${votesCount} votes): Skipping current item!`;
+        resultNotice=`📊 Poll passed (${votesCount}v): Skipped to next! Poll removed.`;
         await qm.skip(poll.destination).catch(()=>{});
       }else if(winner.kind==='play'&&winner.entryId){
         const mode=this.getQueueVoteAction(poll.destination);
-        s.lastNotice=`📊 Viewer Poll winner (${votesCount} votes): ${winner.title}!`;
         const inMovie=(s.movieUpcoming||[]).some(t=>t.entryId===winner.entryId);
-        if(mode==='playnow'){
-          if(inMovie)await qm.playQueuedMovieNow(poll.destination,winner.entryId).catch(()=>{});
-          else await qm.playNow(poll.destination,winner.entryId).catch(()=>{});
-        }else if(inMovie){
-          qm.promoteMovieTrack(poll.destination,winner.entryId);
+        const inMusic=(s.upcoming||[]).some(t=>t.entryId===winner.entryId);
+        if(inMovie||inMusic){
+          if(mode==='playnow'){
+            resultNotice=`📊 Poll winner (${votesCount}v): Playing ${winner.title}!`;
+            if(inMovie)await qm.playQueuedMovieNow(poll.destination,winner.entryId).catch(()=>{});
+            else await qm.playNow(poll.destination,winner.entryId).catch(()=>{});
+          }else{
+            resultNotice=`📊 Poll winner (${votesCount}v): ${winner.title} moved to #1!`;
+            try{
+              if(inMovie)qm.promoteMovieTrack(poll.destination,winner.entryId);
+              else qm.promoteTrack(poll.destination,winner.entryId);
+            }catch{
+              resultNotice=`📊 Poll closed (${votesCount}v): Selected item was no longer in queue.`;
+            }
+          }
         }else{
-          qm.promoteTrack(poll.destination,winner.entryId);
+          resultNotice=`📊 Poll closed (${votesCount}v): Selected item was already played or removed.`;
         }
+      }else if(winner.kind==='keep'){
+        resultNotice=`📊 Poll decided (${votesCount}v): Keeping current movie playing.`;
       }
+      if(resultNotice)s.lastNotice=resultNotice;
       await qm.updatePlayerCard(poll.destination,{forceEdit:true}).catch(()=>{});
     }
     return true;
   }
-  async handlePollUpdate(pollObj){
+  async handlePollUpdate(pollObj,meta=null){
     const pollId=String(pollObj?.id||'');
-    const poll=this.#resolveActivePoll(pollId);
-    if(!poll)return false;
-    const options=Array.isArray(pollObj?.options)?pollObj.options:[];
-    let winnerIndex=null;
-    let bestCount=poll.needed-1;
-    for(let i=0;i<options.length;i++){
-      const target=poll.optionTargets?.[i];
-      if(!target||target.kind==='keep')continue;
-      const cnt=Number(options[i]?.voter_count||0);
-      if(cnt>=poll.needed&&cnt>bestCount){
-        bestCount=cnt;
-        winnerIndex=i;
+    if(!pollId)return false;
+    return this.pollLock.run(pollId,async()=>{
+      const poll=this.#resolveActivePoll(pollId,meta);
+      if(!poll||poll.completed)return false;
+      const options=Array.isArray(pollObj?.options)?pollObj.options:[];
+      const counts=options.map(o=>Number(o?.voter_count||0));
+      poll.optionCounts=counts;
+      const qm=this.app?.musicQueueManager;
+      const s=qm?.getSession?.(poll.destination)||null;
+      let winnerIndex=null;
+      let bestCount=-1;
+      for(let i=0;i<options.length;i++){
+        const target=poll.optionTargets?.[i];
+        if(!target)continue;
+        const cnt=counts[i]||0;
+        const need=this.#thresholdForOption(poll,target);
+        if(cnt>=need&&cnt>bestCount){
+          bestCount=cnt;
+          winnerIndex=i;
+        }
       }
-    }
-    if(winnerIndex!==null){
-      return await this.#completePollVote(poll,winnerIndex,bestCount);
-    }
-    if(pollObj?.is_closed){
-      this.activePolls.delete(pollId);
-      this.app?.db?.setSetting?.(`music.activePoll.${pollId}`,null);
-      const s=this.app?.musicQueueManager?.getSession?.(poll.destination);
-      if(s)s.activePoll=null;
-    }
-    return true;
+      qm?.log?.info?.({chatId:poll.destination,pollId,counts,totalVoters:pollObj?.total_voter_count,winnerIndex},'Telegram poll update received');
+      if(winnerIndex!==null){
+        return await this.#completePollVote(poll,winnerIndex,bestCount);
+      }
+      if(pollObj?.is_closed){
+        poll.completed=true;
+        this.activePolls.delete(pollId);
+        this.#deletePersistedPoll(pollId);
+        if(s?.activePoll?.pollId===pollId)s.activePoll=null;
+        return true;
+      }
+      if(s?.activePoll?.pollId===pollId){
+        s.activePoll={...s.activePoll,counts,totalVoters:Number(pollObj?.total_voter_count||counts.reduce((a,b)=>a+b,0))};
+      }
+      this.#persistActivePoll(poll);
+      return true;
+    });
   }
-  async handlePollAnswer(pollAnswer){
+  async handlePollAnswer(pollAnswer,meta=null){
     const pollId=String(pollAnswer?.poll_id||'');
-    const poll=this.#resolveActivePoll(pollId);
-    if(!poll)return false;
-    const voterId=String(pollAnswer?.user?.id||pollAnswer?.voter_chat?.id||'');
-    if(!voterId)return false;
-    const picks=Array.isArray(pollAnswer.option_ids)?pollAnswer.option_ids:[];
-    if(!picks.length)poll.votesByUser.delete(voterId);
-    else poll.votesByUser.set(voterId,picks);
+    if(!pollId)return false;
+    return this.pollLock.run(pollId,async()=>{
+      const poll=this.#resolveActivePoll(pollId,meta);
+      if(!poll||poll.completed)return false;
+      const voterId=String(pollAnswer?.user?.id||pollAnswer?.voter_chat?.id||'');
+      if(!voterId)return false;
+      const picks=Array.isArray(pollAnswer.option_ids)?pollAnswer.option_ids:[];
+      if(!picks.length)poll.votesByUser.delete(voterId);
+      else poll.votesByUser.set(voterId,picks);
 
-    const tallies=new Map();
-    for(const optIds of poll.votesByUser.values()){
-      for(const oi of optIds)tallies.set(oi,(tallies.get(oi)||0)+1);
-    }
-    let winnerIndex=null;
-    for(const [oi,cnt] of tallies.entries()){
-      if(cnt>=poll.needed&&poll.optionTargets[oi]&&poll.optionTargets[oi].kind!=='keep'){
-        winnerIndex=oi;
-        break;
+      const tallies=new Map();
+      for(const optIds of poll.votesByUser.values()){
+        for(const oi of optIds)tallies.set(oi,(tallies.get(oi)||0)+1);
       }
-    }
-    if(winnerIndex===null)return true;
-    return await this.#completePollVote(poll,winnerIndex,tallies.get(winnerIndex));
+      const counts=Array.isArray(poll.optionTargets)?poll.optionTargets.map((_,idx)=>tallies.get(idx)||0):[];
+      poll.optionCounts=counts;
+      const qm=this.app?.musicQueueManager;
+      const s=qm?.getSession?.(poll.destination)||null;
+      let winnerIndex=null;
+      let bestCount=-1;
+      for(const [oi,cnt] of tallies.entries()){
+        const target=poll.optionTargets?.[oi];
+        if(!target)continue;
+        const need=this.#thresholdForOption(poll,target);
+        if(cnt>=need&&cnt>bestCount){
+          bestCount=cnt;
+          winnerIndex=oi;
+        }
+      }
+      qm?.log?.info?.({chatId:poll.destination,pollId,voterId,picks,counts,winnerIndex},'Telegram poll_answer vote received');
+      if(winnerIndex!==null){
+        return await this.#completePollVote(poll,winnerIndex,bestCount);
+      }
+      this.#persistActivePoll(poll);
+      if(s){
+        if(s.activePoll?.pollId===pollId){
+          s.activePoll={...s.activePoll,counts,totalVoters:poll.votesByUser.size};
+        }
+        const topCnt=counts.length?Math.max(...counts):0;
+        const topIdx=counts.indexOf(topCnt);
+        const topTarget=topIdx>=0?poll.optionTargets?.[topIdx]:null;
+        if(topTarget&&topCnt>0){
+          const need=this.#thresholdForOption(poll,topTarget);
+          s.lastNotice=`🗳 Viewer Poll vote (${topCnt}/${need}): ${String(topTarget.title||'Option').slice(0,60)}`;
+          await qm.updatePlayerCard(poll.destination).catch(()=>{});
+        }
+      }
+      return true;
+    });
   }
   async accountCommand(ctx,args) {
     if(!this.owner(ctx)||Number(ctx.chatId)<0||ctx.isClone)throw new MusicError('OWNER_ONLY','Account-pool management is restricted to the main owner in private chat.');

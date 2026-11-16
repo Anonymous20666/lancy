@@ -493,7 +493,8 @@ export class QueueManager extends EventEmitter {
             track.dubOnlyWarning = '⚠️ Dub Only Available';
           }
         }
-        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=startSeconds>0?startSeconds:0;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
+        const landedStartPos = (typeof r?.position_seconds === 'number' && Number.isFinite(r.position_seconds) && r.position_seconds >= 0) ? r.position_seconds : (startSeconds > 0 ? startSeconds : 0);
+        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=landedStartPos;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
         this.#ensureLiveSubTimer(s);
         this.prefetch(s);
         if(!previous||!s.volumeConfirmed||s.appliedVolume!==s.volume){
@@ -614,6 +615,7 @@ export class QueueManager extends EventEmitter {
     s.lastError = null;
     s.nextCardEdit = 0;
     this.#savePlaybackSnapshot(s);
+    this.emit('playback_stopped', { chatId: s.chatId, reason: 'call_ended', session: s });
     return true;
   }
   async handleCallEnded(id, playbackId = null, reportedPos = null) {
@@ -771,6 +773,7 @@ export class QueueManager extends EventEmitter {
         s.upcoming=[];
       }
       s.currentTrack=null;s.positionSeconds=null;s.lastKnownPositionSeconds=0;s.callEnded=false;s.status='idle';s.lastNotice=null;s.liveSubCue='';s.stopPending=true;
+      this.emit('playback_stopped', { chatId: s.chatId, reason: 'stop', session: s });
       try { await this.#finishStop(s); }
       catch(error) {s.status='error';s.lastError='Queue cleared, but immediate call/group departure was not confirmed. Cleanup will retry.';s.stopRetryAfter=Date.now()+30000;throw error;}
       finally {await this.updatePlayerCard(id);}
@@ -818,7 +821,7 @@ export class QueueManager extends EventEmitter {
   toggleLoopMode(id) { const s = this.getSession(id); const modes = ['off','track','queue']; s.loopMode = modes[(modes.indexOf(s.loopMode) + 1) % 3]; this.#savePlaybackSnapshot(s); return s.loopMode; }
   shuffle(id) { const q = this.getSession(id).upcoming; for (let i=q.length-1; i>0; i--) { const j=Math.floor(Math.random()*(i+1)); [q[i],q[j]]=[q[j],q[i]]; } this.dropPrefetch(this.getSession(id));this.prefetch(this.getSession(id));return q.length; }
   clearQueue(id) { const s = this.getSession(id); const count = s.upcoming.length;for(const t of s.upcoming)t.queuedMedia?.release?.();this.dropPrefetch(s);s.upcoming = [];if(s.radio)s.radio.enabled=false; if (!s.currentTrack && (s.connected||s.prepared)) this.#idle(s); return count; }
-  clearMovieQueue(id) { const s = this.getSession(id); const count = s.movieUpcoming.length; for (const t of s.movieUpcoming) t.queuedMedia?.release?.(); s.movieUpcoming = []; if (!s.currentTrack && (s.connected || s.prepared)) this.#idle(s); return count; }
+  clearMovieQueue(id) { const s = this.getSession(id); const count = s.movieUpcoming.length; for (const t of s.movieUpcoming) t.queuedMedia?.release?.(); s.movieUpcoming = []; if (!s.currentTrack && (s.connected || s.prepared)) this.#idle(s); this.emit('movie_queue_cleared', { chatId: s.chatId, session: s }); return count; }
   removeTrack(id, entryId) { const s = this.getSession(id); const index = typeof entryId === 'number' ? entryId : s.upcoming.findIndex(t => t.entryId === entryId); if(index<0||index>=s.upcoming.length)return null;const removed=s.upcoming.splice(index,1)[0];removed.queuedMedia?.release?.();if(s.prefetched?.entryId===removed.entryId)this.dropPrefetch(s);this.prefetch(s);return removed; }
   removeMovieTrack(id, entryId) { const s = this.getSession(id); const index = typeof entryId === 'number' ? entryId : s.movieUpcoming.findIndex(t => t.entryId === entryId); if (index < 0 || index >= s.movieUpcoming.length) return null; const removed = s.movieUpcoming.splice(index, 1)[0]; removed.queuedMedia?.release?.(); return removed; }
   async playNow(id,entryId){this.sessions.get(Number(id))?.prepareAbort?.abort();return this.locks.run(Number(id),async()=>{const s=this.getSession(id),index=s.upcoming.findIndex(t=>t.entryId===entryId);if(index<0)throw new MusicError('STALE_PLAYER','That queued recording is not available.');const [entry]=s.upcoming.splice(index,1);s.upcoming.unshift(entry);if(s.prefetched?.entryId!==entryId)this.dropPrefetch(s);s.activeDeck='music';s.view='player';const hadActive=Boolean(s.currentTrack&&s.currentTrack.entryId!==entryId&&['playing','paused','buffering'].includes(s.status));return this.#next(s,{manual:true,targetEntryId:entryId,preservePreviousToEnd:hadActive,deck:'music'});});}
@@ -899,6 +902,7 @@ export class QueueManager extends EventEmitter {
         s.positionSeconds = null;
         s.status = 'idle';
         s.liveSubCue = '';
+        this.emit('playback_stopped', { chatId: s.chatId, reason: 'deck_switch', session: s });
       }
       s.activeDeck = target;
       s.view = target === 'movie' ? 'cinema' : 'player';
@@ -1361,7 +1365,7 @@ export class QueueManager extends EventEmitter {
       try {
         const freshRes = await this.app.movieResolver.resolve(track, {
           allowAdultFeatures: Boolean(track.isAdult),
-          fetchSubtitles: false,
+          fetchSubtitles: !track.isAdult && !track.subtitlePath,
           excludeUrls: [...blocked]
         });
         if (freshRes?.ok && freshRes.track?.streamUrl) {
@@ -1377,7 +1381,13 @@ export class QueueManager extends EventEmitter {
             track.streamHeaders = { ...(track.streamHeaders || {}), ...(freshRes.track.streamHeaders || freshRes.track.headers || {}) };
           }
           if (freshRes.track.referer) track.referer = freshRes.track.referer;
-          if (!track.subtitlePath && freshRes.track.subtitlePath) track.subtitlePath = freshRes.track.subtitlePath;
+          if (!track.subtitlePath && freshRes.track.subtitlePath) {
+            track.subtitlePath = freshRes.track.subtitlePath;
+            if (freshRes.track.subtitleLabel) track.subtitleLabel = freshRes.track.subtitleLabel;
+            if (Array.isArray(freshRes.track.subtitleTracks) && freshRes.track.subtitleTracks.length) {
+              track.subtitleTracks = freshRes.track.subtitleTracks;
+            }
+          }
           if (freshRes.track.durationSeconds && !track.durationSeconds) track.durationSeconds = freshRes.track.durationSeconds;
           track.streamResolvedAt = Date.now();
           delete track._restoredFromSnapshot;
@@ -1647,16 +1657,33 @@ export class QueueManager extends EventEmitter {
           this.#handleCallEndedSession(s, r.last_position_seconds);
         } else if (r.info?.playback_id === s.playbackId) {
           if (typeof r.info.position_seconds === 'number' && Number.isFinite(r.info.position_seconds)) {
+            const prevPos = s.positionSeconds;
             s.positionSeconds = r.info.position_seconds;
-            s.positionUpdatedAt = Date.now();
+            if (prevPos === null || prevPos === undefined || Math.abs(r.info.position_seconds - prevPos) >= 0.05 || (Date.now() - (s.positionUpdatedAt || 0)) >= 1400) {
+              s.positionUpdatedAt = Date.now();
+            }
             if (r.info.position_seconds > 0) s.lastKnownPositionSeconds = r.info.position_seconds;
           } else {
             s.positionSeconds = null;
           }
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}
           const prevSyncing = Boolean(s.avSync?.syncing);
+          const prevSyncHealth = s.avSync?.sync_health || null;
+          const prevResyncCount = Number(s.avSync?.resync_count || 0);
           s.avSync = r.info.av_sync || null;
-          if (Boolean(s.avSync?.syncing) !== prevSyncing) {
+          const nextSyncHealth = s.avSync?.sync_health || null;
+          const nextResyncCount = Number(s.avSync?.resync_count || 0);
+          if (nextSyncHealth && nextSyncHealth !== prevSyncHealth) {
+            if (['drifted', 'stalled'].includes(nextSyncHealth)) {
+              this.log.warn({ chatId: s.chatId, syncHealth: nextSyncHealth, skewMs: s.avSync?.skew_ms, hbAgeSec: s.avSync?.hb_age_sec }, 'VC A/V sync degraded');
+            } else if (['drifted', 'stalled', 'syncing'].includes(prevSyncHealth) && nextSyncHealth === 'locked') {
+              this.log.info({ chatId: s.chatId, skewMs: s.avSync?.skew_ms }, 'VC A/V sync locked');
+            }
+          }
+          if (nextResyncCount > prevResyncCount) {
+            this.log.warn({ chatId: s.chatId, resyncCount: nextResyncCount, reason: s.avSync?.last_resync_reason }, 'VC A/V auto-resync triggered');
+          }
+          if (Boolean(s.avSync?.syncing) !== prevSyncing || nextSyncHealth !== prevSyncHealth || nextResyncCount !== prevResyncCount) {
             s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
           }
           if (r.info.audio_language && s.currentTrack) s.currentTrack.audioLanguage = r.info.audio_language;

@@ -1232,6 +1232,140 @@ while True:
             for a, b in zip(samples, samples[1:]):
                 self.assertGreaterEqual(b + 1e-6, a, f'Non-monotonic audio_sec: {a} -> {b}')
 
+    def test_nut_reader_positive_frame_pts_deltas_and_writer_roundtrip(self):
+        import io
+        import json
+        import subprocess
+        import nut_stream
+
+        cmd = [
+            'ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-f', 'lavfi', '-i', 'color=c=black:s=64x64:r=24000/1001:d=0.6',
+            '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo:d=0.6',
+            '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p',
+            '-c:a', 'pcm_s16le', '-write_index', '0', '-f', 'nut', 'pipe:1',
+        ]
+        raw = subprocess.check_output(cmd)
+        probe_pkts = json.loads(
+            subprocess.check_output(
+                ['ffprobe', '-v', 'error', '-show_packets', '-show_entries', 'packet=stream_index,pts', '-of', 'json', '-f', 'nut', '-'],
+                input=raw,
+            )
+        )['packets']
+        parsed = [
+            (int(p[1]['stream_id']), int(p[1]['pts']))
+            for p in nut_stream.NutStreamReader(io.BytesIO(raw)).iter_packets()
+            if p[0] == 'frame'
+        ]
+        expected = [(int(x['stream_index']), int(x['pts'])) for x in probe_pkts]
+        self.assertEqual(parsed, expected)
+        v_pts = [pts for sid, pts in parsed if sid == 0]
+        self.assertGreaterEqual(len(v_pts), 10)
+        self.assertTrue(all(b > a for a, b in zip(v_pts, v_pts[1:])), f'Video PTS went backwards: {v_pts[:10]}')
+
+        # Verify 1080p NutStreamWriter emits zero-warning FFmpeg-readable NUT packets
+        w, h = 1920, 1080
+        writer = nut_stream.NutStreamWriter(width=w, height=h)
+        buf = bytearray(writer.build_headers())
+        v_frame = b'\x10' * (w * h) + b'\x80' * (w * h // 2)
+        a_chunk = b'\x01\x00' * 4000
+        for i in range(4):
+            pts_us = i * 41667
+            buf.extend(writer.pack_syncpoint(pts_us))
+            ah, ab = writer.pack_frame(1, pts_us, a_chunk)
+            vh, vb = writer.pack_frame(0, pts_us, v_frame)
+            buf.extend(ah); buf.extend(ab); buf.extend(vh); buf.extend(vb)
+        pr = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_packets', '-show_entries', 'packet=stream_index,pts', '-of', 'json', '-f', 'nut', '-'],
+            input=bytes(buf),
+            capture_output=True,
+        )
+        self.assertEqual(pr.returncode, 0)
+        self.assertEqual(pr.stderr.decode().strip(), '')
+        out_pkts = json.loads(pr.stdout)['packets']
+        self.assertEqual(len(out_pkts), 8)
+
+    def test_bridge_active_sync_monitor_detects_stall_and_auto_resyncs(self):
+        import asyncio
+        import main as voice_main
+
+        async def _run():
+            with tempfile.TemporaryDirectory(prefix='lancy_syncmon_') as td:
+                bridge = voice_main.Bridge(td, factory=object())
+                bridge.sync_monitor_interval_sec = 0.05
+                bridge.allow_auto_resync_in_tests = True
+                bridge.accounts['main'] = {
+                    'alias': 'main', 'enabled': True, 'allowed': [], 'status': 'available',
+                    'leases': {-10077}, 'client': None, 'engine': object(), 'managed': set(),
+                    'denied': [], 'group_grants': set(), 'member_fallback_enabled': False,
+                }
+                sid = f'mon_{os.getpid()}'
+                voice_main._init_sync_state(sid, paused=False)
+                now_m = time.monotonic()
+                voice_main._mutate_sync_state(sid, lambda st: (
+                    setattr(st, 'audio_state', 1),
+                    setattr(st, 'video_state', 1),
+                    setattr(st, 'audio_hb_mono', now_m),
+                    setattr(st, 'video_hb_mono', now_m),
+                    setattr(st, 'audio_sec', 10.0),
+                    setattr(st, 'video_sec', 10.0),
+                    setattr(st, 'skew_ms', 12),
+                ))
+                resync_calls = []
+
+                async def _fake_stream(_a, _chat, c):
+                    resync_calls.append(float(c.get('offset') or 0.0))
+                    nm = time.monotonic()
+                    voice_main._mutate_sync_state(sid, lambda st: (
+                        setattr(st, 'audio_hb_mono', nm),
+                        setattr(st, 'video_hb_mono', nm),
+                        setattr(st, 'skew_ms', 0),
+                    ))
+
+                bridge.stream = _fake_stream
+                bridge._call_elapsed_seconds = lambda _eng, _chat, _call, timeout=3.0: asyncio.sleep(0, result=42.5)
+                bridge.calls[-10077] = {
+                    'alias': 'main',
+                    'path': '/tmp/fake.mp4',
+                    'stream_mode': 'rtmp',
+                    'status': 'playing',
+                    'playback_id': 'pb1',
+                    'av_sync_id': sid,
+                    'duration': 3600.0,
+                    'offset': 0.0,
+                    'position_seconds': 12.0,
+                    'last_known_position': 42.5,
+                    'last_seek_at': 0.0,
+                    'last_progress': now_m,
+                    'clock_errors': 0,
+                    'retries': 0,
+                    'retry_after': 0.0,
+                    'video': True,
+                    'volume': 100,
+                    'publisher_verified': True,
+                    'publisher_muted': False,
+                }
+                st_ok = await bridge.status(-10077)
+                self.assertTrue(st_ok['info']['av_sync']['monitored'])
+                self.assertEqual(st_ok['info']['av_sync']['sync_health'], 'locked')
+                self.assertFalse(st_ok['info']['av_sync']['syncing'])
+
+                # Simulate sustained skew (+340ms) -> background monitor triggers auto-resync
+                voice_main._mutate_sync_state(sid, lambda st: setattr(st, 'skew_ms', 340))
+                bridge.ensure_sync_monitor()
+                deadline = time.monotonic() + 2.0
+                while time.monotonic() < deadline and not resync_calls:
+                    await asyncio.sleep(0.04)
+                await bridge.shutdown()
+                try:
+                    av_sync.shm_path_for(sid).unlink(missing_ok=True)
+                except Exception:
+                    pass
+                self.assertGreaterEqual(len(resync_calls), 1)
+                self.assertAlmostEqual(resync_calls[0], 42.5, places=1)
+
+        asyncio.run(_run())
+
 
 if __name__ == '__main__':
     unittest.main()

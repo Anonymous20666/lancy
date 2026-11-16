@@ -724,12 +724,23 @@ export function createMusicScreen({ app }) {
     const skipNeed = app.music?.getSkipVoteThreshold?.(destId) ?? 2;
     const queueNeed = app.music?.getQueueVoteThreshold?.(destId) ?? 2;
     const voteMode = app.music?.getQueueVoteAction?.(destId) ?? 'playnow';
+    const autoPoll = app.music?.isAutoPollEnabled?.(destId) ?? true;
     const b = card('🗳 LANCY MUSIC · VIEWER VOTE DASHBOARD', `${cut(s.destinationTitle || 'Voice Chat', 40)} · Owner & Admin Controls`);
-    b.table([
+    const rows = [
+      ['🤖 Auto-Poll (Movies)', autoPoll ? '✅ ON · 1 poll per movie, deletes when decided' : '⚪ OFF · Manual polls only'],
       ['⏭ Skip Votes Needed', `${skipNeed} viewer vote(s)`],
       ['🗳 Queue Votes Needed', `${queueNeed} viewer vote(s)`],
       ['⚡ Winning Queue Action', voteMode === 'playnow' ? 'Play Immediately' : 'Move to Next (#1)']
-    ], { striped: true, bordered: true, compact: true });
+    ];
+    if (s.activePoll?.pollId) {
+      rows.push(['📊 Active Poll', `Live (${Number(s.activePoll.totalVoters || 0)} votes recorded)`]);
+    }
+    b.table(rows, { striped: true, bordered: true, compact: true });
+    if (s.lastError) b.blockquote(rt.text(`⚠ ${cut(s.lastError, 240)}`));
+    else if (s.lastNotice) b.blockquote(rt.text(`ℹ️ ${cut(s.lastNotice, 240)}`));
+    b.buttons([
+      controls(s, autoPoll ? '🤖 Auto-Poll · ON' : '🤖 Auto-Poll · OFF', 'setvotethresh', 'autopoll', autoPoll ? 'off' : 'on', { style: autoPoll ? 'success' : 'primary' })
+    ]);
     b.paragraph(rt.bold('⏭ Skip Threshold (votes required to skip):'));
     b.buttons([1, 2, 3, 5, 10].map((n) => controls(s, `${n}v`, 'setvotethresh', 'skip', n, { style: n === skipNeed ? 'success' : 'primary' })));
     b.paragraph(rt.bold('🗳 Queue Vote Threshold (votes required to win):'));
@@ -742,6 +753,7 @@ export function createMusicScreen({ app }) {
       controls(s, '📊 Launch Telegram Poll', 'launchpoll', { style: 'success' }),
       controls(s, '◀ Back to Player', 'player')
     ]);
+    b.paragraph(rt.italic('When Auto-Poll is ON, 1 poll posts automatically per playing movie whenever queue has upcoming items, executes the winner on threshold, and deletes cleanly. /autopoll on|off [votes]'));
     return finish(b);
   }
 
@@ -2145,7 +2157,7 @@ export function createMusicScreen({ app }) {
       '/stop', '/end', '/leave', '/queue', '/q', '/volume', '/vol', '/loop', '/repeat',
       '/shuffle', '/seek', '/eq', '/bass', '/streammode', '/rtmp', '/vcmsg', '/aidj', '/dj', '/movie', '/movies', '/moviesearch', '/movieai', '/mediaai',
       '/vcsudo', '/rmsudo', '/accounts', '/destination',
-      '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce',
+      '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce', '/autopoll', '/votes',
       '/channel', '/session', '/gensession', '/authassistant', '/linkassistant', '/playlist', '/lyrics'
     ];
     if (!commands.includes(command)) return false;
@@ -2201,6 +2213,21 @@ export function createMusicScreen({ app }) {
               : (res.enabled ? '✅ Movies will now broadcast to all eligible bot users when VC streaming starts.' : '🔕 Movie broadcasts to all users are now DISALLOWED. Playback continues quietly.'))
           : null;
         await sendOrEditMenu(ctx, renderMovieBroadcastCard(res, { notice, chatId: ctx.chatId, canGlobal }));
+        return true;
+      }
+      if (command === '/autopoll' || command === '/votes') {
+        const destId = await app.music.authorize(ctx, false, null, { allowDj: false });
+        if (command === '/votes' || !args.length || String(args[0] || '').toLowerCase() === 'settings') {
+          const s = await app.music.player(channelPlayerCtx());
+          await adoptChannelPlayerResult(ctx, s);
+          await app.music.control({ ...ctx, messageId: null, query: null }, 'voteset', []);
+        } else {
+          const res = await app.music.autopollCommand(ctx, args);
+          const s = app.musicQueueManager?.getSession?.(destId);
+          if (!s?.screenMessageId) {
+            await ctx.api.sendMessage(ctx.chatId, `🤖 Auto-Poll: ${res.enabled ? 'ON' : 'OFF'} · Vote limit: ${res.queueNeed}v (Skip: ${res.skipNeed}v)`).catch(() => {});
+          }
+        }
         return true;
       }
       if (command === '/movie' || command === '/movies' || command === '/moviesearch') {
@@ -2567,7 +2594,7 @@ export function createMusicScreen({ app }) {
     '/vc', '/stream', '/pause', '/resume', '/skip', '/voteskip', '/next', '/previous',
     '/stop', '/end', '/leave', '/queue', '/q', '/volume', '/vol', '/seek', '/eq', '/bass', '/streammode', '/rtmp', '/vcmsg',
     '/aidj', '/dj', '/movie', '/movies', '/moviesearch', '/movieai', '/mediaai',
-    '/vcsudo', '/rmsudo', '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce',
+    '/vcsudo', '/rmsudo', '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce', '/autopoll', '/votes',
     '/repeat', '/loop', '/shuffle', '/playlist', '/lyrics', '/play', '/song',
     '/music', '/cancel'
   ]);
@@ -2861,9 +2888,13 @@ export function createMusicScreen({ app }) {
         : '';
       const syncStateTag = s.status === 'paused'
         ? ' · ⏸ Paused'
-        : s.avSync?.syncing
-          ? ' · ⏳ Syncing A/V'
-          : '';
+        : s.avSync?.sync_health === 'stalled'
+          ? ' · ⚠️ Resyncing A/V'
+          : s.avSync?.syncing
+            ? ` · ⏳ Syncing A/V (${Number(s.avSync?.skew_ms || 0) >= 0 ? '+' : ''}${Number(s.avSync?.skew_ms || 0)}ms)`
+            : s.avSync?.monitored
+              ? ' · ✅ A/V Synced'
+              : '';
       const audioDisplay = t.dubOnlyWarning
         ? t.dubOnlyWarning
         : t.audioIsDub
@@ -2946,7 +2977,7 @@ export function createMusicScreen({ app }) {
       controls(s, '🎬 Movies', 'movie', { style: 'primary' })
     ];
     if (t) row3.push(controls(s, '⏱ Sync', 'subsync', { style: 'link' }));
-    row3.push(controls(s, '📊 Poll', 'launchpoll', { style: 'link' }));
+    row3.push(controls(s, s.activePoll ? '📊 Live Poll' : '📊 Poll', 'launchpoll', { style: s.activePoll ? 'success' : 'link' }));
     b.buttons(row3);
 
     // Row 4: SubMode, Anti-Lag Quality Tier & Neutral Source Switch
@@ -2969,12 +3000,13 @@ export function createMusicScreen({ app }) {
     }
     b.buttons(row4);
 
-    // Row 5: Vote, Loop & Options
+    // Row 5: Vote, Loop, Votes Settings & Options
     const row5 = [];
-    if (t && ['playing', 'paused'].includes(s.status)) {
+    if (t && ['playing', 'paused'].includes(s.status) && !s.isChannel) {
       row5.push(controls(s, `⏭ Vote (${skipCount}/${skipNeed})`, 'voteskip', { style: 'link' }));
     }
     row5.push(controls(s, `🔁 ${s.loopMode === 'off' ? 'Loop' : s.loopMode === 'track' ? 'One' : 'All'}`, 'loop', { style: 'link' }));
+    row5.push(controls(s, '🗳 Votes', 'voteset', { style: 'link' }));
     row5.push(controls(s, '⚙ Options', 'options', { style: 'link' }));
     b.buttons(row5);
 
@@ -3047,8 +3079,10 @@ export function createMusicScreen({ app }) {
       }
     }
     if (movieQ.length) {
+      const autoPoll = app.music?.isAutoPollEnabled?.(destId) ?? true;
       b.buttons([
-        controls(s, '📊 Viewer Poll', 'launchpoll', { style: 'primary' }),
+        controls(s, s.activePoll ? '📊 Live Poll' : '📊 Viewer Poll', 'launchpoll', { style: s.activePoll ? 'success' : 'primary' }),
+        controls(s, autoPoll ? '🤖 Auto-Poll · ON' : '🤖 Auto-Poll · OFF', 'autopoll', autoPoll ? 'off' : 'on', { style: autoPoll ? 'success' : 'link' }),
         controls(s, `⚙ Vote Limit (${queueNeed})`, 'voteset')
       ]);
     }

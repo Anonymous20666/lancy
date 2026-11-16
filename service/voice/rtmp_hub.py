@@ -136,7 +136,7 @@ def run_rtmp_hub(
         except Exception as err:
             print(f'[rtmp_hub] SubOverlay init skipped: {err}', file=sys.stderr)
             sub_overlay = None
-        if cfg_path is not None and rtmp_streamer.AUDIO_PIPE_PLACEHOLDER not in cmd_tokens:
+        if cfg_path is not None:
             try:
                 sub_monitor = sub_align.LiveSubSyncMonitor(
                     sync_id=sync_id,
@@ -156,8 +156,6 @@ def run_rtmp_hub(
         if is_nut:
             resolved_dec, had_re = _extract_realtime_from_cmd(cmd_tokens)
             enc_realtime = bool(realtime or had_re)
-            enc_aud_r, enc_aud_w = os.pipe()
-            av_hub._enlarge_pipe(enc_aud_w)
             enc_cmd = rtmp_streamer.build_rtmp_encoder_args(
                 rtmp_target,
                 width=w,
@@ -167,10 +165,9 @@ def run_rtmp_hub(
                 vb=vb,
                 vmax=vmax,
                 vbuf=vbuf,
-                audio_input=f'pipe:{enc_aud_r}',
                 preset=preset,
                 threads=threads,
-                input_format='raw',
+                input_format='nut',
                 realtime=False,
             )
             enc_proc = subprocess.Popen(
@@ -178,15 +175,11 @@ def run_rtmp_hub(
                 stdin=subprocess.PIPE,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                pass_fds=(enc_aud_r,),
                 bufsize=0,
             )
-            os.close(enc_aud_r)
-            enc_aud_r = -1
             av_hub._enlarge_pipe(enc_proc.stdin.fileno())
-            a_out = os.fdopen(enc_aud_w, 'wb', buffering=0)
-            enc_aud_w = -1
-            v_out = enc_proc.stdin
+            enc_in = enc_proc.stdin
+            nut_writer = nut_stream.NutStreamWriter(width=w, height=h, sample_rate=48000, channels=2)
 
             dec_proc = subprocess.Popen(
                 resolved_dec,
@@ -204,9 +197,10 @@ def run_rtmp_hub(
 
             AUDIO_BPS = 192000  # 48kHz * 2ch * s16le
             SAMPLE_ALIGN = 4
-            STARVE_SEC = 0.250
-            DRIFT_SILENT_SEC = 0.045
-            TARGET_LOCK_SEC = 0.030
+            STARVE_SEC = 0.220
+            DRIFT_SILENT_SEC = 0.042
+            AUDIO_DROP_SEC = 0.220
+            TARGET_LOCK_SEC = 0.025
             frame_dur = 1.0 / eff_fps
             max_vq = max(48, min(180, int(round(eff_fps * 3.0))))
             max_apcm = AUDIO_BPS * 6
@@ -216,12 +210,15 @@ def run_rtmp_hub(
             audio_pcm = bytearray()
             audio_head_pts = None
             audio_tail_pts = None
+            audio_pts_rebase = 0.0
+            video_pts_rebase = 0.0
+            last_raw_v_pts = None
             v_seen = False
             a_seen = False
             dec_eof = False
 
             def _demux_nut_reader():
-                nonlocal audio_head_pts, audio_tail_pts, v_seen, a_seen, dec_eof
+                nonlocal audio_head_pts, audio_tail_pts, audio_pts_rebase, video_pts_rebase, last_raw_v_pts, v_seen, a_seen, dec_eof
                 reader = nut_stream.NutStreamReader(dec_proc.stdout)
                 try:
                     for pkt in reader.iter_packets():
@@ -240,7 +237,11 @@ def run_rtmp_hub(
                                     cond.wait(timeout=0.04)
                                 if stop_event.is_set():
                                     break
-                                video_q.append((pts, bytes(payload)))
+                                if last_raw_v_pts is not None and (pts - last_raw_v_pts) < -2.0:
+                                    # Backward PTS reset across discontinuity: keep monotonic progression
+                                    video_pts_rebase += (last_raw_v_pts + frame_dur) - pts
+                                last_raw_v_pts = pts
+                                video_q.append((pts + video_pts_rebase, bytes(payload)))
                                 v_seen = True
                                 cond.notify_all()
                         elif sc == 1:
@@ -253,11 +254,17 @@ def run_rtmp_hub(
                                     cond.wait(timeout=0.04)
                                 if stop_event.is_set():
                                     break
+                                eff_pts = pts + audio_pts_rebase
                                 if audio_head_pts is None:
-                                    audio_head_pts = pts
-                                    audio_tail_pts = pts
+                                    audio_head_pts = eff_pts
+                                    audio_tail_pts = eff_pts
                                 else:
-                                    gap = pts - audio_tail_pts
+                                    gap = eff_pts - audio_tail_pts
+                                    if gap < -2.0:
+                                        # Backward PTS discontinuity reset: advance rebase rather than discarding future audio
+                                        audio_pts_rebase += (audio_tail_pts - eff_pts)
+                                        eff_pts = audio_tail_pts
+                                        gap = 0.0
                                     if gap > 0.025:
                                         pad_b = min(int(round(gap * AUDIO_BPS)), AUDIO_BPS * 5)
                                         pad_b -= (pad_b % SAMPLE_ALIGN)
@@ -303,6 +310,7 @@ def run_rtmp_hub(
                 total_pcm_written = 0
                 last_raw_frame = bytes(frame_bytes)
                 last_frame_pts = 0.0
+                last_audio_pts = 0.0
                 startup_epoch_pts = 0.0
                 wall_origin = None
                 starve_since = None
@@ -314,23 +322,26 @@ def run_rtmp_hub(
                     return max(0.0, float(raw_pts) - startup_epoch_pts)
 
                 out_cond = threading.Condition()
-                v_out_q = deque()
-                a_out_q = deque()
+                enc_q = deque()
                 verify_eof = False
 
-                def _pipe_writer_loop(q, sink_stream):
+                def _enc_writer_loop():
                     try:
+                        av_sync._write_all(enc_in, nut_writer.build_headers())
                         while True:
                             with out_cond:
-                                while not q and not verify_eof and not stop_event.is_set():
+                                while not enc_q and not verify_eof and not stop_event.is_set():
                                     out_cond.wait(timeout=0.05)
-                                if not q and (verify_eof or stop_event.is_set()):
+                                if not enc_q and (verify_eof or stop_event.is_set()):
                                     break
-                                if not q:
+                                if not enc_q:
                                     continue
-                                chunk = q.popleft()
+                                pts_us, frame_chunk, pcm_chunk = enc_q.popleft()
                                 out_cond.notify_all()
-                            av_sync._write_all(sink_stream, chunk)
+                            sync_b = nut_writer.pack_syncpoint(pts_us)
+                            ah, ab = nut_writer.pack_frame(1, pts_us, pcm_chunk)
+                            vh, vb = nut_writer.pack_frame(0, pts_us, frame_chunk)
+                            nut_stream.write_fd_all(enc_in.fileno(), sync_b, ah, ab, vh, vb)
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         broken_event.set()
                         stop_event.set()
@@ -338,21 +349,21 @@ def run_rtmp_hub(
                             out_cond.notify_all()
                     finally:
                         try:
-                            sink_stream.close()
+                            enc_in.close()
                         except OSError:
                             pass
 
-                t_vw = threading.Thread(target=_pipe_writer_loop, args=(v_out_q, v_out), daemon=True)
-                t_aw = threading.Thread(target=_pipe_writer_loop, args=(a_out_q, a_out), daemon=True)
-                t_vw.start()
-                t_aw.start()
+                t_ew = threading.Thread(target=_enc_writer_loop, daemon=True)
+                t_ew.start()
 
-                def _emit_tick(frame_buf, pcm_buf, media_pts, skew_s=0.0, sync_bits=0):
+                def _emit_tick(frame_buf, pcm_buf, v_media_pts, a_media_pts=None, skew_s=0.0, sync_bits=0):
                     nonlocal tick_idx, total_pcm_written, wall_origin
                     safe_frame = bytes(frame_buf) if type(frame_buf) is not bytes else frame_buf
                     safe_pcm = bytes(pcm_buf) if type(pcm_buf) is not bytes else pcm_buf
+                    eff_a_pts = v_media_pts if a_media_pts is None else a_media_pts
+                    enc_pts_us = int(round((tick_idx * frame_dur) * 1_000_000.0))
                     with out_cond:
-                        while (len(v_out_q) >= 10 or len(a_out_q) >= 10) and not stop_event.is_set():
+                        while len(enc_q) >= 10 and not stop_event.is_set():
                             out_cond.wait(timeout=0.04)
                         if stop_event.is_set():
                             return
@@ -364,23 +375,26 @@ def run_rtmp_hub(
                                     wall_origin = now_m - 0.15
                                 target_m = wall_origin + ((tick_idx + 1) * frame_dur)
                                 rem = target_m - now_m
-                                if rem > 0.002:
+                                if rem < -0.22:
+                                    # Re-anchor clock cleanly after backpressure instead of bursting frames
+                                    wall_origin = now_m - ((tick_idx + 1) * frame_dur)
+                                elif rem > 0.002:
                                     time.sleep(min(rem, 0.25))
                             finally:
                                 out_cond.acquire()
                         if stop_event.is_set():
                             return
-                        v_out_q.append(safe_frame)
-                        a_out_q.append(safe_pcm)
-                        q_depth = max(len(v_out_q), len(a_out_q))
+                        enc_q.append((enc_pts_us, safe_frame, safe_pcm))
+                        q_depth = len(enc_q)
                         out_cond.notify_all()
                     total_pcm_written += len(safe_pcm)
                     tick_idx += 1
                     if state is not None:
-                        rel_out = _rel_pts(media_pts)
+                        rel_v = _rel_pts(v_media_pts)
+                        rel_a = _rel_pts(eff_a_pts)
                         now_hb = time.monotonic()
-                        state.audio_sec = rel_out
-                        state.video_sec = rel_out
+                        state.audio_sec = rel_a
+                        state.video_sec = rel_v
                         state.audio_hb_mono = now_hb
                         state.video_hb_mono = now_hb
                         state.skew_ms = int(round(skew_s * 1000.0))
@@ -390,13 +404,16 @@ def run_rtmp_hub(
                             state.pipeline_delay_sec = round((q_depth / float(eff_fps)) + enc_overhead, 3)
 
                 try:
-                    # Wait for aligned startup epoch across video + audio (unless EOF/audio-less)
+                    # Wait for aligned startup epoch across video + sufficient initial audio (so lead trim isn't truncated)
                     with cond:
                         wait_start = time.monotonic()
                         while not stop_event.is_set() and not dec_eof:
                             have_v = len(video_q) > 0
+                            enough_a = (len(audio_pcm) >= (AUDIO_BPS // 5)) or no_audio_eof
                             have_a = (len(audio_pcm) >= SAMPLE_ALIGN) or no_audio_eof
-                            if have_v and have_a:
+                            if have_v and enough_a:
+                                break
+                            if have_v and have_a and (time.monotonic() - wait_start) >= 1.2:
                                 break
                             if (time.monotonic() - wait_start) >= 3.0 and (have_v or a_seen):
                                 break
@@ -408,6 +425,8 @@ def run_rtmp_hub(
                             last_raw_frame = v0_buf
                             last_frame_pts = max(0.0, v0_pts)
                             startup_epoch_pts = max(0.0, float(v0_pts))
+                            if state is not None:
+                                state.epoch_mono = time.monotonic()
                             if audio_head_pts is not None:
                                 if audio_head_pts > v0_pts + 0.015:
                                     pad_b = min(int(round((audio_head_pts - v0_pts) * AUDIO_BPS)), AUDIO_BPS * 15)
@@ -421,6 +440,7 @@ def run_rtmp_hub(
                                     if drop_b > 0:
                                         del audio_pcm[:drop_b]
                                         audio_head_pts += drop_b / float(AUDIO_BPS)
+                                last_audio_pts = max(0.0, float(audio_head_pts))
 
                     while not stop_event.is_set():
                         target_pcm_end = int(round(((tick_idx + 1) * float(AUDIO_BPS)) / eff_fps))
@@ -437,12 +457,13 @@ def run_rtmp_hub(
                                 if sub_overlay is not None
                                 else last_raw_frame
                             )
-                            _emit_tick(hud_frame, b'\x00' * need_pcm, last_frame_pts, skew_s=0.0, sync_bits=0)
+                            _emit_tick(hud_frame, b'\x00' * need_pcm, last_frame_pts, last_audio_pts, skew_s=0.0, sync_bits=0)
                             continue
 
                         emit_frame = None
                         emit_pcm = None
-                        emit_pts = last_frame_pts
+                        emit_v_pts = last_frame_pts
+                        emit_a_pts = last_audio_pts
                         emit_skew = 0.0
                         sync_bits = 0
                         should_break = False
@@ -455,8 +476,11 @@ def run_rtmp_hub(
 
                             if v_len == 0 and dec_eof:
                                 if expect_audio and a_len >= need_pcm and (last_frame_pts == 0.0 or a_len <= AUDIO_BPS * 2):
-                                    # Drain brief audio tail cleanly after final video frame
+                                    cur_a_pts = float(audio_head_pts) if audio_head_pts is not None else last_audio_pts
                                     emit_pcm = _pop_audio_bytes(need_pcm)
+                                    emit_a_pts = max(0.0, cur_a_pts)
+                                    emit_v_pts = emit_a_pts
+                                    last_audio_pts = emit_a_pts
                                     emit_frame = (
                                         sub_overlay.render(last_raw_frame, _rel_pts(last_frame_pts))
                                         if sub_overlay is not None
@@ -468,19 +492,20 @@ def run_rtmp_hub(
                                 v_pts, v_buf = video_q[0]
                                 if expect_audio and audio_head_pts is not None:
                                     skew = audio_head_pts - v_pts
-                                    emit_skew = skew
-                                    # Video lagging behind audio -> drop stale video frames up to lock
+                                    # Video lagging behind audio -> wait briefly if only 1 queued frame, or drop stale frames up to lock
+                                    if skew > DRIFT_SILENT_SEC and len(video_q) == 1 and not dec_eof:
+                                        cond.wait(timeout=0.025)
+                                        v_len = len(video_q)
                                     if skew > DRIFT_SILENT_SEC and len(video_q) > 1:
                                         while len(video_q) > 1 and (audio_head_pts - video_q[0][0]) > TARGET_LOCK_SEC:
                                             video_q.popleft()
                                         v_pts, v_buf = video_q[0]
                                         skew = audio_head_pts - v_pts
-                                        emit_skew = skew
-                                    # Audio lagging behind video -> discard stale audio samples up to lock
-                                    elif skew < -DRIFT_SILENT_SEC and a_len > need_pcm:
+                                    # Severe audio lag behind video (>220ms) with surplus buffered PCM -> catch up audio up to lock
+                                    elif skew < -AUDIO_DROP_SEC and a_len > need_pcm:
                                         drop_b = min(
                                             max(0, a_len - need_pcm),
-                                            int(round((v_pts - audio_head_pts) * AUDIO_BPS)),
+                                            int(round(((v_pts - audio_head_pts) - TARGET_LOCK_SEC) * AUDIO_BPS)),
                                         )
                                         drop_b -= (drop_b % SAMPLE_ALIGN)
                                         if drop_b > 0:
@@ -488,15 +513,23 @@ def run_rtmp_hub(
                                             audio_head_pts += drop_b / float(AUDIO_BPS)
                                             a_len = len(audio_pcm)
                                             skew = audio_head_pts - v_pts
-                                            emit_skew = skew
 
-                                    # Still severely skewed (>250ms) and not EOF -> hold & sync
+                                    emit_skew = skew
+                                    # Severe skew (>220ms) and not EOF -> hold or advance stalled single frame cleanly
                                     if not dec_eof and skew > STARVE_SEC:
                                         now_m = time.monotonic()
                                         if starve_since is None:
                                             starve_since = now_m
+                                        # Discard single hopelessly stale frame (>450ms behind) when waiting won't catch up
+                                        if skew > 0.450 and len(video_q) >= 1:
+                                            video_q.popleft()
+                                            last_raw_frame = v_buf
+                                            last_frame_pts = max(0.0, v_pts)
                                         sync_bits = 2
                                         rel_last = _rel_pts(last_frame_pts)
+                                        emit_v_pts = last_frame_pts
+                                        emit_a_pts = max(0.0, float(audio_head_pts))
+                                        last_audio_pts = emit_a_pts
                                         emit_frame = (
                                             sub_overlay.render_hud(last_raw_frame, rel_last, mode='syncing')
                                             if (now_m - starve_since) >= STARVE_SEC and sub_overlay is not None
@@ -509,20 +542,27 @@ def run_rtmp_hub(
                                             starve_since = now_m
                                         sync_bits = 1
                                         rel_last = _rel_pts(last_frame_pts)
+                                        emit_v_pts = max(0.0, v_pts)
+                                        emit_a_pts = max(0.0, float(audio_head_pts))
+                                        last_audio_pts = emit_a_pts
                                         emit_frame = (
                                             sub_overlay.render_hud(last_raw_frame, rel_last, mode='syncing')
                                             if (now_m - starve_since) >= STARVE_SEC and sub_overlay is not None
                                             else (sub_overlay.render(last_raw_frame, rel_last) if sub_overlay is not None else last_raw_frame)
                                         )
                                         emit_pcm = b'\x00' * need_pcm
-                                    # Moderate video ahead (45..250ms, e.g. dropped video frame) -> repeat cached frame silently while audio runs
+                                    # Moderate audio lag (-42ms..-220ms) -> hold video frame silently while audio catches up smoothly (zero audio chop)
                                     elif skew < -DRIFT_SILENT_SEC:
                                         starve_since = None
-                                        cur_a_pts = audio_head_pts
+                                        cur_a_pts = float(audio_head_pts)
                                         emit_pcm = _pop_audio_bytes(need_pcm)
-                                        emit_pts = max(0.0, cur_a_pts)
+                                        if len(emit_pcm) < need_pcm:
+                                            emit_pcm = emit_pcm + (b'\x00' * (need_pcm - len(emit_pcm)))
+                                        emit_a_pts = max(0.0, cur_a_pts)
+                                        emit_v_pts = max(0.0, v_pts)
+                                        last_audio_pts = emit_a_pts
                                         emit_frame = (
-                                            sub_overlay.render(last_raw_frame, _rel_pts(emit_pts))
+                                            sub_overlay.render(last_raw_frame, _rel_pts(emit_v_pts))
                                             if sub_overlay is not None
                                             else last_raw_frame
                                         )
@@ -531,10 +571,13 @@ def run_rtmp_hub(
                                         video_q.popleft()
                                         last_raw_frame = v_buf
                                         last_frame_pts = max(0.0, v_pts)
-                                        emit_pts = last_frame_pts
+                                        cur_a_pts = float(audio_head_pts)
                                         emit_pcm = _pop_audio_bytes(need_pcm)
                                         if len(emit_pcm) < need_pcm:
                                             emit_pcm = emit_pcm + (b'\x00' * (need_pcm - len(emit_pcm)))
+                                        emit_v_pts = last_frame_pts
+                                        emit_a_pts = max(0.0, cur_a_pts)
+                                        last_audio_pts = emit_a_pts
                                         emit_frame = (
                                             sub_overlay.render(v_buf, _rel_pts(last_frame_pts))
                                             if sub_overlay is not None
@@ -545,10 +588,13 @@ def run_rtmp_hub(
                                     video_q.popleft()
                                     last_raw_frame = v_buf
                                     last_frame_pts = max(0.0, v_pts)
-                                    emit_pts = last_frame_pts
+                                    cur_a_pts = float(audio_head_pts) if audio_head_pts is not None else last_frame_pts
                                     emit_pcm = _pop_audio_bytes(need_pcm)
                                     if len(emit_pcm) < need_pcm:
                                         emit_pcm = emit_pcm + (b'\x00' * (need_pcm - len(emit_pcm)))
+                                    emit_v_pts = last_frame_pts
+                                    emit_a_pts = max(0.0, cur_a_pts)
+                                    last_audio_pts = emit_a_pts
                                     emit_frame = (
                                         sub_overlay.render(v_buf, _rel_pts(last_frame_pts))
                                         if sub_overlay is not None
@@ -559,10 +605,14 @@ def run_rtmp_hub(
                                 now_m = time.monotonic()
                                 if starve_since is None:
                                     starve_since = now_m
+                                if audio_head_pts is not None:
+                                    emit_skew = float(audio_head_pts) - float(last_frame_pts)
                                 if (now_m - starve_since) < STARVE_SEC:
                                     need_wait = True
                                 else:
                                     sync_bits = (2 if v_len == 0 else 0) | (1 if (expect_audio and a_len < need_pcm) else 0)
+                                    emit_v_pts = last_frame_pts
+                                    emit_a_pts = max(0.0, float(audio_head_pts)) if audio_head_pts is not None else last_audio_pts
                                     emit_frame = (
                                         sub_overlay.render_hud(last_raw_frame, _rel_pts(last_frame_pts), mode='syncing')
                                         if sub_overlay is not None
@@ -577,9 +627,9 @@ def run_rtmp_hub(
                         if should_break:
                             break
                         if emit_frame is not None and emit_pcm is not None:
-                            _emit_tick(emit_frame, emit_pcm, emit_pts, skew_s=emit_skew, sync_bits=sync_bits)
-                            if sub_monitor is not None and sync_bits == 0 and len(emit_pcm) > 0:
-                                sub_monitor.feed_pcm(_rel_pts(emit_pts), emit_pcm)
+                            _emit_tick(emit_frame, emit_pcm, emit_v_pts, a_media_pts=emit_a_pts, skew_s=emit_skew, sync_bits=sync_bits)
+                            if sub_monitor is not None and (sync_bits & 3) == 0 and len(emit_pcm) > 0:
+                                sub_monitor.feed_pcm(_rel_pts(emit_a_pts), emit_pcm)
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     broken_event.set()
                     stop_event.set()
@@ -591,8 +641,7 @@ def run_rtmp_hub(
                     verify_eof = True
                     with out_cond:
                         out_cond.notify_all()
-                    t_vw.join(timeout=3.0)
-                    t_aw.join(timeout=3.0)
+                    t_ew.join(timeout=3.0)
                     if state is not None:
                         state.audio_state = 2
                         state.video_state = 2
@@ -602,11 +651,7 @@ def run_rtmp_hub(
                     with cond:
                         cond.notify_all()
                     try:
-                        v_out.close()
-                    except OSError:
-                        pass
-                    try:
-                        a_out.close()
+                        enc_in.close()
                     except OSError:
                         pass
                     try:
@@ -684,21 +729,51 @@ def run_rtmp_hub(
             t_dec_err.start()
             t_enc_err.start()
 
+            AUDIO_BPS = 192000
+            SAMPLE_ALIGN = 4
+            if state is not None:
+                state.video_state = 1
+                state.audio_state = 1
+
             def _pump_video():
                 frame_idx = 0
+                last_raw = bytes(frame_bytes)
                 try:
                     while not stop_event.is_set():
+                        if state is not None and int(state.paused) == 1:
+                            now_m = time.monotonic()
+                            state.video_hb_mono = now_m
+                            if sub_overlay is not None:
+                                hud = sub_overlay.render_hud(last_raw, frame_idx / eff_fps, mode='paused')
+                                av_sync._write_all(v_out, hud)
+                            time.sleep(1.0 / eff_fps)
+                            continue
                         frame = av_sync._read_exact(v_in, frame_bytes)
                         if len(frame) < frame_bytes:
                             break
+                        last_raw = bytes(frame)
+                        v_sec = frame_idx / eff_fps
+                        while state is not None and not stop_event.is_set() and int(state.audio_state) == 1 and (v_sec - float(state.audio_sec)) > 0.140:
+                            state.waiting_mask = int(state.waiting_mask) | 2
+                            state.video_hb_mono = time.monotonic()
+                            time.sleep(0.01)
+                        if state is not None:
+                            state.waiting_mask = int(state.waiting_mask) & ~2
                         if sub_overlay is not None:
-                            frame = sub_overlay.render(frame, frame_idx / eff_fps)
+                            frame = sub_overlay.render(frame, v_sec)
                         av_sync._write_all(v_out, frame)
                         frame_idx += 1
+                        if state is not None:
+                            now_m = time.monotonic()
+                            state.video_sec = frame_idx / eff_fps
+                            state.video_hb_mono = now_m
+                            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     broken_event.set()
                     stop_event.set()
                 finally:
+                    if state is not None:
+                        state.video_state = 2
                     v_done.set()
                     try:
                         v_out.close()
@@ -710,16 +785,47 @@ def run_rtmp_hub(
                         pass
 
             def _pump_audio():
+                bytes_written = 0
+                rem = bytearray()
                 try:
                     while not stop_event.is_set():
+                        if state is not None and int(state.paused) == 1:
+                            now_m = time.monotonic()
+                            state.audio_hb_mono = now_m
+                            av_sync._write_all(a_out, b'\x00' * max(SAMPLE_ALIGN, (AUDIO_BPS // int(round(eff_fps))) - ((AUDIO_BPS // int(round(eff_fps))) % SAMPLE_ALIGN)))
+                            time.sleep(1.0 / eff_fps)
+                            continue
                         chunk = a_in.read(CHUNK_BYTES)
                         if not chunk:
                             break
-                        av_sync._write_all(a_out, chunk)
+                        rem.extend(chunk)
+                        usable = len(rem) - (len(rem) % SAMPLE_ALIGN)
+                        if usable <= 0:
+                            continue
+                        body = bytes(rem[:usable])
+                        del rem[:usable]
+                        a_sec = bytes_written / float(AUDIO_BPS)
+                        while state is not None and not stop_event.is_set() and int(state.video_state) == 1 and (a_sec - float(state.video_sec)) > 0.140:
+                            state.waiting_mask = int(state.waiting_mask) | 1
+                            state.audio_hb_mono = time.monotonic()
+                            time.sleep(0.01)
+                        if state is not None:
+                            state.waiting_mask = int(state.waiting_mask) & ~1
+                        av_sync._write_all(a_out, body)
+                        if sub_monitor is not None:
+                            sub_monitor.feed_pcm(a_sec, body)
+                        bytes_written += len(body)
+                        if state is not None:
+                            now_m = time.monotonic()
+                            state.audio_sec = bytes_written / float(AUDIO_BPS)
+                            state.audio_hb_mono = now_m
+                            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     broken_event.set()
                     stop_event.set()
                 finally:
+                    if state is not None:
+                        state.audio_state = 2
                     a_done.set()
                     try:
                         a_out.close()

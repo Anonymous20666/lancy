@@ -615,6 +615,9 @@ def correlate_speech_and_cues(
     }
 
 
+_HLS_TRIM_DELTA_CACHE = {}
+
+
 def _fetch_hls_skipped_hdrs(url):
     v_skip = None
     a_skip = None
@@ -623,13 +626,22 @@ def _fetch_hls_skipped_hdrs(url):
         with urllib.request.urlopen(req, timeout=4.0) as resp:
             vh = resp.headers.get('X-Lancy-Skipped-Sec')
             ah = resp.headers.get('X-Lancy-Audio-Skipped-Sec')
+            dh = resp.headers.get('X-Lancy-Audio-Trim-Delta')
             if vh is not None:
                 v_skip = float(vh)
             if ah is not None:
                 a_skip = float(ah)
+            if dh is not None:
+                if len(_HLS_TRIM_DELTA_CACHE) > 256:
+                    _HLS_TRIM_DELTA_CACHE.clear()
+                _HLS_TRIM_DELTA_CACHE[str(url)] = max(0.0, float(dh))
     except Exception:
         pass
     return v_skip, a_skip
+
+
+def _fetch_hls_audio_trim_delta(url):
+    return _HLS_TRIM_DELTA_CACHE.get(str(url))
 
 
 def _fetch_hls_skipped_sec(url):
@@ -1005,9 +1017,9 @@ class LiveSubSyncMonitor:
         state=None,
         sample_rate=48000,
         channels=2,
-        check_interval_sec=16.0,
-        min_window_sec=32.0,
-        max_window_sec=48.0,
+        check_interval_sec=10.0,
+        min_window_sec=20.0,
+        max_window_sec=44.0,
     ):
         self.sync_id = str(sync_id or 'default')
         self.config_path = Path(config_path) if config_path else None
@@ -1143,7 +1155,8 @@ class LiveSubSyncMonitor:
             if (
                 self._ring_start_pts is None
                 or self._next_raw_pts is None
-                or abs(pts_sec - self._next_raw_pts) > 2.0
+                or pts_sec < (self._next_raw_pts - 1.5)
+                or (pts_sec - self._next_raw_pts) > 6.0
             ):
                 self._ring.clear()
                 self._pcm_rem.clear()
@@ -1507,8 +1520,8 @@ class LiveSubSyncMonitor:
                         if dur >= self.min_window_sec and (forced or (now_m - self._last_check_mono) >= self.check_interval_sec):
                             self._last_check_mono = now_m
                             self._run_one_check(cfg)
-            except Exception:
-                pass
+            except Exception as err:
+                print(f'[sub_align] monitor error ({self.sync_id}): {err}', file=sys.stderr)
 
     def close(self):
         self._stop.set()

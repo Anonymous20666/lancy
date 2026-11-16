@@ -233,21 +233,54 @@ def _read_sync_metrics(sync_id):
     out = {}
 
     def _rd(st):
+        now_m = time.monotonic()
         epoch = max(0.0, float(getattr(st, 'epoch_pts_sec', 0.0) or 0.0))
         a = max(0.0, float(st.audio_sec or 0.0) - epoch)
         v = max(0.0, float(st.video_sec or 0.0) - epoch)
-        if int(st.audio_state) == 1 and int(st.video_state) == 1:
+        a_st = int(st.audio_state)
+        v_st = int(st.video_state)
+        if a_st == 1 and v_st == 1:
             pos = min(a, v) if (a > 0.0 and v > 0.0) else max(a, v)
-        elif int(st.video_state) == 1:
+        elif v_st == 1:
             pos = v
         else:
             pos = a
+        hb_ages = []
+        a_hb = float(getattr(st, 'audio_hb_mono', 0.0) or 0.0)
+        v_hb = float(getattr(st, 'video_hb_mono', 0.0) or 0.0)
+        if a_st == 1 and a_hb > 0.0:
+            hb_ages.append(max(0.0, now_m - a_hb))
+        if v_st == 1 and v_hb > 0.0:
+            hb_ages.append(max(0.0, now_m - v_hb))
+        hb_age = max(hb_ages) if hb_ages else 0.0
+        sync_flags = int(st.sync_flags)
+        waiting_mask = int(getattr(st, 'waiting_mask', 0) or 0)
+        skew_ms = int(st.skew_ms)
+        paused = bool(int(st.paused) == 1)
+        stalled = bool((not paused) and hb_age > av_sync.STALL_HEARTBEAT_TIMEOUT_SEC)
+        syncing = bool((not paused) and ((sync_flags & 3) != 0 or abs(skew_ms) >= 220))
+        if stalled:
+            health = 'stalled'
+        elif (sync_flags & 3) != 0:
+            health = 'syncing'
+        elif abs(skew_ms) >= 220:
+            health = 'drifted'
+        elif abs(skew_ms) >= 110 or (waiting_mask & 3) != 0:
+            health = 'correcting'
+        else:
+            health = 'locked'
         out['media_pts_sec'] = round(max(0.0, pos), 3)
-        out['paused'] = bool(int(st.paused) == 1)
-        out['sync_flags'] = int(st.sync_flags)
-        out['skew_ms'] = int(st.skew_ms)
-        out['audio_state'] = int(st.audio_state)
-        out['video_state'] = int(st.video_state)
+        out['audio_sec'] = round(a, 3)
+        out['video_sec'] = round(v, 3)
+        out['paused'] = paused
+        out['sync_flags'] = sync_flags
+        out['waiting_mask'] = waiting_mask
+        out['skew_ms'] = skew_ms
+        out['audio_state'] = a_st
+        out['video_state'] = v_st
+        out['hb_age_sec'] = round(hb_age, 2)
+        out['syncing'] = syncing
+        out['sync_health'] = health
         out['pipeline_delay_sec'] = round(max(0.0, float(getattr(st, 'pipeline_delay_sec', 0.0) or 0.0)), 3)
 
     if _mutate_sync_state(sync_id, _rd):
@@ -620,6 +653,8 @@ def build_unified_av_ffmpeg_command(audio_cmd, video_cmd, *, output_format='raw'
         if v_r:
             out.extend(['-r', v_r])
         if a_af:
+            if 'asetpts=PTS-' in a_af and 'asetpts=PTS-STARTPTS' not in a_af:
+                a_af = re.sub(r':first_pts=0\b', '', a_af)
             out.extend(['-af', a_af])
         out.extend([
             '-c:v', 'rawvideo', '-pix_fmt', 'yuv420p',
@@ -1007,6 +1042,9 @@ class Bridge:
         self.lock = asyncio.Lock()  # only lease assignment/configuration, never network I/O
         self.chat_locks = {}
         self.closing = False
+        self._sync_monitor_task = None
+        self.sync_monitor_interval_sec = 2.5
+        self.allow_auto_resync_in_tests = False
 
     def chat_lock(self, chat): return self.chat_locks.setdefault(chat, asyncio.Lock())
 
@@ -1228,10 +1266,20 @@ class Bridge:
                     return str(link)
             except Exception:
                 pass
-            exported = await asyncio.wait_for(
-                a['client'].invoke(raw.functions.phone.ExportGroupCallInvite(call=input_call), sleep_threshold=threshold),
-                8,
-            )
+            # Private channels/groups reject export with PUBLIC_CHANNEL_MISSING (500);
+            # never let Pyrogram retry/back off on it — fall back to the chat link.
+            try:
+                exported = await asyncio.wait_for(
+                    a['client'].invoke(raw.functions.phone.ExportGroupCallInvite(call=input_call), retries=0, sleep_threshold=0),
+                    8,
+                )
+            except TypeError:
+                exported = await asyncio.wait_for(
+                    a['client'].invoke(raw.functions.phone.ExportGroupCallInvite(call=input_call), sleep_threshold=0),
+                    8,
+                )
+            except Exception:
+                return None
             link = getattr(exported, 'link', None)
             if link and str(link).startswith('https://t.me/'):
                 return str(link)
@@ -2129,6 +2177,139 @@ class Bridge:
         except Exception:
             pass
 
+    def ensure_sync_monitor(self):
+        if self.closing:
+            return None
+        task = getattr(self, '_sync_monitor_task', None)
+        if task is not None and not task.done():
+            return task
+        try:
+            self._sync_monitor_task = asyncio.create_task(self._sync_monitor_loop())
+            return self._sync_monitor_task
+        except Exception:
+            return None
+
+    async def _resync_active_call(self, a, chat, call, *, reason='drift'):
+        if not call or call.get('status') != 'playing':
+            return False
+        pos = max(0.0, float(call.get('last_known_position') or call.get('position_seconds') or call.get('offset') or 0.0))
+        if call.get('duration') and float(call['duration']) > 2.0:
+            pos = min(pos, max(0.0, float(call['duration']) - 1.5))
+        mon = call.setdefault('_sync_mon', {})
+        mon['resync_count'] = int(mon.get('resync_count') or 0) + 1
+        mon['last_resync_at'] = time.monotonic()
+        mon['last_resync_reason'] = str(reason)
+        mon['skew_streak'] = 0
+        call['offset'] = pos
+        call.pop('_landed_offset', None)
+        call['last_seek_at'] = time.monotonic()
+        if call.get('stream_mode') == 'rtmp':
+            call['_rtmp_target'] = None
+        await self.stream(a, chat, call)
+        call['status'] = 'playing'
+        call['clock_errors'] = 0
+        call['last_progress'] = time.monotonic()
+        log.warning('Auto-resync completed destination=%s reason=%s pos=%.2fs attempt=%s', chat, reason, pos, mon['resync_count'])
+        return True
+
+    def _evaluate_call_sync(self, chat, call, metrics=None):
+        sid = call.get('av_sync_id')
+        if metrics is None and sid:
+            metrics = _read_sync_metrics(sid)
+        self._sync_live_sub_monitor_state(call)
+        hub_proc = call.get('_hub_proc')
+        hub_dead = bool(
+            hub_proc is not None
+            and call.get('stream_mode') != 'rtmp'
+            and call.get('status') == 'playing'
+            and getattr(hub_proc, 'returncode', None) not in (None, 0)
+        )
+        mon = call.setdefault('_sync_mon', {
+            'health': 'locked',
+            'skew_streak': 0,
+            'stall_streak': 0,
+            'resync_count': 0,
+            'last_resync_at': 0.0,
+            'last_resync_reason': None,
+            'last_log_health': 'locked',
+            'checked_at': 0.0,
+        })
+        now_m = time.monotonic()
+        mon['checked_at'] = round(time.time(), 3)
+        if not metrics:
+            if hub_dead:
+                mon['health'] = 'stalled'
+                mon['stall_streak'] = int(mon.get('stall_streak') or 0) + 1
+                return metrics, 'hub_exited'
+            return None, None
+
+        health = str(metrics.get('sync_health') or 'locked')
+        skew_ms = int(metrics.get('skew_ms') or 0)
+        prev_health = mon.get('last_log_health') or 'locked'
+        mon['health'] = 'stalled' if hub_dead else health
+        if abs(skew_ms) >= 260 and not metrics.get('paused'):
+            mon['skew_streak'] = int(mon.get('skew_streak') or 0) + 1
+        else:
+            mon['skew_streak'] = 0
+        if (health == 'stalled' or hub_dead) and not metrics.get('paused'):
+            mon['stall_streak'] = int(mon.get('stall_streak') or 0) + 1
+        else:
+            mon['stall_streak'] = 0
+
+        if health != prev_health:
+            if health in {'drifted', 'stalled'}:
+                log.warning(
+                    'A/V sync degraded destination=%s health=%s skew=%+dms hb_age=%.1fs flags=%s',
+                    chat, health, skew_ms, float(metrics.get('hb_age_sec') or 0.0), int(metrics.get('sync_flags') or 0),
+                )
+            elif prev_health in {'drifted', 'stalled', 'syncing'} and health == 'locked':
+                log.info('A/V sync locked destination=%s skew=%+dms', chat, skew_ms)
+            mon['last_log_health'] = health
+
+        since_seek = now_m - float(call.get('last_seek_at') or 0.0)
+        since_resync = now_m - float(mon.get('last_resync_at') or 0.0)
+        can_resync = (
+            call.get('status') == 'playing'
+            and int(mon.get('resync_count') or 0) < 3
+            and since_seek >= 18.0
+            and since_resync >= 22.0
+            and (not self.factory or bool(getattr(self, 'allow_auto_resync_in_tests', False)))
+        )
+        trigger_reason = None
+        if can_resync:
+            if hub_dead:
+                trigger_reason = 'hub_exited'
+            elif mon['stall_streak'] >= 1:
+                trigger_reason = f"hb_stalled_{float(metrics.get('hb_age_sec') or 0.0):.0f}s"
+            elif mon['skew_streak'] >= 2:
+                trigger_reason = f'sustained_skew_{skew_ms:+d}ms'
+        return metrics, trigger_reason
+
+    async def _sync_monitor_loop(self):
+        try:
+            while not self.closing:
+                interval = max(0.05, float(getattr(self, 'sync_monitor_interval_sec', 2.5) or 2.5))
+                await asyncio.sleep(interval)
+                if self.closing:
+                    break
+                for chat in list(self.calls):
+                    if self.closing:
+                        break
+                    async with self.chat_lock(chat):
+                        call = self.calls.get(chat)
+                        if not call or call.get('status') not in {'playing', 'paused'}:
+                            continue
+                        metrics, reason = self._evaluate_call_sync(chat, call)
+                        if reason:
+                            a = self.accounts.get(call.get('alias'))
+                            if a:
+                                try:
+                                    await self._resync_active_call(a, chat, call, reason=reason)
+                                except Exception as err:
+                                    log.warning('Auto-resync failed destination=%s reason=%s err=%s', chat, reason, err)
+        except asyncio.CancelledError:
+            return
+
     async def publisher_step(self, operation, stage, timeout=8):
         try: return await asyncio.wait_for(operation, timeout)
         except VoiceFailure: raise
@@ -2284,6 +2465,7 @@ class Bridge:
                 ),
                 asyncio.to_thread(sub_align._fetch_hls_skipped_hdrs, hls_seek_url),
             )
+            trim_delta_hdr = sub_align._fetch_hls_audio_trim_delta(hls_seek_url)
             if seek_info and not info:
                 info = seek_info
                 call['_probe_info'] = seek_info
@@ -2297,7 +2479,8 @@ class Bridge:
             if same_epoch:
                 t_anchor = max(float(v_pkt), float(a_pkt))
                 movie_landed = max(0.0, t_anchor - base_v0)
-                if not (hdr_v is not None and movie_landed <= 0.1 and float(hdr_v) > 1.0):
+                seg_pts_reset = bool(hdr_v is not None and float(hdr_v) > 1.0 and (movie_landed <= 0.1 or abs(movie_landed - float(hdr_v)) > 25.0))
+                if not seg_pts_reset:
                     sync_copyts = True
                     sync_trim_start = round(max(0.0, t_anchor), 3)
                     sync_pts_anchor = sync_trim_start
@@ -2306,9 +2489,11 @@ class Bridge:
                         sub_shift_offset = movie_landed
                         call['_landed_offset'] = movie_landed
                 else:
-                    v_el = float(v_pkt) - base_v0
-                    a_el = float(a_pkt) - float(pkt_a0 if pkt_a0 is not None else base_v0)
-                    diff = v_el - a_el
+                    hdr_delta = float(trim_delta_hdr) if trim_delta_hdr is not None else (
+                        (float(hdr_v) - float(hdr_a)) if (hdr_a is not None and hdr_v is not None) else 0.0
+                    )
+                    pkt_diff = (float(v_pkt) - float(a_pkt))
+                    diff = hdr_delta if 0.025 <= hdr_delta <= 15.0 else pkt_diff
                     if 0.025 <= diff <= 15.0:
                         hls_audio_trim_start = round(diff, 3)
                     elif -15.0 <= diff <= -0.025:
@@ -3193,6 +3378,7 @@ class Bridge:
                         call['last_known_position'] = landed_pos
                 call['status'] = 'playing'; self.calls[chat] = call; self.last_failures.pop(chat, None); self.last_ended_positions.pop(chat, None)
                 self._maybe_schedule_sub_align(a, chat, call)
+                self.ensure_sync_monitor()
                 probe_meta = call.get('_probe_info') or {}
                 return {
                     'ok': True,
@@ -3551,9 +3737,10 @@ class Bridge:
                                 audio_stream_index=(call.get('_probe_info') or {}).get('audio_stream_index'),
                                 origin_pts_sec=call.get('_v0_origin'),
                             ),
-                            timeout=16.0,
+                            timeout=28.0,
                         )
-                    except Exception:
+                    except Exception as err:
+                        log.warning('subcheck probe did not complete destination=%s err=%s', chat, type(err).__name__)
                         probe_res = None
                 self._sync_live_sub_monitor_state(call)
                 if isinstance(probe_res, dict) and (probe_res.get('confident') or not isinstance(call.get('subtitle_sync'), dict)):
@@ -3747,6 +3934,14 @@ class Bridge:
             if call.get('av_sync_id'):
                 sync_m = _read_sync_metrics(call.get('av_sync_id'))
                 if sync_m is not None:
+                    self._evaluate_call_sync(chat, call, metrics=sync_m)
+                    mon = call.get('_sync_mon') or {}
+                    sync_m['monitored'] = True
+                    sync_m['resync_count'] = int(mon.get('resync_count') or 0)
+                    if mon.get('last_resync_reason'):
+                        sync_m['last_resync_reason'] = mon.get('last_resync_reason')
+                    if mon.get('checked_at'):
+                        sync_m['checked_at'] = mon.get('checked_at')
                     info_out['av_sync'] = sync_m
                     if is_rtmp:
                         info_out['rtmp_pipeline_delay_sec'] = float(sync_m.get('pipeline_delay_sec') or 0.0)
@@ -3754,6 +3949,10 @@ class Bridge:
 
     async def shutdown(self):
         self.closing = True
+        mon_task = getattr(self, '_sync_monitor_task', None)
+        if mon_task is not None and not mon_task.done():
+            mon_task.cancel()
+            await asyncio.gather(mon_task, return_exceptions=True)
         for chat in list(self.calls):
             try: await self.control('stop', {'chat_id': chat})
             except Exception: log.warning('Call cleanup failed destination=%s', chat)

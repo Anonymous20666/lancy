@@ -27,12 +27,12 @@ SHM_DIR = Path('/dev/shm') if Path('/dev/shm').is_dir() else Path('/tmp')
 PCM_BYTES_PER_SEC = 48000 * 2 * 2  # 192,000 B/s (48kHz stereo s16le)
 AUDIO_PREBUFFER_BYTES = 7680       # 40ms of PCM before startup release
 BARRIER_TIMEOUT_SEC = 20.0
-VIDEO_CATCHUP_LAG_SEC = 0.280
-VIDEO_TARGET_LAG_SEC = 0.050
-AUDIO_MAX_LEAD_SEC = 0.165
-AUDIO_RESUME_LEAD_SEC = 0.045
-VIDEO_MAX_LEAD_SEC = 0.155
-VIDEO_RESUME_LEAD_SEC = 0.045
+VIDEO_CATCHUP_LAG_SEC = 0.180
+VIDEO_TARGET_LAG_SEC = 0.035
+AUDIO_MAX_LEAD_SEC = 0.145
+AUDIO_RESUME_LEAD_SEC = 0.030
+VIDEO_MAX_LEAD_SEC = 0.110
+VIDEO_RESUME_LEAD_SEC = 0.030
 PTS_DISCONTINUITY_SEC = 0.035
 SYNC_STARVATION_SEC = 0.280
 STALL_HEARTBEAT_TIMEOUT_SEC = 12.0
@@ -287,6 +287,29 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
     _wait_for_barrier(state, 'audio', stop_ev)
     if not init_chunks or stop_ev.is_set():
         return
+    state.epoch_mono = time.monotonic()
+    # Align initial audio PTS to video epoch_pts_sec set before barrier so A/V start on identical sample #0.
+    target_epoch = float(getattr(state, 'epoch_pts_sec', 0.0) or 0.0)
+    if target_epoch >= 0.020:
+        if first_pts < target_epoch - 0.020:
+            trim_bytes = int(round((target_epoch - first_pts) * bps))
+            trim_bytes -= (trim_bytes % sample_align)
+            while init_chunks and trim_bytes > 0:
+                sp, sb = init_chunks[0]
+                if len(sb) <= trim_bytes:
+                    trim_bytes -= len(sb)
+                    first_pts = sp + (len(sb) / float(bps))
+                    init_chunks.pop(0)
+                else:
+                    init_chunks[0] = (sp + (trim_bytes / float(bps)), sb[trim_bytes:])
+                    first_pts = sp + (trim_bytes / float(bps))
+                    trim_bytes = 0
+        elif first_pts > target_epoch + 0.020:
+            pad_bytes = min(int(round((first_pts - target_epoch) * bps)), bps * 10)
+            pad_bytes -= (pad_bytes % sample_align)
+            if pad_bytes > 0:
+                init_chunks.insert(0, (target_epoch, b'\x00' * pad_bytes))
+                first_pts = target_epoch
 
     out = sys.stdout.buffer
     out_fd = out.fileno()
@@ -449,13 +472,16 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                         break
                     if wait_started is None:
                         wait_started = now_m
+                        last_sync_silence = now_m - 0.020
                     if v_syncing or (now_m - wait_started) >= SYNC_STARVATION_SEC:
                         if (now_m - last_sync_silence) >= 0.020:
                             pre_unread = _pipe_unread_bytes(out_fd)
                             _write_all(out, silence_buf)
                             silence_since_last_real = min(silence_since_last_real, pre_unread) + len(silence_buf)
-                            last_sync_silence = time.monotonic()
-                            state.audio_hb_mono = last_sync_silence
+                            last_sync_silence += 0.020
+                            if (time.monotonic() - last_sync_silence) > 0.060:
+                                last_sync_silence = time.monotonic()
+                            state.audio_hb_mono = time.monotonic()
                     time.sleep(0.005)
             finally:
                 pass
@@ -577,6 +603,12 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None)
                 if not dq:
                     continue
                 pkt = dq.popleft()
+                if int(state.video_state) == 1 and float(state.video_sec or 0.0) > 0.0:
+                    cur_pkt_sec = (bytes_sent + len(pkt)) / float(bps)
+                    if (float(state.video_sec) - cur_pkt_sec) > VIDEO_CATCHUP_LAG_SEC:
+                        while dq and (float(state.video_sec) - ((bytes_sent + len(pkt)) / float(bps))) > VIDEO_TARGET_LAG_SEC:
+                            bytes_sent += len(pkt)
+                            pkt = dq.popleft()
                 cond.notify_all()
 
             # Bidirectional lead clamp: hold audio cleanly whenever video is still alive & trailing
@@ -584,17 +616,18 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None)
             silence_sz = max(sample_align, (bps // 50) - ((bps // 50) % sample_align))
             silence_buf = b'\x00' * silence_sz
             last_sync_silence = 0.0
+            silence_bytes = 0
             while not stop_ev.is_set() and int(state.video_state) == 1:
                 if int(state.paused) == 1:
                     _wait_if_paused(state, stop_ev)
                     wait_started = None
                     continue
-                consumed_a = max(0.0, (bytes_sent - _pipe_unread_bytes(out_fd)) / float(bps))
+                consumed_a = max(0.0, (bytes_sent - max(0, _pipe_unread_bytes(out_fd) - silence_bytes)) / float(bps))
                 state.audio_sec = consumed_a
                 now_m = time.monotonic()
                 if proc.poll() is None:
                     state.audio_hb_mono = now_m
-                cur_a = max(consumed_a, ((bytes_sent + len(pkt)) - _pipe_unread_bytes(out_fd)) / float(bps))
+                cur_a = max(consumed_a, ((bytes_sent + len(pkt)) - max(0, _pipe_unread_bytes(out_fd) - silence_bytes)) / float(bps))
                 cur_v = float(state.video_sec)
                 state.skew_ms = int(round((cur_a - cur_v) * 1000.0))
                 limit = AUDIO_MAX_LEAD_SEC if wait_started is None else AUDIO_RESUME_LEAD_SEC
@@ -603,9 +636,14 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None)
                     break
                 if wait_started is None:
                     wait_started = now_m
+                    last_sync_silence = now_m - 0.020
                 if (now_m - wait_started) >= SYNC_STARVATION_SEC and (now_m - last_sync_silence) >= 0.020:
+                    pre_unread = _pipe_unread_bytes(out_fd)
                     _write_all(out, silence_buf)
-                    last_sync_silence = time.monotonic()
+                    silence_bytes = min(silence_bytes, pre_unread) + len(silence_buf)
+                    last_sync_silence += 0.020
+                    if (time.monotonic() - last_sync_silence) > 0.060:
+                        last_sync_silence = time.monotonic()
                 time.sleep(0.005)
 
             if int(state.paused) == 1:
@@ -616,7 +654,7 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None)
             if sub_monitor is not None:
                 sub_monitor.feed_pcm(bytes_sent / float(bps), pkt)
             bytes_sent += len(pkt)
-            state.audio_sec = max(0.0, (bytes_sent - _pipe_unread_bytes(out_fd)) / float(bps))
+            state.audio_sec = max(0.0, (bytes_sent - max(0, _pipe_unread_bytes(out_fd) - silence_bytes)) / float(bps))
             state.audio_hb_mono = time.monotonic()
             state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
     except BrokenPipeError:
@@ -881,9 +919,10 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
     out = sys.stdout.buffer
     out_fd = out.fileno()
     try:
-        fcntl.fcntl(out_fd, F_SETPIPE_SZ, max(65536, min(524288, frame_bytes // 2)))
+        fcntl.fcntl(out_fd, F_SETPIPE_SZ, max(131072, min(2097152, max(524288, frame_bytes))))
     except Exception:
         pass
+    state.epoch_mono = time.monotonic()
     dq_maxlen = max(10, min(32, int(round(eff_fps))))
     dq = deque()
     cond = threading.Condition()
@@ -1114,9 +1153,10 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
     out = sys.stdout.buffer
     out_fd = out.fileno()
     try:
-        fcntl.fcntl(out_fd, F_SETPIPE_SZ, max(65536, min(524288, frame_bytes // 2)))
+        fcntl.fcntl(out_fd, F_SETPIPE_SZ, max(131072, min(2097152, max(524288, frame_bytes))))
     except Exception:
         pass
+    state.epoch_mono = time.monotonic()
     frames_decoded = 1
     dq_maxlen = max(12, min(48, int(round(eff_fps * 1.5))))
     dq = deque()
@@ -1298,7 +1338,8 @@ def main():
                         sample_rate=args.sample_rate,
                         channels=args.channels,
                     )
-                except Exception:
+                except Exception as err:
+                    print(f'[av_sync] LiveSubSyncMonitor init skipped: {err}', file=sys.stderr)
                     sub_monitor = None
             _run_audio(proc, state, stop_ev, args.sample_rate, args.channels, sub_monitor=sub_monitor)
         else:
