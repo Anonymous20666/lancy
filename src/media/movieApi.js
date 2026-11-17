@@ -171,12 +171,27 @@ function firstLangValue(lang) {
 }
 
 const EN_PRIMARY_COUNTRIES_RE = /^\s*(?:United States(?: of America)?|USA|U\.S\.A\.?|United Kingdom|UK|U\.K\.|Great Britain|Australia|New Zealand|Ireland)\b/i;
+const COUNTRY_LANG_MAP = [
+  [EN_PRIMARY_COUNTRIES_RE, 'English'],
+  [/^\s*(?:China|People's Republic of China|PRC|Taiwan|Hong Kong)\b/i, 'Chinese'],
+  [/^\s*Japan\b/i, 'Japanese'],
+  [/^\s*(?:South Korea|Republic of Korea|Korea)\b/i, 'Korean'],
+  [/^\s*France\b/i, 'French'],
+  [/^\s*Germany\b/i, 'German'],
+  [/^\s*Italy\b/i, 'Italian'],
+  [/^\s*Spain\b/i, 'Spanish'],
+  [/^\s*(?:Russia|Russian Federation)\b/i, 'Russian'],
+  [/^\s*(?:Brazil|Portugal)\b/i, 'Portuguese'],
+  [/^\s*Thailand\b/i, 'Thai']
+];
 
 function inferLangFromCountry(country) {
   const val = Array.isArray(country) ? country[0] : country;
   const s = String(val || '').trim();
   if (!s) return null;
-  if (EN_PRIMARY_COUNTRIES_RE.test(s)) return 'English';
+  for (const [re, langName] of COUNTRY_LANG_MAP) {
+    if (re.test(s)) return langName;
+  }
   return null;
 }
 
@@ -267,8 +282,20 @@ export class MovieApiClient {
       const oldest = this.externalItems.keys().next().value;
       if (oldest !== undefined) this.externalItems.delete(oldest);
     }
-    this.externalItems.set(`${item.type || 'movie'}:${item.id}`, item);
-    this.externalItems.set(String(item.id), item);
+    const typedKey = `${item.type || 'movie'}:${item.id}`;
+    const prev = this.externalItems.get(typedKey) || this.externalItems.get(String(item.id));
+    const merged = prev
+      ? {
+          ...item,
+          imdbId: item.imdbId || prev.imdbId || null,
+          tmdbId: item.tmdbId || prev.tmdbId || null,
+          tvmazeId: item.tvmazeId || prev.tvmazeId || null,
+          language: item.language || prev.language || null,
+          originalLanguage: item.originalLanguage || prev.originalLanguage || null
+        }
+      : item;
+    this.externalItems.set(typedKey, merged);
+    this.externalItems.set(String(item.id), merged);
   }
 
   async #fetchExternalJson(url, { ttlMs = 180_000, headers = {}, timeoutMs = 4200 } = {}) {

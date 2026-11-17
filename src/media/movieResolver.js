@@ -1386,11 +1386,19 @@ export class MovieStreamResolver {
             subtitles: masterSubs
           });
         }
+        const rawTopSubs = [
+          ...(Array.isArray(data?.stream?.subtitles) ? data.stream.subtitles : []),
+          ...(Array.isArray(data?.subtitles) ? data.subtitles : []),
+          ...(Array.isArray(data?.captions) ? data.captions : []),
+          ...(Array.isArray(data?.tracks) ? data.tracks : []),
+          ...(Array.isArray(data?.subs) ? data.subs : [])
+        ];
         if (normalizedSources.length) {
           payloads.push({
             tmdbId: String(tmdbId),
             _route: 'vidbolt',
             _headers: { ...VIDBOLT_HEADERS },
+            subtitles: rawTopSubs,
             sources: normalizedSources
           });
         }

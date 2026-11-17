@@ -4044,40 +4044,52 @@ test('VidBolt candidate parser preserves source.language (skips 1080p French/Pt-
   assert.equal(normalizeLangCode('French'), 'fr');
 
   const masterM3u8 = '#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:1250.0,\nhttps://cdn.example/seg1.ts\n#EXT-X-ENDLIST\n';
+  const srtBody = '1\n00:00:01,000 --> 00:00:04,000\nNicely done, Maurice.\n\n2\n00:00:05,000 --> 00:00:09,000\nNow peel me a grape.\n\n3\n00:00:10,000 --> 00:00:14,000\nOperation popcorn.\n\n4\n00:00:15,000 --> 00:00:19,000\nCute and cuddly.\n\n5\n00:00:20,000 --> 00:00:24,000\nMove it.\n';
+  const subDir = mkdtempSync(join(tmpdir(), 'lancy-vb-subs-'));
+  t.after(() => rmSync(subDir, { recursive: true, force: true }));
+  const vbFetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith('https://vidbolt.xyz/api/resolve')) {
+      return {
+        ok: true,
+        json: async () => ({
+          stream: {
+            sources: [
+              { url: 'https://cdn.example/fr_1080.m3u8', kind: 'hls', quality: '1080p', language: 'French' },
+              { url: 'https://cdn.example/pt_720.m3u8', kind: 'hls', quality: '720p', language: 'Brazilian Portuguese' },
+              { url: 'https://cdn.example/en_480.m3u8', kind: 'hls', quality: '480p', language: 'English' }
+            ],
+            subtitles: [
+              { url: 'https://cdn.example/fr.srt', label: 'Français', lang: 'Français' },
+              { url: 'https://cdn.example/en_vb.srt', label: 'English', lang: 'English' }
+            ]
+          }
+        })
+      };
+    }
+    if (u.startsWith('https://cdn.example/') && u.endsWith('.m3u8')) {
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-type': 'application/vnd.apple.mpegurl' }),
+        text: async () => masterM3u8
+      };
+    }
+    if (u.startsWith('https://cdn.example/seg1.ts')) {
+      return { ok: true, status: 206, headers: new Headers({ 'content-type': 'video/mp2t' }), arrayBuffer: async () => new ArrayBuffer(64) };
+    }
+    if (u === 'https://cdn.example/en_vb.srt') {
+      return { ok: true, status: 200, text: async () => srtBody };
+    }
+    return { ok: false, status: 404, text: async () => '' };
+  };
+  const subs = new SubtitleService({ cacheDir: subDir, fetchImpl: vbFetch });
   const resolver = new MovieStreamResolver({
     movieApi: null,
-    subtitles: null,
+    subtitles: subs,
     enableWebFallback: false,
     enableYtDlp: false,
-    fetchImpl: async (url) => {
-      const u = String(url);
-      if (u.startsWith('https://vidbolt.xyz/api/resolve')) {
-        return {
-          ok: true,
-          json: async () => ({
-            stream: {
-              sources: [
-                { url: 'https://cdn.example/fr_1080.m3u8', kind: 'hls', quality: '1080p', language: 'French' },
-                { url: 'https://cdn.example/pt_720.m3u8', kind: 'hls', quality: '720p', language: 'Brazilian Portuguese' },
-                { url: 'https://cdn.example/en_480.m3u8', kind: 'hls', quality: '480p', language: 'English' }
-              ]
-            }
-          })
-        };
-      }
-      if (u.startsWith('https://cdn.example/') && u.endsWith('.m3u8')) {
-        return {
-          ok: true,
-          status: 200,
-          headers: new Headers({ 'content-type': 'application/vnd.apple.mpegurl' }),
-          text: async () => masterM3u8
-        };
-      }
-      if (u.startsWith('https://cdn.example/seg1.ts')) {
-        return { ok: true, status: 206, headers: new Headers({ 'content-type': 'video/mp2t' }), arrayBuffer: async () => new ArrayBuffer(64) };
-      }
-      return { ok: false, status: 404, text: async () => '' };
-    }
+    fetchImpl: vbFetch
   });
 
   const picked = await resolver.resolve({
@@ -4089,12 +4101,31 @@ test('VidBolt candidate parser preserves source.language (skips 1080p French/Pt-
     season: 1,
     episode: 1,
     originalLanguage: 'English',
-    fetchSubtitles: false
+    fetchSubtitles: true
   });
   assert.equal(picked.ok, true);
   assert.equal(picked.track.streamUrl, 'https://cdn.example/en_480.m3u8');
   assert.equal(picked.track.audioLanguage, 'en');
   assert.equal(picked.track.audioIsDub, false);
+  assert.equal(picked.track.subtitleSameRoute, true, 'VidBolt stream.subtitles must be attached as Same-Stream subtitles');
+  assert.equal(picked.track.subtitleCuesCount, 5);
+
+  const apiZh = new MovieApiClient({
+    baseUrl: 'https://primary.invalid',
+    fetchImpl: async (url) => {
+      if (String(url).includes('v3-cinemeta.strem.io/meta/series/tt12953630.json')) {
+        return {
+          ok: true,
+          json: async () => ({
+            meta: { id: 'tt12953630', name: 'Fog Hill of Five Elements', country: 'China', moviedb_id: 102788, videos: [{ season: 1, episode: 1 }] }
+          })
+        };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    }
+  });
+  const fogShow = await apiZh.getTvShow('tt12953630');
+  assert.equal(fogShow?.originalLanguage, 'Chinese');
 
   const h = buildTestHarness(t);
   h.app.db.setSetting('music.streamMode.-10091.movie', 'interactive');
