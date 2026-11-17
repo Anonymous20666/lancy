@@ -1,7 +1,7 @@
 import { block, rt, richButton, encodeCallback } from '../rich.js';
 import { ProgressTracker } from '../progress.js';
 import { States } from '../../core/stateMachine.js';
-import { durationText, MusicError, stripRemotePhotoBlocks } from '../../music/model.js';
+import { durationText, MusicError, stripRemotePhotoBlocks, sendRichWithPhotoFallback } from '../../music/model.js';
 import { PANEL_ACTIONS } from '../../music/channelPanels.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, normalizeDownloadQuality, uploadLimitBytes } from '../../media/telegramLimits.js';
 import { isBotSuperAdmin, isAnonymousGroupAdmin } from '../permissions.js';
@@ -861,8 +861,9 @@ export function createMovieUi({
     const dmOnly = isDmDownloadMode(ctx, ms);
     const runtime = item.runtimeMinutes || item.runtime || null;
     const b = card(`🎬 ${cut(item.title || 'Movie', 52)}`, `${item.year || ''} ${item.rating ? `· ⭐ ${item.rating}` : ''} ${runtime ? `· ${runtime} min` : ''}`.trim());
-    if (isSafeHttpsUrl(item.poster)) {
-      b.photo(item.poster, cut(item.title, 90));
+    const detailArt = item.poster || item.backdrop || item.artwork;
+    if (isSafeHttpsUrl(detailArt)) {
+      b.photo(detailArt, cut(item.title, 90));
     }
     const dlQuality = getUserDownloadQuality(ctx, ms);
     const estDur = Number(item.runtimeSeconds || (runtime ? Number(runtime) * 60 : 5400));
@@ -1256,15 +1257,11 @@ export function createMovieUi({
     let sent;
     let sentRich = rich;
     try {
-      sent = await ctx.api.sendRichMessage(ctx.chatId, rich, sendExtra);
+      const out = await sendRichWithPhotoFallback(ctx.api, ctx.chatId, rich, sendExtra);
+      sent = out.sent;
+      if (!out.hasPhoto) sentRich = stripRemotePhotoBlocks(rich) || rich;
     } catch (e) {
-      const msgStr = String(e?.description || e?.message || '');
-      if (hasRichPhoto(rich) && /wrong type of the web page content|failed to get http url content|wrong file identifier|media_empty|webpage_media_empty|photo_invalid_dimensions|wrong_file_id/i.test(msgStr)) {
-        sentRich = stripRemotePhotoBlocks(rich);
-        sent = await ctx.api.sendRichMessage(ctx.chatId, sentRich, sendExtra);
-      } else {
-        throw e;
-      }
+      throw e;
     }
     if (sent?.message_id) {
       ms.messageId = sent.message_id;
@@ -1980,6 +1977,9 @@ export function createMovieUi({
         imdbId: tr.imdbId ?? desc?.imdbId ?? null,
         activeSourceIndex: Number.isInteger(tr.activeSourceIndex) ? tr.activeSourceIndex : 0,
         sourceCount: Number(tr.sourceCount || (1 + (Array.isArray(tr.fallbackStreams) ? tr.fallbackStreams.length : 0))),
+        artwork: tr.artwork || desc?.artwork || desc?.poster || desc?.backdrop || tr.poster || tr.backdrop || null,
+        poster: tr.poster || desc?.poster || tr.artwork || null,
+        backdrop: tr.backdrop || desc?.backdrop || null,
         year: tr.year ?? desc?.year ?? null,
         rating: tr.rating ?? desc?.rating ?? null,
         genres: tr.genres ?? desc?.genres ?? null,
@@ -2084,12 +2084,16 @@ export function createMovieUi({
       (updatedSession.screenMessageId && Number(updatedSession.playerChatId || targetCtx.chatId) === Number(targetCtx.chatId) && !updatedSession.callEnded && ['playing', 'paused', 'buffering'].includes(updatedSession.status)) ||
       (panel?.screenMessageId && Number(panel?.chatId || targetCtx.chatId) === Number(targetCtx.chatId))
     );
+    const nextPlayerTrack = updatedSession.currentTrack || updatedSession.movieUpcoming?.[0] || null;
+    const nextPlayerArt = nextPlayerTrack?.artwork || nextPlayerTrack?.poster || nextPlayerTrack?.backdrop || nextPlayerTrack?.thumbnailUrl || nextPlayerTrack?.thumb || null;
+    const nextPlayerHasPhoto = Boolean(isSafeHttpsUrl(nextPlayerArt) && !(nextPlayerTrack?.isAdult && Number(dest) < 0));
     const canMorphSearchCard = Boolean(
       searchCardId &&
       !hasLivePlayerInChat &&
       Number(targetCtx.chatId) === Number(ms.chatId) &&
       searchCardId !== updatedSession.screenMessageId &&
-      !isChannelCtx(targetCtx)
+      !isChannelCtx(targetCtx) &&
+      (ms.messageHasPhoto == null || Boolean(ms.messageHasPhoto) === nextPlayerHasPhoto)
     );
     const p = await app.music.player({
       ...targetCtx,

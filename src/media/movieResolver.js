@@ -3237,6 +3237,10 @@ export class MovieStreamResolver {
       episodeTitle = null,
       durationSeconds = null,
       artwork = null,
+      poster = null,
+      backdrop = null,
+      thumbnailUrl = null,
+      thumb = null,
       imdbId = null,
       rating = null,
       genres = null,
@@ -3266,8 +3270,9 @@ export class MovieStreamResolver {
     let franchiseSeasonNumber = opts.franchiseSeasonNumber ?? null;
     let franchiseSeasonName = opts.franchiseSeasonName || opts.seasonName || null;
 
+    const inputArtwork = artwork || poster || backdrop || thumbnailUrl || thumb || null;
     if (this.movieApi && id) {
-      const needDetail = !year || !imdbId || !rawReleaseDate || !opts.originalLanguage || (!durationSeconds && !isTv);
+      const needDetail = !year || !imdbId || !rawReleaseDate || !opts.originalLanguage || !inputArtwork || (!durationSeconds && !isTv);
       const isGenericEpTitle = !episodeTitle || /^episode\s*\d+$/i.test(String(episodeTitle).trim());
       const needEpMeta = isTv && episode != null && (isGenericEpTitle || !durationSeconds) && typeof this.movieApi.getTvSeasonEpisodes === 'function';
       const [pbRes, dtRes, epRes, mapRes] = await Promise.allSettled([
@@ -3313,7 +3318,7 @@ export class MovieStreamResolver {
     const effectiveYear = year ?? detailMeta?.year ?? null;
     const effectiveReleaseDate = rawReleaseDate ?? detailMeta?.releaseDate ?? playback?.releaseDate ?? null;
     const effectiveImdbId = imdbId ?? detailMeta?.imdbId ?? null;
-    const effectiveArtwork = artwork || epMeta?.still || detailMeta?.poster || detailMeta?.backdrop || null;
+    const effectiveArtwork = inputArtwork || epMeta?.still || detailMeta?.poster || detailMeta?.backdrop || null;
     const effectiveDurationSeconds = durationSeconds ?? epMeta?.runtimeSeconds ?? detailMeta?.runtimeSeconds ?? detailMeta?.durationSeconds ?? null;
     const effectiveRating = rating ?? detailMeta?.rating ?? null;
     const effectiveGenres = Array.isArray(genres) && genres.length ? genres : (Array.isArray(detailMeta?.genres) ? detailMeta.genres : null);

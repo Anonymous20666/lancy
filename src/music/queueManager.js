@@ -6,7 +6,7 @@ import { basename } from 'node:path';
 import { logger } from '../core/logger.js';
 import { getCueAt, mapMediaSecToSubMs } from '../media/subtitles.js';
 import { resolveAppScreen } from './accounts.js';
-import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError } from './model.js';
+import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback } from './model.js';
 
 /** Sole owner of ephemeral destination queues. The bridge exclusively owns account leases. */
 export class QueueManager extends EventEmitter {
@@ -1864,7 +1864,7 @@ export class QueueManager extends EventEmitter {
     const messageId = Number(msgId || s.screenMessageId);
     const chatId = Number(targetChatId || s.playerChatId || id);
     const useApi = api || s.api || this.app?.telegram?.api;
-    const isActive = Boolean(s.currentTrack) || ['playing', 'paused', 'buffering'].includes(s.status);
+    const isActive = Boolean(s.currentTrack && ['playing', 'paused'].includes(s.status));
     if (!messageId || !useApi || !(chatId < 0) || !isActive || s.pinnedMessageId === messageId) return false;
     if (typeof useApi.pinChatMessage !== 'function') return false;
     try {
@@ -2074,26 +2074,65 @@ export class QueueManager extends EventEmitter {
         : screen.renderPlayer(display);
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
+      const nextHasPhoto = hasRichPhotoPayload(rich);
+      const needsMediaReplacement = Boolean(!preview && s.lastRenderHasPhoto === false && nextHasPhoto && typeof api.sendRichMessage === 'function');
       try {
         const files = preview ? await audioUpload(preview.media) : null;
         // A track/control can change while reading the file. Never upload stale audio.
         if (preview && (!previews.current(s, preview.request) || s.view !== 'player')) return false;
         let sent;
-        try {
-          sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, rich, { dropOnFloodWait: !forceEdit }, files);
-        } catch (editErr) {
-          if (!preview && isRemotePhotoError(editErr)) {
-            const noPhoto = stripRemotePhotoBlocks(rich);
-            if (noPhoto) {
-              sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, noPhoto, { dropOnFloodWait: !forceEdit }, files);
+        let renderedHasPhoto = nextHasPhoto;
+        if (needsMediaReplacement) {
+          const oldMsgId = s.screenMessageId;
+          const out = await sendRichWithPhotoFallback(api, s.playerChatId, rich);
+          sent = out.sent;
+          renderedHasPhoto = out.hasPhoto;
+          if (sent?.message_id) {
+            if (oldMsgId && oldMsgId !== sent.message_id && typeof api.deleteMessage === 'function') {
+              await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
+            }
+            if (oldMsgId !== sent.message_id) {
+              s.pinned = false;
+              s.pinnedMessageId = null;
+            }
+            s.screenMessageId = sent.message_id;
+          }
+        } else {
+          try {
+            sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, rich, { dropOnFloodWait: !forceEdit }, files);
+          } catch (editErr) {
+            if (!preview && isRemotePhotoError(editErr)) {
+              if (nextHasPhoto && typeof api.sendRichMessage === 'function') {
+                const oldMsgId = s.screenMessageId;
+                const out = await sendRichWithPhotoFallback(api, s.playerChatId, rich);
+                sent = out.sent;
+                renderedHasPhoto = out.hasPhoto;
+                if (sent?.message_id) {
+                  if (oldMsgId && oldMsgId !== sent.message_id && typeof api.deleteMessage === 'function') {
+                    await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
+                  }
+                  if (oldMsgId !== sent.message_id) {
+                    s.pinned = false;
+                    s.pinnedMessageId = null;
+                  }
+                  s.screenMessageId = sent.message_id;
+                }
+              } else {
+                const noPhoto = stripRemotePhotoBlocks(rich);
+                if (noPhoto) {
+                  sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, noPhoto, { dropOnFloodWait: !forceEdit }, files);
+                  renderedHasPhoto = false;
+                } else {
+                  throw editErr;
+                }
+              }
             } else {
               throw editErr;
             }
-          } else {
-            throw editErr;
           }
         }
         s.lastRender = content;
+        s.lastRenderHasPhoto = renderedHasPhoto;
         await this.autoPinPlayerCard(s.chatId, s.screenMessageId, s.playerChatId, api);
         if (preview) {
           const fileId = audioFileId(sent);
@@ -2120,17 +2159,9 @@ export class QueueManager extends EventEmitter {
           if (oldMsgId && (forceEdit || now - (s._lastCardReplaceAt || 0) >= 8000) && typeof api.sendRichMessage === 'function') {
             s._lastCardReplaceAt = now;
             try {
-              let replacement = null;
-              try {
-                replacement = await api.sendRichMessage(s.playerChatId, rich);
-              } catch (sendErr) {
-                if (isRemotePhotoError(sendErr)) {
-                  const noPhoto = stripRemotePhotoBlocks(rich);
-                  if (noPhoto) replacement = await api.sendRichMessage(s.playerChatId, noPhoto);
-                } else {
-                  throw sendErr;
-                }
-              }
+              const out = await sendRichWithPhotoFallback(api, s.playerChatId, rich);
+              const replacement = out.sent;
+              const replacementHasPhoto = out.hasPhoto;
               if (replacement?.message_id) {
                 if (oldMsgId !== replacement.message_id && typeof api.deleteMessage === 'function') {
                   await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
@@ -2145,6 +2176,7 @@ export class QueueManager extends EventEmitter {
                   s.screenMessageId = replacement.message_id;
                 }
                 s.lastRender = content;
+                s.lastRenderHasPhoto = replacementHasPhoto;
                 s.editAfter = 0;
                 await this.autoPinPlayerCard(s.chatId, replacement.message_id, s.playerChatId, api);
                 return true;

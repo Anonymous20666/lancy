@@ -2,6 +2,89 @@ import { logger } from '../core/logger.js';
 
 const DEFAULT_BASE_URL = 'https://pappy-hosting.duckdns.org/media/api/v1/movies';
 
+export const DEFAULT_MOVIE_CATEGORIES = [
+  { id: 'hollywood', name: 'Hollywood & Western', description: 'Major studio releases, American cinema, and blockbusters', keywords: ['hollywood', 'blockbuster', 'us cinema'], language: 'en' },
+  { id: 'bollywood', name: 'Bollywood & Indian Cinema', description: 'Hindi, Tamil, Telugu, and pan-Indian cinema and musicals', keywords: ['bollywood', 'hindi', 'tamil', 'telugu'], language: 'hi|te|ta|ml' },
+  { id: 'nollywood', name: 'Nollywood & African Cinema', description: 'Nigerian Nollywood feature films and African cinema', keywords: ['nollywood', 'african film', 'nigeria'], country: 'NG' },
+  { id: 'korean', name: 'Korean Cinema & K-Drama', description: 'South Korean thrillers, award-winning dramas, and K-Drama series', keywords: ['k-drama', 'korean drama', 'hallyu'], language: 'ko' },
+  { id: 'chinese', name: 'Chinese Cinema & Wuxia', description: 'Chinese martial arts, historical epics, and modern cinema', keywords: ['wuxia', 'chinese film', 'martial arts'], language: 'zh|cn' },
+  { id: 'donghua', name: 'Chinese Donghua Animation', description: 'Chinese 2D & 3D animated series and cinematic animation', keywords: ['donghua', 'chinese animation', '3d anime'], language: 'zh', tmdb_genre_id: 16 },
+  { id: 'anime', name: 'Anime Movies & Series', description: 'Japanese animated feature films and serialized anime', keywords: ['anime', 'japanese animation', 'manga adaptation'], language: 'ja', tmdb_genre_id: 16 },
+  { id: 'action', name: 'Action & High Octane', description: 'Action-packed cinema, martial arts, spy thrillers, and adventures', keywords: ['action', 'thriller', 'explosive'], tmdb_genre_id: 28 },
+  { id: 'comedy', name: 'Comedy & Entertainment', description: 'Comedies, parodies, rom-coms, and feel-good entertainment', keywords: ['comedy', 'funny', 'rom-com'], tmdb_genre_id: 35 },
+  { id: 'horror', name: 'Horror & Supernatural', description: 'Horror, creature features, psychological terror, and ghost stories', keywords: ['horror', 'scary', 'supernatural'], tmdb_genre_id: 27 },
+  { id: 'scifi', name: 'Sci-Fi & Cyberpunk', description: 'Space operas, time travel, dystopian futures, and cyberpunk', keywords: ['sci-fi', 'science fiction', 'fantasy'], tmdb_genre_id: 878 },
+  { id: 'romance', name: 'Romance & Drama', description: 'Heartwarming romances, relationship dramas, and love stories', keywords: ['romance', 'love story', 'drama'], tmdb_genre_id: 10749 },
+  { id: 'thriller', name: 'Crime, Mystery & Thrillers', description: 'Heists, detective investigations, psychological suspense, and mob crime', keywords: ['thriller', 'crime', 'mystery'], tmdb_genre_id: 53 },
+  { id: 'documentary', name: 'Documentaries & Real Life', description: 'True crime, nature documentaries, historical archives, and science', keywords: ['documentary', 'true story', 'biography'], tmdb_genre_id: 99 },
+  { id: 'family', name: 'Family & Kids', description: 'Family-friendly entertainment, animated adventures, and stories for all ages', keywords: ['family', 'kids', 'disney'], tmdb_genre_id: 10751 },
+  { id: 'classics', name: 'Golden Age Classics', description: 'Historic cinema, timeless masterpieces, and cinematic classics', keywords: ['classic', 'vintage', 'golden age'] }
+];
+
+export const DEFAULT_MOVIE_GENRES = [
+  { id: 28, name: 'Action', type: 'movie' },
+  { id: 12, name: 'Adventure', type: 'movie' },
+  { id: 16, name: 'Animation', type: 'both' },
+  { id: 35, name: 'Comedy', type: 'both' },
+  { id: 80, name: 'Crime', type: 'both' },
+  { id: 99, name: 'Documentary', type: 'both' },
+  { id: 18, name: 'Drama', type: 'both' },
+  { id: 10751, name: 'Family', type: 'both' },
+  { id: 14, name: 'Fantasy', type: 'movie' },
+  { id: 36, name: 'History', type: 'movie' },
+  { id: 27, name: 'Horror', type: 'movie' },
+  { id: 10402, name: 'Music', type: 'movie' },
+  { id: 9648, name: 'Mystery', type: 'both' },
+  { id: 10749, name: 'Romance', type: 'movie' },
+  { id: 878, name: 'Science Fiction', type: 'movie' },
+  { id: 53, name: 'Thriller', type: 'movie' },
+  { id: 10752, name: 'War', type: 'movie' },
+  { id: 37, name: 'Western', type: 'both' }
+];
+
+const CINEMETA_GENRE_MAP = {
+  romance: 'Romance',
+  10749: 'Romance',
+  action: 'Action',
+  28: 'Action',
+  10759: 'Action',
+  comedy: 'Comedy',
+  35: 'Comedy',
+  horror: 'Horror',
+  27: 'Horror',
+  scifi: 'Sci-Fi',
+  'sci-fi': 'Sci-Fi',
+  878: 'Sci-Fi',
+  10765: 'Sci-Fi',
+  thriller: 'Thriller',
+  53: 'Thriller',
+  80: 'Crime',
+  9648: 'Mystery',
+  drama: 'Drama',
+  18: 'Drama',
+  animation: 'Animation',
+  anime: 'Animation',
+  donghua: 'Animation',
+  16: 'Animation',
+  documentary: 'Documentary',
+  99: 'Documentary',
+  family: 'Family',
+  10751: 'Family',
+  adventure: 'Adventure',
+  12: 'Adventure',
+  fantasy: 'Fantasy',
+  14: 'Fantasy',
+  history: 'History',
+  36: 'History',
+  music: 'Music',
+  10402: 'Music',
+  war: 'War',
+  10752: 'War',
+  western: 'Western',
+  37: 'Western',
+  classics: 'Drama'
+};
+
 class TtlCache {
   constructor(maxEntries = 300) {
     this.maxEntries = maxEntries;
@@ -645,10 +728,23 @@ export class MovieApiClient {
       if (hit) return hit;
     }
 
-    const res = await this.fetch(cacheKey, {
-      headers: { Accept: 'application/json', 'User-Agent': 'LancyBot/10.3' },
-      signal: AbortSignal.timeout(this.timeoutMs)
-    });
+    let res;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        res = await this.fetch(cacheKey, {
+          headers: { Accept: 'application/json', 'User-Agent': 'LancyBot/10.3' },
+          signal: AbortSignal.timeout(this.timeoutMs)
+        });
+        break;
+      } catch (err) {
+        const msg = `${err?.message || ''} ${err?.cause?.code || ''} ${err?.code || ''}`;
+        if (attempt === 0 && /ECONNRESET|ETIMEDOUT|ECONNREFUSED|UND_ERR|fetch failed|network/i.test(msg)) {
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
+        throw err;
+      }
+    }
     if (!res.ok) {
       const msg = await res.text().catch(() => '');
       const err = new Error(`Movie API HTTP ${res.status}: ${msg.slice(0, 120)}`);
@@ -900,6 +996,71 @@ export class MovieApiClient {
     };
   }
 
+  async #fetchCinemetaCatalog({ type = 'movie', genre = null, sort = 'top', page = 1, limit = 20 } = {}) {
+    const cType = String(type).toLowerCase() === 'tv' ? 'series' : 'movie';
+    const genreSeg = genre ? `/genre=${encodeURIComponent(genre)}` : '';
+    const url = `https://cinemeta-catalogs.strem.io/top/catalog/${cType}/${sort}${genreSeg}.json`;
+    const data = await this.#fetchExternalJson(url, { ttlMs: 300_000 });
+    const metas = Array.isArray(data?.metas) ? data.metas : [];
+    const mapped = metas
+      .map((m) => {
+        const imdb = String(m?.imdb_id || m?.id || '').trim();
+        if (!imdb || !m?.name) return null;
+        const ym = String(m.releaseInfo || m.year || '').match(/\d{4}/);
+        const rtMin = parseArchiveRuntimeMinutes(m.runtime) || null;
+        return normalizeListItem({
+          id: imdb,
+          imdb_id: /^tt\d+$/i.test(imdb) ? imdb : null,
+          type: cType === 'series' ? 'tv' : 'movie',
+          title: m.name,
+          year: ym ? Number(ym[0]) : null,
+          poster: m.poster || m.background || null,
+          backdrop: m.background || null,
+          overview: m.description || '',
+          genres: Array.isArray(m.genres) ? m.genres : [],
+          rating: m.imdbRating ?? null,
+          runtime: m.runtime || null,
+          runtimeMinutes: rtMin,
+          cast: Array.isArray(m.cast) ? m.cast : [],
+          provider: 'cinemeta',
+          sourceProvider: 'cinemeta'
+        }, cType === 'series' ? 'tv' : 'movie');
+      })
+      .filter(Boolean);
+    for (const item of mapped) {
+      this.externalItems.set(`${item.type}:${item.id}`, item);
+      this.externalItems.set(item.id, item);
+    }
+    const start = Math.max(0, (Math.max(1, Number(page) || 1) - 1) * limit);
+    return mapped.slice(start, start + limit);
+  }
+
+  async #browseFallback({ type = 'movie', genreId, category, page = 1, limit = 20 } = {}) {
+    const catKey = String(category || '').toLowerCase().trim();
+    const mappedGenre = CINEMETA_GENRE_MAP[catKey] || CINEMETA_GENRE_MAP[Number(genreId)] || null;
+    if (mappedGenre) {
+      const catHits = await this.#fetchCinemetaCatalog({ type, genre: mappedGenre, page, limit }).catch(() => []);
+      if (catHits.length) return catHits;
+    }
+    if (['nollywood', 'bollywood', 'korean', 'chinese', 'hollywood'].includes(catKey)) {
+      const kwMap = {
+        nollywood: ['nollywood', 'nigeria'],
+        bollywood: ['bollywood', 'india'],
+        korean: ['korea', 'korean'],
+        chinese: ['chinese', 'hong kong'],
+        hollywood: ['hollywood']
+      };
+      const terms = kwMap[catKey] || [catKey];
+      const searchHits = [];
+      for (const term of terms.slice(0, 2)) {
+        const cm = await this.#searchCinemeta(term, { type, limit }).catch(() => []);
+        searchHits.push(...cm);
+      }
+      if (searchHits.length) return this.#mergeCatalogResults([], searchHits).slice(0, limit);
+    }
+    return await this.#fetchCinemetaCatalog({ type, page, limit }).catch(() => []);
+  }
+
   async trending({ window = 'day', type = 'all', page = 1, includeUpcoming = false, forceRefresh = false } = {}) {
     const primaryFallback = type === 'tv' ? 'tv' : 'movie';
     const requests = [
@@ -922,6 +1083,10 @@ export class MovieApiClient {
     const settled = await Promise.allSettled(requests);
     const primaryRes = settled[0];
     if (primaryRes.status === 'rejected' && settled.every((r) => r.status === 'rejected')) {
+      const fbMovies = type === 'tv' ? [] : await this.#fetchCinemetaCatalog({ type: 'movie', page, limit: 15 }).catch(() => []);
+      const fbTv = type === 'movie' ? [] : await this.#fetchCinemetaCatalog({ type: 'tv', page, limit: 10 }).catch(() => []);
+      const combined = [...fbMovies, ...fbTv];
+      if (combined.length) return { window, type, count: combined.length, results: combined };
       throw primaryRes.reason;
     }
 
@@ -948,36 +1113,60 @@ export class MovieApiClient {
   }
 
   async popular({ type = 'movie', page = 1 } = {}) {
-    const data = await this.#getJson('/popular', { type, page }, { ttlMs: 300_000 });
-    const results = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
-    return { type, count: results.length, results };
+    try {
+      const data = await this.#getJson('/popular', { type, page }, { ttlMs: 300_000 });
+      const results = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
+      if (results.length) return { type, count: results.length, results };
+    } catch {}
+    const fb = await this.#fetchCinemetaCatalog({ type, page, limit: 20 }).catch(() => []);
+    return { type, count: fb.length, results: fb };
   }
 
   async topRated({ type = 'movie', page = 1 } = {}) {
-    const data = await this.#getJson('/top-rated', { type, page }, { ttlMs: 300_000 });
-    const results = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
-    return { type, count: results.length, results };
+    try {
+      const data = await this.#getJson('/top-rated', { type, page }, { ttlMs: 300_000 });
+      const results = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
+      if (results.length) return { type, count: results.length, results };
+    } catch {}
+    const fb = await this.#fetchCinemetaCatalog({ type, sort: 'imdbRating', page, limit: 20 }).catch(() => []);
+    return { type, count: fb.length, results: fb };
   }
 
   async browse({ type = 'movie', genreId, category, year, sortBy = 'popularity.desc', page = 1, limit = 20, includeUpcoming = false } = {}) {
-    const data = await this.#getJson('/browse', { type, genreId, category, year, sortBy, page, limit }, { ttlMs: 300_000 });
-    const rawResults = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
+    let rawResults = [];
+    let resPage = Number(page) || 1;
+    try {
+      const data = await this.#getJson('/browse', { type, genreId, category, year, sortBy, page, limit }, { ttlMs: 300_000 });
+      rawResults = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
+      resPage = Number(data?.page || page);
+    } catch {
+      rawResults = await this.#browseFallback({ type, genreId, category, page, limit });
+    }
+    if (!rawResults.length) {
+      rawResults = await this.#browseFallback({ type, genreId, category, page, limit });
+    }
     const today = new Date().toISOString().slice(0, 10);
     const released = includeUpcoming
       ? rawResults
       : rawResults.filter((item) => !item.releaseDate || String(item.releaseDate).slice(0, 10) <= today);
     const results = released.length ? released : rawResults;
-    return { page: Number(data?.page || page), count: results.length, results };
+    return { page: resPage, count: results.length, results };
   }
 
   async categories() {
-    const data = await this.#getJson('/categories', null, { ttlMs: 3_600_000 });
-    return Array.isArray(data?.categories) ? data.categories : [];
+    try {
+      const data = await this.#getJson('/categories', null, { ttlMs: 3_600_000 });
+      if (Array.isArray(data?.categories) && data.categories.length) return data.categories;
+    } catch {}
+    return DEFAULT_MOVIE_CATEGORIES;
   }
 
   async genres() {
-    const data = await this.#getJson('/genres', null, { ttlMs: 3_600_000 });
-    return Array.isArray(data?.genres) ? data.genres : [];
+    try {
+      const data = await this.#getJson('/genres', null, { ttlMs: 3_600_000 });
+      if (Array.isArray(data?.genres) && data.genres.length) return data.genres;
+    } catch {}
+    return DEFAULT_MOVIE_GENRES;
   }
 
   async pickRandom({ type = 'all', category = null, genreId = null } = {}) {

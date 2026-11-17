@@ -7,7 +7,7 @@ import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { originalPlayDelivery } from './originalPlayCard.js';
 import { isMusicOwner, isMusicSuperAdmin, resolveAppScreen, isSameMusicBot } from './accounts.js';
-import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError } from './model.js';
+import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback } from './model.js';
 import { checkChatMediaPermissions, isGroupSuperAdminMember, isAnonymousGroupAdmin } from '../telegram/permissions.js';
 import { ProgressTracker } from '../telegram/progress.js';
 import { RichMessageBuilder, rt } from '../telegram/rich.js';
@@ -726,48 +726,42 @@ export class MusicService {
       const oldPlayerChatId = prevPlayerChatId || Number(ctx.chatId);
       const screen = resolveAppScreen(this.app, 'music', { ctx, session: s });
       const rich = isCinemaDeck && typeof screen.renderCinemaPlayer === 'function' ? screen.renderCinemaPlayer(s) : screen.renderPlayer(s);
-      const noPhotoRich = stripRemotePhotoBlocks(rich);
-      let sent=null;
-      if(ctx.reuseMessageId && Number(ctx.chatId)===Number(id) && typeof ctx.api.editMessageRich==='function'){
-        try{
-          const edited=await ctx.api.editMessageRich(ctx.chatId,ctx.reuseMessageId,rich);
-          sent=edited?.message_id ? edited : {message_id:ctx.reuseMessageId};
-        }catch(editErr){
-          if (noPhotoRich && isRemotePhotoError(editErr)) {
-            try{
-              const edited=await ctx.api.editMessageRich(ctx.chatId,ctx.reuseMessageId,noPhotoRich);
-              sent=edited?.message_id ? edited : {message_id:ctx.reuseMessageId};
-            }catch{}
+      const wantPhoto = hasRichPhotoPayload(rich);
+      let sent = null;
+      let sentHasPhoto = wantPhoto;
+      if (ctx.reuseMessageId && Number(ctx.chatId) === Number(id) && typeof ctx.api.editMessageRich === 'function') {
+        try {
+          const edited = await ctx.api.editMessageRich(ctx.chatId, ctx.reuseMessageId, rich);
+          sent = edited?.message_id ? edited : { message_id: ctx.reuseMessageId };
+        } catch (editErr) {
+          if (!wantPhoto || !isRemotePhotoError(editErr)) {
+            // Fall through cleanly to sendRichMessage if message can't be edited in place
           }
         }
       }
-      if(!sent){
-        try{
-          sent=await ctx.api.sendRichMessage(ctx.chatId,rich);
-        }catch(sendErr){
-          if (noPhotoRich && isRemotePhotoError(sendErr)) {
-            sent=await ctx.api.sendRichMessage(ctx.chatId,noPhotoRich);
-          } else {
-            throw sendErr;
-          }
-        }
-        if(sent?.message_id && ctx.reuseMessageId && sent.message_id!==ctx.reuseMessageId && typeof ctx.api.deleteMessage==='function'){
-          await ctx.api.deleteMessage(ctx.chatId,ctx.reuseMessageId).catch(()=>{});
+      if (!sent) {
+        const out = await sendRichWithPhotoFallback(ctx.api, ctx.chatId, rich);
+        sent = out.sent;
+        sentHasPhoto = out.hasPhoto;
+        if (sent?.message_id && ctx.reuseMessageId && sent.message_id !== ctx.reuseMessageId && typeof ctx.api.deleteMessage === 'function') {
+          await ctx.api.deleteMessage(ctx.chatId, ctx.reuseMessageId).catch(() => {});
         }
       }
-      if(sent?.message_id && sent.message_id !== oldMessageId){
+      if (sent?.message_id && sent.message_id !== oldMessageId) {
         s.pinned = false;
         s.pinnedMessageId = null;
       }
-      qm.setPlayerMessage(id,sent.message_id,Number(ctx.chatId),ctx.api);
-      s.lastRender=JSON.stringify(rich);
-      s.editAfter=0;
-      if(oldMessageId && oldMessageId !== sent.message_id && sameBot && typeof ctx.api?.deleteMessage === 'function'){
-        await ctx.api.deleteMessage(oldPlayerChatId, oldMessageId).catch(()=>{});
+      qm.setPlayerMessage(id, sent.message_id, Number(ctx.chatId), ctx.api);
+      s.lastRender = JSON.stringify(rich);
+      s.lastRenderHasPhoto = sentHasPhoto;
+      s.editAfter = 0;
+      if (oldMessageId && oldMessageId !== sent.message_id && sameBot && typeof ctx.api?.deleteMessage === 'function') {
+        await ctx.api.deleteMessage(oldPlayerChatId, oldMessageId).catch(() => {});
       }
       await qm.autoPinPlayerCard?.(id, sent.message_id, Number(ctx.chatId), ctx.api);
     };
-    let created=Boolean(!s.screenMessageId || ctx.forceNew || !sameBot || (prevPlayerChatId && prevPlayerChatId !== Number(ctx.chatId)));
+    const needFreshForPhoto = Boolean(s.lastRenderHasPhoto === false && isCinemaDeck && (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop));
+    let created = Boolean(!s.screenMessageId || ctx.forceNew || !sameBot || needFreshForPhoto || (prevPlayerChatId && prevPlayerChatId !== Number(ctx.chatId)));
     if(created){
       await sendFreshPlayerCard();
     } else {

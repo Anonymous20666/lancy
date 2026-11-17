@@ -756,6 +756,83 @@ test('Conversational genre requests route to browse instead of literal "me Roman
   assert.deepEqual(searchCalls, ['Me Before You', 'True Romance']);
 });
 
+test('Categories and browse survive primary API ECONNRESET via defaults/Cinemeta, and player preserves preview image across text->photo transition', async (t) => {
+  const api = new MovieApiClient({
+    fetchImpl: async (url) => {
+      const s = String(url);
+      if (s.includes('pappy-hosting')) {
+        const err = new Error('fetch failed');
+        err.cause = Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' });
+        throw err;
+      }
+      if (s.includes('cinemeta-catalogs.strem.io')) {
+        return {
+          ok: true,
+          json: async () => ({
+            metas: [
+              { imdb_id: 'tt0120338', name: 'Titanic', releaseInfo: '1997', poster: 'https://image.tmdb.org/t/p/w500/titanic.jpg', imdbRating: '7.9' }
+            ]
+          })
+        };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    }
+  });
+  const cats = await api.categories();
+  assert.ok(cats.length >= 16);
+  assert.ok(cats.some((c) => c.id === 'romance'));
+  const rom = await api.browse({ category: 'romance', page: 1, limit: 10 });
+  assert.equal(rom.results.length, 1);
+  assert.equal(rom.results[0].title, 'Titanic');
+
+  const h = buildTestHarness(t);
+  const ctx = h.makeCtx(-10050);
+  const resolver = new MovieStreamResolver({
+    movieApi: {
+      getPlaybackInfo: async () => ({ rootStream: { direct_url: 'https://cdn.example.com/titanic.mp4', format: 'mp4' } })
+    },
+    ytdlpEnabled: false,
+    enableWebFallback: true,
+    fetchImpl: async () => ({ ok: true, status: 200, headers: new Map([['content-type', 'video/mp4'], ['content-length', '500000000']]), url: 'https://cdn.example.com/titanic.mp4' })
+  });
+  const resolved = await resolver.resolve({
+    id: '597',
+    type: 'movie',
+    title: 'Titanic',
+    year: 1997,
+    poster: 'https://image.tmdb.org/t/p/w500/titanic.jpg'
+  });
+  assert.equal(resolved.track.artwork, 'https://image.tmdb.org/t/p/w500/titanic.jpg');
+
+  // Verify queueManager replaces text-only card (lastRenderHasPhoto=false) with sendRichMessage instead of stripping photo on editMessageRich failure
+  const sentPayloads = [];
+  const deletedIds = [];
+  const s = h.qm.getSession(-10050);
+  s.connected = true;
+  s.status = 'playing';
+  s.activeDeck = 'movie';
+  s.view = 'cinema';
+  s.screenMessageId = 700;
+  s.playerChatId = -10050;
+  s.lastRenderHasPhoto = false;
+  s.currentTrack = resolved.track;
+  s.api = {
+    editMessageRich: async () => {
+      throw Object.assign(new Error('Telegram editMessageText: Bad Request: wrong type of the web page content'), { description: 'Bad Request: wrong type of the web page content' });
+    },
+    sendRichMessage: async (_cid, rich) => {
+      sentPayloads.push(rich);
+      return { message_id: 701 };
+    },
+    deleteMessage: async (_cid, mid) => { deletedIds.push(mid); }
+  };
+  await h.qm.updatePlayerView(s, { forceEdit: true });
+  assert.equal(s.screenMessageId, 701);
+  assert.equal(s.lastRenderHasPhoto, true);
+  assert.ok(deletedIds.includes(700));
+  assert.ok(sentPayloads[0]?.blocks?.some((b) => b.type === 'photo' && b.photo?.media === 'https://image.tmdb.org/t/p/w500/titanic.jpg'));
+});
+
 test('DM Channel Panel routes pc -> movie -> mv -> Back to Player & Cinema Queue cleanly with zero WebApp buttons', async (t) => {
   const h = buildTestHarness(t);
   h.api.me = { id: 999, username: 'LancyBot' };

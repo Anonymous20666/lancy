@@ -35,7 +35,76 @@ export function stripRemotePhotoBlocks(rich) {
   return filtered.length < rich.blocks.length ? { ...rich, blocks: filtered } : null;
 }
 export function isRemotePhotoError(err) {
-  return /wrong type of the web page|failed to get http url|photo_invalid|webpage_curl|wrong file identifier|media_empty|invalid file id|photo_ext_invalid/i.test(
+  return /wrong type of the web page|failed to get http url|photo_invalid|webpage_curl|wrong file identifier|media_empty|invalid file id|photo_ext_invalid|there is no text in the message/i.test(
     String(err?.description || err?.message || '')
   );
+}
+export function hasRichPhotoPayload(rich) {
+  if (!rich || typeof rich !== 'object') return false;
+  if (rich.photo) return true;
+  return Array.isArray(rich.blocks) && rich.blocks.some((b) => b?.type === 'photo' || b?.type === 'slideshow' || b?.type === 'collage');
+}
+async function downloadRemotePhotoAsJpeg(url) {
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LancyBot/10.3)', Accept: 'image/*,*/*;q=0.8' },
+    signal: AbortSignal.timeout(6000)
+  });
+  if (!res?.ok) return null;
+  const arr = new Uint8Array(await res.arrayBuffer());
+  if (!arr.length || arr.length > 5 * 1024 * 1024) return null;
+  let buf = Buffer.from(arr);
+  let ct = String(res.headers.get('content-type') || '').toLowerCase();
+  const isWebp = /webp/.test(ct) || (buf.length >= 12 && buf.subarray(0, 4).toString('ascii') === 'RIFF' && buf.subarray(8, 12).toString('ascii') === 'WEBP');
+  if (isWebp) {
+    try {
+      const { execFile } = await import('node:child_process');
+      const { promisify } = await import('node:util');
+      const { writeFile, readFile, unlink } = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      const uid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const inP = join(tmpdir(), `lancy-img-${uid}.webp`);
+      const outP = join(tmpdir(), `lancy-img-${uid}.jpg`);
+      await writeFile(inP, buf);
+      try {
+        await promisify(execFile)('/usr/bin/ffmpeg', ['-y', '-loglevel', 'error', '-i', inP, '-vframes', '1', '-q:v', '3', outP], { timeout: 5000 });
+        buf = await readFile(outP);
+        ct = 'image/jpeg';
+      } finally {
+        await Promise.allSettled([unlink(inP), unlink(outP)]);
+      }
+    } catch {}
+  }
+  const ext = /png/.test(ct) ? 'png' : (/webp/.test(ct) ? 'webp' : 'jpg');
+  return { buffer: buf, filename: `artwork.${ext}`, contentType: ct && ct.startsWith('image/') ? ct : 'image/jpeg' };
+}
+export async function sendRichWithPhotoFallback(api, chatId, rich, extra = {}, files = null) {
+  try {
+    const sent = await api.sendRichMessage(chatId, rich, extra, files);
+    return { sent, hasPhoto: hasRichPhotoPayload(rich) };
+  } catch (err) {
+    if (files || !hasRichPhotoPayload(rich) || !isRemotePhotoError(err)) throw err;
+    const blocks = Array.isArray(rich.blocks) ? rich.blocks : [];
+    const idx = blocks.findIndex((b) => b?.type === 'photo' && /^https?:\/\//i.test(String(b.photo?.media || b.photo?.url || b.url || b.media || '')));
+    if (idx >= 0) {
+      const targetBlock = blocks[idx];
+      const url = String(targetBlock.photo?.media || targetBlock.photo?.url || targetBlock.url || targetBlock.media || '');
+      const uploaded = await downloadRemotePhotoAsJpeg(url).catch(() => null);
+      if (uploaded?.buffer?.length) {
+        const nextBlocks = blocks.map((b, i) => (
+          i === idx
+            ? { ...b, photo: { ...(typeof b.photo === 'object' && b.photo ? b.photo : { type: 'photo' }), type: 'photo', media: 'attach://artwork_photo' } }
+            : b
+        ));
+        try {
+          const sent = await api.sendRichMessage(chatId, { ...rich, blocks: nextBlocks }, extra, { artwork_photo: uploaded });
+          return { sent, hasPhoto: true };
+        } catch {}
+      }
+    }
+    const noPhoto = stripRemotePhotoBlocks(rich);
+    if (!noPhoto) throw err;
+    const sent = await api.sendRichMessage(chatId, noPhoto, extra);
+    return { sent, hasPhoto: false };
+  }
 }

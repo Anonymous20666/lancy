@@ -1,10 +1,10 @@
 import { randomBytes } from 'node:crypto';
-import { KeyedLock, MusicError } from './model.js';
+import { KeyedLock, MusicError, sendRichWithPhotoFallback } from './model.js';
 import { resolveAppScreen } from './accounts.js';
 
 // Compact wire actions keep scoped callbacks below Telegram's 64-byte bound.
 export const PANEL_ACTIONS = ['player','previous','pause','resume','skip','seekby','queue','lyrics','volume','options','loop','shuffle','bass','accounts','pin','preview','stop','leave','qpage','lypage','clear','remove','setvol','selectaccount','seek','prompt','playnow','radio','rpage','rpick','rstart','roff','channels','retry','eq','voteskip','catmenu','catpick','genresub','infinact','aidj','submode','streammode','vcquality','vcmsg','movie','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','voteset','setvotethresh','votequeue','launchpoll','downloadnow','downloadq','subsync','subtrack','subcheck','dlq','seekmenu','setseekstep','switchsource','autopoll'];
-const LOCAL = new Set(['destination','userId','botKey','screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom','overlayView','overlayAt','dlqTarget']);
+const LOCAL = new Set(['destination','userId','botKey','screenMessageId','playerChatId','api','view','page','lyrics','lyricsPage','availableAccounts','fullPreview','lastRender','lastRenderHasPhoto','editAfter','pinned','panelToken','panelActive','panelNotice','radioPage','radioSelected','radioCustom','overlayView','overlayAt','dlqTarget']);
 
 /** Many verified administrators' private views; one authoritative destination queue.
  * No channel messages are sent, and a callback never relies on the latest DM binding. */
@@ -98,14 +98,22 @@ export class ChannelPanels {
         state.lastError = null;
       }
       const api = this.api(p);
+      const renderStateRich = () => {
+        const scr = resolveAppScreen(this.app, 'music', { ctx, session: state });
+        const isCinema = state.activeDeck === 'movie' || state.currentTrack?.provider === 'movie';
+        return (isCinema && typeof scr.renderCinemaPlayer === 'function')
+          ? scr.renderCinemaPlayer(state)
+          : scr.renderPlayer(state);
+      };
       const shouldSendNew = Boolean(!p.screenMessageId || forceNew || ctx.forceNew || (ctx.message && !ctx.query));
       if (shouldSendNew) {
         const oldMsgId = p.screenMessageId;
-        const rich = resolveAppScreen(this.app, 'music', { ctx, session: state }).renderPlayer(state);
+        const rich = renderStateRich();
         try {
-          const sent = await api.sendRichMessage(p.playerChatId, rich);
-          this.registerMessage(p.panelToken, sent.message_id);
+          const out = await sendRichWithPhotoFallback(api, p.playerChatId, rich);
+          this.registerMessage(p.panelToken, out.sent.message_id);
           p.lastRender = JSON.stringify(rich);
+          p.lastRenderHasPhoto = out.hasPhoto;
           p.pinned = false;
         } catch (error) {
           if (!oldMsgId) this.panels.delete(p.panelToken);
@@ -121,10 +129,11 @@ export class ChannelPanels {
       if (!shouldSendNew) {
         const updated = await this.app.musicQueueManager.updatePlayerView(state, { forceEdit: true });
         if (!updated && !p.screenMessageId) {
-          const rich = resolveAppScreen(this.app, 'music', { ctx, session: state }).renderPlayer(state);
-          const sent = await api.sendRichMessage(p.playerChatId, rich);
-          this.registerMessage(p.panelToken, sent.message_id);
+          const rich = renderStateRich();
+          const out = await sendRichWithPhotoFallback(api, p.playerChatId, rich);
+          this.registerMessage(p.panelToken, out.sent.message_id);
           p.lastRender = JSON.stringify(rich);
+          p.lastRenderHasPhoto = out.hasPhoto;
           p.pinned = false;
           try { await this.pin(p.panelToken, { force: true }); } catch {}
           this.savePersistedPanels();
