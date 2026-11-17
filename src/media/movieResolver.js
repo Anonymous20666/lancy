@@ -3040,13 +3040,17 @@ export class MovieStreamResolver {
     return Array.isArray(parsed?.entries) ? parsed.entries : [];
   }
 
-  async #defaultYtExtract(pageUrl) {
+  async #defaultYtExtract(pageUrl, { preferredAudioLang = '' } = {}) {
+    const prefLang = /^[a-z]{2,3}$/.test(String(preferredAudioLang || '')) ? String(preferredAudioLang) : '';
+    const fmtSelector = prefLang
+      ? `best[ext=mp4][height<=720][acodec!=none][vcodec!=none][language^=${prefLang}]/best[height<=720][acodec!=none][vcodec!=none][language^=${prefLang}]/best[ext=mp4][height<=720][acodec!=none][vcodec!=none]/best[height<=720][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best`
+      : 'best[ext=mp4][height<=720][acodec!=none][vcodec!=none]/best[height<=720][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best';
     const { stdout } = await execFileAsync('yt-dlp', [
       '--no-warnings',
       '--js-runtimes', 'node:/usr/bin/node',
       '--extractor-args', 'youtube:player_client=default,web_safari,android',
       '--dump-single-json',
-      '-f', 'best[ext=mp4][height<=720][acodec!=none][vcodec!=none]/best[height<=720][acodec!=none][vcodec!=none]/best[ext=mp4][acodec!=none][vcodec!=none]/best[acodec!=none][vcodec!=none]/best',
+      '-f', fmtSelector,
       pageUrl
     ], { timeout: 18000, maxBuffer: 4 * 1024 * 1024 });
     return JSON.parse(stdout || '{}');
@@ -3055,7 +3059,7 @@ export class MovieStreamResolver {
   async #extractYtDlpStream(pageUrl, { title, year = null, isTv = false, season = null, episode = null, episodeTitle = null, alternateTitle = null, alternateSeason = null, minDuration = 1800, maxDuration = 0, strictTitle = true, preferredAudioLang = '' } = {}) {
     try {
       const prefLang = normalizeLangCode(preferredAudioLang);
-      const info = await this.#defaultYtExtract(pageUrl);
+      const info = await this.#defaultYtExtract(pageUrl, { preferredAudioLang: prefLang });
       const filterOpts = { isTv, episodeTitle: episodeTitle || '', alternateTitle: alternateTitle || '' };
       if (!info || isTrailerLike(info.title || '', title, filterOpts)) return null;
       const dur = Number(info.duration || 0);
@@ -3065,7 +3069,8 @@ export class MovieStreamResolver {
       const url = info.url || info.requested_downloads?.[0]?.url;
       if (!url || !/^https?:\/\//i.test(url)) return null;
       if (info.vcodec === 'none' || info.acodec === 'none') return null;
-      const ytLang = normalizeLangCode(info.language || '');
+      const reqAudioLang = info.requested_formats?.find?.((f) => f?.acodec && f.acodec !== 'none')?.language || info.requested_downloads?.[0]?.language || '';
+      const ytLang = normalizeLangCode(info.language || reqAudioLang || '');
       const titleIsDub = isDubbedCandidateText(info.title || '', { preferredAudioLang: prefLang, targetTitle: title });
       const langMismatch = Boolean(prefLang && ytLang && ytLang !== prefLang);
       return {
@@ -3117,6 +3122,9 @@ export class MovieStreamResolver {
     if (isTv && episode != null) {
       const leadTitle = spacedAlt || spacedTitle;
       queriesToRun.push(`ytsearch8:${leadTitle}${cleanEp ? ` ${cleanEp}` : ''} Episode ${episode}`);
+      if (prefLang === 'en') {
+        queriesToRun.push(`ytsearch8:${leadTitle}${cleanEp ? ` ${cleanEp}` : ''} English full episode`);
+      }
       queriesToRun.push(`ytsearch8:${spacedTitle} S${sPad}E${ePad} full episode`);
       if (spacedAlt && spacedAlt !== leadTitle) {
         queriesToRun.push(`ytsearch8:${spacedAlt} ${cleanEp || `Episode ${episode}`}`);
@@ -3127,9 +3135,12 @@ export class MovieStreamResolver {
       }
     } else {
       queriesToRun.push(`ytsearch8:${spacedTitle} ${year || ''} full movie`.trim());
+      if (prefLang === 'en') {
+        queriesToRun.push(`ytsearch8:${spacedTitle} ${year || ''} English full movie`.trim());
+      }
       if (year) queriesToRun.push(`ytsearch8:${spacedTitle} full movie`);
     }
-    const uniqueQueries = [...new Set(queriesToRun)].slice(0, this.ytSearchFn ? 2 : 3);
+    const uniqueQueries = [...new Set(queriesToRun)].slice(0, this.ytSearchFn ? 3 : 4);
 
     const searchRunner = this.ytSearchFn || ((q) => this.#defaultYtSearch(q));
     const filterOpts = { isTv, episodeTitle: episodeTitle || '', alternateTitle: spacedAlt };
@@ -3272,7 +3283,7 @@ export class MovieStreamResolver {
 
     const inputArtwork = artwork || poster || backdrop || thumbnailUrl || thumb || null;
     if (this.movieApi && id) {
-      const needDetail = !year || !imdbId || !rawReleaseDate || !opts.originalLanguage || !inputArtwork || (!durationSeconds && !isTv);
+      const needDetail = !year || !imdbId || !rawReleaseDate || !(opts.originalLanguage || opts.language) || !inputArtwork || (!durationSeconds && !isTv);
       const isGenericEpTitle = !episodeTitle || /^episode\s*\d+$/i.test(String(episodeTitle).trim());
       const needEpMeta = isTv && episode != null && (isGenericEpTitle || !durationSeconds) && typeof this.movieApi.getTvSeasonEpisodes === 'function';
       const [pbRes, dtRes, epRes, mapRes] = await Promise.allSettled([
@@ -3324,7 +3335,7 @@ export class MovieStreamResolver {
     const effectiveGenres = Array.isArray(genres) && genres.length ? genres : (Array.isArray(detailMeta?.genres) ? detailMeta.genres : null);
     const effectiveOverview = overview || epMeta?.overview || detailMeta?.overview || null;
     const effectiveOriginalLanguage = normalizeLangCode(
-      opts.originalLanguage || extra?.originalLanguage || detailMeta?.originalLanguage || playback?.originalLanguage || detailMeta?.language || ''
+      opts.originalLanguage || extra?.originalLanguage || detailMeta?.originalLanguage || playback?.originalLanguage || opts.language || extra?.language || detailMeta?.language || ''
     );
     const alternateTitle = (franchiseTitle && franchiseSeasonName && !String(franchiseSeasonName).toLowerCase().startsWith('season '))
       ? (String(franchiseTitle).toLowerCase().replace(/[^a-z0-9]/g, '') === String(franchiseSeasonName).toLowerCase().replace(/[^a-z0-9]/g, '')

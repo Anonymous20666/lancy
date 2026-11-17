@@ -170,6 +170,16 @@ function firstLangValue(lang) {
   return s || null;
 }
 
+const EN_PRIMARY_COUNTRIES_RE = /^\s*(?:United States(?: of America)?|USA|U\.S\.A\.?|United Kingdom|UK|U\.K\.|Great Britain|Australia|New Zealand|Ireland)\b/i;
+
+function inferLangFromCountry(country) {
+  const val = Array.isArray(country) ? country[0] : country;
+  const s = String(val || '').trim();
+  if (!s) return null;
+  if (EN_PRIMARY_COUNTRIES_RE.test(s)) return 'English';
+  return null;
+}
+
 function cleanWpMovieTitle(rawTitle = '') {
   return stripHtml(rawTitle)
     .replace(/^(?:download|watch(?:\s+online)?)\s*[:\-–]?\s*/i, '')
@@ -1236,11 +1246,13 @@ export class MovieApiClient {
       if (meta) {
         const ym = String(meta.releaseInfo || meta.year || '').match(/\d{4}/);
         const rtMin = Number(String(meta.runtime || '').match(/\d+/)?.[0] || 0) || cached?.runtimeMinutes || null;
-        const metaLang = firstLangValue(meta.language) || cached?.originalLanguage || cached?.language || null;
+        const metaLang = firstLangValue(meta.language) || cached?.originalLanguage || cached?.language || inferLangFromCountry(meta.country) || null;
+        const moviedbCandidate = meta.moviedb_id && /^\d+$/.test(String(meta.moviedb_id)) ? String(meta.moviedb_id) : null;
         return normalizeListItem({
           ...cached,
           id: idStr,
           imdb_id: idStr,
+          tmdb_id: cached?.tmdbId || moviedbCandidate || null,
           type: 'movie',
           title: meta.name || cached?.title || idStr,
           original_title: meta.originalTitle || cached?.originalTitle || null,
@@ -1483,8 +1495,16 @@ export class MovieApiClient {
             const candType = candTv ? 'tv' : 'movie';
             if (candId && /^\d+$/.test(String(candId))) {
               const checkPath = candType === 'tv' ? `/tv/${encodeURIComponent(candId)}` : `/movie/${encodeURIComponent(candId)}`;
-              const verified = await this.#getJson(checkPath, null, { ttlMs: 900_000 }).catch(() => null);
+              let checkHttpStatus = 0;
+              const verified = await this.#getJson(checkPath, null, { ttlMs: 900_000 }).catch((err) => {
+                checkHttpStatus = Number(err?.status || 0);
+                return null;
+              });
               if (verified && (verified.id || verified.provider_id || verified.title || verified.name)) {
+                return saveAndReturn({ ...empty, tmdbId: String(candId) });
+              }
+              // Skip deleted/4xx TMDB IDs (e.g. 404), but still accept Wikidata's P345->TMDB claim during API network outages.
+              if (checkHttpStatus === 0) {
                 return saveAndReturn({ ...empty, tmdbId: String(candId) });
               }
             }
@@ -1514,6 +1534,7 @@ export class MovieApiClient {
         let genres = Array.isArray(data.genres) && data.genres.length ? data.genres : (base.genres?.length ? base.genres : (cached?.genres || []));
         let runtimeMinutes = base.runtimeMinutes || cached?.runtimeMinutes || null;
         let tvmazeId = cached?.tvmazeId || null;
+        let fbLang = null;
 
         if (!seasons.length || !resolvedImdb || seasons.some((s) => s.episodeCount <= 0)) {
           const fb = await this.#findFallbackTvMeta({
@@ -1522,6 +1543,7 @@ export class MovieApiClient {
             title: base.title,
             year
           }).catch(() => null);
+          fbLang = firstLangValue(fb?.cinemeta?.language) || firstLangValue(fb?.tvmaze?.language) || inferLangFromCountry(fb?.cinemeta?.country) || null;
           if (fb?.imdbId && !resolvedImdb) resolvedImdb = fb.imdbId;
           if (fb?.tvmaze?.id) tvmazeId = fb.tvmaze.id;
           const fbSeasons = [];
@@ -1579,8 +1601,8 @@ export class MovieApiClient {
           status: data.status || null,
           imdbId: resolvedImdb,
           tvmazeId,
-          language: data.language || data.original_language || base.language || null,
-          originalLanguage: data.original_language || data.originalLanguage || base.originalLanguage || null,
+          language: data.language || data.original_language || base.language || fbLang || null,
+          originalLanguage: data.original_language || data.originalLanguage || base.originalLanguage || fbLang || null,
           originalTitle: data.original_title || data.originalTitle || base.originalTitle || null,
           cast: Array.isArray(data.cast) ? data.cast.slice(0, 8) : [],
           seasons
@@ -1654,13 +1676,14 @@ export class MovieApiClient {
           }
         }
         const rtMin = parseArchiveRuntimeMinutes(meta.runtime) || cached?.runtimeMinutes || null;
-        const metaLang = firstLangValue(meta.language) || cached?.originalLanguage || cached?.language || null;
+        const metaLang = firstLangValue(meta.language) || cached?.originalLanguage || cached?.language || inferLangFromCountry(meta.country) || null;
+        const moviedbCandidate = meta.moviedb_id && /^\d+$/.test(String(meta.moviedb_id)) ? String(meta.moviedb_id) : null;
         const outShow = {
           ...normalizeListItem({
             ...cached,
             id: idStr,
             imdb_id: idStr,
-            tmdb_id: tmdbMap?.tmdbId || cached?.tmdbId || null,
+            tmdb_id: tmdbMap?.tmdbId || moviedbCandidate || cached?.tmdbId || null,
             type: 'tv',
             title: effTitle,
             original_title: meta.originalTitle || cached?.originalTitle || null,
@@ -1713,6 +1736,8 @@ export class MovieApiClient {
             tvmazeId: show.id,
             type: 'tv',
             title: show.name,
+            original_language: cached?.originalLanguage || firstLangValue(show.language) || null,
+            language: cached?.language || firstLangValue(show.language) || null,
             year: show.premiered ? Number(String(show.premiered).slice(0, 4)) || null : null,
             poster: show.image?.original || show.image?.medium || cached?.poster || null,
             overview: stripHtml(show.summary || '') || cached?.overview || '',

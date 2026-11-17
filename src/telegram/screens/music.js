@@ -3153,12 +3153,15 @@ export function createMusicScreen({ app }) {
             : s.avSync?.monitored
               ? ' · ✅ A/V Synced'
               : '';
+      const origLangCode = String(t.originalLanguage || '').trim().toUpperCase();
+      const actLangCode = String(t.audioLanguage || '').trim().toUpperCase();
+      const langMismatch = Boolean(origLangCode && actLangCode && origLangCode !== actLangCode);
       const audioDisplay = t.dubOnlyWarning
-        ? t.dubOnlyWarning
-        : t.audioIsDub
-          ? '⚠️ Dub Only Available'
-          : t.audioLanguage
-            ? `Original (${String(t.audioLanguage).toUpperCase()})`
+        ? (t.dubOnlyWarning === '⚠️ Dub Only Available' && langMismatch ? `⚠️ Dub Only Available (${actLangCode})` : t.dubOnlyWarning)
+        : (t.audioIsDub || langMismatch)
+          ? `⚠️ Dub Only Available${actLangCode ? ` (${actLangCode})` : ''}`
+          : actLangCode
+            ? `Original (${actLangCode})`
             : null;
       const liveSyncBadge = t.subtitlePath && s.subtitleSyncStatus?.status
         ? ` · ${formatSubSyncSummary(s, t).badge}`

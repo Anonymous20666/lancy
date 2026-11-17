@@ -3926,3 +3926,114 @@ test('restoreActiveSessions prioritizes playing streams over paused ones and def
   const { DEFAULT_SETTINGS: cfgDefaults } = await import('../src/config/defaults.js');
   assert.equal(cfgDefaults.cinema.maxVideoCallsPerAccount, 0, 'Default maxVideoCallsPerAccount must be 0 (Auto) so 1 assistant resumes all GCs');
 });
+
+test('Cinemeta/Wikidata fallbacks preserve originalLanguage + TMDB ID on API outage, and mismatched audio language is flagged as dubbed', async (t) => {
+  // 1. Wikidata P345->P4983 still resolves on transient network error, while HTTP 404 still rejects deleted TMDB IDs
+  const apiNet = new MovieApiClient({
+    baseUrl: 'https://primary.invalid',
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.includes('wikidata.org') && u.includes('haswbstatement%3AP345%3Dtt0892700')) {
+        return { ok: true, json: async () => ({ query: { search: [{ title: 'Q420' }] } }) };
+      }
+      if (u.includes('wikidata.org') && u.includes('haswbstatement%3AP345%3Dtt9999999')) {
+        return { ok: true, json: async () => ({ query: { search: [{ title: 'Q404' }] } }) };
+      }
+      if (u.includes('wikidata.org') && u.includes('wbgetentities') && u.includes('Q420')) {
+        return { ok: true, json: async () => ({ entities: { Q420: { claims: { P4983: [{ mainsnak: { datavalue: { value: '7869' } } }] } } } }) };
+      }
+      if (u.includes('wikidata.org') && u.includes('wbgetentities') && u.includes('Q404')) {
+        return { ok: true, json: async () => ({ entities: { Q404: { claims: { P4983: [{ mainsnak: { datavalue: { value: '139440' } } }] } } } }) };
+      }
+      if (u.includes('primary.invalid/tv/139440')) {
+        return { ok: false, status: 404, text: async () => 'Not Found' };
+      }
+      if (u.includes('primary.invalid/tv/7869')) {
+        const err = new Error('read ECONNRESET');
+        err.code = 'ECONNRESET';
+        throw err;
+      }
+      if (u.includes('v3-cinemeta.strem.io/meta/series/tt0892700.json')) {
+        return {
+          ok: true,
+          json: async () => ({
+            meta: {
+              id: 'tt0892700',
+              name: 'The Penguins of Madagascar',
+              country: 'United States, New Zealand',
+              moviedb_id: 7869,
+              videos: [{ season: 1, episode: 1, title: 'Gone in a Flash' }]
+            }
+          })
+        };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    }
+  });
+
+  const tvMeta = await apiNet.getTvShow('tt0892700');
+  assert.equal(tvMeta?.tmdbId, '7869');
+  assert.equal(tvMeta?.originalLanguage, 'English');
+
+  const deletedCheck = await apiNet.resolveNumericTmdbInfo({ id: 'tt9999999', imdbId: 'tt9999999', type: 'tv' });
+  assert.equal(deletedCheck?.tmdbId, null, 'Deleted TMDB IDs (HTTP 404) must still be skipped');
+
+  // 2. MovieStreamResolver inherits opts.language -> effectiveOriginalLanguage and renderCinemaPlayer never labels mismatched language Original
+  const resolver = new MovieStreamResolver({
+    movieApi: null,
+    subtitles: null,
+    fetchImpl: async () => ({ ok: false, status: 404 }),
+    enableWebFallback: false,
+    enableYtDlp: true,
+    ytSearchFn: async (q) => {
+      if (String(q).includes('Hindi Dub')) return [];
+      return [
+        { title: 'The Penguins of Madagascar | Full Episode | Gone In A Flash (Hindi)', duration: 635, directStreamUrl: 'https://cdn.example/penguins_hi.mp4', qualityLabel: '720p' },
+        ...(String(q).includes('English full episode')
+          ? [{ title: 'The Penguins of Madagascar | Gone In A Flash | English', duration: 635, directStreamUrl: 'https://cdn.example/penguins_en.mp4', qualityLabel: '720p' }]
+          : [])
+      ];
+    }
+  });
+  const enPick = await resolver.resolve({
+    type: 'tv',
+    id: 'tt0892700',
+    title: 'The Penguins of Madagascar',
+    year: 2008,
+    season: 1,
+    episode: 1,
+    episodeTitle: 'Gone in a Flash',
+    durationSeconds: 720,
+    language: 'English',
+    fetchSubtitles: false
+  });
+  assert.equal(enPick.ok, true);
+  assert.equal(enPick.track.originalLanguage, 'en');
+  assert.equal(enPick.track.streamUrl, 'https://cdn.example/penguins_en.mp4');
+  assert.equal(enPick.track.audioIsDub, false);
+
+  // 3. renderCinemaPlayer never renders "Original (HI)" when track originalLanguage is "en" and audioLanguage is "hi"
+  const h = buildTestHarness(t);
+  const card = h.screen.renderCinemaPlayer({
+    chatId: -10077,
+    activeDeck: 'movie',
+    status: 'playing',
+    positionSeconds: 45,
+    currentTrack: {
+      id: 'tv:tt0892700:1:1',
+      provider: 'movie',
+      title: 'The Penguins of Madagascar · S01E01 — Gone in a Flash',
+      artist: '2008 · S01E01 · 720p',
+      mediaType: 'video',
+      durationSeconds: 635,
+      originalLanguage: 'en',
+      audioLanguage: 'hi',
+      audioIsDub: false,
+      capabilities: { seek: true, video: true }
+    },
+    movieQueue: []
+  });
+  const cardText = JSON.stringify(card);
+  assert.equal(cardText.includes('Original (HI)'), false, 'Mismatched audio language must never be labeled Original (HI)');
+  assert.match(cardText, /Dub Only Available \(HI\)/);
+});
