@@ -139,6 +139,22 @@ export const DEFAULT_SETTINGS = {
     cinemaAnnounceEnabled: true
   },
 
+  cinema: {
+    maxVideoCallsPerAccount: 0,         // 0 = Auto (balanced across assistants without blocking 1-assistant setups; 1-3 = hard cap per assistant)
+    dualAssistantSubTilesEnabled: false,// Opt-in secondary muted video+subtitle assistant tile inside group VCs
+    dualTileDefaultLang: 'spa',         // Default secondary tile subtitle language
+    scheduleRepinHours: 1,              // Re-pin countdown card every N hours (0 = off)
+    scheduleSilentPin: true,            // Pin silently without notifying whole group each hour
+    schedulePrewarmMinutes: 3,          // Pre-resolve stream & subtitles N minutes before showtime
+    aiScheduleEnabled: true,            // Enable AI-curated watch party schedules (/schedule ai)
+    starsEnabled: true,                 // Enable Telegram Stars (XTR) invoices
+    requireStarsForGcBroadcast: true,   // Gate non-VIP GC broadcasts with Stars passes
+    starsBroadcastSinglePrice: 25,      // Stars price for a single movie broadcast boost
+    starsBroadcast24hPrice: 75,         // Stars price for a 24h GC broadcast pass
+    starsVip7dPrice: 250,               // Stars price for a 7-day VIP Cinema pass
+    freeBroadcastChats: []              // Owner-allowlisted group/channel IDs exempt from Stars gate
+  },
+
   media: {
     ffmpegPath: '',              // empty = auto-detect (ffmpeg-static, vendor, PATH)
     maxDownloadBytes: 60 * 1024 * 1024,

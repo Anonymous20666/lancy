@@ -37,6 +37,13 @@ export class CallSetup {
       if(typeof voice.accounts==='function'){
         let pool=await checked(voice.accounts(id));
         if(!pool.accounts.some(a=>a.enabled&&['available','busy'].includes(a.status))){
+          if(pool.accounts.some(a=>a.enabled)){
+            throw new MusicError('SESSION_NOT_READY','The approved playback assistant is currently offline or needs re-authentication. Ask the owner to check /accounts health.');
+          }
+          const storedRecords=this.service.accounts?.records?.();
+          if(Array.isArray(storedRecords)&&!storedRecords.some(a=>a.enabled)){
+            throw new MusicError('SESSION_NOT_READY','No enabled playback assistant is registered yet. Ask the owner to register an assistant with /accounts.');
+          }
           if(chat.type!=='channel'&&this.app.settings?.get('music.allowExistingGroupMembers')===true&&typeof voice.existingGroupAccounts==='function'){
             const candidates=await checked(voice.existingGroupAccounts(id));existingOnly=true;
             if(!candidates.accounts?.length)throw new MusicError('EXISTING_ASSISTANT_REQUIRED',`No ready owner-registered assistant is already a member of this group (${id}). Add the registered assistant yourself, or ask the owner to approve this exact group. Lancy will not join an unapproved group.`);
@@ -93,7 +100,8 @@ export class CallSetup {
           (!preSession.upcoming?.length&&Boolean(preSession.movieUpcoming?.length))
         );
         const streamMode=this.app.musicQueueManager.getDeckStreamMode?.(id,isMovieIntent?'movie':'music')||(preSession.streamMode==='rtmp'?'rtmp':isMovieIntent?'rtmp':'interactive');
-        current();const result=await checked(voice.setup(id,'start',{create:true,...(vcTitle?{vc_title:vcTitle}:{}),stream_mode:streamMode}));
+        const maxVidCap=Number(this.app.settings?.get?.('cinema.maxVideoCallsPerAccount')||0)||undefined;
+        current();const result=await checked(voice.setup(id,'start',{create:true,...(vcTitle?{vc_title:vcTitle}:{}),stream_mode:streamMode,...(isMovieIntent?{video:true}:{}),...(maxVidCap?{max_video_calls_per_account:maxVidCap}:{})}));
         const s=this.app.musicQueueManager.getSession(id);s.destinationTitle=chat.title||String(id);s.isChannel=chat.type==='channel';if(result?.stream_mode)s.streamMode=result.stream_mode;s.lastError=null;s.lastNotice=result.created?'Assistant ready · a new call/broadcast was created. Add a recording to start playback.':'Assistant ready · reusing the existing call. Add a recording or use the current player.';
         await this.app?.music?.syncSessionIdentity?.(s,ctx,chat,{bridgeInviteLink:result?.call_invite_link||null});
         return {...result,destination:id};

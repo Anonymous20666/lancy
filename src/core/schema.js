@@ -419,4 +419,53 @@ CREATE TABLE IF NOT EXISTS group_members (
   PRIMARY KEY (chat_id, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_group_members_chat ON group_members(chat_id);
+
+-- Scheduled Movie Screenings (Countdown, Hourly Re-pin, AI Lineups & Pre-warming)
+CREATE TABLE IF NOT EXISTS scheduled_screenings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL,
+  bot_id INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  media_type TEXT NOT NULL DEFAULT 'movie',
+  tmdb_id TEXT,
+  season INTEGER,
+  episode INTEGER,
+  scheduled_at INTEGER NOT NULL,
+  timezone TEXT NOT NULL DEFAULT 'UTC',
+  repin_interval_hours REAL NOT NULL DEFAULT 1,
+  last_pinned_at INTEGER NOT NULL DEFAULT 0,
+  last_countdown_step TEXT,
+  countdown_msg_id INTEGER,
+  prewarmed_json TEXT,
+  ai_note TEXT,
+  repeat_rule TEXT,
+  boosted INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'scheduled', -- scheduled | live | completed | cancelled | failed
+  error_text TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_screenings_due ON scheduled_screenings(status, scheduled_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_screenings_chat ON scheduled_screenings(chat_id, status);
+
+-- Telegram Stars (XTR) Paid Broadcasts & VIP Cinema Passes
+CREATE TABLE IF NOT EXISTS star_payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  payload_id TEXT NOT NULL UNIQUE,
+  charge_id TEXT,
+  provider_charge_id TEXT,
+  payer_tg_id INTEGER NOT NULL,
+  chat_id INTEGER NOT NULL,
+  bot_id INTEGER NOT NULL DEFAULT 0,
+  product_kind TEXT NOT NULL,           -- broadcast_single | broadcast_24h | vip_7d
+  stars_amount INTEGER NOT NULL,
+  status TEXT NOT NULL DEFAULT 'paid',  -- paid | used | refunded
+  expires_at INTEGER,
+  meta_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  refunded_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_star_payments_chat ON star_payments(chat_id, status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_star_payments_payer ON star_payments(payer_tg_id, status);
 `;

@@ -494,7 +494,7 @@ export class QueueManager extends EventEmitter {
           }
         }
         const landedStartPos = (typeof r?.position_seconds === 'number' && Number.isFinite(r.position_seconds) && r.position_seconds >= 0) ? r.position_seconds : (startSeconds > 0 ? startSeconds : 0);
-        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=landedStartPos;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
+        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.secondaryTile=null;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=landedStartPos;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
         this.#ensureLiveSubTimer(s);
         this.prefetch(s);
         if(!previous||!s.volumeConfirmed||s.appliedVolume!==s.volume){
@@ -549,7 +549,7 @@ export class QueueManager extends EventEmitter {
       catch(error){if(error.code!=='NO_ACTIVE_CALL')throw error;s.connected=false;s.accountAlias=null;s.lastError='The voice chat has ended. Use /vc to prepare it again.';}
     }
     if(previous&&sameDeckPrevious){const {startOffsetSeconds:_so,resumePositionSeconds:_rp,...histItem}=previous;hist.push(histItem);if(hist.length>25)hist.shift();}
-    this.dropPrefetch(s);this.#release(s);s.currentTrack=null;s.playbackId=null;s.positionSeconds=null;s.lastKnownPositionSeconds=0;s.callEnded=false;s.status='idle';
+    this.dropPrefetch(s);this.#release(s);s.currentTrack=null;s.secondaryTile=null;s.playbackId=null;s.positionSeconds=null;s.lastKnownPositionSeconds=0;s.callEnded=false;s.status='idle';
     if(s.connected||s.prepared)this.#idle(s);
     this.#clearPlaybackSnapshot(s.chatId);
     this.emit('queue_empty',{chatId:s.chatId});await this.updatePlayerCard(s.chatId);return null;
@@ -754,7 +754,7 @@ export class QueueManager extends EventEmitter {
   }
   async #finishStop(s) {
     this.#assert(await this.voice.stop(s.chatId,{leaveMembership:!s.isChannel}));
-    this.#release(s);s.connected=false;s.prepared=false;s.accountAlias=null;s.playbackId=null;s.stopPending=false;s.stopRetryAfter=0;s.lastError=null;
+    this.#release(s);s.connected=false;s.prepared=false;s.accountAlias=null;s.secondaryTile=null;s.playbackId=null;s.stopPending=false;s.stopRetryAfter=0;s.lastError=null;
     this.app?.music?.setup?.forget(s.chatId);
   }
   requestStop(id) {const s=this.getSession(id);s.stopGeneration=(s.stopGeneration||0)+1;s.prepareAbort?.abort();if(s.radio&&s.activeDeck!=='movie')s.radio.enabled=false;}
@@ -946,7 +946,7 @@ export class QueueManager extends EventEmitter {
       const dRate = Number(raw.driftRate) || 0;
       const dAnchor = Number(raw.driftAnchor) || 0;
       return {
-        offset: Number.isFinite(num) ? Math.max(-20, Math.min(20, num)) : 0,
+        offset: Number.isFinite(num) ? Math.max(-180, Math.min(180, num)) : 0,
         manual: Boolean(raw.manual),
         driftRate: Number.isFinite(dRate) ? Math.max(-0.08, Math.min(0.08, dRate)) : 0,
         driftAnchor: (Number.isFinite(dAnchor) && dAnchor >= 0) ? dAnchor : 0
@@ -957,7 +957,7 @@ export class QueueManager extends EventEmitter {
     if (!Number.isFinite(val) || Math.abs(val) > 3.0) {
       return { offset: 0, manual: false, driftRate: 0, driftAnchor: 0 };
     }
-    return { offset: Math.max(-20, Math.min(20, val)), manual: false, driftRate: 0, driftAnchor: 0 };
+    return { offset: Math.max(-180, Math.min(180, val)), manual: false, driftRate: 0, driftAnchor: 0 };
   }
   #readTrackSubOffset(track, filePath = null) {
     return this.#readTrackSubState(track, filePath).offset;
@@ -968,7 +968,7 @@ export class QueueManager extends EventEmitter {
     const prev = this.db?.getSetting?.(k, null);
     const prevRate = (prev && typeof prev === 'object' && Number.isFinite(Number(prev.driftRate))) ? Number(prev.driftRate) : 0;
     const prevAnchor = (prev && typeof prev === 'object' && Number.isFinite(Number(prev.driftAnchor))) ? Number(prev.driftAnchor) : 0;
-    const clamped = Math.round(Math.max(-20, Math.min(20, Number(offset) || 0)) * 100) / 100;
+    const clamped = Math.round(Math.max(-180, Math.min(180, Number(offset) || 0)) * 100) / 100;
     const effRate = (driftRate !== null && driftRate !== undefined && Number.isFinite(Number(driftRate)))
       ? Math.max(-0.08, Math.min(0.08, Number(driftRate)))
       : prevRate;
@@ -1489,7 +1489,7 @@ export class QueueManager extends EventEmitter {
       const cur = Number(s.subtitleSyncOffset || 0) || 0;
       const val = Number(deltaOrValue) || 0;
       const nextRaw = absolute ? val : cur + val;
-      const next = Math.round(Math.max(-20, Math.min(20, nextRaw)) * 10) / 10;
+      const next = Math.round(Math.max(-180, Math.min(180, nextRaw)) * 10) / 10;
       s.subtitleSyncOffset = next;
       s.subtitleManualOverride = true;
       s.subtitleSyncStatus = {
@@ -1815,7 +1815,14 @@ export class QueueManager extends EventEmitter {
   async restoreActiveSessions({ api = null } = {}) {
     if (this.closed || !this.db?.getSetting) return [];
     const saved = this.db.getSetting('music.activePlaybackSnapshots', {}) || {};
-    const entries = Object.values(saved).filter(snap => (snap?.currentTrack || (snap?.callEnded && (snap?.movieUpcoming?.length || snap?.upcoming?.length))) && snap?.chatId);
+    const entries = Object.values(saved)
+      .filter(snap => (snap?.currentTrack || (snap?.callEnded && (snap?.movieUpcoming?.length || snap?.upcoming?.length))) && snap?.chatId)
+      .sort((a, b) => {
+        const rank = (s) => (s?.callEnded && !s?.currentTrack ? 2 : (s?.paused ? 1 : 0));
+        const r = rank(a) - rank(b);
+        if (r !== 0) return r;
+        return (Number(b?.savedAt || 0) - Number(a?.savedAt || 0));
+      });
     if (!entries.length) return [];
     const restored = [];
     const maxAgeMs = Number(process.env.MUSIC_RESUME_MAX_AGE_MS || 24 * 60 * 60 * 1000);

@@ -769,6 +769,7 @@ class SubOverlay:
         self._drift_rate = 0.0
         self._drift_anchor = 0.0
         self._render_screen = True
+        self._pts_anchored = False
         self._hud_key = None
         self._refresh(force=True)
 
@@ -808,6 +809,7 @@ class SubOverlay:
         self._drift_rate = self._sa.clamp_drift_rate(cfg.get('drift_sec_per_sec') or 0.0)
         self._drift_anchor = float(cfg.get('drift_anchor_sec') or 0.0)
         self._render_screen = bool(cfg.get('render_screen', True))
+        self._pts_anchored = bool(cfg.get('pts_anchored', False))
         enabled = bool(cfg.get('enabled', False)) and self._render_screen
         sub_path = str(cfg.get('subtitle_path') or '').strip()
         if not enabled or not sub_path:
@@ -908,7 +910,12 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
     first_pts, first_dur, first_frame = first_pkt if first_pkt is not None else (0.0, default_dur, b'')
     has_full = (len(first_frame) == frame_bytes)
     if has_full:
-        state.epoch_pts_sec = max(0.0, float(first_pts)) if float(first_pts) >= 0.05 else 0.0
+        anchored = bool(sub_overlay is not None and getattr(sub_overlay, '_pts_anchored', False))
+        state.epoch_pts_sec = (
+            0.0
+            if (anchored and 0.0 <= float(first_pts) <= 30.0)
+            else (max(0.0, float(first_pts)) if float(first_pts) >= 0.05 else 0.0)
+        )
     state.video_hb_mono = time.monotonic()
     state.video_state = 1 if has_full else 2
 

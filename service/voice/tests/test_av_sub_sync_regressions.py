@@ -1366,6 +1366,221 @@ while True:
 
         asyncio.run(_run())
 
+    def test_live_sub_monitor_does_not_falsely_revert_to_zero_when_shifted_wins(self):
+        import json
+        import av_hub
+        with tempfile.TemporaryDirectory(prefix='lancy_norevert_') as td:
+            srt_path = os.path.join(td, 'subs.srt')
+            cfg_path = Path(td) / 'sub_cfg.json'
+            _write_srt(srt_path, [15.0, 25.0], prefix='REVERT')
+            cfg_path.write_text(json.dumps({
+                'enabled': True,
+                'render_screen': True,
+                'subtitle_path': srt_path,
+                'subtitle_offset': 14.0,
+                'base_sec': 100.0,
+                'manual_override': False,
+                'auto_normalize': True,
+                'cfg_rev': 2,
+            }), encoding='utf-8')
+            sid = f'test_norevert_{os.getpid()}'
+            fd, mm, state = av_sync._open_sync_state(av_sync.shm_path_for(sid))
+            try:
+                mon = sub_align.LiveSubSyncMonitor(sync_id=sid, config_path=cfg_path, state=state)
+                mon._ring = bytearray(8000 * 2 * 35)
+                mon._ring_start_pts = 10.0
+
+                def fake_cor(_pcm, cues_arg, _abs_s, **kw):
+                    # Shifted disp_cues starts near 1s -> strong z=5.8, score=0.09
+                    # Unshifted cues starts at 15s -> weak spurious in_sync=True, z=2.7, score=0.02
+                    first_s = cues_arg[0][0] / 1000.0 if cues_arg else 0.0
+                    if first_s >= 20.0:
+                        return {
+                            'ok': True, 'offset': 0.0, 'confident': False, 'in_sync': True,
+                            'z_score': 5.8, 'z_at_0': 5.8, 'score_at_0': 0.09, 'best_score': 0.09,
+                            'used_cues': 6,
+                        }
+                    return {
+                        'ok': True, 'offset': 0.0, 'confident': False, 'in_sync': True,
+                        'z_score': 2.7, 'z_at_0': 2.7, 'score_at_0': 0.02, 'best_score': 0.02,
+                        'used_cues': 6,
+                    }
+
+                with mock.patch.object(sub_align, 'correlate_speech_and_cues', side_effect=fake_cor):
+                    mon._run_one_check(json.loads(cfg_path.read_text(encoding='utf-8')))
+
+                saved = json.loads(cfg_path.read_text(encoding='utf-8'))
+                self.assertAlmostEqual(float(saved['subtitle_offset']), 14.0, places=2)
+                self.assertEqual(int(saved['cfg_rev']), 2)
+            finally:
+                state = None
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+                os.close(fd)
+                av_hub.cleanup_hub_files(sid)
+
+    def test_pts_anchored_overlay_preserves_post_seek_first_pts_and_wide_hls_plan(self):
+        import asyncio
+        import json
+        import av_hub
+        import main as voice_main
+
+        with tempfile.TemporaryDirectory(prefix='lancy_anchored_') as td:
+            srt_path = os.path.join(td, 'subs.srt')
+            cfg_path = Path(td) / 'sub_cfg.json'
+            _write_srt(srt_path, [860.0, 870.0], prefix='ANCHOR')
+            cfg_path.write_text(json.dumps({
+                'enabled': True,
+                'render_screen': True,
+                'pts_anchored': True,
+                'subtitle_path': srt_path,
+                'subtitle_offset': 0.0,
+                'base_sec': 859.0,
+                'cfg_rev': 1,
+            }), encoding='utf-8')
+            sid = f'test_anch_{os.getpid()}'
+            fd, mm, state = av_sync._open_sync_state(av_sync.shm_path_for(sid))
+            try:
+                overlay = av_sync.SubOverlay(cfg_path, state, 320, 180, 320 * 180 * 3 // 2)
+                try:
+                    self.assertTrue(overlay._pts_anchored)
+                    anchored = bool(getattr(overlay, '_pts_anchored', False))
+                    state.epoch_pts_sec = 0.0 if (anchored and 0.0 <= 4.2 <= 30.0) else 4.2
+                    self.assertEqual(state.epoch_pts_sec, 0.0)
+                    pts_ms = sub_align.map_media_sec_to_sub_ms(
+                        overlay._base_sec + overlay._rel_pts_adjusted(4.2),
+                        subtitle_offset=overlay._sub_offset,
+                    )
+                    self.assertEqual(pts_ms, 863200)
+                finally:
+                    overlay.close()
+            finally:
+                state = None
+                try:
+                    mm.close()
+                except Exception:
+                    pass
+                os.close(fd)
+                av_hub.cleanup_hub_files(sid)
+
+        async def _check_plan():
+            with tempfile.TemporaryDirectory(prefix='lancy_plan_wide_') as td:
+                bridge = voice_main.Bridge(td, factory=object())
+                call = {
+                    'remote_proxy': True,
+                    'duration': 3600.0,
+                    '_probe_info': {
+                        'width': 1280, 'height': 720, 'stream_index': 0, 'audio_stream_index': 1,
+                        'video_count': 1, 'audio_count': 1, 'video_start_time': 0.0, 'audio_start_time': 0.0,
+                        'format_start_time': 0.0, 'fps': 24.0, 'duration': 3600.0, 'format_name': 'hls', 'is_image': False,
+                    },
+                    '_v0_origin': 0.0,
+                    '_a0_origin': 0.0,
+                }
+                with mock.patch.object(voice_main, 'probe_media_stream_info', return_value=call['_probe_info']), \
+                     mock.patch.object(voice_main, 'probe_initial_packet_pts', return_value=(1236.0, 1234.0)), \
+                     mock.patch.object(sub_align, '_fetch_hls_skipped_hdrs', return_value=(1200.0, 1198.0)), \
+                     mock.patch.object(sub_align, '_fetch_hls_audio_trim_delta', return_value=2.0):
+                    plan = await bridge._resolve_media_sync_plan(
+                        call,
+                        base_path='http://127.0.0.1:3055/movie-proxy/abc.m3u8',
+                        offset_val=1200.0,
+                        max_w=1280,
+                        max_h=720,
+                    )
+                self.assertTrue(plan['sync_copyts'])
+                self.assertAlmostEqual(plan['sync_pts_anchor'], 1236.0, places=2)
+                self.assertAlmostEqual(plan['sub_shift_offset'], 1236.0, places=2)
+                await bridge.shutdown()
+
+        asyncio.run(_check_plan())
+
+    def test_asr_phrase_alignment_finds_wide_cut_offset_and_tight_load_rtmp_scaling(self):
+        import asyncio
+        import types
+        import main as voice_main
+
+        cues = [
+            (20000, 23000, 'Previously on the northern front'),
+            (185000, 188000, 'Commander we have lost the eastern relay'),
+            (190500, 193000, 'Open the emergency bulkhead doors now'),
+            (196000, 199000, 'All squads prepare for orbital drop'),
+        ]
+        # Spoken at 102..118s in media timeline -> cue times are +83s later => subtitle_offset = -83.0
+        fake_segs = [
+            types.SimpleNamespace(start=2.0, end=4.5, text='Commander we have lost the eastern relay'),
+            types.SimpleNamespace(start=7.5, end=10.0, text='Open the emergency bulkhead doors now'),
+            types.SimpleNamespace(start=13.0, end=16.0, text='All squads prepare for orbital drop'),
+        ]
+        fake_model = types.SimpleNamespace(
+            transcribe=lambda *a, **kw: (iter(fake_segs), types.SimpleNamespace(language='en'))
+        )
+        pcm_8k = b'\x01\x00' * (8000 * 20)
+        res = sub_align.align_speech_transcript_to_cues(
+            pcm_8k, cues, 100.0, max_shift_sec=180.0, model=fake_model
+        )
+        self.assertTrue(res['ok'])
+        self.assertTrue(res['confident'])
+        self.assertAlmostEqual(float(res['offset']), -83.0, places=1)
+
+        # Mismatched dialogue returns not confident + asr_mismatch
+        bad_segs = [
+            types.SimpleNamespace(start=1.0, end=3.0, text='Pizza delivery with extra pepperoni cheese'),
+            types.SimpleNamespace(start=4.0, end=6.0, text='Turn left at the supermarket roundabout'),
+            types.SimpleNamespace(start=7.0, end=9.0, text='Football practice starts on Wednesday afternoon'),
+            types.SimpleNamespace(start=10.0, end=12.0, text='Remember to water the garden tomatoes'),
+        ]
+        bad_model = types.SimpleNamespace(
+            transcribe=lambda *a, **kw: (iter(bad_segs), types.SimpleNamespace(language='en'))
+        )
+        res_bad = sub_align.align_speech_transcript_to_cues(
+            pcm_8k, cues, 100.0, max_shift_sec=180.0, model=bad_model
+        )
+        self.assertFalse(res_bad['ok'])
+        self.assertEqual(res_bad['reason'], 'asr_mismatch')
+
+        async def _check_tight_load_rtmp():
+            with tempfile.TemporaryDirectory(prefix='lancy_tight_rtmp_') as td:
+                bridge = voice_main.Bridge(td, factory=object())
+                bridge.accounts['main'] = {
+                    'alias': 'main', 'enabled': True, 'allowed': [], 'status': 'available',
+                    'leases': {-1001, -1002, -1003}, 'client': None, 'engine': object(), 'managed': set(),
+                    'denied': [], 'group_grants': set(), 'member_fallback_enabled': False,
+                }
+                for cid in (-1001, -1002, -1003):
+                    bridge.calls[cid] = {'alias': 'main', 'video': True, 'status': 'playing'}
+                spawned = []
+                bridge.rtmp_mock_spawn = lambda c, args, is_standby=False: spawned.append((c, list(args)))
+                call = {
+                    'alias': 'main',
+                    'path': 'http://example.com/movie.mp4',
+                    'stream_mode': 'rtmp',
+                    'video': True,
+                    'video_quality': 'FHD_1080p',
+                    'playback_id': 'pb_tight',
+                    '_rtmp_target': 'rtmps://mock.local/live/k',
+                    '_probe_info': {
+                        'width': 1920, 'height': 1080, 'stream_index': 0, 'audio_stream_index': 1,
+                        'video_count': 1, 'audio_count': 1, 'video_start_time': 0.0, 'audio_start_time': 0.0,
+                        'format_start_time': 0.0, 'fps': 24.0, 'duration': 3600.0, 'format_name': 'mp4', 'is_image': False,
+                    },
+                    '_v0_origin': 0.0,
+                    '_a0_origin': 0.0,
+                }
+                with mock.patch.object(sub_align, 'host_load_pressure', return_value=0.92):
+                    await bridge._stream_rtmp(bridge.accounts['main'], -1004, call)
+                self.assertEqual(len(spawned), 1)
+                args = spawned[0][1]
+                self.assertEqual(args[args.index('--video-quality') + 1], 'HD_720p')
+                self.assertEqual(args[args.index('--preset') + 1], 'ultrafast')
+                self.assertEqual(args[args.index('--threads') + 1], '2')
+                bridge._cleanup_sub_overlay(call)
+                await bridge.shutdown()
+
+        asyncio.run(_check_tight_load_rtmp())
+
 
 if __name__ == '__main__':
     unittest.main()

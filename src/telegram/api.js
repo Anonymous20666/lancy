@@ -499,6 +499,41 @@ export class TelegramAPI {
     return this.call('pinChatMessage', { chat_id: chatId, message_id: messageId, disable_notification: disableNotification }).catch(() => null);
   }
 
+  unpinChatMessage(chatId, messageId = undefined) {
+    const params = { chat_id: chatId };
+    if (messageId !== undefined && messageId !== null) params.message_id = messageId;
+    return this.call('unpinChatMessage', params).catch(() => null);
+  }
+
+  sendInvoice(chatId, { title, description, payload, currency = 'XTR', prices = [], startParameter = undefined, replyToMessageId = undefined } = {}) {
+    return this.call('sendInvoice', {
+      chat_id: chatId,
+      title: String(title || '').slice(0, 32),
+      description: String(description || '').slice(0, 255),
+      payload: String(payload || ''),
+      currency: String(currency || 'XTR'),
+      prices,
+      ...(currency === 'XTR' ? {} : { provider_token: '' }),
+      ...(startParameter ? { start_parameter: startParameter } : {}),
+      ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {})
+    });
+  }
+
+  answerPreCheckoutQuery(preCheckoutQueryId, ok = true, errorMessage = undefined) {
+    return this.call('answerPreCheckoutQuery', {
+      pre_checkout_query_id: preCheckoutQueryId,
+      ok: Boolean(ok),
+      ...(!ok && errorMessage ? { error_message: String(errorMessage).slice(0, 255) } : {})
+    });
+  }
+
+  refundStarPayment(userId, telegramPaymentChargeId) {
+    return this.call('refundStarPayment', {
+      user_id: Number(userId),
+      telegram_payment_charge_id: String(telegramPaymentChargeId)
+    });
+  }
+
   sendPoll(chatId, question, options, extra = {}) {
     const opts = Array.isArray(options)
       ? options.map((o) => (typeof o === 'string' ? { text: o } : o))
@@ -680,7 +715,8 @@ export class TelegramAPI {
         'my_chat_member',
         'chat_join_request',
         'poll',
-        'poll_answer'
+        'poll_answer',
+        'pre_checkout_query'
       ]
     };
     const controller = new AbortController();

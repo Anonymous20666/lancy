@@ -6,8 +6,9 @@ import { LancyApp } from './app.js';
  * ✦ LANCY BOT ✦ — entrypoint.
  */
 async function main() {
-  loadEnvFile('.env');
-  const env = getEnv();
+  const fileEnv = loadEnvFile('.env');
+  const env = { ...getEnv(), ...fileEnv };
+  if (fileEnv.DATA_DIR) process.env.DATA_DIR = fileEnv.DATA_DIR;
 
   if (!env.BOT_TOKEN) {
     console.error('✦ Lancy Bot needs a BOT_TOKEN.');

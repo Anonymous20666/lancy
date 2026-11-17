@@ -548,6 +548,7 @@ export class TelegramController extends EventEmitter {
     if (update.chat_join_request) return this.#handleChatJoinRequest(update.chat_join_request);
     if (update.poll) return this.app?.music?.handlePollUpdate?.(update.poll, { api: this.api, botId: Number(this.botContext?.botId || 0) || 0 });
     if (update.poll_answer) return this.app?.music?.handlePollAnswer?.(update.poll_answer, { api: this.api, botId: Number(this.botContext?.botId || 0) || 0 });
+    if (update.pre_checkout_query) return this.app?.starsBilling?.handlePreCheckout?.(update.pre_checkout_query, this.api);
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
     if (update.edited_message) return this.#handleMessage(update.edited_message, { edited: true });
@@ -3777,6 +3778,11 @@ export class TelegramController extends EventEmitter {
   async #handleMessage(message, { edited = false, isChannelPost = false } = {}) {
     if (!message) return;
     if (message.is_automatic_forward || message.from?.id === 777000) return;
+    if (message.successful_payment) {
+      if (message.from) this.#upsertUser(message.from);
+      await this.app?.starsBilling?.handleSuccessfulPayment?.(message, this.api);
+      return;
+    }
     const user = message.from ? this.#upsertUser(message.from) : null;
     const chatType = message.chat?.type;
     const isGroup = Boolean(chatType === 'group' || chatType === 'supergroup');
@@ -4627,10 +4633,13 @@ export class TelegramController extends EventEmitter {
         }
         return;
       }
-      if (command === '/settings') {
+      if (command === '/settings' || command === '/ownersettings' || command === '/cinemasettings') {
         await this.sm.reset(tgId, { reason: 'command' });
         const settingsScreen = this.screens.get('settings');
-        const sent = await settingsScreen?.open(this.#ctx(tgId, { message }, { forceNew: true }));
+        const sctx = this.#ctx(tgId, { message }, { forceNew: true });
+        const sent = (command === '/ownersettings' || command === '/cinemasettings') && settingsScreen?.handle
+          ? await settingsScreen.handle(sctx, 'category', ['cinema'])
+          : await settingsScreen?.open(sctx);
         updateScreenMsg(sent);
         return;
       }

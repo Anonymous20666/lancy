@@ -7,6 +7,8 @@ import { RichMessageBuilder, block, rt, richButton, encodeCallback, decodeCallba
 import { progressBar } from '../../utils/text.js';
 import { States } from '../../core/stateMachine.js';
 import { durationText, MusicError } from '../../music/model.js';
+import { parseScheduleInput, formatClockInTz } from '../../music/movieScheduler.js';
+import { STAR_PRODUCTS } from '../../music/starsBilling.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, uploadLimitBytes } from '../../media/telegramLimits.js';
 import { toSansBold } from '../../captions/engine.js';
 import { createMovieUi } from './movieUi.js';
@@ -1738,6 +1740,184 @@ export function createMusicScreen({ app }) {
         }
         return true;
       }
+      if (action === 'boostmenu') {
+        const destId = Number(args[0] || ctx.chatId);
+        await app.music.authorize(ctx, true, destId, { allowDj: true });
+        const billing = app.starsBilling;
+        const gate = billing?.canBroadcastChat?.(destId, { initiatorUserId: ctx.tgId, consumeSingle: false });
+        if (gate?.allowed) {
+          const s = app.musicQueueManager?.getSession?.(destId);
+          if (s?.currentTrack?.provider === 'movie' && app.cinemaAnnouncer) {
+            await app.cinemaAnnouncer.onTrackStart({ chatId: destId, track: s.currentTrack, session: s, forceBoost: true, initiatorUserId: ctx.tgId }).catch(() => {});
+            await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: '📣 Broadcast sent to cinema viewers!', show_alert: true }).catch(() => {});
+            return true;
+          }
+        }
+        const pSingle = billing?.getPrice?.('broadcast_single') ?? 25;
+        const p24 = billing?.getPrice?.('broadcast_24h') ?? 75;
+        const p7d = billing?.getPrice?.('vip_7d') ?? 250;
+        const b = card('📣 CINEMA BROADCAST BOOST', 'Promote this group watch party to Lancy viewers');
+        b.blockquote('Choose a Telegram Stars (⭐ XTR) pass to broadcast your movie night card with a direct Join Watch Party button.');
+        b.buttons([
+          richButton.callback(`⭐ ${pSingle} · Single Movie`, encodeCallback('music', 'buystar', String(destId), 'broadcast_single'), { style: 'primary' }),
+          richButton.callback(`⭐ ${p24} · 24h Unlimited`, encodeCallback('music', 'buystar', String(destId), 'broadcast_24h'), { style: 'success' })
+        ]);
+        b.buttons([
+          richButton.callback(`👑 ${p7d}⭐ · 7-Day VIP Pass`, encodeCallback('music', 'buystar', String(destId), 'vip_7d'), { style: 'primary' })
+        ]);
+        await sendOrEditMenu(ctx, finish(b));
+        return true;
+      }
+      if (action === 'buystar') {
+        const destId = Number(args[0] || ctx.chatId);
+        const kind = String(args[1] || 'broadcast_single');
+        await app.music.authorize(ctx, true, destId, { allowDj: true });
+        if (!app.starsBilling || !STAR_PRODUCTS[kind]) {
+          throw new MusicError('STARS_UNAVAILABLE', 'Telegram Stars billing is unavailable.');
+        }
+        const chatInfo = await ctx.api?.getChat?.(destId).catch(() => null);
+        const targetDm = Number(ctx.chatId) > 0 ? Number(ctx.chatId) : Number(ctx.tgId);
+        try {
+          await app.starsBilling.sendBroadcastInvoice({
+            api: ctx.api,
+            invoiceChatId: targetDm,
+            targetChatId: destId,
+            payerTgId: ctx.tgId,
+            productKind: kind,
+            botId: Number(ctx.botId || 0),
+            meta: { chatTitle: chatInfo?.title || String(destId) }
+          });
+          await ctx.api?.answerCallbackQuery?.(ctx.query?.id, {
+            text: Number(ctx.chatId) < 0 ? '⭐ Stars invoice sent to your DM!' : '⭐ Tap Pay below to complete!'
+          }).catch(() => {});
+        } catch (err) {
+          throw new MusicError('STARS_INVOICE_FAILED', err?.message || 'Open a DM with the bot first so I can send your Stars invoice.');
+        }
+        return true;
+      }
+      if (action === 'schboost') {
+        const schId = Number(args[0]);
+        const row = app.movieScheduler?.getById?.(schId);
+        if (!row) throw new MusicError('SCHEDULE_NOT_FOUND', 'That scheduled screening was not found.');
+        await app.music.authorize(ctx, true, Number(row.chat_id), { allowDj: true });
+        const gate = app.starsBilling?.canBroadcastChat?.(row.chat_id, { initiatorUserId: ctx.tgId, consumeSingle: true });
+        if (!gate?.allowed) {
+          return await handle(ctx, 'boostmenu', [String(row.chat_id)]);
+        }
+        app.db?.run?.(`UPDATE scheduled_screenings SET boosted = 1, updated_at = datetime('now') WHERE id = ?`, row.id);
+        const updated = app.movieScheduler.getById(row.id);
+        if (ctx.messageId && ctx.api?.editMessageRich) {
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, app.movieScheduler.buildCountdownCard(updated)).catch(() => {});
+        }
+        await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: '📣 Screening marked for broadcast!' }).catch(() => {});
+        return true;
+      }
+      if (action === 'schcancel') {
+        const schId = Number(args[0]);
+        const row = app.movieScheduler?.getById?.(schId);
+        if (!row) throw new MusicError('SCHEDULE_NOT_FOUND', 'That scheduled screening was already removed.');
+        await app.music.authorize(ctx, true, Number(row.chat_id), { allowDj: true });
+        await app.movieScheduler.cancelScreening(schId, row.chat_id, ctx.api);
+        await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: '✖ Scheduled screening cancelled.' }).catch(() => {});
+        return true;
+      }
+      if (action === 'schai') {
+        const prev = app.movieScheduler?.aiProposals?.get(args[0]);
+        const destId = prev?.chatId || await app.music.authorize(ctx, false, null, { allowDj: true });
+        const proposal = await app.movieScheduler.suggestScheduleWithAi({
+          chatId: destId,
+          userId: ctx.tgId,
+          botId: Number(ctx.botId || 0),
+          promptText: prev?.promptText || 'tonight'
+        });
+        if (ctx.messageId && ctx.api?.editMessageRich) {
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, app.movieScheduler.buildAiProposalCard(proposal)).catch(() => {});
+        }
+        return true;
+      }
+      if (action === 'schaiok') {
+        const proposal = app.movieScheduler?.aiProposals?.get(args[0]);
+        if (!proposal || proposal.expiresAt < Date.now()) {
+          throw new MusicError('SCHEDULE_EXPIRED', 'That AI schedule suggestion expired. Run /schedule ai again.');
+        }
+        await app.music.authorize(ctx, true, proposal.chatId, { allowDj: true });
+        const created = [];
+        for (let i = 0; i < proposal.slots.length; i++) {
+          const sl = proposal.slots[i];
+          const row = await app.movieScheduler.createScreening({
+            chatId: proposal.chatId,
+            botId: proposal.botId,
+            createdBy: ctx.tgId,
+            title: sl.title,
+            mediaType: sl.mediaType,
+            tmdbId: sl.tmdbId,
+            season: sl.season,
+            episode: sl.episode,
+            scheduledAt: sl.scheduledAt,
+            aiNote: sl.aiNote,
+            api: ctx.api,
+            pin: i === 0
+          });
+          created.push(row);
+        }
+        app.movieScheduler.aiProposals.delete(args[0]);
+        await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: `✅ Scheduled ${created.length} AI watch parties!` }).catch(() => {});
+        if (ctx.messageId && ctx.api?.deleteMessage) {
+          await ctx.api.deleteMessage(ctx.chatId, ctx.messageId).catch(() => {});
+        }
+        return true;
+      }
+      if (action === 'dualtile') {
+        const destId = await app.music.authorize(ctx, true, null, { allowDj: true });
+        const qm = app.musicQueueManager;
+        const s = qm?.getSession?.(destId);
+        if (!s?.currentTrack || !['playing', 'paused'].includes(s.status)) {
+          throw new MusicError('NO_ACTIVE_CALL', 'Start playing a movie in a group Voice Chat first.');
+        }
+        if (s.isChannel || s.streamMode === 'rtmp') {
+          throw new MusicError('INVALID_REQUEST', 'Dual-assistant subtitle tiles work only in group Interactive VCs (channels allow one stream).');
+        }
+        if (s.secondaryTile) {
+          await app.voiceClient.stopSecondaryTile(destId).catch(() => {});
+          s.secondaryTile = null;
+          s.lastNotice = '👁 Secondary subtitle tile stopped.';
+          await qm.updatePlayerCard(destId, { forceEdit: true });
+          return true;
+        }
+        const t = s.currentTrack;
+        const secLang = String(app.settings?.get?.('cinema.dualTileDefaultLang') || 'spa').toLowerCase();
+        const tracks = Array.isArray(t.subtitleTracks) ? t.subtitleTracks : [];
+        let altTrack = tracks.find((tr) => tr?.filePath && tr.filePath !== t.subtitlePath && String(tr.language || '').toLowerCase().startsWith(secLang.slice(0, 2)));
+        if (!altTrack) altTrack = tracks.find((tr) => tr?.filePath && tr.filePath !== t.subtitlePath);
+        if (!altTrack && app.subtitles?.resolveForMedia) {
+          const res = await app.subtitles.resolveForMedia({
+            title: t.title,
+            year: t.year,
+            tmdbId: t.tmdbId || (/^\d+$/.test(String(t.id || '')) ? t.id : null),
+            type: t.seasonNumber ? 'tv' : 'movie',
+            season: t.seasonNumber,
+            episode: t.episodeNumber,
+            language: secLang,
+            durationSeconds: t.durationSeconds
+          }).catch(() => null);
+          if (res?.filePath) altTrack = { filePath: res.filePath, language: res.language || secLang, label: res.label || `${secLang.toUpperCase()} Subtitles` };
+        }
+        if (!altTrack?.filePath) {
+          throw new MusicError('NO_ALT_SUBTITLE', `No secondary (${secLang.toUpperCase()}) subtitle track found for this title.`);
+        }
+        const maxVid = Number(app.settings?.get?.('cinema.maxVideoCallsPerAccount') || 0) || undefined;
+        const tileRes = await app.voiceClient.startSecondaryTile(destId, {
+          subtitlePath: altTrack.filePath,
+          language: altTrack.language || secLang,
+          label: altTrack.label || `${secLang.toUpperCase()} Subtitles`,
+          subtitleOffset: s.subtitleSyncOffset || 0,
+          maxVideoCallsPerAccount: maxVid
+        });
+        s.secondaryTile = { alias: tileRes.account_alias, language: tileRes.language, label: tileRes.label };
+        s.lastNotice = `👁 Dual subtitle tile live (${tileRes.account_alias} · ${tileRes.label})`;
+        await qm.updatePlayerCard(destId, { forceEdit: true });
+        return true;
+      }
       if (action === 'mv') return await movieUi.handleCallback(ctx, args);
       if (action === 'moviehub' || action === 'movie') return await movieUi.openHub(ctx);
       if (action === 'aichat') return await movieUi.startAiChat(ctx, args.join(' '));
@@ -2215,6 +2395,66 @@ export function createMusicScreen({ app }) {
         await sendOrEditMenu(ctx, renderMovieBroadcastCard(res, { notice, chatId: ctx.chatId, canGlobal }));
         return true;
       }
+      if (command === '/schedule') {
+        const destId = await app.music.authorize(ctx, true, null, { allowDj: true });
+        if (!app.movieScheduler) {
+          await ctx.api.sendMessage(ctx.chatId, '⏰ Movie scheduler service is unavailable.').catch(() => {});
+          return true;
+        }
+        const sub = String(args[0] || '').toLowerCase();
+        if (!args.length || sub === 'list') {
+          const rows = app.movieScheduler.listByChat(destId);
+          const b = card('⏰ SCHEDULED WATCH PARTIES', `${rows.length} upcoming`);
+          if (!rows.length) {
+            b.blockquote('No movies scheduled yet.\n\nTry:\n• /schedule Bahubali 9pm\n• /schedule Inception in 2h\n• /schedule ai tonight');
+          } else {
+            const tz = app.movieScheduler.getTimezone();
+            b.table(rows.map((r) => [`#${r.id} · ${formatClockInTz(r.scheduled_at, tz)}`, cut(r.title, 42)]), { compact: true, striped: true });
+          }
+          await sendOrEditMenu(ctx, finish(b));
+          return true;
+        }
+        if (sub === 'cancel' || sub === 'del' || sub === 'rm') {
+          const ok = await app.movieScheduler.cancelScreening(Number(args[1]), destId, ctx.api);
+          await ctx.api.sendMessage(ctx.chatId, ok ? `✖ Cancelled schedule #${args[1]}.` : `⚠️ Schedule #${args[1] || ''} not found in this chat.`).catch(() => {});
+          return true;
+        }
+        if (sub === 'ai') {
+          const proposal = await app.movieScheduler.suggestScheduleWithAi({
+            chatId: destId,
+            userId: ctx.tgId,
+            botId: Number(ctx.botId || 0),
+            promptText: args.slice(1).join(' ') || 'tonight'
+          });
+          await sendOrEditMenu(ctx, app.movieScheduler.buildAiProposalCard(proposal));
+          return true;
+        }
+        const parsed = parseScheduleInput(args.join(' '), { timezone: app.movieScheduler.getTimezone() });
+        if (!parsed) {
+          await ctx.api.sendMessage(ctx.chatId, '⏰ Use: /schedule <movie title> <time> (e.g. /schedule Bahubali 9pm, /schedule Dune in 2h, or /schedule ai tonight)').catch(() => {});
+          return true;
+        }
+        const meta = await app.movieScheduler.resolveItemMetadata(parsed.title);
+        await app.movieScheduler.createScreening({
+          chatId: destId,
+          botId: Number(ctx.botId || 0),
+          createdBy: ctx.tgId,
+          title: meta.title,
+          mediaType: meta.mediaType,
+          tmdbId: meta.tmdbId,
+          season: meta.season,
+          episode: meta.episode,
+          scheduledAt: parsed.scheduledAt,
+          repeatRule: parsed.repeatRule,
+          api: ctx.api
+        });
+        return true;
+      }
+      if (command === '/boost' || command === '/broadcastboost') {
+        const destId = await app.music.authorize(ctx, true, null, { allowDj: true });
+        await handle(ctx, 'boostmenu', [String(destId)]);
+        return true;
+      }
       if (command === '/autopoll' || command === '/votes') {
         const destId = await app.music.authorize(ctx, false, null, { allowDj: false });
         if (command === '/votes' || !args.length || String(args[0] || '').toLowerCase() === 'settings') {
@@ -2595,6 +2835,7 @@ export function createMusicScreen({ app }) {
     '/stop', '/end', '/leave', '/queue', '/q', '/volume', '/vol', '/seek', '/eq', '/bass', '/streammode', '/rtmp', '/vcmsg',
     '/aidj', '/dj', '/movie', '/movies', '/moviesearch', '/movieai', '/mediaai',
     '/vcsudo', '/rmsudo', '/moviecast', '/moviebroadcast', '/moviealert', '/cinemaalert', '/movieannounce', '/autopoll', '/votes',
+    '/schedule', '/boost', '/broadcastboost',
     '/repeat', '/loop', '/shuffle', '/playlist', '/lyrics', '/play', '/song',
     '/music', '/cancel'
   ]);
@@ -2998,12 +3239,18 @@ export function createMusicScreen({ app }) {
       const srcBtnLabel = srcTotal > 1 ? `📡 Source ${srcNum}/${srcTotal}` : '📡 Alt Source';
       row4.push(controls(s, srcBtnLabel, 'switchsource', { style: 'link' }));
     }
+    if (t && ['playing', 'paused'].includes(s.status) && !s.isChannel && s.streamMode !== 'rtmp' && app.settings?.get?.('cinema.dualAssistantSubTilesEnabled') === true) {
+      row4.push(controls(s, s.secondaryTile ? '👁 Tile: ON' : '👁 Sub Tile', 'dualtile', { style: s.secondaryTile ? 'success' : 'link' }));
+    }
     b.buttons(row4);
 
-    // Row 5: Vote, Loop, Votes Settings & Options
+    // Row 5: Vote, Loop, Votes Settings, Boost & Options
     const row5 = [];
     if (t && ['playing', 'paused'].includes(s.status) && !s.isChannel) {
       row5.push(controls(s, `⏭ Vote (${skipCount}/${skipNeed})`, 'voteskip', { style: 'link' }));
+      if (app.settings?.get?.('cinema.starsEnabled') !== false) {
+        row5.push(controls(s, '📣 Boost', 'boostmenu', String(s.chatId), { style: 'link' }));
+      }
     }
     row5.push(controls(s, `🔁 ${s.loopMode === 'off' ? 'Loop' : s.loopMode === 'track' ? 'One' : 'All'}`, 'loop', { style: 'link' }));
     row5.push(controls(s, '🗳 Votes', 'voteset', { style: 'link' }));

@@ -44,7 +44,7 @@ export function isSameMusicBot(session, ctx) {
   return sessBotId > 0 && ctxBotId > 0 && sessBotId === ctxBotId;
 }
 export class AccountStore {
-  constructor({ db, root, voice, allowExistingMemberGroups=false }) { this.allowExistingMemberGroups=Boolean(allowExistingMemberGroups);this.db = db; this.root = root; this.voice = voice; this.lock = new KeyedLock(); this.initialized = false; }
+  constructor({ db, root, voice, allowExistingMemberGroups=false }) { this.allowExistingMemberGroups=Boolean(allowExistingMemberGroups);this.db = db; this.root = root; this.voice = voice; this.lock = new KeyedLock(); this.initialized = false; this.retryAfter = new Map(); }
   key() {
     const dir = join(this.root, 'secrets'); mkdirSync(dir, { recursive:true, mode:0o700 });
     const path = join(dir,'music-session.key'); let key;
@@ -77,12 +77,25 @@ export class AccountStore {
         }
       }
       if (upgraded) this.save(records);
-      const live = await this.voice.accounts(); const known = new Set(live.accounts.map(a => a.alias));
+      const live = await this.voice.accounts();
+      const liveByAlias = new Map(live.accounts.map(a => [a.alias, a]));
       const failures = [];
       for (const record of records) if (record.enabled) {
-        if (!known.has(record.alias)) {
-          try { const managed=this.db.getSetting('music.managedMemberships',{})||{};await this.voice.registerAccount({ ...record, encrypted:undefined, session:this.decrypt(record.encrypted), allow_existing_member_groups:this.allowExistingMemberGroups, managed_destinations:Object.entries(managed).filter(([,m])=>m.alias===record.alias).map(([id])=>Number(id)) }); }
-          catch { failures.push(record.alias); }
+        const runtime = liveByAlias.get(record.alias);
+        const needRecover = Boolean(runtime && runtime.status === 'authentication_required' && Date.now() >= (this.retryAfter.get(record.alias) || 0));
+        if (!runtime || needRecover) {
+          try {
+            if (needRecover && typeof this.voice.configureAccount === 'function') {
+              await this.voice.configureAccount({ alias: record.alias, remove: true }).catch(() => {});
+            }
+            const managed=this.db.getSetting('music.managedMemberships',{})||{};
+            await this.voice.registerAccount({ ...record, encrypted:undefined, session:this.decrypt(record.encrypted), allow_existing_member_groups:this.allowExistingMemberGroups, managed_destinations:Object.entries(managed).filter(([,m])=>m.alias===record.alias).map(([id])=>Number(id)) });
+            this.retryAfter.delete(record.alias);
+          } catch (err) {
+            this.retryAfter.set(record.alias, Date.now() + 30000);
+            failures.push(record.alias);
+            this.voice?.log?.warn?.({ alias: record.alias, code: err?.code, err: err?.message }, 'Failed to register playback account');
+          }
         } else if (upgraded && typeof this.voice.configureAccount === 'function') {
           await this.voice.configureAccount({ alias:record.alias, enabled:record.enabled, allowed:record.allowed, denied:record.denied || [] }).catch(() => {});
         }

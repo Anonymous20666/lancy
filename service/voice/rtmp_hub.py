@@ -212,10 +212,22 @@ def run_rtmp_hub(
             audio_tail_pts = None
             audio_pts_rebase = 0.0
             video_pts_rebase = 0.0
+            pending_disc = {'v': None, 'a': None}
             last_raw_v_pts = None
             v_seen = False
             a_seen = False
             dec_eof = False
+
+            def _resolve_disc_rebase(kind, raw_prev_tail, new_raw_pts, cur_rebase):
+                peer_kind = 'a' if kind == 'v' else 'v'
+                raw_jump = float(raw_prev_tail) - float(new_raw_pts)
+                peer_evt = pending_disc.get(peer_kind)
+                if peer_evt is not None and abs(raw_jump - peer_evt['raw_jump']) <= 2.5:
+                    pending_disc[peer_kind] = None
+                    return float(peer_evt['new_rebase'])
+                new_rebase = cur_rebase + (float(raw_prev_tail) - float(new_raw_pts))
+                pending_disc[kind] = {'raw_jump': raw_jump, 'new_rebase': new_rebase}
+                return new_rebase
 
             def _demux_nut_reader():
                 nonlocal audio_head_pts, audio_tail_pts, audio_pts_rebase, video_pts_rebase, last_raw_v_pts, v_seen, a_seen, dec_eof
@@ -238,8 +250,8 @@ def run_rtmp_hub(
                                 if stop_event.is_set():
                                     break
                                 if last_raw_v_pts is not None and (pts - last_raw_v_pts) < -2.0:
-                                    # Backward PTS reset across discontinuity: keep monotonic progression
-                                    video_pts_rebase += (last_raw_v_pts + frame_dur) - pts
+                                    # Backward PTS reset across discontinuity: synchronize rebase delta with audio stream
+                                    video_pts_rebase = _resolve_disc_rebase('v', last_raw_v_pts + frame_dur, pts, video_pts_rebase)
                                 last_raw_v_pts = pts
                                 video_q.append((pts + video_pts_rebase, bytes(payload)))
                                 v_seen = True
@@ -261,10 +273,15 @@ def run_rtmp_hub(
                                 else:
                                     gap = eff_pts - audio_tail_pts
                                     if gap < -2.0:
-                                        # Backward PTS discontinuity reset: advance rebase rather than discarding future audio
-                                        audio_pts_rebase += (audio_tail_pts - eff_pts)
-                                        eff_pts = audio_tail_pts
-                                        gap = 0.0
+                                        # Backward PTS discontinuity reset: share splice delta with video stream
+                                        audio_pts_rebase = _resolve_disc_rebase(
+                                            'a',
+                                            audio_tail_pts - audio_pts_rebase,
+                                            pts,
+                                            audio_pts_rebase,
+                                        )
+                                        eff_pts = pts + audio_pts_rebase
+                                        gap = eff_pts - audio_tail_pts
                                     if gap > 0.025:
                                         pad_b = min(int(round(gap * AUDIO_BPS)), AUDIO_BPS * 5)
                                         pad_b -= (pad_b % SAMPLE_ALIGN)
@@ -424,7 +441,12 @@ def run_rtmp_hub(
                             v0_pts, v0_buf = video_q[0]
                             last_raw_frame = v0_buf
                             last_frame_pts = max(0.0, v0_pts)
-                            startup_epoch_pts = max(0.0, float(v0_pts))
+                            pts_anchored = bool(sub_overlay is not None and getattr(sub_overlay, '_pts_anchored', False))
+                            startup_epoch_pts = (
+                                0.0
+                                if (pts_anchored and 0.0 <= float(v0_pts) <= 30.0)
+                                else max(0.0, float(v0_pts))
+                            )
                             if state is not None:
                                 state.epoch_mono = time.monotonic()
                             if audio_head_pts is not None:
@@ -562,7 +584,7 @@ def run_rtmp_hub(
                                         emit_v_pts = max(0.0, v_pts)
                                         last_audio_pts = emit_a_pts
                                         emit_frame = (
-                                            sub_overlay.render(last_raw_frame, _rel_pts(emit_v_pts))
+                                            sub_overlay.render(last_raw_frame, _rel_pts(emit_a_pts))
                                             if sub_overlay is not None
                                             else last_raw_frame
                                         )

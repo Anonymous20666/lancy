@@ -3765,3 +3765,45 @@ test('/moviecast allow/disallow gates global & group movie DM broadcasts and /vc
   assert.match(cinemaGuideStr, /\/vcmsg/);
   assert.doesNotMatch(cinemaGuideStr, /Spotify|Lyrics|Bass|AI DJ|Infinite/i);
 });
+
+test('restoreActiveSessions prioritizes playing streams over paused ones and defaults allow multi-GC on 1 assistant', async (t) => {
+  const h = buildTestHarness(t);
+  const playOrder = [];
+  const origPlay = h.qm.voice.play.bind(h.qm.voice);
+  h.qm.voice.play = async (chatId, source, opts = {}) => {
+    playOrder.push({ chatId, opts });
+    return origPlay(chatId, source, opts);
+  };
+
+  const nowTs = Date.now();
+  h.app.db.setSetting('music.activePlaybackSnapshots', {
+    '-10011': {
+      chatId: -10011,
+      activeDeck: 'movie',
+      paused: true,
+      status: 'paused',
+      positionSeconds: 850,
+      savedAt: nowTs - 1000,
+      currentTrack: { id: 'm1', title: 'Paused Movie', provider: 'movie', mediaType: 'video', streamUrl: 'https://cdn.example/1.mp4', capabilities: { seek: true, video: true } }
+    },
+    '-10022': {
+      chatId: -10022,
+      activeDeck: 'movie',
+      paused: false,
+      status: 'playing',
+      positionSeconds: 420,
+      savedAt: nowTs - 5000,
+      currentTrack: { id: 'm2', title: 'Live Playing Movie', provider: 'movie', mediaType: 'video', streamUrl: 'https://cdn.example/2.mp4', capabilities: { seek: true, video: true } }
+    }
+  });
+
+  await h.qm.shutdown();
+  const qm2 = new QueueManager({ app: { ...h.app }, db: h.app.db, voiceClient: h.qm.voice, pollMs: 0 });
+  h.app.musicQueueManager = qm2;
+  t.after(() => qm2.shutdown());
+  const restored = await qm2.restoreActiveSessions({ api: h.api });
+  assert.deepEqual(restored, [-10022, -10011], 'Playing streams must restore before paused ones');
+  assert.equal(playOrder[0].chatId, -10022);
+  const { DEFAULT_SETTINGS: cfgDefaults } = await import('../src/config/defaults.js');
+  assert.equal(cfgDefaults.cinema.maxVideoCallsPerAccount, 0, 'Default maxVideoCallsPerAccount must be 0 (Auto) so 1 assistant resumes all GCs');
+});

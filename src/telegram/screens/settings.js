@@ -12,6 +12,7 @@ import { getCloneForceJoinChannels, getGlobalForceJoinChannels } from '../forceJ
  */
 const CATEGORIES = [
   ['general', '♡ General'],
+  ['cinema', '🎬 Cinema & Stars'],
   ['telegram', '✦ Telegram'],
   ['whatsapp', '♡ WhatsApp'],
   ['pinterest', '✦ Pinterest'],
@@ -35,6 +36,21 @@ const EDITABLE = {
     ['general.language', 'Language'],
     ['general.defaultStyle', 'Default style'],
     ['general.defaultCreatorName', 'Creator name']
+  ],
+  cinema: [
+    ['cinema.maxVideoCallsPerAccount', 'Max movies per assistant'],
+    ['cinema.dualAssistantSubTilesEnabled', 'Dual-assistant sub tile (true/false)'],
+    ['cinema.dualTileDefaultLang', 'Dual-tile default lang (spa/fra/ara/hin)'],
+    ['cinema.scheduleRepinHours', 'Countdown re-pin hours (0=off)'],
+    ['cinema.scheduleSilentPin', 'Silent hourly re-pin (true/false)'],
+    ['cinema.schedulePrewarmMinutes', 'Pre-warm minutes before showtime'],
+    ['cinema.aiScheduleEnabled', 'AI watch-party scheduler (true/false)'],
+    ['cinema.starsEnabled', 'Telegram Stars billing (true/false)'],
+    ['cinema.requireStarsForGcBroadcast', 'Require Stars for GC broadcast (true/false)'],
+    ['cinema.starsBroadcastSinglePrice', 'Single broadcast price (Stars)'],
+    ['cinema.starsBroadcast24hPrice', '24h GC broadcast pass (Stars)'],
+    ['cinema.starsVip7dPrice', '7d VIP cinema pass (Stars)'],
+    ['cinema.freeBroadcastChats', 'VIP free broadcast chat IDs (JSON array)']
   ],
   telegram: [
     ['telegram.paginationSize', 'Pagination size'],
@@ -337,9 +353,34 @@ export function createSettingsScreen({ app }) {
 
   async function openCategory(ctx, category) {
     const b = new RichMessageBuilder();
-    b.heading(`⚙ ${category.toUpperCase()}`, 2);
+    b.heading(category === 'cinema' ? '🎬 CINEMA & STARS OWNER PANEL' : `⚙ ${category.toUpperCase()}`, 2);
     if (['performance', 'storage', 'security', 'logging', 'advanced'].includes(category)) {
       b.blockquote('⚠️ Engine & system settings are automatically tuned by Lancy core.');
+    }
+    if (category === 'cinema') {
+      const starsOn = ctx.settings.get('cinema.starsEnabled') !== false;
+      const gated = ctx.settings.get('cinema.requireStarsForGcBroadcast') === true;
+      const repinH = Number(ctx.settings.get('cinema.scheduleRepinHours') ?? 1);
+      const dualOn = ctx.settings.get('cinema.dualAssistantSubTilesEnabled') === true;
+      const aiOn = ctx.settings.get('cinema.aiScheduleEnabled') !== false;
+      const cap = Number(ctx.settings.get('cinema.maxVideoCallsPerAccount') ?? 0);
+      b.blockquote('👑 Owner controls for multi-assistant load balancing, hourly countdown re-pins, AI schedule curator, and Telegram Stars (XTR) group broadcasts.');
+      b.buttons([
+        richButton.callback(starsOn ? '⭐ Stars: ON' : '⚪ Stars: OFF', encodeCallback(id, 'cinemaToggle', 'starsEnabled'), { style: starsOn ? 'success' : 'secondary' }),
+        richButton.callback(gated ? '🔒 Gate: Paid GC' : '🆓 Gate: Free All', encodeCallback(id, 'cinemaToggle', 'requireStarsForGcBroadcast'), { style: gated ? 'primary' : 'secondary' })
+      ]);
+      b.buttons([
+        richButton.callback(`📌 Re-Pin: ${repinH > 0 ? `${repinH}h` : 'OFF'}`, encodeCallback(id, 'cinemaToggle', 'scheduleRepinHours')),
+        richButton.callback(`👥 Max/Asst: ${cap > 0 ? cap : 'Auto'}`, encodeCallback(id, 'cinemaToggle', 'maxVideoCallsPerAccount'))
+      ]);
+      b.buttons([
+        richButton.callback(dualOn ? '👁 Dual Sub Tile: ON' : '👁 Dual Sub Tile: OFF', encodeCallback(id, 'cinemaToggle', 'dualAssistantSubTilesEnabled')),
+        richButton.callback(aiOn ? '🤖 AI Schedule: ON' : '🤖 AI Schedule: OFF', encodeCallback(id, 'cinemaToggle', 'aiScheduleEnabled'))
+      ]);
+      b.buttons([
+        richButton.callback('💳 Stars Ledger & Refunds', encodeCallback(id, 'starsLedger'), { style: 'primary' }),
+        richButton.callback('👥 Assistant Pool Load', encodeCallback(id, 'assistantLoad'))
+      ]);
     }
     b.divider();
     const rows = (EDITABLE[category] ?? []).map(([path, label]) => [
@@ -535,6 +576,15 @@ export function createSettingsScreen({ app }) {
         }
 
         let value = parseValue(message.text);
+        if (path === 'cinema.freeBroadcastChats') {
+          const rawTxt = message.text.trim();
+          if (rawTxt.startsWith('[')) {
+            try { value = JSON.parse(rawTxt); } catch {}
+          } else {
+            value = rawTxt.split(/[\s,]+/).map((s) => s.trim()).filter((s) => /^-?\d+$/.test(s)).map(Number);
+          }
+          if (!Array.isArray(value)) value = [];
+        }
         if (path === 'stickers.packNameTemplate') {
           // If simple sticker name was sent (e.g. "Toji"), inject into default template
           const text = message.text.trim();
@@ -660,6 +710,79 @@ export function createSettingsScreen({ app }) {
             return openMenu(ctx);
           }
           return openCategory(ctx, args[0]);
+        case 'cinemaToggle': {
+          if (!isMain) return openMenu(ctx);
+          const field = args[0];
+          const path = `cinema.${field}`;
+          const cur = ctx.settings.get(path);
+          let next;
+          if (field === 'scheduleRepinHours') next = cur === 1 ? 2 : cur === 2 ? 3 : cur === 3 ? 0 : 1;
+          else if (field === 'maxVideoCallsPerAccount') next = Number(cur || 0) === 0 ? 1 : cur === 1 ? 2 : cur === 2 ? 3 : 0;
+          else next = !Boolean(cur);
+          app.settings.setForUser ? app.settings.setForUser(userId, path, next) : app.settings.set(path, next);
+          app.applyHotReload?.(path, next);
+          await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: `${field}: ${next}` }).catch(() => {});
+          return openCategory(ctx, 'cinema');
+        }
+        case 'starsLedger': {
+          if (!isMain) return openMenu(ctx);
+          const sum = app.starsBilling?.summary?.() || { totalStars: 0, paidCount: 0, refundedCount: 0 };
+          const rows = app.starsBilling?.listPayments?.({ limit: 10 }) || [];
+          const b = new RichMessageBuilder();
+          b.heading('⭐ TELEGRAM STARS LEDGER', 2);
+          b.table([
+            ['Total Earned', `${sum.totalStars} ⭐`],
+            ['Paid Passes', String(sum.paidCount)],
+            ['Refunded', String(sum.refundedCount)]
+          ], { compact: true, striped: true });
+          if (!rows.length) {
+            b.paragraph(rt.text('No Stars payments recorded yet.'));
+          } else {
+            b.divider();
+            b.table(rows.map((r) => [
+              `#${r.id} · ${r.product_kind}`,
+              `${r.stars_amount}⭐ · ${r.status} · chat ${r.chat_id}`
+            ]), { compact: true });
+            for (const r of rows.filter((x) => x.status !== 'refunded' && x.charge_id).slice(0, 5)) {
+              b.buttons([richButton.callback(`↩️ Refund #${r.id} (${r.stars_amount}⭐)`, encodeCallback(id, 'starsRefund', String(r.id)), { style: 'danger' })]);
+            }
+          }
+          b.buttons([richButton.callback('« Back to Cinema & Stars', encodeCallback(id, 'category', 'cinema'))]);
+          b.validate();
+          return editOrSend(ctx, b.toJSON());
+        }
+        case 'starsRefund': {
+          if (!isMain) return openMenu(ctx);
+          try {
+            await app.starsBilling.refundPayment(Number(args[0]), ctx.api);
+            await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: `Refunded #${args[0]}`, show_alert: true }).catch(() => {});
+          } catch (err) {
+            await ctx.api?.answerCallbackQuery?.(ctx.query?.id, { text: `Refund failed: ${String(err?.message || '').slice(0, 120)}`, show_alert: true }).catch(() => {});
+          }
+          return this.handle(ctx, 'starsLedger', []);
+        }
+        case 'assistantLoad': {
+          if (!isMain) return openMenu(ctx);
+          const pool = await app.voiceClient?.accounts?.().catch(() => ({ accounts: [] }));
+          const sessions = app.musicQueueManager?.sessions;
+          const b = new RichMessageBuilder();
+          b.heading('👥 ASSISTANT POOL LOAD', 2);
+          if (!pool?.accounts?.length) {
+            b.paragraph(rt.text('No playback accounts loaded.'));
+          } else {
+            const tableRows = pool.accounts.map((a) => {
+              const dests = (a.destinations || []).map((cid) => {
+                const s = sessions?.get?.(Number(cid));
+                return s?.currentTrack?.title ? `${s.destinationTitle || cid}: ${truncate(s.currentTrack.title, 26)}` : String(cid);
+              });
+              return [`${a.alias} (${a.status})`, dests.length ? dests.join(' | ') : 'Idle'];
+            });
+            b.table(tableRows, { compact: true, striped: true });
+          }
+          b.buttons([richButton.callback('« Back to Cinema & Stars', encodeCallback(id, 'category', 'cinema'))]);
+          b.validate();
+          return editOrSend(ctx, b.toJSON());
+        }
         case 'edit':
           if (!isMain) {
             await ctx.reply?.('<blockquote>🔒 Only the General Studio Owner can edit system settings ♡</blockquote>', { parse_mode: 'HTML' });

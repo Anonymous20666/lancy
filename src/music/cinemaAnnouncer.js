@@ -316,13 +316,13 @@ export class CinemaVcAnnouncer {
     return this.db?.getSetting?.(`cinema.announceGroup.${cid}`, true) !== false;
   }
 
-  async onTrackStart({ chatId, track, session } = {}) {
+  async onTrackStart({ chatId, track, session, forceBoost = false, initiatorUserId = null } = {}) {
     const cid = Number(chatId);
     if (!Number.isFinite(cid) || cid >= 0) return null;
     if (!track || track.provider !== 'movie' || track.isAdult) return null;
     if (session?.isChannel) return null;
 
-    if (session?._suppressCinemaAnnounce) {
+    if (session?._suppressCinemaAnnounce && !forceBoost) {
       session._suppressCinemaAnnounce = false;
       return { skipped: 'suppressed_resume' };
     }
@@ -334,11 +334,21 @@ export class CinemaVcAnnouncer {
       return { skipped: 'disabled_for_group' };
     }
 
+    if (this.app?.starsBilling?.canBroadcastChat) {
+      const gate = this.app.starsBilling.canBroadcastChat(cid, {
+        initiatorUserId: initiatorUserId ?? track?.requesterId ?? null,
+        consumeSingle: true
+      });
+      if (!gate.allowed) {
+        return { skipped: 'stars_required' };
+      }
+    }
+
     const titleKey = normalizeAnnounceTitleKey(track.title || '');
     if (!titleKey) return { skipped: 'empty_title' };
 
     const botId = this.#botIdForSession(session);
-    if (this.#wasRecentlyAnnounced(botId, cid, titleKey)) {
+    if (!forceBoost && this.#wasRecentlyAnnounced(botId, cid, titleKey)) {
       return { skipped: 'already_announced' };
     }
 

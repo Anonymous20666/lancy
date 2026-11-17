@@ -55,6 +55,8 @@ import { MatchedLyrics } from './music/lyrics.js';
 import { AccountStore } from './music/accounts.js';
 import { MusicService } from './music/service.js';
 import { CinemaVcAnnouncer } from './music/cinemaAnnouncer.js';
+import { StarsBillingService } from './music/starsBilling.js';
+import { MovieScheduleService } from './music/movieScheduler.js';
 import { MovieApiClient } from './media/movieApi.js';
 import { SubtitleService } from './media/subtitles.js';
 import { MovieStreamResolver } from './media/movieResolver.js';
@@ -199,7 +201,9 @@ export class LancyApp {
     this.movieDownloader = new MovieDownloader({ app: this, log: this.log });
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
+    this.starsBilling = new StarsBillingService({ app: this, db: this.db, settings: this.settings, log: this.log });
     this.cinemaAnnouncer = new CinemaVcAnnouncer({ app: this, db: this.db, queueManager: this.musicQueueManager, log: this.log });
+    this.movieScheduler = new MovieScheduleService({ app: this, db: this.db, settings: this.settings, log: this.log });
 
     // ── Screens ──
     this.screens = new Map();
@@ -319,9 +323,10 @@ export class LancyApp {
     const restored = await this.whatsapp.restore();
     if (restored) this.log.info({ count: restored }, 'whatsapp sessions restored');
 
-    // Start the AI worker & autonomous scheduler.
+    // Start the AI worker & autonomous schedulers.
     this.ai.start();
     this.scheduler.start();
+    this.movieScheduler.start();
 
     // Media cache cleanup interval.
     if (this.settings.get('storage.automaticCleanup')) {
@@ -414,6 +419,7 @@ export class LancyApp {
     clearInterval(this.cleanupTimer);
     clearInterval(this.triggerInterval);
     this.scheduler?.stop();
+    this.movieScheduler?.stop();
     await this.telegram.controller?.stop();
     await this.multiBotManager?.stopAll();
     await this.musicQueueManager?.shutdown();

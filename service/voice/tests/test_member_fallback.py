@@ -36,3 +36,17 @@ class ExistingMemberTests(unittest.IsolatedAsyncioTestCase):
   self.b.accounts['one']['allowed']=['-1'];self.b.stream.side_effect=RuntimeError('private-session-fixture-do-not-print')
   with self.assertRaises(RuntimeError):await self.b.play({'chat_id':-1,'stream_url':str(self.file),'playback_id':'test','duration_seconds':2})
   status=await self.b.status(-1);self.assertEqual(status['last_failure']['kind'],'RuntimeError');self.assertNotIn('private-session-fixture',str(status))
+ async def test_register_replaces_failed_auth_entry_and_transient_health_keeps_uid(self):
+  self.b.accounts['stale']={'alias':'stale','enabled':True,'allowed':['*'],'status':'authentication_required','leases':set(),'client':None,'engine':None,'managed':set(),'denied':[],'group_grants':set(),'member_fallback_enabled':False}
+  orig_factory=self.b.factory
+  async def multi_factory(alias,*args):return self.client,self.engine,(56 if alias=='stale' else 55)
+  self.b.factory=multi_factory
+  await self.b.register({'alias':'stale','session':'s2','allowed':['*']})
+  self.assertEqual(self.b.accounts['stale']['status'],'available')
+  self.client.get_me.side_effect=OSError('transient socket reset')
+  self.b.factory=None
+  try:
+   await self.b.refresh_health()
+   self.assertEqual(self.b.accounts['one']['status'],'available')
+  finally:
+   self.b.factory=orig_factory

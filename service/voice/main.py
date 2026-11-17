@@ -73,6 +73,7 @@ def _write_sub_config(
     auto_normalize=True,
     force_check_seq=0,
     render_screen=True,
+    pts_anchored=False,
 ):
     global _CFG_REV_COUNTER
     cfg_path = av_sync.sub_config_path_for(sync_id)
@@ -88,6 +89,7 @@ def _write_sub_config(
     payload = {
         'enabled': bool(enabled and subtitle_path),
         'render_screen': bool(render_screen),
+        'pts_anchored': bool(pts_anchored),
         'subtitle_path': str(subtitle_path or ''),
         'base_sec': round(float(base_sec or 0.0), 4),
         'subtitle_offset': round(float(subtitle_offset or 0.0), 3),
@@ -303,6 +305,7 @@ MESSAGES = {
     'CALL_FAILED': 'Telegram could not complete the call operation. Check account health, membership and call permissions.',
     'INVALID_REQUEST': 'Invalid voice-engine request.',
     'ACCOUNT_LIMIT': 'The playback pool has reached its eight-account limit.',
+    'POOL_EXHAUSTED': 'All active playback assistants are currently streaming video in other chats. Try again after a show finishes or add another assistant.',
 }
 
 class VoiceFailure(Exception):
@@ -1035,6 +1038,7 @@ class Bridge:
         self.factory = factory
         self.accounts = {}
         self.calls = {}
+        self.secondary_tiles = {}
         self.prepared = {}
         self.last_failures = {}
         self.last_ended_positions = {}
@@ -1053,7 +1057,12 @@ class Bridge:
         alias = str(data.get('alias', ''))
         if not re.fullmatch(r'[a-z0-9_-]{1,24}', alias): raise VoiceFailure('INVALID_REQUEST')
         async with self.lock:
-            if alias in self.accounts: raise VoiceFailure('ACCOUNT_UNAVAILABLE')
+            existing_acc = self.accounts.get(alias)
+            if existing_acc:
+                if existing_acc.get('status') == 'authentication_required' and existing_acc.get('client') is None and not existing_acc.get('leases'):
+                    self.accounts.pop(alias, None)
+                else:
+                    raise VoiceFailure('ACCOUNT_UNAVAILABLE')
             if len(self.accounts) >= 8: raise VoiceFailure('ACCOUNT_LIMIT')
             self.accounts[alias] = {'alias': alias, 'enabled': bool(data.get('enabled', True)), 'allowed': list(data.get('allowed', [])), 'status': 'connecting', 'leases': set(), 'client': None, 'engine': None, 'managed': set(int(x) for x in data.get('managed_destinations', [])), 'denied': list(data.get('denied', [])), 'group_grants': set(), 'member_fallback_enabled': bool(data.get('allow_existing_member_groups', False))}
         account = self.accounts[alias]
@@ -1135,8 +1144,10 @@ class Bridge:
                     if not self.factory:
                         account['me_checked_at'] = time.monotonic()
             except Exception as error:
-                if not self.factory and account.get('uid') and (isinstance(error, TimeoutError) or classify(error) in {'RATE_LIMITED', 'NO_ACTIVE_CALL'}):
+                if not self.factory and account.get('uid') and (isinstance(error, (TimeoutError, ConnectionError, OSError)) or classify(error) in {'RATE_LIMITED', 'NO_ACTIVE_CALL'}):
+                    log.warning('Transient account health check error alias=%s kind=%s', account.get('alias'), type(error).__name__)
                     continue
+                log.warning('Account health failed alias=%s kind=%s', account.get('alias'), type(error).__name__)
                 account['status'] = 'authentication_required'
 
     def public_accounts(self, chat=None):
@@ -1200,16 +1211,40 @@ class Bridge:
         results = await asyncio.gather(*(candidate(a) for a in list(self.accounts.values())))
         return {'ok': True, 'accounts': [a for a in results if a]}
 
-    async def lease(self, chat, alias=None):
+    def _active_video_calls_for_account(self, alias):
+        count = 0
+        for c in self.calls.values():
+            if c.get('alias') == alias and c.get('video') and c.get('status') in {'playing', 'paused', 'buffering'}:
+                count += 1
+        for tile in self.secondary_tiles.values():
+            if tile.get('alias') == alias and tile.get('status') in {'playing', 'paused', 'buffering'}:
+                count += 1
+        return count
+
+    async def lease(self, chat, alias=None, *, exclude_aliases=None, for_video=False, max_video_calls=None):
+        excluded = set(exclude_aliases or ())
         async with self.lock:
-            existing = self.calls.get(chat) or self.prepared.get(chat)
+            existing = None if excluded else (self.calls.get(chat) or self.prepared.get(chat))
             if existing:
                 account = self.accounts.get(existing['alias'])
                 if not account or (alias and alias != account['alias']): raise VoiceFailure('ACCOUNT_UNAVAILABLE')
             else:
-                candidates = [a for a in self.accounts.values() if a['enabled'] and a['status'] == 'available' and self.destination_authorized(a, chat) and (not alias or a['alias'] == alias)]
-                if not candidates: raise VoiceFailure('ACCOUNT_UNAVAILABLE' if alias else 'SESSION_NOT_READY')
-                account = min(candidates, key=lambda a: len(a['leases']))
+                candidates = [
+                    a for a in self.accounts.values()
+                    if a['enabled']
+                    and a['status'] == 'available'
+                    and a['alias'] not in excluded
+                    and self.destination_authorized(a, chat)
+                    and (not alias or a['alias'] == alias)
+                ]
+                if not candidates: raise VoiceFailure('ACCOUNT_UNAVAILABLE' if (alias or excluded) else 'SESSION_NOT_READY')
+                if for_video and max_video_calls is not None and int(max_video_calls) >= 1:
+                    cap = int(max_video_calls)
+                    under_cap = [a for a in candidates if self._active_video_calls_for_account(a['alias']) < cap]
+                    if not under_cap:
+                        raise VoiceFailure('POOL_EXHAUSTED')
+                    candidates = under_cap
+                account = min(candidates, key=lambda a: (self._active_video_calls_for_account(a['alias']), len(a['leases']), a['alias']))
             if not account['enabled'] or account['status'] != 'available' or not self.destination_authorized(account, chat): raise VoiceFailure('ACCOUNT_UNAVAILABLE')
         if not self.owner_allowed(account, chat):
             try: await asyncio.wait_for(self.verify_existing_group_member(account, chat), 25)
@@ -1652,7 +1687,10 @@ class Bridge:
                         self.release_destination(a, chat)
                 return {'ok': True}
             was_prepared = chat in self.prepared or chat in self.calls
-            a = await self.lease(chat, data.get('account_alias'))
+            max_vid_raw = data.get('max_video_calls_per_account')
+            max_vid_cap = int(max_vid_raw) if max_vid_raw is not None and int(max_vid_raw) > 0 else None
+            a = await self.lease(chat, data.get('account_alias'), for_video=bool(data.get('video')), max_video_calls=max_vid_cap)
+            await self._stop_secondary_tile_unlocked(chat)
             self.prepared.setdefault(chat, {'alias': a['alias']})
             if stage == 'identity':
                 try:
@@ -2007,6 +2045,7 @@ class Bridge:
             auto_normalize=True,
             force_check_seq=int(call.get('_sub_force_check_seq') or 0),
             render_screen=bool(call.get('subtitle_render_screen', True)),
+            pts_anchored=bool(call.get('_pts_anchored')),
         )
         _bump_sub_gen(sid)
         return True
@@ -2041,7 +2080,7 @@ class Bridge:
     def _apply_probe_sub_result(self, chat, call, res, *, is_same_route=False, force_normalize=False):
         if not isinstance(res, dict):
             return False
-        aligned = round(max(-25.0, min(25.0, float(res.get('offset') or 0.0))), 1)
+        aligned = round(max(-180.0, min(180.0, float(res.get('offset') or 0.0))), 1)
         drift_rate = sub_align.clamp_drift_rate(res.get('drift_sec_per_sec') or 0.0)
         drift_anchor = float(res.get('drift_anchor_sec') or 0.0)
         drift_mpm = round(drift_rate * 60000.0, 2)
@@ -2130,6 +2169,9 @@ class Bridge:
             return
         if not call.get('sub_config_path') or not call.get('av_sync_id'):
             return
+        if not force_normalize and sub_align.host_load_pressure() >= 0.85:
+            # Under tight CPU load, avoid spawning a duplicate FFmpeg probe; LiveSubSyncMonitor handles alignment in-process.
+            return
         media_url = str(call.get('path') or '')
         if not media_url:
             return
@@ -2168,6 +2210,15 @@ class Bridge:
                     or cur.get('subtitle_path') != target_sub
                     or (cur.get('manual_sub_override') and not force_normalize)
                     or cur.get('status') not in {'playing', 'paused'}
+                ):
+                    return
+                self._sync_live_sub_monitor_state(cur)
+                if (
+                    not force_normalize
+                    and (
+                        bool((cur.get('subtitle_sync') or {}).get('auto_normalized'))
+                        or abs(float(cur.get('subtitle_offset') or 0.0)) >= 0.45
+                    )
                 ):
                     return
                 self._apply_probe_sub_result(chat, cur, res, is_same_route=is_same_route, force_normalize=force_normalize)
@@ -2479,13 +2530,22 @@ class Bridge:
             if same_epoch:
                 t_anchor = max(float(v_pkt), float(a_pkt))
                 movie_landed = max(0.0, t_anchor - base_v0)
-                seg_pts_reset = bool(hdr_v is not None and float(hdr_v) > 1.0 and (movie_landed <= 0.1 or abs(movie_landed - float(hdr_v)) > 25.0))
+                seg_pts_reset = bool(
+                    hdr_v is not None
+                    and float(hdr_v) > 1.0
+                    and (
+                        movie_landed <= 0.1
+                        or (float(hdr_v) >= 5.0 and movie_landed < float(hdr_v) * 0.25)
+                        or abs(movie_landed - float(hdr_v)) > max(60.0, float(hdr_v) * 0.25)
+                    )
+                )
                 if not seg_pts_reset:
                     sync_copyts = True
                     sync_trim_start = round(max(0.0, t_anchor), 3)
                     sync_pts_anchor = sync_trim_start
                     sync_strip_first_pts_zero = False
-                    if hdr_v is None or abs(movie_landed - offset_val) <= 30.0:
+                    dur_cap = float(call.get('duration') or 0.0)
+                    if dur_cap <= 0.0 or movie_landed <= dur_cap + 15.0:
                         sub_shift_offset = movie_landed
                         call['_landed_offset'] = movie_landed
                 else:
@@ -2737,6 +2797,17 @@ class Bridge:
         if requested_quality == 'FHD_1080p' and final_w <= 1280 and final_h <= 720:
             bitrate_quality = 'HD_720p'
 
+        # Adaptive tight-load protection: dynamically scale encoder threads/preset & cap 1080p under multi-stream load.
+        active_vids = sum(self._active_video_calls_for_account(al) for al in self.accounts)
+        load_ratio = sub_align.host_load_pressure()
+        if (active_vids >= 3 or load_ratio >= 0.85) and requested_quality == 'FHD_1080p' and final_w > 1280:
+            scaled_down = compute_target_video_size(final_w, final_h, 1280, 720, adjust_by_height=True)
+            if scaled_down:
+                final_w, final_h = scaled_down
+            scale_needed = not (info and not is_img and int(info.get('width') or 0) == final_w and int(info.get('height') or 0) == final_h)
+            bitrate_quality = 'HD_720p'
+        enc_threads = 2 if (active_vids >= 3 or load_ratio >= 0.75) else (3 if (active_vids >= 2 or load_ratio >= 0.50) else 4)
+
         has_video_stream = bool(info.get('video_count', 1 if video_active else 0) > 0)
         has_audio_stream = bool(info.get('audio_count', 1) > 0)
         sub_raw = call.get('subtitle_path')
@@ -2749,6 +2820,7 @@ class Bridge:
         eff_v_trim = plan['hls_video_trim_start'] if (plan['hls_video_trim_start'] is not None and not is_img) else (plan['sync_trim_start'] if not is_img else None)
         eff_a_trim = plan['hls_audio_trim_start'] if (plan['hls_audio_trim_start'] is not None and not is_img) else (plan['sync_trim_start'] if not is_img else None)
         pts_anchor = None if is_img else plan['sync_pts_anchor']
+        call['_pts_anchored'] = bool(pts_anchor is not None)
 
         old_sub_cfg = call.pop('sub_config_path', None)
         if old_sub_cfg:
@@ -2781,6 +2853,7 @@ class Bridge:
                 auto_normalize=True,
                 force_check_seq=int(call.get('_sub_force_check_seq') or 0),
                 render_screen=bool(call.get('subtitle_render_screen', True)),
+                pts_anchored=bool(pts_anchor is not None),
             )
             _init_sync_state(sync_id, paused=(call.get('status') == 'paused'))
             call['av_sync_id'] = sync_id
@@ -2809,7 +2882,11 @@ class Bridge:
                 realtime=True,
                 scale_needed=scale_needed,
             )
-            rtmp_preset = 'superfast' if bitrate_quality == 'FHD_1080p' else 'veryfast'
+            rtmp_preset = (
+                'ultrafast'
+                if (active_vids >= 2 or load_ratio >= 0.65)
+                else ('superfast' if bitrate_quality == 'FHD_1080p' else 'veryfast')
+            )
             cmd_args = [
                 sys.executable,
                 RTMP_HUB_SCRIPT,
@@ -2819,6 +2896,7 @@ class Bridge:
                 '--fps', f'{eff_fps:.3f}',
                 '--video-quality', bitrate_quality,
                 '--preset', rtmp_preset,
+                '--threads', str(enc_threads),
                 '--sub-config', cfg_path,
                 '--rtmp-env', 'LANCY_RTMP_TARGET',
                 *(['--no-audio-eof'] if not has_audio_stream else []),
@@ -3078,10 +3156,12 @@ class Bridge:
                             auto_normalize=True,
                             force_check_seq=int(call.get('_sub_force_check_seq') or 0),
                             render_screen=bool(call.get('subtitle_render_screen', True)),
+                            pts_anchored=bool(eff_video_anchor is not None),
                         )
                         call['av_sync_id'] = sid
                         call['sub_config_path'] = sub_cfg_path
                         call['sub_base_sec'] = float(sub_shift_offset)
+                        call['_pts_anchored'] = bool(eff_video_anchor is not None)
 
                     wrap_a_in = stream.microphone.path
                     wrap_v_in = stream.camera.path
@@ -3238,7 +3318,10 @@ class Bridge:
         async with self.chat_lock(chat):
             path = self.resolve_media_input(data)
             sub_path = self.source_subtitle(data.get('subtitle_path'))
-            a = await self.lease(chat, data.get('account_alias'))
+            max_vid_raw = data.get('max_video_calls_per_account')
+            max_vid_cap = int(max_vid_raw) if max_vid_raw is not None and int(max_vid_raw) > 0 else None
+            a = await self.lease(chat, data.get('account_alias'), for_video=bool(data.get('video')), max_video_calls=max_vid_cap)
+            await self._stop_secondary_tile_unlocked(chat)
             previous = self.calls.get(chat)
             if previous and previous['playback_id'] == data.get('playback_id'): return {'ok': True, 'account_alias': a['alias'], 'status': previous['status'], 'stream_mode': previous.get('stream_mode', 'interactive')}
             req_mode = str(data.get('stream_mode') or '').strip().lower()
@@ -3424,6 +3507,7 @@ class Bridge:
             hot_paused = False
             hot_resumed = False
             if op == 'stop':
+                await self._stop_secondary_tile_unlocked(chat)
                 if is_rtmp:
                     await self._stop_rtmp_proc(call, wait_settle=False)
                 self._cleanup_sub_overlay(call)
@@ -3439,6 +3523,7 @@ class Bridge:
                 self.calls.pop(chat, None); self.prepared.pop(chat, None); self.last_ended_positions.pop(chat, None); self.release_destination(a, chat); a.get('group_grants', set()).discard(chat)
                 return {'ok': True, 'status': 'stopped'}
             if op == 'idle':
+                await self._stop_secondary_tile_unlocked(chat)
                 self._cleanup_sub_overlay(call)
                 if is_rtmp:
                     call['status'] = 'idle'; call['playback_id'] = None; call['position_seconds'] = None
@@ -3523,6 +3608,16 @@ class Bridge:
                                         _set_sync_paused(call.get('av_sync_id'), True)
                                 raise
                 call['status'] = 'paused' if op == 'pause' else 'playing'; call['last_progress'] = time.monotonic()
+                tile = self.secondary_tiles.get(chat)
+                if tile:
+                    a2 = self.accounts.get(tile.get('alias'))
+                    eng2 = a2.get('engine') if a2 else None
+                    if eng2 is not None and hasattr(eng2, op):
+                        try:
+                            await asyncio.wait_for(getattr(eng2, op)(chat), 6)
+                            tile['status'] = call['status']
+                        except Exception:
+                            pass
             elif op == 'volume':
                 volume = int(data['volume'])
                 if not 0 <= volume <= 200: raise VoiceFailure('INVALID_REQUEST')
@@ -3828,6 +3923,7 @@ class Bridge:
                 if not ignore_leave_error and classify(leave_error) != 'NO_ACTIVE_CALL':
                     raise
         self._cleanup_sub_overlay(call)
+        await self._stop_secondary_tile_unlocked(chat)
         self.calls.pop(chat, None)
         self.prune_shifted_subtitles()
         if a is not None:
@@ -3945,7 +4041,123 @@ class Bridge:
                     info_out['av_sync'] = sync_m
                     if is_rtmp:
                         info_out['rtmp_pipeline_delay_sec'] = float(sync_m.get('pipeline_delay_sec') or 0.0)
+            tile = self.secondary_tiles.get(chat)
+            if tile:
+                info_out['secondary_tile'] = {
+                    'alias': tile.get('alias'),
+                    'language': tile.get('language'),
+                    'label': tile.get('label'),
+                    'status': tile.get('status'),
+                }
             return {'ok': True, 'active': True, 'last_failure': self.last_failures.get(chat), 'info': info_out}
+
+    async def _stop_secondary_tile_unlocked(self, chat):
+        tile = self.secondary_tiles.pop(chat, None)
+        if not tile:
+            return False
+        self._cleanup_sub_overlay(tile)
+        a2 = self.accounts.get(tile.get('alias'))
+        eng2 = a2.get('engine') if a2 else None
+        if eng2 is not None:
+            clear_engine_cache(eng2, chat)
+            try:
+                await asyncio.wait_for(eng2.leave_call(chat), 10)
+            except Exception:
+                pass
+        if a2 is not None:
+            self.release_destination(a2, chat)
+        return True
+
+    async def start_secondary_tile(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0 or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        sub_path = self.source_subtitle(data.get('subtitle_path'))
+        if not sub_path:
+            raise VoiceFailure('INVALID_REQUEST')
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call or call.get('status') not in {'playing', 'paused'}:
+                raise VoiceFailure('NO_ACTIVE_CALL')
+            if call.get('is_channel') or call.get('stream_mode') == 'rtmp' or not call.get('video'):
+                raise VoiceFailure('INVALID_REQUEST')
+            await self._stop_secondary_tile_unlocked(chat)
+            primary_a = self.accounts.get(call['alias'])
+            elapsed = 0.0
+            if primary_a and primary_a.get('engine') is not None:
+                try:
+                    elapsed = await self._call_elapsed_seconds(primary_a['engine'], chat, call, timeout=2.0)
+                except Exception:
+                    elapsed = 0.0
+            sync_pos = max(0.0, float(call.get('offset') or 0.0) + elapsed)
+            max_vid_raw = data.get('max_video_calls_per_account')
+            max_vid_cap = int(max_vid_raw) if max_vid_raw is not None and int(max_vid_raw) > 0 else None
+            a2 = await self.lease(
+                chat,
+                data.get('account_alias'),
+                exclude_aliases={call['alias']},
+                for_video=True,
+                max_video_calls=max_vid_cap,
+            )
+            tile = {
+                'alias': a2['alias'],
+                'path': call['path'],
+                'remote_proxy': call.get('remote_proxy', False),
+                'video': True,
+                'video_quality': call.get('video_quality') or 'HD_720p',
+                'subtitle_path': sub_path,
+                'subtitle_offset': float(data.get('subtitle_offset') or 0.0),
+                'subtitle_same_route': False,
+                'subtitle_render_screen': True,
+                'sub_drift_sec_per_sec': 0.0,
+                'sub_drift_anchor_sec': 0.0,
+                'manual_sub_override': True,
+                'language': str(data.get('language') or 'sub'),
+                'label': str(data.get('label') or 'Secondary Subtitles')[:64],
+                'offset': sync_pos,
+                'status': 'playing' if call.get('status') == 'playing' else 'paused',
+                'is_channel': False,
+            }
+            try:
+                if self.factory:
+                    if hasattr(a2['engine'], 'play'):
+                        await asyncio.wait_for(a2['engine'].play(chat, f'secondary:{sub_path}'), 15)
+                else:
+                    from pytgcalls.types import MediaStream, VideoQuality, GroupCallConfig
+                    base_path = re.sub(r'[?&]start=[0-9.]+', '', str(call['path'] or ''))
+                    known_hls = bool(call.get('remote_proxy') and '.m3u8' in base_path.lower())
+                    eff_path = f"{base_path}{'&' if '?' in base_path else '?'}start={sync_pos:.3f}" if (known_hls and sync_pos > 0.05) else base_path
+                    ff = f'-ss {sync_pos:.3f}' if (sync_pos > 0.05 and not known_hls) else ''
+                    info = await self.inspect_media(eff_path, False)
+                    active_sub = await self._prepare_subtitle_overlay_for_call(tile, sub_path, base_sec=0.0 if (known_hls and sync_pos > 0.05) else sync_pos, info=info)
+                    vf = build_video_subtitle_filter(active_sub) if active_sub else ''
+                    if vf:
+                        ff = f'{ff} --video ---mid -vf {shlex.quote(vf)}'.strip()
+                    vq = VideoQuality.HD_720p if str(tile['video_quality']) != 'SD_480p' else VideoQuality.SD_480p
+                    stream = MediaStream(eff_path, audio_parameters=None, video_parameters=vq, ffmpeg_parameters=ff or None, video_flags=MediaStream.Flags.REQUIRED)
+                    await asyncio.wait_for(a2['engine'].play(chat, stream, config=GroupCallConfig(join_muted=True, auto_start=False)), 20)
+                    if call.get('status') == 'paused' and hasattr(a2['engine'], 'pause'):
+                        await asyncio.wait_for(a2['engine'].pause(chat), 5)
+            except Exception:
+                self._cleanup_sub_overlay(tile)
+                self.release_destination(a2, chat)
+                raise
+            self.secondary_tiles[chat] = tile
+            return {
+                'ok': True,
+                'account_alias': a2['alias'],
+                'language': tile['language'],
+                'label': tile['label'],
+                'position_seconds': sync_pos,
+            }
+
+    async def stop_secondary_tile(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0 or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        async with self.chat_lock(chat):
+            stopped = await self._stop_secondary_tile_unlocked(chat)
+            return {'ok': True, 'stopped': stopped}
 
     async def shutdown(self):
         self.closing = True
@@ -3953,6 +4165,9 @@ class Bridge:
         if mon_task is not None and not mon_task.done():
             mon_task.cancel()
             await asyncio.gather(mon_task, return_exceptions=True)
+        for chat in list(self.secondary_tiles):
+            try: await self._stop_secondary_tile_unlocked(chat)
+            except Exception: pass
         for chat in list(self.calls):
             try: await self.control('stop', {'chat_id': chat})
             except Exception: log.warning('Call cleanup failed destination=%s', chat)
@@ -4001,12 +4216,15 @@ def make_app(bridge, token):
     async def call_settings(request): return web.json_response(await bridge.update_call_settings(await request.json()))
     async def call_message(request): return web.json_response(await bridge.send_call_message(await request.json()))
     async def call_messages_delete(request): return web.json_response(await bridge.delete_call_messages(await request.json()))
+    async def secondary_tile_start(request): return web.json_response(await bridge.start_secondary_tile(await request.json()))
+    async def secondary_tile_stop(request): return web.json_response(await bridge.stop_secondary_tile(await request.json()))
     app.router.add_get('/events', events)
     app.router.add_get('/health', health); app.router.add_get('/accounts', accounts)
     app.router.add_post('/accounts/register', register); app.router.add_post('/accounts/configure', configure)
     app.router.add_post('/destination/setup', setup); app.router.add_post('/destination/existing-group', existing)
     app.router.add_post('/call/play', play); app.router.add_get('/call/status', status); app.router.add_get('/call/invite-link', call_invite)
     app.router.add_post('/call/settings', call_settings); app.router.add_post('/call/message', call_message); app.router.add_post('/call/messages/delete', call_messages_delete)
+    app.router.add_post('/call/secondary-tile/start', secondary_tile_start); app.router.add_post('/call/secondary-tile/stop', secondary_tile_stop)
     app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek|subtitle|subcheck}', control)
     async def cleanup(_): await bridge.shutdown()
     app.on_cleanup.append(cleanup)

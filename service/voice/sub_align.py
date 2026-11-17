@@ -17,6 +17,226 @@ import threading
 import time
 import urllib.request
 
+_WHISPER_LOCK = threading.Lock()
+_WHISPER_MODEL = None
+_WHISPER_UNAVAILABLE = False
+
+
+def host_load_pressure():
+    """Return normalized 1-minute CPU load ratio (load1 / cpu_count), or 0.0 if unavailable."""
+    try:
+        l1 = float(os.getloadavg()[0])
+        cpus = max(1, int(os.cpu_count() or 4))
+        return round(max(0.0, l1 / float(cpus)), 3)
+    except Exception:
+        return 0.0
+
+
+def _whisper_cache_dir():
+    env_dir = str(os.environ.get('LANCY_WHISPER_DIR') or '').strip()
+    if env_dir:
+        return env_dir
+    repo_root = Path(__file__).resolve().parents[2]
+    data_dir = Path(os.environ.get('DATA_DIR') or (repo_root / 'data'))
+    if not data_dir.is_absolute():
+        data_dir = (repo_root / data_dir).resolve()
+    return str(data_dir / 'cache' / 'whisper')
+
+
+def _pcm8k_to_float16k(pcm_s16le_8k):
+    """Fast 8kHz s16le mono -> 16kHz float32 tensor for Silero VAD & Whisper ASR."""
+    import numpy as np
+    usable = len(pcm_s16le_8k) - (len(pcm_s16le_8k) % 2)
+    if usable <= 0:
+        return None
+    s16 = np.frombuffer(pcm_s16le_8k[:usable], dtype=np.int16).astype(np.float32) / 32768.0
+    if len(s16) < 4:
+        return None
+    x_new = np.linspace(0.0, float(len(s16) - 1), len(s16) * 2, dtype=np.float32)
+    x_old = np.arange(len(s16), dtype=np.float32)
+    return np.interp(x_new, x_old, s16).astype(np.float32)
+
+
+def _silero_vad_spans(pcm_s16le_8k):
+    """Detect neural Silero VAD speech spans [(start_sec, end_sec)] cleanly rejecting BGM/SFX."""
+    try:
+        from faster_whisper.vad import get_speech_timestamps, VadOptions
+        audio16 = _pcm8k_to_float16k(pcm_s16le_8k)
+        if audio16 is None or len(audio16) < 16000:
+            return []
+        chunks = get_speech_timestamps(
+            audio16,
+            VadOptions(min_silence_duration_ms=260, min_speech_duration_ms=220),
+        )
+        return [(c['start'] / 16000.0, c['end'] / 16000.0) for c in (chunks or []) if c.get('end', 0) > c.get('start', 0)]
+    except Exception:
+        return []
+
+
+def _get_whisper_model(*, cpu_threads=1):
+    global _WHISPER_MODEL, _WHISPER_UNAVAILABLE
+    if _WHISPER_UNAVAILABLE:
+        return None
+    if _WHISPER_MODEL is not None:
+        return _WHISPER_MODEL
+    with _WHISPER_LOCK:
+        if _WHISPER_UNAVAILABLE:
+            return None
+        if _WHISPER_MODEL is not None:
+            return _WHISPER_MODEL
+        try:
+            from faster_whisper import WhisperModel
+            cdir = _whisper_cache_dir()
+            has_local = os.path.isdir(cdir) and any('whisper' in p.lower() for p in os.listdir(cdir))
+            os.makedirs(cdir, exist_ok=True)
+            _WHISPER_MODEL = WhisperModel(
+                'tiny',
+                device='cpu',
+                compute_type='int8',
+                cpu_threads=max(1, int(cpu_threads or 1)),
+                download_root=cdir,
+                local_files_only=bool(has_local),
+            )
+            return _WHISPER_MODEL
+        except Exception:
+            _WHISPER_UNAVAILABLE = True
+            return None
+
+
+def _cue_tokens(text):
+    clean = _SDH_BRACKET_RE.sub(' ', str(text or '').replace('\\N', ' ').replace('\n', ' '))
+    clean = _SDH_MUSIC_LINE_RE.sub(' ', clean)
+    clean = _SDH_SPEAKER_PREFIX_RE.sub('', clean.strip())
+    return [w for w in re.findall(r"[a-z0-9']+", clean.lower()) if len(w) >= 2]
+
+
+def _cues_are_english_latin(cues):
+    sample = ' '.join(str(t or '') for _, _, t in (cues or [])[:40])
+    letters = [ch for ch in sample if ch.isalpha()]
+    if len(letters) < 12:
+        return False
+    ascii_letters = sum(1 for ch in letters if 'a' <= ch.lower() <= 'z')
+    return (ascii_letters / float(len(letters))) >= 0.75
+
+
+def align_speech_transcript_to_cues(
+    pcm_s16le_8k,
+    cues,
+    probe_start_sec,
+    *,
+    max_shift_sec=180.0,
+    cpu_threads=1,
+    model=None,
+):
+    """Word/phrase-level Whisper ASR offset alignment against cue texts over wide (±180s) cut differences."""
+    if not pcm_s16le_8k or not cues:
+        return {'ok': False, 'reason': 'insufficient_inputs', 'offset': 0.0, 'confident': False}
+    mdl = model if model is not None else _get_whisper_model(cpu_threads=cpu_threads)
+    if mdl is None:
+        return {'ok': False, 'reason': 'asr_unavailable', 'offset': 0.0, 'confident': False}
+    try:
+        audio16 = _pcm8k_to_float16k(pcm_s16le_8k)
+        if audio16 is None or len(audio16) < 16000 * 6:
+            return {'ok': False, 'reason': 'short_audio', 'offset': 0.0, 'confident': False}
+        dur_sec = len(audio16) / 16000.0
+        lang_hint = 'en' if _cues_are_english_latin(cues) else None
+        segs_iter, _info = mdl.transcribe(
+            audio16,
+            language=lang_hint,
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            vad_filter=True,
+        )
+        segs = [(float(s.start), float(s.end), str(s.text or '').strip()) for s in segs_iter]
+    except Exception as err:
+        return {'ok': False, 'reason': f'asr_error:{type(err).__name__}', 'offset': 0.0, 'confident': False}
+
+    spoken_segs = []
+    for st, en, txt in segs:
+        toks = _cue_tokens(txt)
+        if len(toks) >= 2:
+            spoken_segs.append((st, en, set(toks), toks))
+    if len(spoken_segs) < 2:
+        return {'ok': False, 'reason': 'few_asr_segments', 'offset': 0.0, 'confident': False}
+
+    win_lo = float(probe_start_sec) - float(max_shift_sec) - 5.0
+    win_hi = float(probe_start_sec) + dur_sec + float(max_shift_sec) + 5.0
+    cand_cues = []
+    for s_ms, e_ms, txt in filter_speech_cues(cues):
+        cs = s_ms / 1000.0
+        if win_lo <= cs <= win_hi:
+            toks = _cue_tokens(txt)
+            if len(toks) >= 2:
+                cand_cues.append((cs, set(toks), len(toks)))
+    if len(cand_cues) < 3:
+        return {'ok': False, 'reason': 'few_cand_cues', 'offset': 0.0, 'confident': False}
+
+    matches = []
+    for st, _en, seg_set, seg_list in spoken_segs:
+        abs_t = float(probe_start_sec) + st
+        for cs, cue_set, cue_len in cand_cues:
+            delta = abs_t - cs
+            if abs(delta) > float(max_shift_sec):
+                continue
+            ov = len(seg_set & cue_set)
+            if ov < 2:
+                continue
+            recall = ov / float(min(len(seg_list), cue_len))
+            jacc = ov / float(len(seg_set | cue_set))
+            if (ov >= 3 and recall >= 0.35) or (ov >= 2 and jacc >= 0.45):
+                matches.append((delta, ov * (recall + jacc), cs))
+
+    total_words = sum(len(s[3]) for s in spoken_segs)
+    if not matches:
+        return {
+            'ok': False,
+            'reason': 'asr_mismatch' if (len(spoken_segs) >= 4 and total_words >= 12) else 'asr_no_match',
+            'offset': 0.0,
+            'confident': False,
+            'used_cues': len(cand_cues),
+        }
+
+    # Find strongest cluster within +-0.9s tolerance
+    best_cluster = None
+    best_w = 0.0
+    for center_d, _, _ in matches:
+        grp = [m for m in matches if abs(m[0] - center_d) <= 0.9]
+        distinct_cues = {round(m[2], 2) for m in grp}
+        w_sum = sum(m[1] for m in grp)
+        if (len(distinct_cues) >= 2 or (len(grp) >= 1 and w_sum >= 3.2)) and w_sum > best_w:
+            best_w = w_sum
+            best_cluster = grp
+
+    if not best_cluster:
+        return {'ok': False, 'reason': 'asr_weak_cluster', 'offset': 0.0, 'confident': False}
+
+    mean_d = sum(m[0] * m[1] for m in best_cluster) / sum(m[1] for m in best_cluster)
+    runner_w = max(
+        (
+            sum(m[1] for m in matches if abs(m[0] - c_d) <= 0.9)
+            for c_d, _, _ in matches
+            if abs(c_d - mean_d) > 1.8
+        ),
+        default=0.0,
+    )
+    if runner_w > 0.0 and best_w < runner_w * 1.4:
+        return {'ok': False, 'reason': 'asr_ambiguous', 'offset': 0.0, 'confident': False}
+
+    aligned = round(max(-180.0, min(180.0, mean_d)), 1)
+    distinct_hits = len({round(m[2], 2) for m in best_cluster})
+    return {
+        'ok': True,
+        'offset': aligned,
+        'raw_best_offset': aligned,
+        'z_score': round(min(9.5, 4.2 + distinct_hits * 0.9), 2),
+        'confident': True,
+        'in_sync': abs(aligned) < 0.45,
+        'used_cues': distinct_hits,
+        'method': 'asr',
+    }
+
+
 PROMO_SUB_RE = re.compile(
     r'\b(?:opensubtitles\.(?:org|com)|osdb\.link|subscene\.com|yify-?subtitles|addic7ed\.com|'
     r'podnapisi\.net|hoofoot\.ru|subdl\.com|subf2m\.|subtitlecat\.|tvsubtitles\.|titlovi\.com|'
@@ -412,7 +632,7 @@ def choose_probe_window(cues, seek_offset=0.0, window_sec=120.0):
     return max(0.0, starts[0] - 4.0) if starts else 0.0, min(window_sec, max(45.0, max_t + 10.0))
 
 
-def _speech_activity_envelope(pcm_s16le_8k, bin_sec=0.1, sample_rate=8000):
+def _speech_activity_envelope(pcm_s16le_8k, bin_sec=0.1, sample_rate=8000, use_neural_vad=False):
     samples = array('h')
     samples.frombytes(pcm_s16le_8k[:len(pcm_s16le_8k) - (len(pcm_s16le_8k) % 2)])
     step = max(1, int(round(sample_rate * bin_sec)))
@@ -443,6 +663,21 @@ def _speech_activity_envelope(pcm_s16le_8k, bin_sec=0.1, sample_rate=8000):
         raw_v = min(1.0, 0.72 * level + 0.45 * min(1.0, flux / 0.85))
         act[i] = raw_v
 
+    if use_neural_vad and sample_rate == 8000 and n_bins >= 120 and host_load_pressure() < 0.85:
+        vad_spans = _silero_vad_spans(pcm_s16le_8k)
+        total_vad = sum(max(0.0, e - s) for s, e in vad_spans)
+        if len(vad_spans) >= 2 and total_vad >= 1.5:
+            vad_mask = [False] * n_bins
+            for sp_s, sp_e in vad_spans:
+                b0 = max(0, int(round(sp_s / bin_sec)))
+                b1 = min(n_bins, int(round(sp_e / bin_sec)) + 1)
+                for b in range(b0, b1):
+                    vad_mask[b] = True
+            act = [
+                (max(0.82, act[b]) if vad_mask[b] else (act[b] * 0.15))
+                for b in range(n_bins)
+            ]
+
     gap_bins = max(3, int(round(0.4 / bin_sec)))
     onset = [0.0] * n_bins
     for i in range(gap_bins, n_bins):
@@ -461,6 +696,7 @@ def correlate_speech_and_cues(
     same_route=False,
     min_cues=6,
     min_z=None,
+    use_neural_vad=False,
 ):
     """Cross-correlate vocal-band modulation & onsets against subtitle dialogue intervals.
 
@@ -468,7 +704,7 @@ def correlate_speech_and_cues(
     in a single scene cannot produce false shift adjustments.
     """
     bin_sec = 0.1
-    act, onset = _speech_activity_envelope(pcm_s16le_8k, bin_sec=bin_sec, sample_rate=8000)
+    act, onset = _speech_activity_envelope(pcm_s16le_8k, bin_sec=bin_sec, sample_rate=8000, use_neural_vad=use_neural_vad)
     n_audio = len(act)
     if n_audio < 100 or not cues:
         return {'ok': False, 'reason': 'insufficient_audio_or_cues', 'offset': 0.0, 'confident': False}
@@ -553,7 +789,7 @@ def correlate_speech_and_cues(
     best_base = pad_bins - best_sb
     aligned_cue_bins = sum(1 for b in cue_grid[best_base:best_base + n_audio] if b > 0.0)
     cue_duty = aligned_cue_bins / float(n_audio)
-    sane_duty = (0.08 <= cue_duty <= 0.72)
+    sane_duty = (0.08 <= cue_duty <= 0.85)
 
     # Split-window consensus check for windows >= 30s so single-scene BGM/SFX cannot bias shift
     # (short <30s windows have sub-windows <= max_shift_sec which can alias periodic cues)
@@ -733,7 +969,7 @@ def probe_audio_and_align(
     same_route=False,
     audio_stream_index=None,
     ffmpeg_bin='ffmpeg',
-    max_shift_sec=25.0,
+    max_shift_sec=45.0,
     origin_pts_sec=None,
 ):
     """Extract speech-band audio over an active dialogue window and correlate with subtitle cues."""
@@ -819,6 +1055,43 @@ def probe_audio_and_align(
             max_shift_sec=max_shift_sec if win_max_shift is None else float(win_max_shift),
             same_route=same_route,
         )
+        if (
+            win_max_shift is None
+            and host_load_pressure() < 0.85
+            and (
+                (not cor.get('confident') and not cor.get('in_sync'))
+                or (not same_route and not cor.get('confident') and float(cor.get('z_score') or 0.0) < 3.6)
+            )
+        ):
+            vad_cor = correlate_speech_and_cues(
+                proc.stdout,
+                cues,
+                eff_actual,
+                max_shift_sec=max_shift_sec,
+                same_route=same_route,
+                use_neural_vad=True,
+            )
+            if vad_cor.get('confident') or (vad_cor.get('in_sync') and float(vad_cor.get('z_score') or 0.0) > float(cor.get('z_score') or 0.0)):
+                cor = vad_cor
+        if (
+            win_max_shift is None
+            and host_load_pressure() < 0.85
+            and (
+                (not cor.get('confident') and not cor.get('in_sync'))
+                or (not same_route and not cor.get('confident') and float(cor.get('z_score') or 0.0) < 3.6)
+            )
+        ):
+            asr = align_speech_transcript_to_cues(
+                proc.stdout,
+                cues,
+                eff_actual,
+                max_shift_sec=max(180.0, float(max_shift_sec)),
+                cpu_threads=1 if host_load_pressure() >= 0.50 else 2,
+            )
+            if asr.get('ok') and asr.get('confident'):
+                cor = asr
+            elif asr.get('reason') == 'asr_mismatch' and not cor.get('in_sync'):
+                cor = {**cor, 'ok': True, 'confident': False, 'in_sync': False, 'z_score': 0.8, 'used_cues': max(4, int(asr.get('used_cues') or 4))}
         cor['window_start'] = round(eff_actual, 3)
         cor['window_sec'] = round(req_sec, 1)
         return cor, eff_actual
@@ -1058,6 +1331,8 @@ class LiveSubSyncMonitor:
         self._mismatch_streak = 0
         self._checks_run = 0
         self._confident_checks = 0
+        self._synced_streak = 0
+        self._last_asr_mono = 0.0
         self._auto_normalized = False
         self._last_gen = -1
         self._last_force_seq = 0
@@ -1234,7 +1509,7 @@ class LiveSubSyncMonitor:
         ):
             return False
         updated = dict(disk_cfg)
-        updated['subtitle_offset'] = round(max(-30.0, min(30.0, float(new_offset))), 2)
+        updated['subtitle_offset'] = round(max(-180.0, min(180.0, float(new_offset))), 2)
         updated['drift_sec_per_sec'] = round(clamp_drift_rate(new_drift), 6)
         updated['drift_anchor_sec'] = round(float(new_anchor or 0.0), 3)
         updated['cfg_rev'] = int(disk_cfg.get('cfg_rev') or 0) + 1
@@ -1278,11 +1553,12 @@ class LiveSubSyncMonitor:
             drift_sec_per_sec=cur_drift,
             drift_anchor_sec=cur_anchor,
         )
+        live_max_shift = 32.0 if (abs(cur_offset) < 0.45 or self._confident_checks < 2) else 18.0
         cor = correlate_speech_and_cues(
             bytes(self._ring),
             disp_cues,
             abs_start_sec,
-            max_shift_sec=14.0,
+            max_shift_sec=live_max_shift,
             fine_step_sec=0.1,
             same_route=False,
             min_cues=6,
@@ -1293,13 +1569,13 @@ class LiveSubSyncMonitor:
         used_cues = int(cor.get('used_cues') or 0)
         now_ts = round(time.time(), 3)
 
-        # If auto-sync previously pushed offset away from 0.0, verify unshifted timeline hasn't become superior
+        # If auto-sync previously pushed offset away from 0.0, verify unshifted timeline hasn't become strictly superior
         if abs(cur_offset) >= 0.45 and not manual_override and auto_normalize:
             cor_raw = correlate_speech_and_cues(
                 bytes(self._ring),
                 cues,
                 abs_start_sec,
-                max_shift_sec=14.0,
+                max_shift_sec=live_max_shift,
                 fine_step_sec=0.1,
                 same_route=False,
                 min_cues=6,
@@ -1310,8 +1586,8 @@ class LiveSubSyncMonitor:
                 raw_sc0 = float(cor_raw.get('score_at_0') or 0.0)
                 cur_z0 = float(cor.get('z_at_0') or 0.0) if cor.get('ok') else -999.0
                 cur_sc_best = float(cor.get('best_score') or 0.0) if cor.get('ok') else -999.0
-                if raw_z0 >= 2.6 and (
-                    cor_raw.get('in_sync') or (raw_z0 > cur_z0 + 0.4 and raw_sc0 > cur_sc_best)
+                if raw_z0 >= 2.8 and raw_sc0 > cur_sc_best and (
+                    raw_z0 > cur_z0 + 0.4 or (not cor.get('ok') and cor_raw.get('in_sync'))
                 ):
                     if self._apply_normalization(cfg, new_offset=0.0, new_drift=0.0, new_anchor=0.0):
                         self._history.clear()
@@ -1360,9 +1636,71 @@ class LiveSubSyncMonitor:
             })
             return
 
+        if not cor.get('confident') and not cor.get('in_sync') and host_load_pressure() < 0.85:
+            try:
+                vad_cor = correlate_speech_and_cues(
+                    bytes(self._ring),
+                    disp_cues,
+                    abs_start_sec,
+                    max_shift_sec=live_max_shift,
+                    fine_step_sec=0.1,
+                    same_route=False,
+                    min_cues=6,
+                    min_z=2.7,
+                    use_neural_vad=True,
+                )
+            except TypeError:
+                vad_cor = {}
+            if vad_cor.get('confident') or (vad_cor.get('in_sync') and float(vad_cor.get('z_score') or 0.0) > float(cor.get('z_score') or 0.0)):
+                cor = vad_cor
+                z_val = round(float(cor.get('z_score') or 0.0), 2)
+
         if not cor.get('confident') and not cor.get('in_sync'):
+            if (
+                auto_normalize
+                and not manual_override
+                and self._mismatch_streak >= 1
+                and host_load_pressure() < 0.80
+                and (time.monotonic() - self._last_asr_mono) >= 60.0
+            ):
+                self._last_asr_mono = time.monotonic()
+                asr_live = align_speech_transcript_to_cues(
+                    bytes(self._ring),
+                    disp_cues,
+                    abs_start_sec,
+                    max_shift_sec=150.0,
+                    cpu_threads=1,
+                )
+                if asr_live.get('ok') and asr_live.get('confident') and abs(float(asr_live.get('offset') or 0.0)) >= 0.65:
+                    target_asr_off = cur_offset + float(asr_live['offset'])
+                    if self._apply_normalization(cfg, new_offset=target_asr_off, new_drift=cur_drift, new_anchor=cur_anchor):
+                        self._auto_normalized = True
+                        self._mismatch_streak = 0
+                        self._synced_streak = 0
+                        final_asr = round(max(-180.0, min(180.0, target_asr_off)), 2)
+                        self._write_status({
+                            'status': 'auto_normalized',
+                            'checked_at_sec': round(abs_mid_sec, 1),
+                            'residual_sec': 0.0,
+                            'applied_offset_sec': final_asr,
+                            'suggested_offset_sec': final_asr,
+                            'drift_ms_per_min': round(cur_drift * 60000.0, 2),
+                            'drift_sec_per_sec': round(cur_drift, 6),
+                            'drift_anchor_sec': round(cur_anchor, 3),
+                            'z_score': float(asr_live.get('z_score') or 6.0),
+                            'confident': True,
+                            'auto_normalized': True,
+                            'manual_override': False,
+                            'checks_run': self._checks_run,
+                            'confident_checks': self._confident_checks,
+                            'mismatch_streak': 0,
+                            'message': f'ASR auto-aligned subtitles ({final_asr:+.1f}s)',
+                            'updated_at': now_ts,
+                        })
+                        return
             if used_cues >= 3 and z_val < 1.6:
                 self._mismatch_streak += 1
+            self._synced_streak = 0
             status_str = 'mismatch' if self._mismatch_streak >= 3 else 'uncertain'
             msg = (
                 'Subtitles may not match this audio cut — try switching subtitle track'
@@ -1396,7 +1734,7 @@ class LiveSubSyncMonitor:
         implied_total = cur_offset + (cur_drift * (abs_mid_sec - cur_anchor)) + residual
         self._history.append((abs_mid_sec, implied_total))
 
-        suggested_offset = round(max(-30.0, min(30.0, cur_offset + residual)), 1)
+        suggested_offset = round(max(-180.0, min(180.0, cur_offset + residual)), 1)
         new_drift = cur_drift
         new_anchor = cur_anchor
         drift_fitted = fit_linear_drift(list(self._history))
@@ -1449,7 +1787,7 @@ class LiveSubSyncMonitor:
             )
             if applied_now:
                 self._auto_normalized = True
-                final_offset = round(max(-30.0, min(30.0, target_off)), 2)
+                final_offset = round(max(-180.0, min(180.0, target_off)), 2)
                 suggested_offset = final_offset
                 residual = 0.0
                 self._consec_desync_dir = 0
@@ -1458,15 +1796,19 @@ class LiveSubSyncMonitor:
         eff_drift = new_drift if applied_now else cur_drift
         eff_anchor = (new_anchor if (applied_now and drift_fitted is not None) else cur_anchor)
         if applied_now:
+            self._synced_streak = 0
             status_str = 'auto_normalized'
             msg = f'Auto-normalized subtitles ({final_offset:+.1f}s' + (f', {eff_drift * 60000.0:+.0f}ms/min' if abs(eff_drift) >= 0.0005 else '') + ')'
         elif abs(residual) < 0.45:
+            self._synced_streak += 1
             status_str = 'synced'
             msg = f'Subtitles in sync ({residual:+.1f}s, z={z_val:.1f})'
         elif abs(eff_drift) >= 0.0005 or drift_fitted is not None:
+            self._synced_streak = 0
             status_str = 'drifted'
             msg = f'Subtitle drift detected ({residual:+.1f}s)'
         else:
+            self._synced_streak = 0
             status_str = 'desynced'
             msg = f'Subtitles out of sync by {residual:+.1f}s'
 
@@ -1507,7 +1849,13 @@ class LiveSubSyncMonitor:
                     if cur_gen != self._last_gen:
                         self._last_gen = cur_gen
                         gen_changed = True
-                if self._ring_start_pts is not None and (forced or gen_changed or (now_m - self._last_check_mono) >= self.check_interval_sec):
+                        self._synced_streak = 0
+                eff_interval = (
+                    max(self.check_interval_sec, 60.0 if host_load_pressure() >= 0.55 else 45.0)
+                    if self._synced_streak >= 3
+                    else self.check_interval_sec
+                )
+                if self._ring_start_pts is not None and (forced or gen_changed or (now_m - self._last_check_mono) >= eff_interval):
                     cfg = self._read_config()
                     if cfg and cfg.get('enabled') and cfg.get('subtitle_path'):
                         force_seq = int(cfg.get('force_check_seq') or 0)
@@ -1516,8 +1864,9 @@ class LiveSubSyncMonitor:
                             forced = True
                             self._consec_desync_dir = 0
                             self._consec_desync_count = 0
+                            self._synced_streak = 0
                         dur = len(self._ring) / 16000.0
-                        if dur >= self.min_window_sec and (forced or (now_m - self._last_check_mono) >= self.check_interval_sec):
+                        if dur >= self.min_window_sec and (forced or (now_m - self._last_check_mono) >= eff_interval):
                             self._last_check_mono = now_m
                             self._run_one_check(cfg)
             except Exception as err:
