@@ -959,9 +959,14 @@ export class MovieApiClient {
     return { type, count: results.length, results };
   }
 
-  async browse({ type = 'movie', genreId, category, year, sortBy = 'popularity.desc', page = 1, limit = 20 } = {}) {
+  async browse({ type = 'movie', genreId, category, year, sortBy = 'popularity.desc', page = 1, limit = 20, includeUpcoming = false } = {}) {
     const data = await this.#getJson('/browse', { type, genreId, category, year, sortBy, page, limit }, { ttlMs: 300_000 });
-    const results = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
+    const rawResults = (data?.results || []).map((x) => normalizeListItem(x, type)).filter(Boolean);
+    const today = new Date().toISOString().slice(0, 10);
+    const released = includeUpcoming
+      ? rawResults
+      : rawResults.filter((item) => !item.releaseDate || String(item.releaseDate).slice(0, 10) <= today);
+    const results = released.length ? released : rawResults;
     return { page: Number(data?.page || page), count: results.length, results };
   }
 

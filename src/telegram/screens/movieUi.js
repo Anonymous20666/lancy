@@ -6,6 +6,7 @@ import { PANEL_ACTIONS } from '../../music/channelPanels.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, normalizeDownloadQuality, uploadLimitBytes } from '../../media/telegramLimits.js';
 import { isBotSuperAdmin, isAnonymousGroupAdmin } from '../permissions.js';
 import { defaultAdultCatalog, FEATURED_STUDIOS, isBlockedAdultText, formatDurationLabel } from '../../media/adultCatalog.js';
+import { parseMovieSearchIntent } from '../../media/movieQueryParser.js';
 
 const cut = (s, n = 60) => [...String(s || '')].slice(0, n).join('');
 
@@ -1555,14 +1556,22 @@ export function createMovieUi({
     return true;
   }
 
-  async function openMovieSearch(ctx, query, { random = false, movieSid = null, sourceMode = null, xvSource = null, xvDur = null, promptKind = null, originMessageId = null, forceNewCard = false } = {}) {
+  async function openMovieSearch(ctx, query, { random = false, category = null, genreId = null, categoryLabel = null, categoryType = 'movie', movieSid = null, sourceMode = null, xvSource = null, xvDur = null, promptKind = null, originMessageId = null, forceNewCard = false } = {}) {
     await ensureMovieAuth(ctx, null, null);
     const prev = app.movieSessions.getLatestForChat(ctx.chatId);
     const existing = movieSid ? app.movieSessions.get(movieSid) : null;
     const reuseExisting = Boolean(existing && Number(existing.chatId) === Number(ctx.chatId));
-    const q = String(query || '').trim();
-    const isXvUrl = /^https?:\/\/(?:www\.)?(?:xvideos|pornhub|eporner|xhamster|porntrex|fullxcinema|pandamovies)\./i.test(q);
+    const rawQ = String(query || '').trim();
+    const isXvUrl = /^https?:\/\/(?:www\.)?(?:xvideos|pornhub|eporner|xhamster|porntrex|fullxcinema|pandamovies)\./i.test(rawQ);
     const effSource = sourceMode || (reuseExisting ? existing.sourceMode : null) || (isXvUrl ? 'xvideos' : 'movie');
+    const parsedIntent = (effSource !== 'xvideos' && !promptKind && !isXvUrl && !category && !genreId)
+      ? parseMovieSearchIntent(rawQ)
+      : null;
+    const resolvedCategory = category || (parsedIntent?.kind === 'category' ? parsedIntent.category : null);
+    const resolvedGenreId = genreId || (parsedIntent?.kind === 'category' ? parsedIntent.genreId : null);
+    const resolvedCatLabel = categoryLabel || (parsedIntent?.kind === 'category' ? parsedIntent.label : null);
+    const resolvedCatType = categoryType || parsedIntent?.type || 'movie';
+    const q = (parsedIntent?.kind === 'search' && parsedIntent.query) ? parsedIntent.query : rawQ;
     const resolvedOriginMsgId = originMessageId ?? ctx?.directMessageId ?? ctx?.message?.message_id ?? null;
     const ms = reuseExisting
       ? existing
@@ -1592,6 +1601,32 @@ export function createMovieUi({
       ms.results = [pick];
       await loadItemIntoSession(ms, pick);
       await upsertCard(ctx, ms, renderCurrentView(ctx, ms));
+      if (!reuseExisting && prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
+        await cleanupSupersededCards(ctx, prev, ms.messageId);
+      }
+      return ms;
+    }
+    if (resolvedCategory || resolvedGenreId) {
+      const catRes = await app.movieApi.browse({
+        type: resolvedCatType || 'movie',
+        ...(resolvedCategory ? { category: resolvedCategory } : {}),
+        ...(resolvedGenreId ? { genreId: resolvedGenreId } : {}),
+        page: 1,
+        limit: 20
+      }).catch(() => ({ results: [] }));
+      ms.query = '';
+      ms.sourceMode = 'movie';
+      ms.mediaItem = null;
+      ms.categoryLabel = resolvedCatLabel || resolvedCategory || 'Genre Picks';
+      ms.results = catRes?.results || [];
+      ms.resultPage = 0;
+      ms.view = 'results';
+      ms.notice = null;
+      ms.logLines = null;
+      await upsertCard(ctx, ms, renderResults(ctx, ms), {
+        forceNewCard: Boolean((forceNewCard || resolvedOriginMsgId) && !ctx?.reuseMessageId),
+        replyToMessageId: resolvedOriginMsgId
+      });
       if (!reuseExisting && prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
         await cleanupSupersededCards(ctx, prev, ms.messageId);
       }
@@ -1785,6 +1820,16 @@ export function createMovieUi({
       }
       return await ctx.api.sendMessage(ctx.chatId, textToSend, extra).catch(() => null);
     };
+    if (act?.name === 'browse_category' && (act.category || act.genreId)) {
+      if (res.reply && !chanMode) await sendAiNotice(res.reply);
+      await openMovieSearch(resolvedCtx, '', {
+        category: act.category || null,
+        genreId: act.genreId || null,
+        categoryLabel: act.label || act.category || 'Genre Picks',
+        categoryType: act.type || 'movie'
+      });
+      return res;
+    }
     if (act?.name === 'search_movie' && act.query) {
       if (res.reply && !chanMode) await sendAiNotice(res.reply);
       await openMovieSearch(resolvedCtx, act.query);

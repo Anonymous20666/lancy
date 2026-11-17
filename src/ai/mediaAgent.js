@@ -1,4 +1,5 @@
 import { logger } from '../core/logger.js';
+import { parseMovieSearchIntent } from '../media/movieQueryParser.js';
 
 const CONCLUDE_RE = /^(?:(?:ok(?:ay)?|alright|cool|great|nice|awesome|perfect|yes|yeah)[,\s]+)*(?:that'?s\s*(?:all|it)|i'?m\s*(?:good|done|set|ok(?:ay)?)|we(?:'re|\s*are)\s*(?:good|done|set)|all\s*(?:good|done|set)|done|thank(?:s|\s*you)(?:\s*(?:so\s*much|lancy|bestie))?(?:[,\s]*(?:that'?s\s*(?:all|it)|done|bye))?|(?:exit|close|leave|quit|stop|end)\s*(?:ai|chat|dj|mode)?|bye(?:\s*lancy)?|good\s*(?:night|bye))(?:[,\s]+(?:thanks?|thank\s*you|done|that'?s\s*(?:all|it)|for\s*now|bye|lancy))*[\s!.,♡✨]*$/i;
 
@@ -95,11 +96,24 @@ export class MediaAiAgent {
       return { name: 'trending_movies', type: wantsTv ? 'tv' : 'all' };
     }
 
+    // Direct category/genre requests (e.g. "give me Romance movies", "action movies", "k-drama series")
+    const parsedIntent = parseMovieSearchIntent(t);
+    if (parsedIntent.kind === 'category' && (mentionsMovie || (!mentionsSong && lastDomain === 'movie') || !/\b(?:music|song|track|album)\b/i.test(t))) {
+      return {
+        name: 'browse_category',
+        category: parsedIntent.category,
+        genreId: parsedIntent.genreId,
+        label: parsedIntent.label,
+        type: parsedIntent.type || (wantsTv ? 'tv' : 'movie')
+      };
+    }
+
     // Explicit movie/series search request (e.g. "find movie inception", "watch game of thrones season 2", "search for breaking bad series")
-    const explicitMovieCmd = t.match(/^(?:can\s+you\s+|please\s+|help\s+me\s+)?(?:search|find|stream|watch|play|put\s+on|open|load|show(?:\s+me)?|get)\s+(?:the\s+)?(?:movie|film|series|tv\s*show|show)?\s*[:\-]?\s*(.+)$/i);
+    const explicitMovieCmd = t.match(/^(?:can\s+you\s+|please\s+|help\s+me\s+)?(?:search|find|stream|watch|play|put\s+on|open|load|show|give|get|send|bring|recommend|suggest)(?:\s+for)?(?:\s+me)?\s+(?:the\s+)?(?:movies?|films?|series|tv\s*shows?|shows?)?\s*[:\-]?\s*(.+)$/i);
     if (explicitMovieCmd && (mentionsMovie || (!mentionsSong && lastDomain === 'movie' && !/^\s*(?:pause|resume|skip|next|stop|volume|bass|eq)\b/i.test(t)))) {
       let query = explicitMovieCmd[1]
-        .replace(/\b(?:movie|film|series|tv\s*show|show|full\s*movie|in\s*vc|on\s*vc|please)\b/gi, '')
+        .replace(/^\s*me\s+/i, '')
+        .replace(/\b(?:movies?|films?|series|tv\s*shows?|shows?|full\s*movie|in\s*vc|on\s*vc|please)\b/gi, '')
         .replace(/\bseason\s*\d+\b/gi, '')
         .trim();
       if (query.length >= 2 && !/^(?:random|trending|popular|something|anything)$/i.test(query)) {
@@ -217,6 +231,8 @@ export class MediaAiAgent {
     if (!replyText) {
       if (parsedAction?.name === 'random_movie') {
         replyText = `Spinning the reel for a random ${parsedAction.category || parsedAction.type || 'movie/series'} pick right now!`;
+      } else if (parsedAction?.name === 'browse_category') {
+        replyText = `Opening top ${parsedAction.label || parsedAction.category || 'genre'} titles right now — tap any title to stream or download!`;
       } else if (parsedAction?.name === 'search_movie') {
         replyText = `Searching "${parsedAction.query}" now — I'll pull up its details, seasons & stream controls!`;
       } else if (parsedAction?.name === 'trending_movies') {

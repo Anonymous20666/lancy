@@ -850,18 +850,35 @@ export class LancyAssistant {
       }
       case 'search_movie': {
         const musicScreen = this.#getScreen(ctx, 'music');
-        if (musicScreen?.openMovieSearch) {
-          await musicScreen.openMovieSearch(targetCtx, actionParams.query || '', {
+        const openSearch = musicScreen?.movieUi?.openMovieSearch || musicScreen?.openMovieSearch;
+        if (openSearch) {
+          await openSearch(targetCtx, actionParams.query || '', {
             type: actionParams.type || 'multi',
             season: actionParams.season || null
           });
         }
         break;
       }
+      case 'browse_category': {
+        const musicScreen = this.#getScreen(ctx, 'music');
+        const openSearch = musicScreen?.movieUi?.openMovieSearch || musicScreen?.openMovieSearch;
+        if (openSearch) {
+          await openSearch(targetCtx, '', {
+            category: actionParams.category || null,
+            genreId: actionParams.genreId || null,
+            categoryLabel: actionParams.label || actionParams.category || 'Genre Picks',
+            categoryType: actionParams.type || 'movie'
+          });
+        }
+        break;
+      }
       case 'random_movie': {
         const musicScreen = this.#getScreen(ctx, 'music');
-        if (musicScreen?.openRandomMovie) {
-          await musicScreen.openRandomMovie(targetCtx, {
+        const openRandom = musicScreen?.movieUi?.openMovieSearch
+          ? (c, opts) => musicScreen.movieUi.openMovieSearch(c, '', { random: true, ...opts })
+          : musicScreen?.openRandomMovie;
+        if (openRandom) {
+          await openRandom(targetCtx, {
             type: actionParams.type || 'all',
             category: actionParams.category || null
           });

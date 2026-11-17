@@ -724,6 +724,38 @@ test('MediaAiAgent supports multi-turn Movie & Song conversation, triggers movie
   assert.equal(h.app.mediaAgent.getHistory(-10050, 10).length, 0);
 });
 
+test('Conversational genre requests route to browse instead of literal "me Romance movies" search while preserving exact movie titles', async (t) => {
+  const h = buildTestHarness(t);
+  const ctx = h.makeCtx(-10050);
+  const searchCalls = [];
+  const browseCalls = [];
+  h.app.movieApi.search = async (q) => {
+    searchCalls.push(q);
+    return { results: [{ id: '99', type: 'movie', title: q, year: 2016 }] };
+  };
+  h.app.movieApi.browse = async (opts) => {
+    browseCalls.push(opts);
+    return { results: [{ id: '597', type: 'movie', title: 'Titanic', year: 1997 }] };
+  };
+
+  for (const phrase of ['give me Romance movies', 'find me Romance movies', 'me Romance movies']) {
+    const aiRes = await h.app.mediaAgent.chat({ ctx, chatId: -10050, userId: 10, text: phrase, defaultDomain: 'movie' });
+    assert.equal(aiRes.action?.name, 'browse_category');
+    assert.equal(aiRes.action?.category, 'romance');
+    await h.screen.movieUi.openMovieSearch(ctx, phrase);
+  }
+  assert.equal(browseCalls.length, 3);
+  assert.equal(searchCalls.length, 0);
+
+  await h.screen.handleCommand(ctx, '/movie', ['give', 'me', 'Romance', 'movies']);
+  assert.equal(browseCalls.length, 4);
+  assert.equal(searchCalls.length, 0);
+
+  await h.screen.movieUi.openMovieSearch(ctx, 'Me Before You');
+  await h.screen.movieUi.openMovieSearch(ctx, 'True Romance');
+  assert.deepEqual(searchCalls, ['Me Before You', 'True Romance']);
+});
+
 test('DM Channel Panel routes pc -> movie -> mv -> Back to Player & Cinema Queue cleanly with zero WebApp buttons', async (t) => {
   const h = buildTestHarness(t);
   h.api.me = { id: 999, username: 'LancyBot' };
