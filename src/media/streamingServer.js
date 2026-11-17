@@ -132,6 +132,10 @@ export class VideoStreamingServer {
     this.segmentCache = new Map();
     this.segmentCacheBytes = 0;
     this.inflightSegments = new Map();
+    this.activeMainReads = 0;
+    this.prestreamQueue = [];
+    this.prestreamQueuedTokens = new Set();
+    this.inflightPrestream = new Set();
 
     try {
       mkdirSync(this.cacheDir, { recursive: true });
@@ -489,7 +493,7 @@ export class VideoStreamingServer {
     return downloadPromise;
   }
 
-  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000, maxHeight = 720, preferredAudioLang = null } = {}) {
+  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000, maxHeight = 720, videoQuality = null, preferredAudioLang = null } = {}) {
     if (!url || !/^https?:\/\//i.test(String(url))) return null;
     const now = Date.now();
     for (const [k, v] of this.remoteStreams) {
@@ -498,6 +502,8 @@ export class VideoStreamingServer {
     const token = randomBytes(16).toString('hex');
     const urlStr = String(url);
     const capHeight = Number.isFinite(Number(maxHeight)) && Number(maxHeight) > 0 ? Math.round(Number(maxHeight)) : 720;
+    const qualityCap = videoQuality === 'SD_480p' ? 480 : (videoQuality === 'HD_720p' ? 720 : capHeight);
+    const effectiveMaxHeight = Math.min(capHeight, qualityCap);
     const prefAudio = normalizeLangCode(preferredAudioLang);
     const detectedDash = Boolean(isDash || /dash\+xml/i.test(String(contentType || '')) || /\.mpd(\?|$)/i.test(urlStr));
     const detectedHls = !detectedDash && Boolean(isHls || /mpegurl/i.test(String(contentType || '')) || /\.m3u8(\?|$)/i.test(urlStr));
@@ -508,6 +514,13 @@ export class VideoStreamingServer {
       isHls: detectedHls,
       isDash: detectedDash,
       maxHeight: capHeight,
+      effectiveMaxHeight,
+      adaptiveMaxHeight: null,
+      videoQuality: videoQuality || null,
+      rootToken: token,
+      measuredBytesPerSec: 0,
+      slowFetchStreak: 0,
+      selectedVideoBandwidthBps: 0,
       preferredAudioLang: prefAudio,
       forceContentType: null,
       childTokens: new Map(),
@@ -549,6 +562,8 @@ export class VideoStreamingServer {
       isHls: Boolean(isHls),
       isBasePrefix: Boolean(isBasePrefix),
       maxHeight: parentEntry.maxHeight || 720,
+      effectiveMaxHeight: parentEntry.effectiveMaxHeight || parentEntry.maxHeight || 720,
+      rootToken: parentEntry.rootToken || null,
       preferredAudioLang: parentEntry.preferredAudioLang || '',
       forceContentType,
       isChildSegment: !isHls && !isBasePrefix,
@@ -1012,6 +1027,7 @@ export class VideoStreamingServer {
     return {
       lines: filtered,
       winningVideoUri: winner?.uri || null,
+      winningVideoBandwidth: Number(winner?.bandwidth || 0) || 0,
       winningAudioUri,
       hasSeparateAudio
     };
@@ -1103,12 +1119,17 @@ export class VideoStreamingServer {
     let resolvedAudioTrimDelta = 0;
 
     if (isMaster) {
+      const targetCap = parentEntry?.adaptiveMaxHeight || parentEntry?.effectiveMaxHeight || parentEntry?.maxHeight || 720;
       const pruned = this.#pruneHlsMasterLines(
         lines,
-        parentEntry?.maxHeight || 720,
+        targetCap,
         parentEntry?.preferredAudioLang || ''
       );
       lines = pruned.lines;
+      const rootEntry = parentEntry?.rootToken ? this.remoteStreams.get(parentEntry.rootToken) : parentEntry;
+      if (rootEntry && pruned.winningVideoBandwidth > 0) {
+        rootEntry.selectedVideoBandwidthBps = pruned.winningVideoBandwidth;
+      }
       if (targetSeek > 0.05 && pruned.winningVideoUri) {
         try {
           const absVid = new URL(pruned.winningVideoUri, baseUrl).toString();
@@ -1199,15 +1220,17 @@ export class VideoStreamingServer {
         : { isHls: false, contentType: 'video/mp2t', forceContentType: 'video/mp2t', ext: 'ts' });
     }).filter((l) => l !== null).join('\n');
 
+    const lookaheadWindow = mediaSegTokens.length >= 12 ? 10 : 2;
     for (let k = 0; k < mediaSegTokens.length; k++) {
       const segEntry = this.remoteStreams.get(mediaSegTokens[k]);
-      if (segEntry) segEntry.nextSegmentTokens = mediaSegTokens.slice(k + 1, k + 3);
+      if (segEntry) segEntry.nextSegmentTokens = mediaSegTokens.slice(k + 1, k + 1 + lookaheadWindow);
     }
     return {
       text: out,
       skippedSec: resolvedSkippedSec,
       audioSkippedSec: resolvedAudioSkippedSec,
-      audioTrimDelta: resolvedAudioTrimDelta
+      audioTrimDelta: resolvedAudioTrimDelta,
+      initialSegTokens: mediaSegTokens.length >= 12 ? mediaSegTokens.slice(0, 4) : []
     };
   }
 
@@ -1224,7 +1247,7 @@ export class VideoStreamingServer {
 
   #putCachedSegment(token, body, contentType) {
     const maxEntry = 16 * 1024 * 1024;
-    const capMb = Math.max(48, Math.min(1024, Number(process.env.MOVIE_SEG_CACHE_MB || 192) || 192));
+    const capMb = Math.max(48, Math.min(1024, Number(process.env.MOVIE_SEG_CACHE_MB || 256) || 256));
     const maxTotal = capMb * 1024 * 1024;
     if (!Buffer.isBuffer(body) || !body.length || body.length > maxEntry) return;
     const prev = this.segmentCache.get(token);
@@ -1245,11 +1268,33 @@ export class VideoStreamingServer {
       this.segmentCache.delete(oldestKey);
       if (oldest) this.segmentCacheBytes = Math.max(0, this.segmentCacheBytes - oldest.body.length);
     }
-    this.segmentCache.set(token, { body, contentType, expiresAt: now + 60_000 });
+    this.segmentCache.set(token, { body, contentType, expiresAt: now + 240_000 });
     this.segmentCacheBytes += body.length;
   }
 
-  #loadChildSegment(token, entry, upstreamHeaders) {
+  #recordSegmentThroughput(entry, byteLen, elapsedMs) {
+    if (!entry || byteLen < 128 * 1024) return;
+    const rootEntry = entry.rootToken ? this.remoteStreams.get(entry.rootToken) : entry;
+    if (!rootEntry) return;
+    const elapsedSec = Math.max(0.05, Number(elapsedMs || 0) / 1000);
+    const instBps = byteLen / elapsedSec;
+    rootEntry.measuredBytesPerSec = rootEntry.measuredBytesPerSec > 0
+      ? (rootEntry.measuredBytesPerSec * 0.65) + (instBps * 0.35)
+      : instBps;
+    // If 1080p stream downloads slower than its required media bitrate, step adaptive cap down to 720p for smooth playback.
+    const capNow = rootEntry.adaptiveMaxHeight || rootEntry.effectiveMaxHeight || rootEntry.maxHeight || 720;
+    const reqBytesPerSec = rootEntry.selectedVideoBandwidthBps > 0 ? (rootEntry.selectedVideoBandwidthBps / 8) : 0;
+    if (capNow > 720 && reqBytesPerSec > 300_000 && rootEntry.measuredBytesPerSec < reqBytesPerSec * 0.95) {
+      rootEntry.slowFetchStreak = (rootEntry.slowFetchStreak || 0) + 1;
+      if (rootEntry.slowFetchStreak >= 2) {
+        rootEntry.adaptiveMaxHeight = 720;
+      }
+    } else {
+      rootEntry.slowFetchStreak = 0;
+    }
+  }
+
+  #loadChildSegment(token, entry, upstreamHeaders, { isPrestream = false } = {}) {
     if (this.inflightSegments.has(token)) {
       return this.inflightSegments.get(token);
     }
@@ -1257,6 +1302,12 @@ export class VideoStreamingServer {
       ...(entry.headers || {}),
       'User-Agent': entry.headers?.['User-Agent'] || 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
     };
+    const startedAt = Date.now();
+    if (isPrestream) {
+      this.inflightPrestream.add(token);
+    } else {
+      this.activeMainReads += 1;
+    }
     const loader = (async () => {
       const up = await fetch(entry.url, {
         method: 'GET',
@@ -1270,26 +1321,57 @@ export class VideoStreamingServer {
         return { status: up.status, streamThrough: up, headers: {} };
       }
       const buf = Buffer.from(await up.arrayBuffer());
+      this.#recordSegmentThroughput(entry, buf.length, Date.now() - startedAt);
       const ctypeOut = entry.forceContentType || up.headers.get('content-type') || entry.contentType || 'video/mp2t';
       this.#putCachedSegment(token, buf, ctypeOut);
       return { status: 200, contentType: ctypeOut, body: buf };
     })().finally(() => {
       this.inflightSegments.delete(token);
+      if (isPrestream) {
+        this.inflightPrestream.delete(token);
+      } else {
+        this.activeMainReads = Math.max(0, this.activeMainReads - 1);
+      }
+      this.#drainPrestreamQueue();
     });
     this.inflightSegments.set(token, loader);
     return loader;
   }
 
+  #drainPrestreamQueue() {
+    if (!this.server || !this.prestreamQueue.length) return;
+    // Yield completely while an active main-stream segment read is in flight (other than 1 immediate N+1 warm read).
+    const maxBg = this.activeMainReads > 0 ? 1 : 3;
+    while (this.prestreamQueue.length && this.inflightPrestream.size < maxBg && this.inflightSegments.size < 8) {
+      const nextToken = this.prestreamQueue.shift();
+      this.prestreamQueuedTokens.delete(nextToken);
+      if (!nextToken) continue;
+      const nextEntry = this.remoteStreams.get(nextToken);
+      if (!nextEntry || !nextEntry.isChildSegment || Date.now() > nextEntry.expiresAt) continue;
+      if (this.#getCachedSegment(nextToken) || this.inflightSegments.has(nextToken)) continue;
+      void this.#loadChildSegment(nextToken, nextEntry, null, { isPrestream: true }).catch(() => {});
+    }
+  }
+
   #scheduleLookaheadPrefetch(entry) {
     if (!this.server || !Array.isArray(entry?.nextSegmentTokens) || !entry.nextSegmentTokens.length) return;
     const now = Date.now();
-    for (const nextToken of entry.nextSegmentTokens) {
-      if (this.inflightSegments.size >= 8) break;
+    // Always prioritize N+1 immediately at the front, and queue N+2..N+10 for idle background pre-stream.
+    for (let i = 0; i < entry.nextSegmentTokens.length; i++) {
+      const nextToken = entry.nextSegmentTokens[i];
+      if (!nextToken) continue;
       const nextEntry = this.remoteStreams.get(nextToken);
       if (!nextEntry || !nextEntry.isChildSegment || now > nextEntry.expiresAt) continue;
-      if (this.#getCachedSegment(nextToken) || this.inflightSegments.has(nextToken)) continue;
-      void this.#loadChildSegment(nextToken, nextEntry).catch(() => {});
+      if (this.#getCachedSegment(nextToken) || this.inflightSegments.has(nextToken) || this.prestreamQueuedTokens.has(nextToken)) continue;
+      if (i === 0) {
+        this.prestreamQueuedTokens.add(nextToken);
+        this.prestreamQueue.unshift(nextToken);
+      } else {
+        this.prestreamQueuedTokens.add(nextToken);
+        this.prestreamQueue.push(nextToken);
+      }
     }
+    this.#drainPrestreamQueue();
   }
 
   async #sendRewrittenHls(res, rawText, baseUrl, entry, seekSeconds) {
@@ -1312,6 +1394,9 @@ export class VideoStreamingServer {
     }
     res.writeHead(200, hdrs);
     res.end(outBuf);
+    if (Array.isArray(rewritten.initialSegTokens) && rewritten.initialSegTokens.length) {
+      this.#scheduleLookaheadPrefetch({ nextSegmentTokens: rewritten.initialSegTokens });
+    }
   }
 
   async #handleMovieProxy(req, res, token, seekSeconds = 0) {

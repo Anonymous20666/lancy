@@ -438,6 +438,7 @@ export class QueueManager extends EventEmitter {
             isHls,
             isDash,
             maxHeight:(isMovieTrack || streamMode==='rtmp') ? 1080 : 720,
+            videoQuality,
             preferredAudioLang: track.preferredAudioLang || null,
             contentType: isDash ? 'application/dash+xml' : isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'
           });

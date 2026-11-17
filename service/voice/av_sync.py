@@ -34,7 +34,7 @@ AUDIO_RESUME_LEAD_SEC = 0.030
 VIDEO_MAX_LEAD_SEC = 0.110
 VIDEO_RESUME_LEAD_SEC = 0.030
 PTS_DISCONTINUITY_SEC = 0.035
-SYNC_STARVATION_SEC = 0.280
+SYNC_STARVATION_SEC = 0.380
 STALL_HEARTBEAT_TIMEOUT_SEC = 12.0
 F_SETPIPE_SZ = 1031
 TARGET_AUDIO_PIPE_BYTES = 32768    # ~170ms PCM (>1x 100ms ntgcalls burst) without starving readers
@@ -930,7 +930,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
     except Exception:
         pass
     state.epoch_mono = time.monotonic()
-    dq_maxlen = max(10, min(32, int(round(eff_fps))))
+    dq_maxlen = max(16, min(60, int(round(eff_fps * 2.0))))
     dq = deque()
     cond = threading.Condition()
     eof_flag = False
@@ -1165,7 +1165,7 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
         pass
     state.epoch_mono = time.monotonic()
     frames_decoded = 1
-    dq_maxlen = max(12, min(48, int(round(eff_fps * 1.5))))
+    dq_maxlen = max(16, min(60, int(round(eff_fps * 2.0))))
     dq = deque()
     cond = threading.Condition()
     eof_flag = False

@@ -111,6 +111,83 @@ test('VideoStreamingServer prefetches next HLS segments into RAM cache ahead of 
   }
 });
 
+test('VideoStreamingServer respects videoQuality=HD_720p on master playlist and runs rolling 10-seg pre-stream for full movies', async () => {
+  const { dir, cleanup } = tempDb();
+  const segCount = 16;
+  const hits = new Map();
+  const masterM3u8 = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080',
+    'v1080.m3u8',
+    '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720',
+    'v720.m3u8'
+  ].join('\n');
+  const media720 = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-TARGETDURATION:10',
+    '#EXT-X-PLAYLIST-TYPE:VOD',
+    ...Array.from({ length: segCount }, (_, i) => `#EXTINF:10.0,\nseg720_${i}.ts`),
+    '#EXT-X-ENDLIST'
+  ].join('\n');
+  const upstream = http.createServer((req, res) => {
+    const p = req.url.split('?')[0];
+    hits.set(p, (hits.get(p) || 0) + 1);
+    if (p === '/master.m3u8') {
+      res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+      res.end(masterM3u8);
+      return;
+    }
+    if (p === '/v720.m3u8') {
+      res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' });
+      res.end(media720);
+      return;
+    }
+    const m = p.match(/^\/seg720_(\d+)\.ts$/);
+    if (m) {
+      res.writeHead(200, { 'content-type': 'video/mp2t' });
+      res.end(Buffer.from(`seg720-body-${m[1]}`));
+      return;
+    }
+    res.writeHead(404);
+    res.end('nope');
+  });
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+  const upPort = upstream.address().port;
+  const srv = new VideoStreamingServer({ port: 0, cacheDir: dir, audioCacheDir: dir });
+  await srv.start();
+  try {
+    const proxyUrl = srv.registerRemoteStream({
+      url: `http://127.0.0.1:${upPort}/master.m3u8`,
+      isHls: true,
+      maxHeight: 1080,
+      videoQuality: 'HD_720p'
+    });
+    const mRes = await fetch(proxyUrl);
+    assert.equal(mRes.status, 200);
+    const mText = await mRes.text();
+    assert.match(mText, /RESOLUTION=1280x720/);
+    assert.doesNotMatch(mText, /RESOLUTION=1920x1080/);
+    const v720ProxyUrl = mText.split(/\r?\n/).find((l) => l.startsWith('http://'));
+    const pRes = await fetch(v720ProxyUrl);
+    const pText = await pRes.text();
+    const segUrls = pText.split(/\r?\n/).filter((l) => l.startsWith('http://'));
+    assert.equal(segUrls.length, segCount);
+
+    await fetch(segUrls[0]);
+    await new Promise((r) => setTimeout(r, 250));
+    assert.equal(hits.get('/v720.m3u8'), 1);
+    assert.equal(hits.get('/seg720_1.ts'), 1);
+    assert.equal(hits.get('/seg720_5.ts'), 1, 'Rolling 10-segment pre-stream must warm ahead beyond lookahead=2');
+    assert.equal(hits.get('/seg720_8.ts'), 1, 'Rolling 10-segment pre-stream must warm up to seg 8+ ahead');
+  } finally {
+    await srv.stop();
+    await new Promise((resolve) => upstream.close(resolve));
+    cleanup();
+  }
+});
+
 test('Node streamMode persists per chat, forwards stream_mode=rtmp on setup/play, and live-switches active call', async () => {
   const { dir, db, cleanup } = tempDb();
   const sampleFile = join(dir, 'movie.mp4');
