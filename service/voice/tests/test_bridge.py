@@ -246,6 +246,42 @@ class PublisherVerificationTests(unittest.IsolatedAsyncioTestCase):
         async def failed():raise TimeoutError('sensitive-runtime-details')
         with self.assertRaises(VoiceFailure) as caught:await bridge.publisher_step(failed(),'self_participant')
         self.assertEqual(caught.exception.code,'PUBLISHER_UNVERIFIED');self.assertEqual(caught.exception.publisher_state,{'stage':'self_participant','kind':'TimeoutError'});self.assertNotIn('sensitive',str(caught.exception.publisher_state))
+    async def test_muted_publisher_tracks_last_position_recovers_when_allowed_and_allows_pause_resume(self):
+        bridge=Bridge('/tmp')
+        binding=types.SimpleNamespace(get_state=AsyncMock(return_value=types.SimpleNamespace(muted=False,paused=False)))
+        engine=types.SimpleNamespace(unmute=AsyncMock(),pause=AsyncMock(),resume=AsyncMock(),time=AsyncMock(side_effect=[42,65,65]),_binding=binding)
+        client=types.SimpleNamespace(invoke=AsyncMock())
+        bridge.accounts['one']={'engine':engine,'client':client,'uid':7}
+        bridge.native_publisher=AsyncMock(side_effect=[
+            ('existing-call',self.participant(True,False)),
+            ('existing-call',self.participant(True,True)),
+            ('existing-call',self.participant(True,True)),
+            ('existing-call',self.participant(False,True)),
+        ])
+        bridge.calls[-100]={'alias':'one','status':'playing','native_call':'existing-call','publisher_check_after':0,'publisher_verified':True,'retries':0,'playback_id':'recording','position_seconds':42,'last_known_position':42,'duration':240,'offset':0,'last_progress':MODULE.time.monotonic(),'clock_errors':0}
+        muted_res=await bridge.status(-100)
+        self.assertEqual(muted_res['info']['status'],'error')
+        self.assertTrue(muted_res['info']['publisher_muted'])
+        self.assertFalse(muted_res['info']['publisher_can_self_unmute'])
+        self.assertIsNone(muted_res['info']['position_seconds'])
+        self.assertEqual(muted_res['info']['last_known_position'],42)
+        bridge.calls[-100]['publisher_check_after']=0
+        recovered=await bridge.status(-100)
+        self.assertEqual(recovered['info']['status'],'playing')
+        self.assertFalse(recovered['info']['publisher_muted'])
+        self.assertTrue(recovered['info']['publisher_verified'])
+        self.assertEqual(recovered['info']['position_seconds'],65)
+        bridge.native_publisher=AsyncMock(return_value=('existing-call',self.participant(True,True)))
+        bridge.calls[-100]['publisher_check_after']=0
+        await bridge.status(-100)
+        paused=await bridge.control('pause',{'chat_id':-100})
+        self.assertEqual(bridge.calls[-100]['status'],'paused')
+        engine.pause.assert_awaited_once_with(-100)
+        bridge.native_publisher=AsyncMock(side_effect=[('existing-call',self.participant(True,True)),('existing-call',self.participant(False,True))])
+        resumed=await bridge.control('resume',{'chat_id':-100})
+        self.assertEqual(bridge.calls[-100]['status'],'playing')
+        self.assertFalse(bridge.calls[-100]['publisher_muted'])
+        engine.resume.assert_awaited_once_with(-100)
 
 class ResumePublisherFailureTests(unittest.IsolatedAsyncioTestCase):
     body=TestBridge.body

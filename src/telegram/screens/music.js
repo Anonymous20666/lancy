@@ -555,13 +555,16 @@ export function createMusicScreen({ app }) {
       else if (preview?.status === 'pending') b.paragraph(rt.italic('Preparing the full-song audio player… VC playback continues independently.'));
       else if (preview?.status === 'unavailable') b.paragraph(rt.italic(cut(preview.reason, 240)));
 
-      recording(b, t, { lyrics: s.cardLyrics && s.cardLyrics.trackId === t.id ? s.cardLyrics.result : null, vc: true, positionSeconds: s.positionSeconds });
+      const displayMusicPos = Number.isFinite(s.positionSeconds)
+        ? s.positionSeconds
+        : (Number.isFinite(s.lastKnownPositionSeconds) ? s.lastKnownPositionSeconds : s.positionSeconds);
+      recording(b, t, { lyrics: s.cardLyrics && s.cardLyrics.trackId === t.id ? s.cardLyrics.result : null, vc: true, positionSeconds: displayMusicPos });
 
       const eqLabel = eqPreset !== 'off' ? ` · ${eqPreset === 'bass' ? 'Clean Bass' : `EQ ${eqPreset}`}` : '';
-      b.paragraph(rt.text(`VC · ${durationText(s.positionSeconds)} / ${durationText(t.durationSeconds)} · ${t.mediaType === 'video' ? 'HD Video + audio' : 'Audio'}${eqLabel}`));
-      if (Number.isFinite(s.positionSeconds) && t.durationSeconds) {
-        const ratio = safeProgressRatio(s.positionSeconds, t.durationSeconds);
-        const remSec = Math.max(0, Math.round(Number(t.durationSeconds) - Number(s.positionSeconds)));
+      b.paragraph(rt.text(`VC · ${durationText(displayMusicPos)} / ${durationText(t.durationSeconds)} · ${t.mediaType === 'video' ? 'HD Video + audio' : 'Audio'}${eqLabel}`));
+      if (Number.isFinite(displayMusicPos) && t.durationSeconds) {
+        const ratio = safeProgressRatio(displayMusicPos, t.durationSeconds);
+        const remSec = Math.max(0, Math.round(Number(t.durationSeconds) - Number(displayMusicPos)));
         b.paragraph(rt.code(`${progressBar(ratio, { width: 12, filled: '█', empty: '░' })}  ${remSec > 0 ? `-${durationText(remSec)}` : 'Done'}`));
       }
       const volText = s.volumeConfirmed === false ? 'unconfirmed' : `${s.volume}%`;
@@ -591,13 +594,24 @@ export function createMusicScreen({ app }) {
       } else {
         b.pullquote(`${badge} · ${cut(t.title, 54)}`, t.mediaType === 'video' ? '🎬 Video VC' : '🎧 Audio VC');
       }
-      if (['playing', 'paused'].includes(s.status)) {
-        b.buttons([
-          controls(s, '⏮ Previous', 'previous', { style: 'link' }),
-          controls(s, s.status === 'paused' ? 'Resume VC' : 'Pause VC', s.status === 'paused' ? 'resume' : 'pause', { style: s.status === 'paused' ? 'success' : 'primary' }),
-          controls(s, '⏭ Skip', 'skip', { style: 'link' }),
-          controls(s, '⏹ Stop', 'stop', { style: 'danger' })
-        ]);
+      const isMusicMutedLive = Boolean(s.status === 'error' && s.connected && /Telegram muted|still blocks this account/i.test(String(s.lastError || '')));
+      if (['playing', 'paused'].includes(s.status) || isMusicMutedLive) {
+        b.buttons(
+          isMusicMutedLive
+            ? [
+                controls(s, '⏮ Previous', 'previous', { style: 'link' }),
+                controls(s, '🔊 Unmute', 'resume', { style: 'success' }),
+                controls(s, '⏸ Pause', 'pause', { style: 'primary' }),
+                controls(s, '⏭ Skip', 'skip', { style: 'link' }),
+                controls(s, '⏹ Stop', 'stop', { style: 'danger' })
+              ]
+            : [
+                controls(s, '⏮ Previous', 'previous', { style: 'link' }),
+                controls(s, s.status === 'paused' ? 'Resume VC' : 'Pause VC', s.status === 'paused' ? 'resume' : 'pause', { style: s.status === 'paused' ? 'success' : 'primary' }),
+                controls(s, '⏭ Skip', 'skip', { style: 'link' }),
+                controls(s, '⏹ Stop', 'stop', { style: 'danger' })
+              ]
+        );
       }
       const extraRow = [];
       const musicSeekStep = Number(s.seekStepSeconds) >= 5 ? Math.round(Number(s.seekStepSeconds)) : 10;
@@ -3093,10 +3107,11 @@ export function createMusicScreen({ app }) {
     const suppressGroupAdultArt = Boolean(previewTrack?.isAdult && Number(destId) < 0);
     attachSafeArtworkPhoto(b, suppressGroupAdultArt ? null : previewArt, previewTrack?.title || 'Cinema Artwork');
 
+    const isMutedLive = Boolean(t && s.status === 'error' && s.connected && /Telegram muted|still blocks this account/i.test(String(s.lastError || '')));
     if (t) {
       b.paragraph(rt.bold(`${t.isAdult ? '🔞 ' : ''}${cut(t.title || 'Streaming Movie', 78)}`));
       const dur = Number(t.durationSeconds || t.durationSec || 0);
-      const pos = Math.max(0, Number(s.positionSeconds || 0));
+      const pos = Math.max(0, Number(Number.isFinite(s.positionSeconds) ? s.positionSeconds : (s.lastKnownPositionSeconds || 0)));
       if (dur > 0) {
         const ratio = safeProgressRatio(pos, dur);
         const remSec = Math.max(0, Math.round(dur - pos));
@@ -3129,7 +3144,9 @@ export function createMusicScreen({ app }) {
         : '';
       const syncStateTag = s.status === 'paused'
         ? ' · ⏸ Paused'
-        : s.avSync?.sync_health === 'stalled'
+        : isMutedLive
+          ? ' · 🔇 Muted in VC'
+          : s.avSync?.sync_health === 'stalled'
           ? ' · ⚠️ Resyncing A/V'
           : s.avSync?.syncing
             ? ` · ⏳ Syncing A/V (${Number(s.avSync?.skew_ms || 0) >= 0 ? '+' : ''}${Number(s.avSync?.skew_ms || 0)}ms)`
@@ -3194,7 +3211,14 @@ export function createMusicScreen({ app }) {
       row1.push(controls(s, `-${stepLabel}`, 'seekby', -seekStep, { style: 'link' }));
     }
     if (t || resumableItem) {
-      row1.push(controls(s, (s.status === 'paused' || (!t && resumeSec > 0)) ? '▶ Resume' : t ? '⏸ Pause' : '▶ Start Next', (s.status === 'paused' || !t) ? 'resume' : 'pause', { style: (!t || s.status === 'paused') ? 'success' : 'primary' }));
+      if (isMutedLive) {
+        row1.push(
+          controls(s, '🔊 Unmute VC', 'resume', { style: 'success' }),
+          controls(s, '⏸ Pause', 'pause', { style: 'primary' })
+        );
+      } else {
+        row1.push(controls(s, (s.status === 'paused' || (!t && resumeSec > 0)) ? '▶ Resume' : t ? '⏸ Pause' : '▶ Start Next', (s.status === 'paused' || !t) ? 'resume' : 'pause', { style: (!t || s.status === 'paused') ? 'success' : 'primary' }));
+      }
     }
     if (t?.capabilities?.seek) {
       row1.push(controls(s, `+${stepLabel}`, 'seekby', seekStep, { style: 'link' }));

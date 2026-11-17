@@ -3542,14 +3542,19 @@ class Bridge:
                     or (self.factory and call.get('_rtmp_proc') is None and call.get('av_sync_id'))
                     or (rtmp_proc is not None and rtmp_proc.returncode is None)
                 ))
-                if op == 'pause' and call.get('status') == 'playing':
+                was_paused = (call.get('status') == 'paused')
+                was_muted_live = bool(call.get('publisher_muted') and not was_paused)
+                if op == 'pause' and call.get('status') in {'playing', 'recovering', 'error'}:
+                    if call.get('publisher_muted'):
+                        call['publisher_muted_while_paused'] = True
                     try:
                         elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=2.0)
                         paused_pos = max(0.0, float(call.get('offset') or 0.0) + elapsed)
                         if call.get('duration'):
                             paused_pos = min(paused_pos, max(0.0, float(call['duration']) - 1.0))
                         call['last_known_position'] = max(float(call.get('last_known_position') or 0.0), paused_pos)
-                        call['position_seconds'] = call['last_known_position']
+                        if not call.get('publisher_muted'):
+                            call['position_seconds'] = call['last_known_position']
                         if is_rtmp and not rtmp_hub_live:
                             call['offset'] = call['last_known_position']
                     except Exception:
@@ -3579,20 +3584,33 @@ class Bridge:
                         _set_sync_paused(call.get('av_sync_id'), op == 'pause')
                     hub_proc = call.get('_hub_proc')
                     hub_dead = bool(op == 'resume' and hub_proc is not None and getattr(hub_proc, 'returncode', None) is not None)
+                    locally_paused = was_paused
+                    if op == 'resume' and not locally_paused:
+                        binding = getattr(engine, '_binding', None)
+                        if binding is not None and hasattr(binding, 'get_state'):
+                            try:
+                                b_state = await asyncio.wait_for(binding.get_state(chat), 3)
+                                locally_paused = bool(getattr(b_state, 'paused', False))
+                            except Exception:
+                                pass
                     if hub_dead and call.get('path'):
                         call['offset'] = float(call.get('last_known_position') or call.get('offset') or 0.0)
                         call['status'] = 'playing'
+                        call['publisher_muted_while_paused'] = False
                         await self.stream(a, chat, call)
                     else:
                         try:
-                            await asyncio.wait_for(getattr(engine, op)(chat), 10)
+                            if op == 'pause' or locally_paused or not was_muted_live:
+                                await asyncio.wait_for(getattr(engine, op)(chat), 10)
                             if op == 'resume':
                                 await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
+                                call['publisher_muted_while_paused'] = False
                         except Exception as resume_err:
                             if op == 'resume' and call.get('path') and (not isinstance(resume_err, VoiceFailure) or resume_err.code != 'PERMISSION_DENIED'):
                                 try:
                                     call['offset'] = float(call.get('last_known_position') or call.get('offset') or 0.0)
                                     call['status'] = 'playing'
+                                    call['publisher_muted_while_paused'] = False
                                     await self.stream(a, chat, call)
                                 except Exception:
                                     try: await asyncio.wait_for(engine.pause(chat), 8)
@@ -3601,13 +3619,18 @@ class Bridge:
                                         _set_sync_paused(call.get('av_sync_id'), True)
                                     raise
                             else:
-                                if op == 'resume':
+                                if op == 'resume' and (was_paused or locally_paused):
                                     try: await asyncio.wait_for(engine.pause(chat), 8)
                                     except Exception: pass
                                     if call.get('av_sync_id'):
                                         _set_sync_paused(call.get('av_sync_id'), True)
                                 raise
                 call['status'] = 'paused' if op == 'pause' else 'playing'; call['last_progress'] = time.monotonic()
+                if op == 'resume':
+                    call['publisher_muted'] = False
+                    call['publisher_verified'] = True
+                    if call.get('position_seconds') is None and call.get('last_known_position') is not None:
+                        call['position_seconds'] = call.get('last_known_position')
                 tile = self.secondary_tiles.get(chat)
                 if tile:
                     a2 = self.accounts.get(tile.get('alias'))
@@ -3978,15 +4001,70 @@ class Bridge:
                         return {'ok': True, 'active': False, 'last_position_seconds': pos if pos > 0 else self.last_ended_positions.get(chat)}
                     call['clock_errors'] += 1; call['position_seconds'] = None
                     if call['clock_errors'] >= 3: call['status'] = 'error'
-            if call['status'] == 'playing' and not is_rtmp and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
-                call['publisher_check_after'] = time.monotonic() + 5
+            elif call['status'] == 'error' and call.get('publisher_muted'):
+                # Keep tracking live elapsed position while Telegram mutes the account
+                # so the progress indicator and resume timestamp never regress to 0:00.
                 try:
-                    _, participant = await self.native_publisher(a, chat, call['native_call'])
-                except Exception:
-                    participant = None
-                if participant is not None and (getattr(participant, 'left', False) or getattr(participant, 'muted', False)):
-                    # Do not fight subsequent moderator mute actions or discard songs.
-                    call.update(status='error', publisher_muted=True, publisher_verified=False, position_seconds=None)
+                    elapsed = await self._call_elapsed_seconds(a['engine'], chat, call, timeout=3.0)
+                    position = float(call.get('offset') or 0.0) + elapsed
+                    call['last_known_position'] = max(float(call.get('last_known_position') or 0.0), position)
+                    call['clock_errors'] = 0
+                except Exception as error:
+                    if classify(error) == 'NO_ACTIVE_CALL':
+                        pos = await self._close_dropped_call(a, chat, call, reason='NO_ACTIVE_CALL', probe_time=False, emit_event=False, ignore_leave_error=False)
+                        return {'ok': True, 'active': False, 'last_position_seconds': pos if pos > 0 else self.last_ended_positions.get(chat)}
+            if not is_rtmp and not call.get('is_channel') and call.get('native_call') is not None and time.monotonic() >= call.get('publisher_check_after', 0):
+                if call['status'] == 'playing':
+                    call['publisher_check_after'] = time.monotonic() + 5
+                    try:
+                        _, participant = await self.native_publisher(a, chat, call['native_call'])
+                    except Exception:
+                        participant = None
+                    if participant is not None and (getattr(participant, 'left', False) or getattr(participant, 'muted', False)):
+                        # Do not fight subsequent moderator mute actions or discard songs.
+                        call.update(
+                            status='error',
+                            publisher_muted=True,
+                            publisher_verified=False,
+                            position_seconds=None,
+                            publisher_muted_can_self_unmute=bool(getattr(participant, 'can_self_unmute', False)),
+                            publisher_muted_while_paused=False,
+                        )
+                elif call.get('publisher_muted') and call['status'] in {'error', 'paused'}:
+                    call['publisher_check_after'] = time.monotonic() + 5
+                    try:
+                        _, participant = await self.native_publisher(a, chat, call['native_call'])
+                    except Exception:
+                        participant = None
+                    if participant is not None and not getattr(participant, 'left', False):
+                        srv_muted = bool(getattr(participant, 'muted', False))
+                        can_unmute = bool(getattr(participant, 'can_self_unmute', False))
+                        was_can_unmute = call.get('publisher_muted_can_self_unmute')
+                        admin_granted_speak = bool(srv_muted and can_unmute and (was_can_unmute is False))
+                        if not srv_muted or admin_granted_speak:
+                            try:
+                                await asyncio.wait_for(self.ensure_publisher(a, chat, call), 12)
+                                restored_status = 'paused' if (call.get('status') == 'paused' or call.get('publisher_muted_while_paused')) else 'playing'
+                                call.update(
+                                    status=restored_status,
+                                    publisher_muted=False,
+                                    publisher_verified=True,
+                                    publisher_muted_while_paused=False,
+                                    clock_errors=0,
+                                    last_progress=time.monotonic(),
+                                )
+                                try:
+                                    elapsed = await self._call_elapsed_seconds(a['engine'], chat, call, timeout=2.0)
+                                    pos_now = float(call.get('offset') or 0.0) + elapsed
+                                    call['position_seconds'] = pos_now
+                                    call['last_known_position'] = max(float(call.get('last_known_position') or 0.0), pos_now)
+                                except Exception:
+                                    if call.get('last_known_position') is not None:
+                                        call['position_seconds'] = call.get('last_known_position')
+                            except Exception:
+                                call['publisher_muted_can_self_unmute'] = can_unmute
+                        else:
+                            call['publisher_muted_can_self_unmute'] = can_unmute
             if call['status'] == 'recovering' and time.monotonic() >= call['retry_after']: call['status'] = 'error'
             if call['status'] == 'error' and not call.get('publisher_muted') and call['retries'] < 2 and time.monotonic() < call['retry_after']: call['status'] = 'recovering'
             if call['status'] == 'error' and not call.get('publisher_muted') and call['retries'] < 2 and time.monotonic() >= call['retry_after']:
@@ -4021,7 +4099,9 @@ class Bridge:
                 pos = await self._close_dropped_call(a, chat, call, reason='NO_ACTIVE_CALL', probe_time=False, emit_event=False, ignore_leave_error=True)
                 return {'ok': True, 'active': False, 'last_failure': self.last_failures.get(chat), 'last_position_seconds': pos if pos > 0 else self.last_ended_positions.get(chat)}
             self._sync_live_sub_monitor_state(call)
-            info_out = {k: call.get(k) for k in ['status','playback_id','position_seconds','alias','video','volume','publisher_verified','publisher_muted','call_invite_link','subtitle_offset','auto_subtitle_offset','subtitle_same_route','sub_drift_sec_per_sec','sub_drift_anchor_sec','stream_mode','messages_enabled']}
+            info_out = {k: call.get(k) for k in ['status','playback_id','position_seconds','last_known_position','alias','video','volume','publisher_verified','publisher_muted','call_invite_link','subtitle_offset','auto_subtitle_offset','subtitle_same_route','sub_drift_sec_per_sec','sub_drift_anchor_sec','stream_mode','messages_enabled']}
+            if call.get('publisher_muted'):
+                info_out['publisher_can_self_unmute'] = bool(call.get('publisher_muted_can_self_unmute'))
             if call.get('subtitle_sync') is not None:
                 info_out['subtitle_sync'] = call.get('subtitle_sync')
             probe_meta = call.get('_probe_info') or {}

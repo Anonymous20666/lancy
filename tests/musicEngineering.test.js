@@ -93,3 +93,40 @@ test('stopped-panel navigation can open a fresh dashboard without authorizing st
 test('a subsequently muted Telegram publisher retains the current recording and queue without automatic advance',async t=>{const v=voice(),q=qm(t,v);await q.addMany(-1,[track(1),track(2)]);const s=q.getSession(-1),original=s.currentTrack;v.getStatus=async()=>({ok:true,active:true,info:{playback_id:s.playbackId,status:'error',publisher_muted:true,publisher_verified:false,position_seconds:null}});await q.reconcile();assert.equal(s.status,'error');assert.equal(s.currentTrack,original);assert.equal(s.upcoming[0].providerId,'2');assert.equal(s.positionSeconds,null);assert.match(s.lastError,/Telegram muted/);});
 
 test('publisher verification failure retains canonical queue entries rather than discarding them as bad media',async t=>{const v=voice();v.play=async()=>({ok:false,error:'PUBLISHER_UNVERIFIED',message:'Publisher verification failed'});const q=qm(t,v);await q.addMany(-1,[track(1),track(2)]);const s=q.getSession(-1);assert.equal(s.status,'error');assert.equal(s.currentTrack,null);assert.deepEqual(s.upcoming.map(t=>t.providerId),['1','2']);assert.match(s.lastError,/Publisher verification/);});
+
+test('muted publisher keeps cinema live progress, supports pause/unmute without restarting at 0:00, and clears error on recovery',async t=>{
+  const v=voice(),calls=[],edits=[];
+  v.pause=async()=>{calls.push('pause');return{ok:true};};
+  v.resume=async()=>{calls.push('resume');return{ok:true};};
+  const screen=createMusicScreen({app:{}}),q=qm(t,v);
+  q.app={screens:new Map([['music',screen]]),settings:{get:()=>null},db:{getSetting:()=>null}};
+  q.setPlayerMessage(-1,42,-1,{editMessageRich:async(_id,_mid,rich)=>edits.push(rich)});
+  await q.addMany(-1,[{...track(1),provider:'movie',title:'Wonder Woman (2017)',durationSeconds:8476,capabilities:{seek:true}}]);
+  const s=q.getSession(-1);
+  s.activeDeck='movie';
+  s.view='cinema';
+  v.getStatus=async()=>({ok:true,active:true,info:{playback_id:s.playbackId,status:'error',publisher_muted:true,publisher_verified:false,publisher_can_self_unmute:true,position_seconds:null,last_known_position:4169}});
+  await q.reconcile();
+  assert.equal(s.status,'error');
+  assert.equal(s.positionSeconds,null);
+  assert.equal(s.lastKnownPositionSeconds,4169);
+  await q.updatePlayerCard(-1,{forceEdit:true});
+  const mutedJson=JSON.stringify(edits.at(-1));
+  assert.match(mutedJson,/1:09:29 \/ 2:21:16/);
+  assert.match(mutedJson,/🔊 Unmute VC/);
+  assert.match(mutedJson,/⏸ Pause/);
+  assert.ok(await q.pause(-1));
+  assert.equal(s.status,'paused');
+  assert.deepEqual(calls,['pause']);
+  s.status='error';
+  s.lastError='Telegram muted the playback account.';
+  assert.ok(await q.resume(-1));
+  assert.equal(s.status,'playing');
+  assert.equal(s.lastError,null);
+  assert.equal(s.positionSeconds,4169);
+  assert.deepEqual(calls,['pause','resume']);
+  v.getStatus=async()=>({ok:true,active:true,info:{playback_id:s.playbackId,status:'playing',publisher_muted:false,publisher_verified:true,position_seconds:4190,last_known_position:4190}});
+  await q.reconcile();
+  assert.equal(s.status,'playing');
+  assert.equal(s.positionSeconds,4190);
+});

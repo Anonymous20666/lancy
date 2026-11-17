@@ -555,7 +555,19 @@ export class QueueManager extends EventEmitter {
     this.emit('queue_empty',{chatId:s.chatId});await this.updatePlayerCard(s.chatId);return null;
   }
   #assert(r) { if (!r?.ok) throw new MusicError(r?.error || 'BRIDGE_FAILURE', r?.message || 'The playback engine did not confirm this operation.'); return r; }
-  async pause(id) { return this.locks.run(Number(id), async () => { const s = this.getSession(id); if (s.status !== 'playing') return false; this.#assert(await this.voice.pause(id)); s.status = 'paused'; this.#savePlaybackSnapshot(s); await this.updatePlayerCard(id, { forceEdit: true }); return true; }); }
+  async pause(id) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const canPauseMutedLive = Boolean(s.status === 'error' && s.currentTrack && s.connected);
+      if (s.status !== 'playing' && !canPauseMutedLive) return false;
+      this.#assert(await this.voice.pause(id));
+      s.status = 'paused';
+      if (canPauseMutedLive) s.lastError = null;
+      this.#savePlaybackSnapshot(s);
+      await this.updatePlayerCard(id, { forceEdit: true });
+      return true;
+    });
+  }
   #resolveSavedPosition(s, reportedPos = null, track = null) {
     const candidates = [
       reportedPos,
@@ -638,6 +650,33 @@ export class QueueManager extends EventEmitter {
         }
       }
       if (s.status !== 'paused') {
+        if (s.status === 'error' && s.currentTrack && s.connected && typeof this.voice?.resume === 'function') {
+          try {
+            this.#assert(await this.voice.resume(id));
+            this.#cancelIdle(s);
+            s.status = 'playing';
+            s.callEnded = false;
+            s.lastError = null;
+            s.lastNotice = null;
+            s.publisherCanSelfUnmute = null;
+            if (!Number.isFinite(s.positionSeconds) && Number(s.lastKnownPositionSeconds) > 0) {
+              s.positionSeconds = s.lastKnownPositionSeconds;
+            }
+            this.#savePlaybackSnapshot(s);
+            await this.updatePlayerCard(id, { forceEdit: true });
+            return true;
+          } catch (err) {
+            if (err?.code === 'PERMISSION_DENIED') {
+              const lockedErr = err.message || 'Telegram still blocks this account from speaking. Allow it to speak in Voice Chat first, then tap ▶ Resume.';
+              s.lastError = lockedErr;
+              await this.updatePlayerCard(id, { forceEdit: true }).catch(() => {});
+              throw new MusicError('PUBLISHER_LOCKED', lockedErr);
+            }
+            if (!['NO_ACTIVE_CALL', 'CALL_FAILED', 'RATE_LIMITED', 'MEDIA_INVALID', 'BRIDGE_FAILURE', 'PUBLISHER_UNVERIFIED', 'SESSION_NOT_READY', 'STREAM_FAILED'].includes(err?.code)) {
+              throw err;
+            }
+          }
+        }
         let deck = s.currentTrack?.provider === 'movie' ? 'movie' : (s.activeDeck || 'music');
         let deckQ = this.#deckQueue(s, deck);
         if (!s.currentTrack && !deckQ.length) {
@@ -1665,6 +1704,9 @@ export class QueueManager extends EventEmitter {
             if (r.info.position_seconds > 0) s.lastKnownPositionSeconds = r.info.position_seconds;
           } else {
             s.positionSeconds = null;
+            if (typeof r.info.last_known_position === 'number' && Number.isFinite(r.info.last_known_position) && r.info.last_known_position > 0) {
+              s.lastKnownPositionSeconds = Math.max(Number(s.lastKnownPositionSeconds || 0), r.info.last_known_position);
+            }
           }
           if(Number.isFinite(r.info.volume)){s.volume=r.info.volume;s.volumeConfirmed=true;}
           const prevSyncing = Boolean(s.avSync?.syncing);
@@ -1713,9 +1755,31 @@ export class QueueManager extends EventEmitter {
             this.#stopLiveSubTimer(s);
             if (s.liveSubCue) s.liveSubCue = '';
           }
+          const hadTransientError = /Telegram muted|still blocks this account|Reconnecting|Playback status unavailable/i.test(String(s.lastError || ''));
           if (r.info.status === 'ended' && s.status === 'playing') await this.#next(s);
-          else if (r.info.status === 'error' && r.info.publisher_muted) { s.status='error';s.positionSeconds=null;s.lastError='Telegram muted the playback account. Allow it to speak, then stop and retry playback. Your current recording and queue are retained.'; }
-          else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
+          else if (r.info.status === 'error' && r.info.publisher_muted) {
+            s.status = 'error';
+            s.positionSeconds = null;
+            s.publisherCanSelfUnmute = r.info.publisher_can_self_unmute !== undefined ? Boolean(r.info.publisher_can_self_unmute) : null;
+            s.lastError = s.publisherCanSelfUnmute === true
+              ? 'Telegram muted the playback account. Tap 🔊 Unmute / ▶ Resume to speak again (stream & queue are still live).'
+              : 'Telegram muted the playback account. Allow it to speak in Voice Chat — playback recovers automatically or tap 🔊 Unmute.';
+          } else if (r.info.status === 'playing') {
+            s.publisherCanSelfUnmute = null;
+            if (s.status !== 'playing' || hadTransientError) {
+              const changed = s.status !== 'playing' || hadTransientError;
+              s.status = 'playing';
+              if (hadTransientError) s.lastError = null;
+              if (changed) s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+            }
+          } else if (r.info.status === 'paused' && !r.info.publisher_muted) {
+            s.publisherCanSelfUnmute = null;
+            if (s.status === 'error' || hadTransientError) {
+              s.status = 'paused';
+              if (hadTransientError) s.lastError = null;
+              s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+            }
+          } else if (r.info.status === 'error') { s.lastError = 'The stream was interrupted. Advancing to the next queued recording.'; await this.#next(s, { manual: true }); }
         }
         s.failures = 0;
         const totalQueued = (s.upcoming?.length || 0) + (s.movieUpcoming?.length || 0);
