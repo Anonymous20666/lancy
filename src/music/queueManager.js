@@ -427,7 +427,7 @@ export class QueueManager extends EventEmitter {
         s.streamMode=streamMode;
         if(isMovieTrack)s.movieStreamMode=streamMode; else s.musicStreamMode=streamMode;
         const savedQuality = typeof this.getVcQuality === 'function' ? this.getVcQuality(s.chatId, { isMovieTrack, streamMode }) : null;
-        const videoQuality = savedQuality || ((isMovieTrack || streamMode==='rtmp') ? 'FHD_1080p' : (process.env.VOICE_VIDEO_QUALITY || 'HD_720p'));
+        const videoQuality = savedQuality || (streamMode === 'rtmp' ? 'FHD_1080p' : (process.env.VOICE_VIDEO_QUALITY || 'HD_720p'));
         s.vcQuality = videoQuality;
         if(!track.filePath && track.streamUrl && /^https?:\/\//i.test(track.streamUrl) && typeof this.app?.videoServer?.registerRemoteStream==='function'){
           const isDash = Boolean(track.isDash || track.format === 'dash' || /\.mpd(\?|$)/i.test(track.streamUrl));
@@ -1134,10 +1134,11 @@ export class QueueManager extends EventEmitter {
       return nextMode;
     });
   }
-  getVcQuality(id, { isMovieTrack = false, streamMode = 'interactive' } = {}) {
+  getVcQuality(id, { isMovieTrack = false, streamMode = null } = {}) {
     const saved = String(this.db?.getSetting?.(`music.vcQuality.${id}`) || '').trim();
     if (['FHD_1080p', 'HD_720p', 'SD_480p'].includes(saved)) return saved;
-    return (isMovieTrack || streamMode === 'rtmp') ? 'FHD_1080p' : (process.env.VOICE_VIDEO_QUALITY || 'HD_720p');
+    const effMode = streamMode || (isMovieTrack ? this.getDeckStreamMode(id, 'movie') : 'interactive');
+    return effMode === 'rtmp' ? 'FHD_1080p' : (process.env.VOICE_VIDEO_QUALITY || 'HD_720p');
   }
   async setVcQuality(id, targetQuality = null) {
     return this.locks.run(Number(id), async () => {

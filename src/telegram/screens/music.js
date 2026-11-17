@@ -513,7 +513,7 @@ export function createMusicScreen({ app }) {
     const q = s.vcQuality || app.musicQueueManager?.getVcQuality?.(s.destination || s.chatId, {
       isMovieTrack: s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie',
       streamMode: s.streamMode || 'interactive'
-    }) || ((s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie' || s.streamMode === 'rtmp') ? 'FHD_1080p' : 'HD_720p');
+    }) || ((s.streamMode || ((s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie') ? 'rtmp' : 'interactive')) === 'rtmp' ? 'FHD_1080p' : 'HD_720p');
     if (q === 'SD_480p') return '480p Saver';
     if (q === 'HD_720p') return '720p Smooth';
     return '1080p HD';

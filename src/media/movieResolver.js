@@ -1377,6 +1377,10 @@ export class MovieStreamResolver {
             url: s.url,
             type: s.kind || s.type || (/\.m3u8/i.test(s.url) ? 'hls' : ''),
             quality: s.quality || '',
+            language: s.language || s.lang || s.audioLang || s.audio_language || '',
+            label: s.label || s.name || s.title || (s.language ? `${s.quality || ''} ${s.language}`.trim() : ''),
+            dub: Boolean(s.dub || s.isDub),
+            isOriginal: s.isOriginal === true,
             source: 'vidbolt',
             headers: { ...VIDBOLT_HEADERS },
             subtitles: masterSubs

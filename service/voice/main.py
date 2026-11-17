@@ -3001,6 +3001,12 @@ class Bridge:
         ff += ' --audio ---mid -af ' + filters
 
         requested_quality = str(call.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p')
+        if video_active and requested_quality == 'FHD_1080p':
+            active_vids = sum(self._active_video_calls_for_account(al) for al in self.accounts)
+            load_ratio = sub_align.host_load_pressure()
+            if active_vids >= 2 or load_ratio >= 0.55:
+                # Cap WebRTC 1080p down to 720p when multiple video streams or tight CPU load would stutter frames.
+                requested_quality = 'HD_720p'
         video_quality = getattr(VideoQuality, requested_quality, getattr(VideoQuality, 'HD_720p', VideoQuality.SD_360p))
         vq_val = getattr(video_quality, 'value', None)
         if VideoParameters is not None and isinstance(vq_val, tuple) and len(vq_val) >= 3:

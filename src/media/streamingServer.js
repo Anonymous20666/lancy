@@ -15,11 +15,11 @@ const execFileAsync = promisify(execFile);
 const ISO_LANG_ALIAS = {
   jpn: 'ja', jp: 'ja', ja: 'ja', japanese: 'ja',
   eng: 'en', en: 'en', english: 'en',
-  spa: 'es', es: 'es', spanish: 'es',
-  fre: 'fr', fra: 'fr', fr: 'fr', french: 'fr',
+  spa: 'es', es: 'es', spanish: 'es', espanol: 'es', latino: 'es', castellano: 'es', 'latin american spanish': 'es',
+  fre: 'fr', fra: 'fr', fr: 'fr', french: 'fr', francais: 'fr', vf: 'fr', vff: 'fr', vfq: 'fr', truefrench: 'fr',
   ger: 'de', deu: 'de', de: 'de', german: 'de',
   ita: 'it', it: 'it', italian: 'it',
-  por: 'pt', pt: 'pt', portuguese: 'pt',
+  por: 'pt', pt: 'pt', portuguese: 'pt', portugues: 'pt', brazilian: 'pt', 'brazilian portuguese': 'pt', 'pt-br': 'pt', pt_br: 'pt',
   rus: 'ru', ru: 'ru', russian: 'ru',
   kor: 'ko', ko: 'ko', korean: 'ko',
   chi: 'zh', zho: 'zh', cmn: 'zh', zh: 'zh', chinese: 'zh', mandarin: 'zh', cantonese: 'zh',
@@ -50,8 +50,11 @@ export function normalizeLangCode(raw) {
   const cleaned = String(raw || '').trim().toLowerCase();
   if (!cleaned) return '';
   if (ISO_LANG_ALIAS[cleaned] !== undefined) return ISO_LANG_ALIAS[cleaned];
-  const primary = cleaned.split(/[-_;\s,]/)[0];
+  const primary = cleaned.split(/[-_;\s,()\[\]]/)[0];
   if (ISO_LANG_ALIAS[primary] !== undefined) return ISO_LANG_ALIAS[primary];
+  for (const part of cleaned.split(/[-_;\s,()\[\]]+/)) {
+    if (part && ISO_LANG_ALIAS[part] !== undefined) return ISO_LANG_ALIAS[part];
+  }
   return /^[a-z]{2,3}$/.test(primary) ? primary : '';
 }
 

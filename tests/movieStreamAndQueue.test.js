@@ -4037,3 +4037,67 @@ test('Cinemeta/Wikidata fallbacks preserve originalLanguage + TMDB ID on API out
   assert.equal(cardText.includes('Original (HI)'), false, 'Mismatched audio language must never be labeled Original (HI)');
   assert.match(cardText, /Dub Only Available \(HI\)/);
 });
+
+test('VidBolt candidate parser preserves source.language (skips 1080p French/Pt-Br for English) and Interactive VC defaults to HD_720p smooth', async (t) => {
+  const { normalizeLangCode } = await import('../src/media/streamingServer.js');
+  assert.equal(normalizeLangCode('Brazilian Portuguese'), 'pt');
+  assert.equal(normalizeLangCode('French'), 'fr');
+
+  const masterM3u8 = '#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:1250.0,\nhttps://cdn.example/seg1.ts\n#EXT-X-ENDLIST\n';
+  const resolver = new MovieStreamResolver({
+    movieApi: null,
+    subtitles: null,
+    enableWebFallback: false,
+    enableYtDlp: false,
+    fetchImpl: async (url) => {
+      const u = String(url);
+      if (u.startsWith('https://vidbolt.xyz/api/resolve')) {
+        return {
+          ok: true,
+          json: async () => ({
+            stream: {
+              sources: [
+                { url: 'https://cdn.example/fr_1080.m3u8', kind: 'hls', quality: '1080p', language: 'French' },
+                { url: 'https://cdn.example/pt_720.m3u8', kind: 'hls', quality: '720p', language: 'Brazilian Portuguese' },
+                { url: 'https://cdn.example/en_480.m3u8', kind: 'hls', quality: '480p', language: 'English' }
+              ]
+            }
+          })
+        };
+      }
+      if (u.startsWith('https://cdn.example/') && u.endsWith('.m3u8')) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/vnd.apple.mpegurl' }),
+          text: async () => masterM3u8
+        };
+      }
+      if (u.startsWith('https://cdn.example/seg1.ts')) {
+        return { ok: true, status: 206, headers: new Headers({ 'content-type': 'video/mp2t' }), arrayBuffer: async () => new ArrayBuffer(64) };
+      }
+      return { ok: false, status: 404, text: async () => '' };
+    }
+  });
+
+  const picked = await resolver.resolve({
+    type: 'tv',
+    id: '7869',
+    tmdbId: '7869',
+    title: 'The Penguins of Madagascar',
+    year: 2008,
+    season: 1,
+    episode: 1,
+    originalLanguage: 'English',
+    fetchSubtitles: false
+  });
+  assert.equal(picked.ok, true);
+  assert.equal(picked.track.streamUrl, 'https://cdn.example/en_480.m3u8');
+  assert.equal(picked.track.audioLanguage, 'en');
+  assert.equal(picked.track.audioIsDub, false);
+
+  const h = buildTestHarness(t);
+  h.app.db.setSetting('music.streamMode.-10091.movie', 'interactive');
+  assert.equal(h.qm.getVcQuality(-10091, { isMovieTrack: true, streamMode: 'interactive' }), 'HD_720p');
+  assert.equal(h.qm.getVcQuality(-10091, { isMovieTrack: true, streamMode: 'rtmp' }), 'FHD_1080p');
+});
