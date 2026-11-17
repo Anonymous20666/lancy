@@ -6,7 +6,7 @@ import { basename } from 'node:path';
 import { logger } from '../core/logger.js';
 import { getCueAt, mapMediaSecToSubMs } from '../media/subtitles.js';
 import { resolveAppScreen } from './accounts.js';
-import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback } from './model.js';
+import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback, extractRichPhotoUrl, replaceRichPhotoMedia, extractSentPhotoFileId } from './model.js';
 
 /** Sole owner of ephemeral destination queues. The bridge exclusively owns account leases. */
 export class QueueManager extends EventEmitter {
@@ -2074,19 +2074,47 @@ export class QueueManager extends EventEmitter {
         : screen.renderPlayer(display);
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
-      const nextHasPhoto = hasRichPhotoPayload(rich);
-      const needsMediaReplacement = Boolean(!preview && s.lastRenderHasPhoto === false && nextHasPhoto && typeof api.sendRichMessage === 'function');
+      const rawPhotoUrl = extractRichPhotoUrl(rich);
+      let effectiveRich = rich;
+      if (!preview && rawPhotoUrl) {
+        const cachedFileId = s._photoFileIdByUrl?.get?.(rawPhotoUrl);
+        if (cachedFileId) {
+          effectiveRich = replaceRichPhotoMedia(rich, cachedFileId);
+        } else if (s._photoBlockedUrl === rawPhotoUrl) {
+          effectiveRich = stripRemotePhotoBlocks(rich) || rich;
+        }
+      }
+      const nextHasPhoto = hasRichPhotoPayload(effectiveRich);
+      const canAttemptUpgrade = Boolean(
+        !preview
+        && s.lastRenderHasPhoto === false
+        && nextHasPhoto
+        && rawPhotoUrl
+        && s._photoUpgradeAttemptedUrl !== rawPhotoUrl
+        && s._photoBlockedUrl !== rawPhotoUrl
+        && typeof api.sendRichMessage === 'function'
+      );
       try {
         const files = preview ? await audioUpload(preview.media) : null;
         // A track/control can change while reading the file. Never upload stale audio.
         if (preview && (!previews.current(s, preview.request) || s.view !== 'player')) return false;
         let sent;
         let renderedHasPhoto = nextHasPhoto;
-        if (needsMediaReplacement) {
+        if (canAttemptUpgrade) {
+          s._photoUpgradeAttemptedUrl = rawPhotoUrl;
           const oldMsgId = s.screenMessageId;
-          const out = await sendRichWithPhotoFallback(api, s.playerChatId, rich);
+          const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich);
           sent = out.sent;
           renderedHasPhoto = out.hasPhoto;
+          if (!out.hasPhoto && rawPhotoUrl) {
+            s._photoBlockedUrl = rawPhotoUrl;
+          } else if (out.hasPhoto && rawPhotoUrl) {
+            const fid = extractSentPhotoFileId(sent);
+            if (fid) {
+              if (!s._photoFileIdByUrl) s._photoFileIdByUrl = new Map();
+              s._photoFileIdByUrl.set(rawPhotoUrl, fid);
+            }
+          }
           if (sent?.message_id) {
             if (oldMsgId && oldMsgId !== sent.message_id && typeof api.deleteMessage === 'function') {
               await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
@@ -2099,14 +2127,31 @@ export class QueueManager extends EventEmitter {
           }
         } else {
           try {
-            sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, rich, { dropOnFloodWait: !forceEdit }, files);
+            sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, effectiveRich, { dropOnFloodWait: !forceEdit }, files);
           } catch (editErr) {
             if (!preview && isRemotePhotoError(editErr)) {
-              if (nextHasPhoto && typeof api.sendRichMessage === 'function') {
+              const firstUpgradeAttempt = Boolean(
+                nextHasPhoto
+                && rawPhotoUrl
+                && s._photoUpgradeAttemptedUrl !== rawPhotoUrl
+                && s._photoBlockedUrl !== rawPhotoUrl
+                && typeof api.sendRichMessage === 'function'
+              );
+              if (firstUpgradeAttempt) {
+                s._photoUpgradeAttemptedUrl = rawPhotoUrl;
                 const oldMsgId = s.screenMessageId;
-                const out = await sendRichWithPhotoFallback(api, s.playerChatId, rich);
+                const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich);
                 sent = out.sent;
                 renderedHasPhoto = out.hasPhoto;
+                if (!out.hasPhoto && rawPhotoUrl) {
+                  s._photoBlockedUrl = rawPhotoUrl;
+                } else if (out.hasPhoto && rawPhotoUrl) {
+                  const fid = extractSentPhotoFileId(sent);
+                  if (fid) {
+                    if (!s._photoFileIdByUrl) s._photoFileIdByUrl = new Map();
+                    s._photoFileIdByUrl.set(rawPhotoUrl, fid);
+                  }
+                }
                 if (sent?.message_id) {
                   if (oldMsgId && oldMsgId !== sent.message_id && typeof api.deleteMessage === 'function') {
                     await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
@@ -2118,7 +2163,8 @@ export class QueueManager extends EventEmitter {
                   s.screenMessageId = sent.message_id;
                 }
               } else {
-                const noPhoto = stripRemotePhotoBlocks(rich);
+                if (rawPhotoUrl) s._photoBlockedUrl = rawPhotoUrl;
+                const noPhoto = stripRemotePhotoBlocks(effectiveRich);
                 if (noPhoto) {
                   sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, noPhoto, { dropOnFloodWait: !forceEdit }, files);
                   renderedHasPhoto = false;

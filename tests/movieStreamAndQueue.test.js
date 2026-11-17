@@ -817,8 +817,11 @@ test('Categories and browse survive primary API ECONNRESET via defaults/Cinemeta
   s.lastRenderHasPhoto = false;
   s.currentTrack = resolved.track;
   s.api = {
-    editMessageRich: async () => {
-      throw Object.assign(new Error('Telegram editMessageText: Bad Request: wrong type of the web page content'), { description: 'Bad Request: wrong type of the web page content' });
+    editMessageRich: async (_cid, _mid, rich) => {
+      if (rich?.blocks?.some((b) => b.type === 'photo')) {
+        throw Object.assign(new Error('Telegram editMessageText: Bad Request: wrong type of the web page content'), { description: 'Bad Request: wrong type of the web page content' });
+      }
+      return { message_id: s.screenMessageId };
     },
     sendRichMessage: async (_cid, rich) => {
       sentPayloads.push(rich);
@@ -831,6 +834,13 @@ test('Categories and browse survive primary API ECONNRESET via defaults/Cinemeta
   assert.equal(s.lastRenderHasPhoto, true);
   assert.ok(deletedIds.includes(700));
   assert.ok(sentPayloads[0]?.blocks?.some((b) => b.type === 'photo' && b.photo?.media === 'https://image.tmdb.org/t/p/w500/titanic.jpg'));
+
+  // Subsequent progress ticks must edit in-place and NEVER spam extra sendRichMessage cards even if remote edit fails
+  s.positionSeconds = 120;
+  await h.qm.updatePlayerView(s, { forceEdit: true });
+  s.positionSeconds = 150;
+  await h.qm.updatePlayerView(s, { forceEdit: true });
+  assert.equal(sentPayloads.length, 1, 'Must never spam multiple player cards on subsequent edits');
 });
 
 test('DM Channel Panel routes pc -> movie -> mv -> Back to Player & Cinema Queue cleanly with zero WebApp buttons', async (t) => {

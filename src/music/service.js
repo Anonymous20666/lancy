@@ -7,7 +7,7 @@ import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { originalPlayDelivery } from './originalPlayCard.js';
 import { isMusicOwner, isMusicSuperAdmin, resolveAppScreen, isSameMusicBot } from './accounts.js';
-import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback } from './model.js';
+import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback, extractRichPhotoUrl, extractSentPhotoFileId } from './model.js';
 import { checkChatMediaPermissions, isGroupSuperAdminMember, isAnonymousGroupAdmin } from '../telegram/permissions.js';
 import { ProgressTracker } from '../telegram/progress.js';
 import { RichMessageBuilder, rt } from '../telegram/rich.js';
@@ -747,6 +747,19 @@ export class MusicService {
           await ctx.api.deleteMessage(ctx.chatId, ctx.reuseMessageId).catch(() => {});
         }
       }
+      const sentPhotoUrl = extractRichPhotoUrl(rich);
+      if (sentPhotoUrl) {
+        s._photoUpgradeAttemptedUrl = sentPhotoUrl;
+        if (!sentHasPhoto) {
+          s._photoBlockedUrl = sentPhotoUrl;
+        } else {
+          const fid = extractSentPhotoFileId(sent);
+          if (fid) {
+            if (!s._photoFileIdByUrl) s._photoFileIdByUrl = new Map();
+            s._photoFileIdByUrl.set(sentPhotoUrl, fid);
+          }
+        }
+      }
       if (sent?.message_id && sent.message_id !== oldMessageId) {
         s.pinned = false;
         s.pinnedMessageId = null;
@@ -760,7 +773,13 @@ export class MusicService {
       }
       await qm.autoPinPlayerCard?.(id, sent.message_id, Number(ctx.chatId), ctx.api);
     };
-    const needFreshForPhoto = Boolean(s.lastRenderHasPhoto === false && isCinemaDeck && (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop));
+    const needFreshForPhoto = Boolean(
+      s.lastRenderHasPhoto === false
+      && isCinemaDeck
+      && (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop)
+      && s._photoUpgradeAttemptedUrl !== (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop)
+      && s._photoBlockedUrl !== (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop)
+    );
     let created = Boolean(!s.screenMessageId || ctx.forceNew || !sameBot || needFreshForPhoto || (prevPlayerChatId && prevPlayerChatId !== Number(ctx.chatId)));
     if(created){
       await sendFreshPlayerCard();

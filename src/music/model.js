@@ -44,6 +44,46 @@ export function hasRichPhotoPayload(rich) {
   if (rich.photo) return true;
   return Array.isArray(rich.blocks) && rich.blocks.some((b) => b?.type === 'photo' || b?.type === 'slideshow' || b?.type === 'collage');
 }
+export function extractRichPhotoUrl(rich) {
+  if (!rich || !Array.isArray(rich.blocks)) return null;
+  for (const b of rich.blocks) {
+    if (b?.type !== 'photo') continue;
+    const ref = String(b.photo?.media || b.photo?.url || b.url || b.media || '');
+    if (/^https?:\/\//i.test(ref)) return ref;
+  }
+  return null;
+}
+export function replaceRichPhotoMedia(rich, replacementMedia) {
+  if (!rich || !Array.isArray(rich.blocks) || !replacementMedia) return rich;
+  let replaced = false;
+  const nextBlocks = rich.blocks.map((b) => {
+    if (!replaced && b?.type === 'photo') {
+      const ref = String(b.photo?.media || b.photo?.url || b.url || b.media || '');
+      if (/^https?:\/\//i.test(ref)) {
+        replaced = true;
+        return { ...b, photo: { ...(typeof b.photo === 'object' && b.photo ? b.photo : { type: 'photo' }), type: 'photo', media: replacementMedia } };
+      }
+    }
+    return b;
+  });
+  return replaced ? { ...rich, blocks: nextBlocks } : rich;
+}
+export function extractSentPhotoFileId(sent) {
+  if (!sent || typeof sent !== 'object') return null;
+  if (Array.isArray(sent.photo) && sent.photo.length) {
+    return sent.photo[sent.photo.length - 1]?.file_id || null;
+  }
+  const blocks = sent.rich_message?.blocks;
+  if (Array.isArray(blocks)) {
+    for (const b of blocks) {
+      if (b?.type === 'photo') {
+        const fid = b.photo?.file_id || (typeof b.photo?.media === 'string' && !/^https?:|^attach:/i.test(b.photo.media) ? b.photo.media : null);
+        if (fid) return fid;
+      }
+    }
+  }
+  return null;
+}
 async function downloadRemotePhotoAsJpeg(url) {
   const res = await fetch(url, {
     headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LancyBot/10.3)', Accept: 'image/*,*/*;q=0.8' },
