@@ -1942,10 +1942,41 @@ export class MovieStreamResolver {
           }
         }
       }
+      const audioOptions = [];
+      const seenAudioOpt = new Set();
+      const pushAudioOpt = (opt) => {
+        if (!opt?.url || excludeSet.has(opt.url)) return;
+        const lang = normalizeLangCode(opt.audioLanguage || '');
+        const key = `${lang || 'und'}:${opt.audioIsDub ? 'dub' : 'orig'}`;
+        if (seenAudioOpt.has(key)) return;
+        seenAudioOpt.add(key);
+        audioOptions.push(opt);
+      };
+      for (const origHit of originals) {
+        if (origHit?.stream) pushAudioOpt(origHit.stream);
+      }
+      if (dubFallback?.stream) pushAudioOpt(dubFallback.stream);
+      for (const c of candList) {
+        const lang = normalizeLangCode(c.audioLanguage || '');
+        if (!lang) continue;
+        pushAudioOpt({
+          url: c.url,
+          headers: c.headers || CINEMA_PLAYER_HEADERS,
+          format: c.isDash ? 'dash' : c.isHls ? 'hls' : 'mp4',
+          isHls: Boolean(c.isHls),
+          isDash: Boolean(c.isDash),
+          qualityLabel: c.qualityLabel || 'HD',
+          audioLanguage: lang,
+          audioIsDub: Boolean(c.explicitDub || c.isLikelyDub || (prefLang && lang !== prefLang)),
+          source: c.routeName === 'vidbolt' ? 'movie_vidbolt' : 'movie_tmdb_stream',
+          unprobed: true
+        });
+      }
       return {
         original: originals[0] || null,
         fallbackStreams: originals.slice(1, 3).map((x) => x.stream),
-        dubFallback
+        dubFallback,
+        audioOptions
       };
     };
 
@@ -2000,8 +2031,18 @@ export class MovieStreamResolver {
 
     const waveACandidates = collectCandidates(waveAPayloads);
     const waveAHit = await probeBatch(waveACandidates);
+    const audioVariantsAccum = [...(waveAHit.audioOptions || [])];
+    const mergeAudioOptList = (list = []) => {
+      for (const opt of list) {
+        if (!opt?.url) continue;
+        const lang = normalizeLangCode(opt.audioLanguage || '');
+        if (!audioVariantsAccum.some((x) => normalizeLangCode(x.audioLanguage || '') === lang && Boolean(x.audioIsDub) === Boolean(opt.audioIsDub))) {
+          audioVariantsAccum.push(opt);
+        }
+      }
+    };
     if (waveAHit.original) {
-      return { ...waveAHit.original, fallbackStreams: waveAHit.fallbackStreams || [], discoveredTmdbId };
+      return { ...waveAHit.original, fallbackStreams: waveAHit.fallbackStreams || [], audioVariants: audioVariantsAccum, discoveredTmdbId };
     }
     let bestDubFallback = waveAHit.dubFallback || null;
 
@@ -2017,7 +2058,8 @@ export class MovieStreamResolver {
       const discPayloads = [...(punkPayload ? [punkPayload] : []), ...vidboltExtra];
       if (discPayloads.length) {
         const punkHit = await probeBatch(collectCandidates(discPayloads));
-        if (punkHit.original) return { ...punkHit.original, fallbackStreams: punkHit.fallbackStreams || [], discoveredTmdbId };
+        mergeAudioOptList(punkHit.audioOptions || []);
+        if (punkHit.original) return { ...punkHit.original, fallbackStreams: punkHit.fallbackStreams || [], audioVariants: audioVariantsAccum, discoveredTmdbId };
         if (!bestDubFallback && punkHit.dubFallback) bestDubFallback = punkHit.dubFallback;
       }
     }
@@ -2050,7 +2092,8 @@ export class MovieStreamResolver {
     }
     const waveBCandidates = collectCandidates(waveBPayloads);
     const waveBHit = await probeBatch(waveBCandidates);
-    if (waveBHit.original) return { ...waveBHit.original, fallbackStreams: waveBHit.fallbackStreams || [], discoveredTmdbId };
+    mergeAudioOptList(waveBHit.audioOptions || []);
+    if (waveBHit.original) return { ...waveBHit.original, fallbackStreams: waveBHit.fallbackStreams || [], audioVariants: audioVariantsAccum, discoveredTmdbId };
     if (!bestDubFallback && waveBHit.dubFallback) bestDubFallback = waveBHit.dubFallback;
 
     // If Wave A got rate-limited on any host, do one backed-off retry on the non-limited node(s)
@@ -2063,7 +2106,8 @@ export class MovieStreamResolver {
         retryRes.filter((r) => r.status === 'fulfilled' && r.value).map((r) => r.value)
       );
       const retryHit = await probeBatch(retryCandidates);
-      if (retryHit.original) return { ...retryHit.original, fallbackStreams: retryHit.fallbackStreams || [], discoveredTmdbId };
+      mergeAudioOptList(retryHit.audioOptions || []);
+      if (retryHit.original) return { ...retryHit.original, fallbackStreams: retryHit.fallbackStreams || [], audioVariants: audioVariantsAccum, discoveredTmdbId };
       if (!bestDubFallback && retryHit.dubFallback) bestDubFallback = retryHit.dubFallback;
     }
 
@@ -2071,6 +2115,7 @@ export class MovieStreamResolver {
       return {
         ...bestDubFallback,
         fallbackStreams: [],
+        audioVariants: audioVariantsAccum,
         discoveredTmdbId,
         stream: {
           ...bestDubFallback.stream,
@@ -3248,6 +3293,26 @@ export class MovieStreamResolver {
     return dubFallback;
   }
 
+  async verifyAudioVariant(cand, { minDuration = 0, preferredHeight = null, isTv = false } = {}) {
+    if (!cand?.url) return null;
+    if (!cand.unprobed || cand.inManifest) return cand;
+    const hdrs = cand.headers || CINEMA_PLAYER_HEADERS;
+    const prefLang = normalizeLangCode(cand.preferredAudioLang || cand.audioLanguage || '');
+    if (cand.isDash) {
+      const p = await this.#probeDashManifest(cand.url, hdrs, { minDuration, preferredAudioLang: prefLang, isTv }).catch(() => null);
+      if (!p?.url) return null;
+      return { ...cand, url: p.url, headers: p.headers || hdrs, format: 'dash', isDash: true, isHls: false, qualityLabel: p.qualityLabel || cand.qualityLabel, unprobed: false };
+    }
+    if (cand.isHls) {
+      const p = await this.#probeHlsPlaylistAndSegment(cand.url, hdrs, 0, { minDuration, preferredHeight, preferredAudioLang: prefLang, isTv }).catch(() => null);
+      if (!p?.url) return null;
+      return { ...cand, url: p.url, headers: p.headers || hdrs, format: 'hls', isHls: true, isDash: false, qualityLabel: p.qualityLabel || cand.qualityLabel, unprobed: false };
+    }
+    const p = await this.#probeHttpStream(cand.url, hdrs, { minDuration, isTv, preferredAudioLang: prefLang }).catch(() => null);
+    if (!p?.url) return null;
+    return { ...cand, url: p.url, headers: p.headers || hdrs, unprobed: false };
+  }
+
   async resolve(opts = {}, extra = {}) {
     const {
       type = 'movie',
@@ -3813,6 +3878,50 @@ export class MovieStreamResolver {
     const rawIdStr = String(id || '').trim();
     const canonicalTrackId = `${isTv ? 'tv' : 'mv'}:${id || title}:${isTv ? (effectiveSeasonArg ?? 1) : 0}:${episode || 0}`;
 
+    const activeAudioLang = resolvedStream.audioLanguage || effectiveOriginalLanguage || '';
+    const audioVariants = [];
+    const seenAudioVarKeys = new Set();
+    const pushAudioVariant = (v) => {
+      if (!v?.url) return;
+      const lang = normalizeLangCode(v.audioLanguage || v.preferredAudioLang || '');
+      const isDub = Boolean(v.audioIsDub || (effectiveOriginalLanguage && lang && lang !== effectiveOriginalLanguage));
+      const key = `${lang || 'und'}:${isDub ? 'dub' : 'orig'}:${v.inManifest ? 'm' : 'u'}`;
+      if (seenAudioVarKeys.has(key)) return;
+      seenAudioVarKeys.add(key);
+      audioVariants.push({
+        url: v.url,
+        headers: v.headers || resolvedStream.headers || {},
+        format: v.format || (v.isDash ? 'dash' : v.isHls ? 'hls' : 'mp4'),
+        isHls: Boolean(v.isHls ?? isHls),
+        isDash: Boolean(v.isDash ?? isDash),
+        qualityLabel: v.qualityLabel || resolvedStream.qualityLabel || 'HD',
+        audioLanguage: lang || activeAudioLang || '',
+        preferredAudioLang: v.preferredAudioLang || lang || '',
+        audioIsDub: isDub,
+        label: langCodeToDisplayName(lang || activeAudioLang, lang ? lang.toUpperCase() : 'Original'),
+        inManifest: Boolean(v.inManifest),
+        unprobed: Boolean(v.unprobed)
+      });
+    };
+    pushAudioVariant({ ...resolvedStream, audioLanguage: activeAudioLang });
+    if (Array.isArray(resolvedStream.audioLanguages) && resolvedStream.audioLanguages.length > 1) {
+      for (const mLangRaw of resolvedStream.audioLanguages) {
+        const mLang = normalizeLangCode(mLangRaw);
+        if (!mLang) continue;
+        pushAudioVariant({
+          ...resolvedStream,
+          audioLanguage: mLang,
+          preferredAudioLang: mLang,
+          audioIsDub: Boolean(effectiveOriginalLanguage && mLang !== effectiveOriginalLanguage),
+          inManifest: true,
+          unprobed: false
+        });
+      }
+    }
+    for (const v of (netRes?.audioVariants || [])) pushAudioVariant(v);
+    if (dubFallbackStream) pushAudioVariant({ ...dubFallbackStream, audioIsDub: true });
+    for (const fb of cleanFallbacks) pushAudioVariant(fb);
+
     const track = normalizeTrack({
       id: canonicalTrackId,
       providerId: canonicalTrackId,
@@ -3853,6 +3962,7 @@ export class MovieStreamResolver {
       preferredAudioLang: effectiveOriginalLanguage || null,
       audioLanguage: resolvedStream.audioLanguage || effectiveOriginalLanguage || null,
       audioIsDub: Boolean(resolvedStream.audioIsDub),
+      audioVariants: audioVariants.length > 1 ? audioVariants : (audioVariants.length ? audioVariants : null),
       dubOnly: Boolean(resolvedStream.dubOnly || resolvedStream.audioIsDub),
       dubOnlyWarning: resolvedStream.dubOnlyWarning || (resolvedStream.audioIsDub ? '⚠️ Dub Only Available' : null),
       sizeBytes: resolvedStream.sizeBytes || null,

@@ -841,15 +841,77 @@ export function createMusicScreen({ app }) {
       controls(s, '+0.5s', 'subsync', 0.5, { style: 'primary' }),
       controls(s, '+2s', 'subsync', 2)
     ]);
+    if (tracks.length > 1) {
+      const subBtns = tracks.slice(0, 12).map((tr, i) => {
+        const rawLbl = String(tr?.label || tr?.language || `Track ${i + 1}`).replace(/\s*subtitles?$/i, '').trim();
+        const tag = cut(rawLbl || `Track ${i + 1}`, 14);
+        return controls(s, `${i === curIdx ? '✓ ' : ''}${tag}`, 'subtrack', i, i === curIdx ? { style: 'success' } : { style: 'primary' });
+      });
+      for (let i = 0; i < subBtns.length; i += 3) {
+        b.buttons(subBtns.slice(i, i + 3));
+      }
+    }
     const tail = [];
     if (t?.subtitlePath) {
-      tail.push(controls(s, '🔍 Check & Auto-Fix Sync', 'subcheck', { style: 'primary' }));
+      tail.push(controls(s, '🔍 Auto-Sync', 'subcheck', { style: 'primary' }));
     }
     if (tracks.length > 1) {
-      tail.push(controls(s, `🌐 Next Track (${curIdx + 1}/${tracks.length})`, 'subtrack', { style: 'primary' }));
+      tail.push(controls(s, `🌐 Next (${curIdx + 1}/${tracks.length})`, 'subtrack', { style: 'primary' }));
+    }
+    if (Array.isArray(t?.audioVariants) && t.audioVariants.length > 1) {
+      tail.push(controls(s, `🔊 Audio (${t.audioVariants.length})`, 'audiolang', { style: 'primary' }));
     }
     tail.push(controls(s, '◀ Back', 'subsync', 'back'));
     b.buttons(tail);
+    return finish(b);
+  }
+
+  function renderAudioLangPicker(s) {
+    const t = s.currentTrack;
+    const variants = (app.musicQueueManager?.getAudioVariants?.(t) || (Array.isArray(t?.audioVariants) ? t.audioVariants : []))
+      .filter((v) => v?.url);
+    const curLang = String(t?.audioLanguage || '').trim().toLowerCase();
+    const curPref = String(t?.preferredAudioLang || '').trim().toLowerCase();
+    let curIdx = variants.findIndex((v) =>
+      v.url === t?.streamUrl && (!v.inManifest || (v.audioLanguage && v.audioLanguage === (curPref || curLang)))
+    );
+    if (curIdx < 0) curIdx = 0;
+    const active = variants[curIdx] || null;
+    const activeBadge = active
+      ? `${active.audioIsDub ? 'Dubbed' : 'Original'} (${String(active.audioLanguage || 'EN').toUpperCase()}) · ${active.qualityLabel || 'HD'}`
+      : (t?.audioLanguage ? `${t.audioIsDub ? 'Dubbed' : 'Original'} (${String(t.audioLanguage).toUpperCase()})` : 'Default');
+    const b = card('🔊 LANCY CINEMA · AUDIO LANGUAGE', cut(t?.title || s.destinationTitle || 'Voice Chat', 48));
+    b.table([
+      ['Active Audio', activeBadge],
+      ['Original', t?.originalLanguage ? String(t.originalLanguage).toUpperCase() : 'Auto'],
+      ['Available', `${variants.length || 1} track${variants.length === 1 ? '' : 's'}`]
+    ], { striped: true, bordered: true, compact: true });
+    b.paragraph(rt.italic('Tap any audio language below to hot-reload the live call at your exact timestamp without losing subtitles or queue.'));
+    if (variants.length) {
+      const langBtns = variants.slice(0, 9).map((v, i) => {
+        const code = String(v.audioLanguage || '').toUpperCase();
+        const namePart = cut(String(v.label || code || `Audio ${i + 1}`), 12);
+        const typeTag = v.audioIsDub ? 'Dub' : 'Orig';
+        const qPart = v.qualityLabel ? ` ${v.qualityLabel}` : '';
+        return controls(
+          s,
+          `${i === curIdx ? '✓ ' : ''}${namePart} (${typeTag}${qPart})`,
+          'audiolang',
+          i,
+          i === curIdx ? { style: 'success' } : { style: v.audioIsDub ? 'primary' : 'success' }
+        );
+      });
+      for (let i = 0; i < langBtns.length; i += 2) {
+        b.buttons(langBtns.slice(i, i + 2));
+      }
+    }
+    const subTracks = Array.isArray(t?.subtitleTracks) ? t.subtitleTracks : [];
+    const navRow = [];
+    if (subTracks.length > 0 || t?.subtitlePath) {
+      navRow.push(controls(s, `💬 Subs (${subTracks.length || 1})`, 'subsync', { style: 'primary' }));
+    }
+    navRow.push(controls(s, '◀ Back', 'audiolang', 'back'));
+    b.buttons(navRow);
     return finish(b);
   }
 
@@ -3239,16 +3301,23 @@ export function createMusicScreen({ app }) {
     }
     b.buttons(row2);
 
-    // Row 3: Queue, Movies, Subtitle Sync & Poll
+    // Row 3: Queue, Movies, Audio Language, Subtitle Sync & Poll
     const row3 = [
       controls(s, `🗳 Queue (${movieQ.length})`, 'mqueue', 0, { style: 'primary' }),
       controls(s, '🎬 Movies', 'movie', { style: 'primary' })
     ];
-    if (t) row3.push(controls(s, '⏱ Sync', 'subsync', { style: 'link' }));
-    row3.push(controls(s, s.activePoll ? '📊 Live Poll' : '📊 Poll', 'launchpoll', { style: s.activePoll ? 'success' : 'link' }));
+    if (t) {
+      const aVars = Array.isArray(t.audioVariants) ? t.audioVariants : [];
+      const aCode = String(t.audioLanguage || t.originalLanguage || '').trim().toUpperCase();
+      const aBtnLbl = aVars.length > 1
+        ? `🔊 Audio (${aCode || aVars.length})`
+        : (aCode ? `🔊 Audio (${aCode})` : '🔊 Audio');
+      row3.push(controls(s, aBtnLbl, 'audiolang', { style: aVars.length > 1 ? 'primary' : 'link' }));
+      row3.push(controls(s, '⏱ Sync', 'subsync', { style: (Array.isArray(t.subtitleTracks) && t.subtitleTracks.length > 1) ? 'primary' : 'link' }));
+    }
     b.buttons(row3);
 
-    // Row 4: SubMode, Anti-Lag Quality Tier & Neutral Source Switch
+    // Row 4: SubMode, Anti-Lag Quality Tier, Source Switch & Poll
     const row4 = [
       controls(s, `💬 ${subText}`, 'submode', { style: 'link' }),
       controls(s, `🎞 ${qShort}`, 'vcquality', { style: s.vcQuality === 'HD_720p' ? 'success' : 'primary' })
@@ -3266,6 +3335,7 @@ export function createMusicScreen({ app }) {
       const srcBtnLabel = srcTotal > 1 ? `📡 Source ${srcNum}/${srcTotal}` : '📡 Alt Source';
       row4.push(controls(s, srcBtnLabel, 'switchsource', { style: 'link' }));
     }
+    row4.push(controls(s, s.activePoll ? '📊 Live Poll' : '📊 Poll', 'launchpoll', { style: s.activePoll ? 'success' : 'link' }));
     if (t && ['playing', 'paused'].includes(s.status) && !s.isChannel && s.streamMode !== 'rtmp' && app.settings?.get?.('cinema.dualAssistantSubTilesEnabled') === true) {
       row4.push(controls(s, s.secondaryTile ? '👁 Tile: ON' : '👁 Sub Tile', 'dualtile', { style: s.secondaryTile ? 'success' : 'link' }));
     }
@@ -3372,6 +3442,7 @@ export function createMusicScreen({ app }) {
   function renderDeckPlayer(s) {
     if (s?.view === 'mqueue') return renderMovieQueue(s, s.page || 0);
     if (s?.view === 'voteset') return renderVoteSettings(s);
+    if (s?.view === 'audiolang') return renderAudioLangPicker(s);
     if (s?.view === 'subsync') return renderSubSyncPicker(s);
     if (s?.view === 'seekmenu') return renderSeekPicker(s);
     if (s?.view === 'dlq') return renderCinemaDownloadQuality(s);
@@ -3387,6 +3458,7 @@ export function createMusicScreen({ app }) {
     renderListen,
     renderOptions,
     renderVoteSettings,
+    renderAudioLangPicker,
     renderSubSyncPicker,
     renderSeekPicker,
     renderCinemaDownloadQuality,

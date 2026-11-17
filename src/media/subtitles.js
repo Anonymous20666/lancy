@@ -760,7 +760,27 @@ export class SubtitleService {
     };
     candidates.sort((a, b) => rankCandidate(a) - rankCandidate(b));
 
-    const tracks = candidates.slice(0, 8).map((c) => ({
+    // Keep up to 12 tracks, prioritizing distinct languages first so multilingual tracks aren't crowded out by English variants.
+    const diversified = [];
+    const perLangCount = new Map();
+    for (const c of candidates) {
+      const lKey = String(c.language || c.label || 'sub').trim().toLowerCase().slice(0, 12);
+      const cnt = perLangCount.get(lKey) || 0;
+      if (cnt === 0) {
+        perLangCount.set(lKey, 1);
+        diversified.push(c);
+      }
+      if (diversified.length >= 12) break;
+    }
+    if (diversified.length < 12) {
+      for (const c of candidates) {
+        if (diversified.includes(c)) continue;
+        diversified.push(c);
+        if (diversified.length >= 12) break;
+      }
+    }
+
+    const tracks = diversified.map((c) => ({
       filePath: c.filePath,
       language: c.language || language,
       label: c.label || 'Subtitles',
@@ -958,10 +978,27 @@ export class SubtitleService {
       .sort((a, b) => b.score - a.score);
 
     const collected = [];
-    const maxCandidates = collectAll ? 12 : 4;
-    for (let idx = 0; idx < Math.min(ranked.length, maxCandidates); idx++) {
-      const cand = ranked[idx];
-      if (!collectAll && wantEn && ranked.some((r) => r.score >= 25) && cand.score < 20) break;
+    const maxCandidates = collectAll ? 16 : 4;
+    const orderedRanked = collectAll
+      ? (() => {
+          const firstPass = [];
+          const seenLang = new Set();
+          for (const h of ranked) {
+            const lk = (h.lang || h.label || '').toLowerCase();
+            if (lk && !seenLang.has(lk)) {
+              seenLang.add(lk);
+              firstPass.push(h);
+            }
+          }
+          for (const h of ranked) {
+            if (!firstPass.includes(h)) firstPass.push(h);
+          }
+          return firstPass;
+        })()
+      : ranked;
+    for (let idx = 0; idx < Math.min(orderedRanked.length, maxCandidates); idx++) {
+      const cand = orderedRanked[idx];
+      if (!collectAll && wantEn && orderedRanked.some((r) => r.score >= 25) && cand.score < 20) break;
       try {
         const res = await this.fetch(cand.url, {
           headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36', ...cand.headers },

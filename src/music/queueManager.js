@@ -1345,6 +1345,140 @@ export class QueueManager extends EventEmitter {
       return { ok: true, sourceIndex: nextIdx, sourceCount: pool.length, sourceLabel: curTrack.sourceLabel };
     });
   }
+  getAudioVariants(track) {
+    if (!track) return [];
+    const out = [];
+    const seen = new Set();
+    const addOpt = (v) => {
+      if (!v?.url) return;
+      const lang = String(v.audioLanguage || v.preferredAudioLang || '').trim().toLowerCase();
+      const dub = Boolean(v.audioIsDub);
+      const key = `${lang || 'orig'}:${dub ? 'dub' : 'orig'}:${v.inManifest ? 'm' : v.url}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        url: v.url,
+        headers: v.headers || track.streamHeaders || track.headers || {},
+        format: v.format || (v.isDash ? 'dash' : v.isHls ? 'hls' : 'mp4'),
+        isHls: Boolean(v.isHls ?? /\.m3u8(\?|$)/i.test(v.url)),
+        isDash: Boolean(v.isDash ?? /\.mpd(\?|$)/i.test(v.url)),
+        qualityLabel: v.qualityLabel || 'HD',
+        audioLanguage: lang,
+        preferredAudioLang: v.preferredAudioLang || lang || '',
+        audioIsDub: dub,
+        label: v.label || (lang ? lang.toUpperCase() : 'Original'),
+        inManifest: Boolean(v.inManifest),
+        unprobed: Boolean(v.unprobed)
+      });
+    };
+    if (Array.isArray(track.audioVariants)) {
+      for (const v of track.audioVariants) addOpt(v);
+    }
+    if (track.streamUrl) {
+      addOpt({
+        url: track.streamUrl,
+        headers: track.streamHeaders || track.headers,
+        format: track.format,
+        isHls: track.isHls,
+        isDash: track.isDash,
+        audioLanguage: track.audioLanguage || track.preferredAudioLang || track.originalLanguage || '',
+        preferredAudioLang: track.preferredAudioLang || track.audioLanguage || '',
+        audioIsDub: Boolean(track.audioIsDub)
+      });
+    }
+    return out;
+  }
+  async switchAudioLanguage(id, targetIndex = null) {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const curTrack = s.currentTrack;
+      if (!curTrack) return { ok: false, reason: 'no_track' };
+      const variants = this.getAudioVariants(curTrack);
+      if (!variants.length) {
+        s.lastNotice = '⚠️ No alternate audio language tracks found for this stream.';
+        await this.updatePlayerCard(id, { forceEdit: true });
+        return { ok: false, reason: 'no_audio_variants' };
+      }
+      const curLang = String(curTrack.audioLanguage || '').trim().toLowerCase();
+      const curPref = String(curTrack.preferredAudioLang || '').trim().toLowerCase();
+      let curIdx = variants.findIndex((v) =>
+        v.url === curTrack.streamUrl && (!v.inManifest || (v.audioLanguage && v.audioLanguage === (curPref || curLang)))
+      );
+      if (curIdx < 0) curIdx = 0;
+      const nextIdx = (Number.isInteger(targetIndex) && targetIndex >= 0 && targetIndex < variants.length)
+        ? targetIndex
+        : (variants.length > 1 ? ((curIdx + 1) % variants.length) : curIdx);
+      let chosen = variants[nextIdx];
+      if (!chosen?.url) return { ok: false, reason: 'invalid_variant' };
+
+      if (chosen.unprobed && typeof this.app?.movieResolver?.verifyAudioVariant === 'function') {
+        const verified = await this.app.movieResolver.verifyAudioVariant(chosen, {
+          minDuration: Number(curTrack.durationSeconds || 0) || 0,
+          isTv: curTrack.mediaKind === 'tv'
+        }).catch(() => null);
+        if (!verified?.url) {
+          s.lastNotice = `⚠️ ${chosen.label || chosen.audioLanguage?.toUpperCase() || 'Selected'} audio stream unavailable — keeping current audio.`;
+          await this.updatePlayerCard(id, { forceEdit: true });
+          return { ok: false, reason: 'variant_unavailable' };
+        }
+        chosen = { ...chosen, ...verified, unprobed: false };
+        if (Array.isArray(curTrack.audioVariants) && curTrack.audioVariants[nextIdx]) {
+          curTrack.audioVariants[nextIdx] = chosen;
+        }
+      }
+
+      const targetLang = String(chosen.audioLanguage || '').trim().toLowerCase();
+      const origLang = String(curTrack.originalLanguage || '').trim().toLowerCase();
+      const isDub = Boolean(chosen.audioIsDub || (origLang && targetLang && origLang !== targetLang));
+
+      curTrack.streamUrl = chosen.url;
+      curTrack.videoUrl = chosen.url;
+      if (chosen.headers && typeof chosen.headers === 'object') {
+        curTrack.headers = chosen.headers;
+        curTrack.streamHeaders = { ...(curTrack.streamHeaders || {}), ...chosen.headers };
+      }
+      curTrack.format = chosen.format || curTrack.format;
+      curTrack.isHls = Boolean(chosen.isHls);
+      curTrack.isDash = Boolean(chosen.isDash);
+      curTrack.audioLanguage = targetLang || curTrack.audioLanguage || null;
+      curTrack.preferredAudioLang = chosen.preferredAudioLang || targetLang || curTrack.preferredAudioLang || null;
+      curTrack.audioIsDub = isDub;
+      curTrack.dubOnly = isDub;
+      curTrack.dubOnlyWarning = isDub
+        ? (targetLang ? `⚠️ Dub Only Available (${targetLang.toUpperCase()})` : '⚠️ Dub Only Available')
+        : null;
+
+      const wasActive = Boolean(s.connected && ['playing', 'paused', 'buffering'].includes(s.status));
+      if (wasActive) {
+        const deck = (curTrack.provider === 'movie' || s.activeDeck === 'movie') ? 'movie' : 'music';
+        const deckQ = this.#deckQueue(s, deck);
+        const resumePos = this.#resolveSavedPosition(s, null, curTrack);
+        const wasPaused = s.status === 'paused';
+        const requeued = resumePos > 1
+          ? { ...curTrack, resumePositionSeconds: resumePos, startOffsetSeconds: resumePos }
+          : { ...curTrack };
+        s.currentTrack = null;
+        s.playbackId = null;
+        deckQ.unshift(requeued);
+        s.status = 'idle';
+        s._suppressCinemaAnnounce = true;
+        try {
+          await this.#next(s, { manual: true, deck });
+          if (wasPaused && s.status === 'playing' && typeof this.voice?.pause === 'function') {
+            await this.voice.pause(s.chatId).catch(() => {});
+            s.status = 'paused';
+          }
+        } finally {
+          s._suppressCinemaAnnounce = false;
+        }
+      }
+      const langBadge = targetLang ? targetLang.toUpperCase() : (chosen.label || 'Audio');
+      s.lastNotice = `🔊 Switched audio to ${isDub ? `Dubbed (${langBadge})` : `Original (${langBadge})`}`;
+      this.#savePlaybackSnapshot(s);
+      await this.updatePlayerCard(id, { forceEdit: true });
+      return { ok: true, index: nextIdx, audioLanguage: targetLang, audioIsDub: isDub, label: chosen.label };
+    });
+  }
   async #refreshTrackStream(track, { force = false, staleAdultStream = false, staleMovieStream = false, excludeUrls = [] } = {}) {
     if (!track || track.filePath) return false;
     const blocked = new Set([
@@ -1575,6 +1709,8 @@ export class QueueManager extends EventEmitter {
       const chosen = tracks[nextIdx];
       s.subtitleTrackIndex = nextIdx;
       s.currentTrack.subtitlePath = chosen.filePath;
+      s.currentTrack.subtitleLabel = chosen.label || s.currentTrack.subtitleLabel || null;
+      s.currentTrack.subtitleSameRoute = Boolean(chosen.sameRoute);
       s.currentTrack.subtitleFormat = chosen.format || 'srt';
       const nextSaved = this.#readTrackSubState(s.currentTrack, chosen.filePath);
       const nextOffset = nextSaved.offset;

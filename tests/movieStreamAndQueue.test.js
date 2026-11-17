@@ -4078,7 +4078,7 @@ test('VidBolt candidate parser preserves source.language (skips 1080p French/Pt-
     if (u.startsWith('https://cdn.example/seg1.ts')) {
       return { ok: true, status: 206, headers: new Headers({ 'content-type': 'video/mp2t' }), arrayBuffer: async () => new ArrayBuffer(64) };
     }
-    if (u === 'https://cdn.example/en_vb.srt') {
+    if (u === 'https://cdn.example/en_vb.srt' || u === 'https://cdn.example/fr.srt') {
       return { ok: true, status: 200, text: async () => srtBody };
     }
     return { ok: false, status: 404, text: async () => '' };
@@ -4109,6 +4109,9 @@ test('VidBolt candidate parser preserves source.language (skips 1080p French/Pt-
   assert.equal(picked.track.audioIsDub, false);
   assert.equal(picked.track.subtitleSameRoute, true, 'VidBolt stream.subtitles must be attached as Same-Stream subtitles');
   assert.equal(picked.track.subtitleCuesCount, 5);
+  assert.ok(Array.isArray(picked.track.audioVariants) && picked.track.audioVariants.length >= 3, 'audioVariants must expose Original + alternate language dubs');
+  assert.ok(picked.track.audioVariants.some((v) => v.audioLanguage === 'fr' && v.audioIsDub === true));
+  assert.ok(Array.isArray(picked.track.subtitleTracks) && picked.track.subtitleTracks.length >= 2, 'subtitleTracks must retain all distinct languages');
 
   const apiZh = new MovieApiClient({
     baseUrl: 'https://primary.invalid',
@@ -4131,4 +4134,56 @@ test('VidBolt candidate parser preserves source.language (skips 1080p French/Pt-
   h.app.db.setSetting('music.streamMode.-10091.movie', 'interactive');
   assert.equal(h.qm.getVcQuality(-10091, { isMovieTrack: true, streamMode: 'interactive' }), 'HD_720p');
   assert.equal(h.qm.getVcQuality(-10091, { isMovieTrack: true, streamMode: 'rtmp' }), 'FHD_1080p');
+
+  // Hot-reload Audio Language + Direct Subtitle Language selection
+  const setSubCalls = [];
+  h.app.voiceClient.setSubtitle = async (cid, filePath, opts) => {
+    setSubCalls.push({ cid, filePath, opts });
+    return { ok: true };
+  };
+  const enTrack = {
+    ...picked.track,
+    subtitlePath: picked.track.subtitleTracks[0].filePath,
+    subtitleLabel: picked.track.subtitleTracks[0].label,
+    subtitleTracks: picked.track.subtitleTracks,
+    audioVariants: picked.track.audioVariants.map((v) => ({ ...v, unprobed: false }))
+  };
+  const ctxLang = h.makeCtx(-10091);
+  await h.qm.addMany(-10091, [enTrack]);
+  await h.service.player(ctxLang, -10091);
+  const sLang = h.qm.getSession(-10091);
+  sLang.positionSeconds = 180;
+  sLang.lastKnownPositionSeconds = 180;
+
+  await h.service.control({ ...ctxLang, query: { id: 'q-al-open' }, messageId: sLang.screenMessageId }, 'audiolang', []);
+  assert.equal(sLang.view, 'audiolang');
+  const alCard = h.screen.renderPlayer(sLang);
+  const pickerText = JSON.stringify(alCard);
+  assert.match(pickerText, /English \(Orig/);
+  assert.match(pickerText, /French \(Dub/);
+
+  const frBtn = alCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons).find((b) => richTextToString(b.text).includes('French (Dub'));
+  assert.ok(frBtn, 'Must render clickable French audio language button');
+  const frDecoded = decodeCallback(frBtn.callback_data);
+  await h.service.control({ ...ctxLang, query: { id: 'q-al-pick' }, messageId: sLang.screenMessageId }, frDecoded.action, frDecoded.args);
+  assert.equal(sLang.view, 'cinema');
+  assert.equal(sLang.currentTrack.audioLanguage, 'fr');
+  assert.equal(sLang.currentTrack.audioIsDub, true);
+  assert.equal(Math.round(h.voiceCalls.play.at(-1).opts.startSeconds), 180, 'Audio language switch must hot-reload at current timestamp');
+
+  // Open Sub Sync picker and hot-reload directly onto Français track (idx 1) without restarting call
+  const playCountBeforeSub = h.voiceCalls.play.length;
+  await h.service.control({ ...ctxLang, query: { id: 'q-sub-open' }, messageId: sLang.screenMessageId }, 'subsync', [String(sLang.controlRevision)]);
+  const subCard = h.screen.renderPlayer(sLang);
+  const subPickerText = JSON.stringify(subCard);
+  assert.match(subPickerText, /Français/);
+  const frSubIdx = sLang.currentTrack.subtitleTracks.findIndex((tr) => /français/i.test(tr.label));
+  assert.ok(frSubIdx >= 0);
+  const frSubBtn = subCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons).find((b) => richTextToString(b.text).includes('Français'));
+  assert.ok(frSubBtn, 'Must render clickable Français subtitle button');
+  const frSubDecoded = decodeCallback(frSubBtn.callback_data);
+  await h.service.control({ ...ctxLang, query: { id: 'q-sub-pick' }, messageId: sLang.screenMessageId }, frSubDecoded.action, frSubDecoded.args);
+  assert.equal(sLang.subtitleTrackIndex, frSubIdx);
+  assert.equal(h.voiceCalls.play.length, playCountBeforeSub, 'Subtitle language switch must hot-reload via setSubtitle without restarting stream');
+  assert.equal(setSubCalls.at(-1)?.filePath, sLang.currentTrack.subtitleTracks[frSubIdx].filePath);
 });
