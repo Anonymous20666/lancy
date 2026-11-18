@@ -529,7 +529,33 @@ export class SubtitleService {
     const hit = this.cueCache.get(srtPath);
     if (hit) return hit;
     try {
-      const cues = parseSrt(readFileSync(srtPath, 'utf8'));
+      const raw = readFileSync(srtPath, 'utf8');
+      let cues;
+      if (/\.lrc$/i.test(srtPath) || (!raw.includes('-->') && (raw.match(/\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/g)?.length || 0) >= 2)) {
+        let offsetMs = 0;
+        const rows = [];
+        for (const ln of raw.split(/\r?\n/)) {
+          const om = ln.trim().match(/^\[offset:\s*([+-]?\d+)\s*\]$/i);
+          if (om) { offsetMs = Number(om[1]) || 0; continue; }
+          const ms = [...ln.matchAll(/\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/g)];
+          if (!ms.length) continue;
+          const text = ln.replace(/\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/g, '').trim();
+          if (!text) continue;
+          for (const m of ms) {
+            const frac = m[3] ? Number(m[3].padEnd(3, '0').slice(0, 3)) : 0;
+            const startMs = Math.max(0, (Number(m[1]) * 60 + Number(m[2])) * 1000 + frac + offsetMs);
+            rows.push({ startMs, text });
+          }
+        }
+        rows.sort((a, b) => a.startMs - b.startMs);
+        cues = rows.map((r, i) => ({
+          startMs: r.startMs,
+          endMs: rows[i + 1] ? Math.max(r.startMs + 350, Math.min(r.startMs + 9000, rows[i + 1].startMs)) : r.startMs + 5500,
+          text: r.text
+        }));
+      } else {
+        cues = parseSrt(raw);
+      }
       if (this.cueCache.size > 40) {
         const first = this.cueCache.keys().next().value;
         if (first) this.cueCache.delete(first);

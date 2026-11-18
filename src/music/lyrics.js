@@ -110,3 +110,31 @@ export function currentLyricWindow(syncedLyrics, positionSeconds) {
   const next = activeIndex + 1 < cues.length ? `  ${cues[activeIndex + 1].text}` : null;
   return [prev, curr, next].filter(Boolean).join('\n');
 }
+
+/**
+ * Convert MatchedLyrics result (synced .lrc preferred, or plain verses distributed cleanly
+ * across durationSeconds) into valid LRC text so the live VC SubOverlay renders karaoke lyrics.
+ */
+export function buildLrcSubtitleText(lyricsResult, durationSeconds = 180) {
+  if (!lyricsResult?.found || lyricsResult?.instrumental) return null;
+  const synced = String(lyricsResult.syncedLyrics || '').trim();
+  if (synced && (synced.match(/\[\d{1,3}:\d{2}/g)?.length || 0) >= 2) {
+    return synced + '\n';
+  }
+  const plainLines = String(lyricsResult.text || '')
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l && !/^\[.*\]$/.test(l));
+  if (!plainLines.length) return null;
+  const totalSec = Math.max(45, Math.min(900, Number(durationSeconds) || 180));
+  const leadIn = Math.min(10, totalSec * 0.06);
+  const usable = Math.max(20, totalSec - leadIn - 6);
+  const step = usable / plainLines.length;
+  return plainLines.map((line, i) => {
+    const t = Math.max(0, leadIn + i * step);
+    const mm = Math.floor(t / 60);
+    const ss = (t % 60);
+    const secStr = ss.toFixed(2).padStart(5, '0');
+    return `[${String(mm).padStart(2, '0')}:${secStr}] ${line}`;
+  }).join('\n') + '\n';
+}

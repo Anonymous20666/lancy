@@ -69,6 +69,8 @@ class SyncState(ctypes.Structure):
         ('sync_flags', ctypes.c_int32),    # bit 1=audio_syncing, bit 2=video_syncing, bit 4=paused_hud_once
         ('skew_ms', ctypes.c_int32),       # signed (audio_sec - video_sec) in milliseconds
         ('pipeline_delay_sec', ctypes.c_double),
+        ('eq_bands', ctypes.c_uint8 * 16), # 16-band real-time PCM FFT meter for Visual DJ Desk
+        ('bass_pulse', ctypes.c_uint8),    # smoothed low-bass beat envelope (0..255)
     ]
 
 
@@ -82,6 +84,11 @@ def sub_config_path_for(sync_id):
     return SHM_DIR / f'lancy-sub-{safe}.json'
 
 
+def dj_desk_config_path_for(sync_id):
+    safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(sync_id or 'default'))[:64]
+    return SHM_DIR / f'lancy-djdesk-{safe}.json'
+
+
 def substatus_path_for(sync_id):
     safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(sync_id or 'default'))[:64]
     return SHM_DIR / f'lancy-substatus-{safe}.json'
@@ -90,7 +97,7 @@ def substatus_path_for(sync_id):
 def cleanup_stale_shm(max_age_sec=21600):
     try:
         now = time.time()
-        for pat in ('lancy-av-*.shm', 'lancy-sub-*.json', 'lancy-substatus-*.json'):
+        for pat in ('lancy-av-*.shm', 'lancy-sub-*.json', 'lancy-djdesk-*.json', 'lancy-substatus-*.json'):
             for p in SHM_DIR.glob(pat):
                 try:
                     if now - p.stat().st_mtime > max_age_sec:
@@ -234,7 +241,7 @@ def _wait_if_paused(state, stop_ev):
         time.sleep(0.025)
 
 
-def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, *, sub_monitor=None):
+def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, *, sub_monitor=None, dj_analyzer=None):
     bps = max(1, int(sample_rate) * int(channels) * 2)
     sample_align = max(2, int(channels) * 2)
 
@@ -492,6 +499,8 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                 break
             _write_all(out, pkt_body)
             silence_since_last_real = 0
+            if dj_analyzer is not None:
+                dj_analyzer(pkt_body, state, sample_rate, channels)
             if sub_monitor is not None:
                 sub_monitor.feed_pcm(pkt_pts, pkt_body)
             last_emitted_end = pkt_end
@@ -509,10 +518,10 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
         t_reader.join(timeout=0.5)
 
 
-def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None):
+def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None, dj_analyzer=None):
     is_timed, first_pkt, stream = _open_input_adapter(proc.stdout)
     if is_timed:
-        return _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, sub_monitor=sub_monitor)
+        return _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, sub_monitor=sub_monitor, dj_analyzer=dj_analyzer)
     bps = max(1, int(sample_rate) * int(channels) * 2)
     sample_align = max(2, int(channels) * 2)
     first_chunks = bytearray()
@@ -651,6 +660,8 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None)
             if stop_ev.is_set():
                 break
             _write_all(out, pkt)
+            if dj_analyzer is not None:
+                dj_analyzer(pkt, state, sample_rate, channels)
             if sub_monitor is not None:
                 sub_monitor.feed_pcm(bytes_sent / float(bps), pkt)
             bytes_sent += len(pkt)
@@ -904,7 +915,12 @@ class SubOverlay:
         return self._c_buf
 
 
-def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=None):
+def _compose_frame(dj_overlay, sub_overlay, frame_buf, pts):
+    out = dj_overlay.render(frame_buf, pts) if dj_overlay is not None else frame_buf
+    return sub_overlay.render(out, pts) if sub_overlay is not None else out
+
+
+def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_overlay=None):
     eff_fps = max(1.0, float(fps or 30))
     default_dur = 1.0 / eff_fps
     first_pts, first_dur, first_frame = first_pkt if first_pkt is not None else (0.0, default_dur, b'')
@@ -981,7 +997,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
             state.video_hb_mono = time.monotonic()
             return True
 
-        out_first = sub_overlay.render(first_frame, last_raw_pts) if sub_overlay is not None else first_frame
+        out_first = _compose_frame(dj_overlay, sub_overlay, first_frame, last_raw_pts)
         _write_all(out, out_first)
         unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
         eff_first_d = first_dur if first_dur > 0.001 else default_dur
@@ -1126,7 +1142,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                 break
             last_raw_frame = bytes(item_buf)
             last_raw_pts = max(0.0, item_pts)
-            out_buf = sub_overlay.render(item_buf, last_raw_pts) if sub_overlay is not None else item_buf
+            out_buf = _compose_frame(dj_overlay, sub_overlay, item_buf, last_raw_pts)
             _write_all(out, out_buf)
             unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
             state.video_sec = max(0.0, item_pts - (unread_f * item_dur))
@@ -1143,10 +1159,10 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
         t_reader.join(timeout=0.5)
 
 
-def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
+def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_overlay=None):
     is_timed, first_pkt, stream = _open_input_adapter(proc.stdout)
     if is_timed:
-        return _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=sub_overlay)
+        return _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=sub_overlay, dj_overlay=dj_overlay)
     eff_fps = max(1.0, float(fps or 30))
     first_frame = _read_exact(stream, frame_bytes)
     has_full = len(first_frame) == frame_bytes
@@ -1195,8 +1211,7 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
     t_reader.start()
 
     try:
-        if sub_overlay is not None:
-            first_frame = sub_overlay.render(first_frame, 0.0)
+        first_frame = _compose_frame(dj_overlay, sub_overlay, first_frame, 0.0)
         _write_all(out, first_frame)
         unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
         state.video_sec = max(0.0, (1.0 - unread_f) / eff_fps)
@@ -1262,8 +1277,7 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None):
             if stop_ev.is_set():
                 break
 
-            if sub_overlay is not None:
-                item_buf = sub_overlay.render(item_buf, max(0.0, item_sec - (1.0 / eff_fps)))
+            item_buf = _compose_frame(dj_overlay, sub_overlay, item_buf, max(0.0, item_sec - (1.0 / eff_fps)))
             _write_all(out, item_buf)
             unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
             state.video_sec = max(0.0, item_sec - (unread_f / eff_fps))
@@ -1291,6 +1305,7 @@ def main():
     parser.add_argument('--width', type=int, default=0)
     parser.add_argument('--height', type=int, default=0)
     parser.add_argument('--sub-config', default='')
+    parser.add_argument('--dj-config', default='')
     parser.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -1305,10 +1320,13 @@ def main():
     role_bit = 1 if args.role == 'audio' else 2
     shm_path = shm_path_for(args.sync_id)
     sub_cfg_path = Path(args.sub_config) if args.sub_config else None
+    dj_cfg_path = Path(args.dj_config) if args.dj_config else None
     fd, mm, state = _open_sync_state(shm_path)
     proc = None
     sub_overlay = None
+    dj_overlay = None
     sub_monitor = None
+    dj_analyzer = None
 
     def handle_sig(_signum, _frame):
         stop_ev.set()
@@ -1331,6 +1349,15 @@ def main():
             close_fds=True,
         )
         if args.role == 'audio':
+            if dj_cfg_path is not None and dj_cfg_path.is_file():
+                try:
+                    voice_dir = str(Path(__file__).resolve().parent)
+                    if voice_dir not in sys.path:
+                        sys.path.insert(0, voice_dir)
+                    import dj_desk as _dd
+                    dj_analyzer = _dd.analyze_pcm_into_state
+                except Exception as err:
+                    print(f'[av_sync] DjDesk PCM analyzer skipped: {err}', file=sys.stderr)
             if sub_cfg_path is not None:
                 try:
                     voice_dir = str(Path(__file__).resolve().parent)
@@ -1348,20 +1375,29 @@ def main():
                 except Exception as err:
                     print(f'[av_sync] LiveSubSyncMonitor init skipped: {err}', file=sys.stderr)
                     sub_monitor = None
-            _run_audio(proc, state, stop_ev, args.sample_rate, args.channels, sub_monitor=sub_monitor)
+            _run_audio(proc, state, stop_ev, args.sample_rate, args.channels, sub_monitor=sub_monitor, dj_analyzer=dj_analyzer)
         else:
             if args.frame_bytes <= 0:
                 sys.exit(2)
-            if (
-                sub_cfg_path is not None
-                and args.width > 0
+            valid_geom = (
+                args.width > 0
                 and args.height > 0
                 and (args.width % 2) == 0
                 and (args.height % 2) == 0
                 and args.frame_bytes == (args.width * args.height * 3) // 2
-            ):
+            )
+            if dj_cfg_path is not None and valid_geom:
+                try:
+                    voice_dir = str(Path(__file__).resolve().parent)
+                    if voice_dir not in sys.path:
+                        sys.path.insert(0, voice_dir)
+                    import dj_desk as _dd
+                    dj_overlay = _dd.DjDeskOverlay(dj_cfg_path, state, args.width, args.height, args.frame_bytes)
+                except Exception as err:
+                    print(f'[av_sync] DjDeskOverlay init skipped: {err}', file=sys.stderr)
+            if sub_cfg_path is not None and valid_geom:
                 sub_overlay = SubOverlay(sub_cfg_path, state, args.width, args.height, args.frame_bytes)
-            _run_video(proc, state, stop_ev, args.frame_bytes, args.fps, sub_overlay=sub_overlay)
+            _run_video(proc, state, stop_ev, args.frame_bytes, args.fps, sub_overlay=sub_overlay, dj_overlay=dj_overlay)
     finally:
         stop_ev.set()
         if sub_monitor is not None:
@@ -1405,7 +1441,7 @@ def main():
         except Exception:
             pass
         if should_unlink:
-            for p in (shm_path, sub_cfg_path or sub_config_path_for(args.sync_id), substatus_path_for(args.sync_id)):
+            for p in (shm_path, sub_cfg_path or sub_config_path_for(args.sync_id), dj_cfg_path or dj_desk_config_path_for(args.sync_id), substatus_path_for(args.sync_id)):
                 try:
                     p.unlink(missing_ok=True)
                 except Exception:

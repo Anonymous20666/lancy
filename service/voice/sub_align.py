@@ -352,11 +352,71 @@ def dedupe_overlapping_cues(cues, *, trim_overlaps=True, max_cue_ms=20000):
     return [(s, e, t) for s, e, t, _ in out]
 
 
-def parse_subtitle_cues(raw_text, *, is_ass=False):
+_LRC_TS_RE = re.compile(r'\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]')
+_LRC_OFFSET_RE = re.compile(r'^\[offset:\s*([+-]?\d+)\s*\]$', re.I)
+
+
+def parse_lrc_cues(raw_text):
+    """Parse synced .lrc lyrics lines into sorted [(start_ms, end_ms, plain_line)] tuples."""
+    text = str(raw_text or '').lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
+    offset_ms = 0
+    rows = []
+    for raw_line in text.split('\n'):
+        st = raw_line.strip()
+        if not st:
+            continue
+        off_m = _LRC_OFFSET_RE.match(st)
+        if off_m:
+            try:
+                offset_ms = int(off_m.group(1))
+            except ValueError:
+                pass
+            continue
+        matches = list(_LRC_TS_RE.finditer(st))
+        if not matches:
+            continue
+        lyric = _LRC_TS_RE.sub('', st).strip()
+        if not lyric or PROMO_SUB_RE.search(lyric):
+            continue
+        for m in matches:
+            mins = int(m.group(1))
+            secs = int(m.group(2))
+            frac = m.group(3) or ''
+            ms_part = int(frac.ljust(3, '0')[:3]) if frac else 0
+            ts_ms = max(0, ((mins * 60) + secs) * 1000 + ms_part + offset_ms)
+            rows.append((ts_ms, lyric))
+    if not rows:
+        return []
+    rows.sort(key=lambda r: r[0])
+    out = []
+    for i, (s_ms, line) in enumerate(rows):
+        nxt_ms = rows[i + 1][0] if (i + 1) < len(rows) else (s_ms + 5500)
+        e_ms = max(s_ms + 350, min(s_ms + 9000, nxt_ms))
+        out.append((s_ms, e_ms, line))
+    return out
+
+
+def _is_lrc_text(raw_text):
+    text = str(raw_text or '')
+    if '-->' in text or ('[Events]' in text and 'Dialogue:' in text):
+        return False
+    hits = len(_LRC_TS_RE.findall(text[:4096]))
+    return hits >= 2
+
+
+def parse_subtitle_cues(raw_text, *, is_ass=False, is_lrc=False):
     """Return sorted list of (start_ms, end_ms, ass_text) tuples."""
     text = str(raw_text or '').lstrip('\ufeff').replace('\r\n', '\n').replace('\r', '\n')
     if not text.strip():
         return []
+
+    if is_lrc or (not is_ass and _is_lrc_text(text)):
+        lrc_rows = parse_lrc_cues(text)
+        if lrc_rows:
+            return [
+                (s_ms, e_ms, line.replace('\\', '\\\\').replace('{', '(').replace('}', ')'))
+                for s_ms, e_ms, line in lrc_rows
+            ]
 
     if is_ass or ('[Events]' in text and 'Dialogue:' in text):
         cues = []
@@ -500,11 +560,12 @@ def _normalize_ass_script(raw, width=1280, height=720, fallback_cues=None):
 
 
 def subtitles_to_ass(sub_path, width=1280, height=720):
-    """Load .srt/.vtt/.ass file and return (ass_bytes, sorted_spans[(start_ms, end_ms)])."""
+    """Load .srt/.vtt/.ass/.lrc file and return (ass_bytes, sorted_spans[(start_ms, end_ms)])."""
     p = Path(sub_path)
     raw = p.read_text(encoding='utf-8', errors='replace').lstrip('\ufeff')
     is_ass = p.suffix.lower() in {'.ass', '.ssa'}
-    cues = parse_subtitle_cues(raw, is_ass=is_ass)
+    is_lrc = p.suffix.lower() == '.lrc' or (not is_ass and _is_lrc_text(raw))
+    cues = parse_subtitle_cues(raw, is_ass=is_ass, is_lrc=is_lrc)
     spans = [(c[0], c[1]) for c in cues]
 
     if is_ass and '[Events]' in raw and 'Dialogue:' in raw:
@@ -514,8 +575,8 @@ def subtitles_to_ass(sub_path, width=1280, height=720):
     w = max(320, int(width or 1280))
     # Keep readable proportional typography on both 16:9 HD and ultra-wide 2.39:1 cinema frames.
     h_eff = max(h, int(round(w * 9.0 / 16.0)))
-    font_sz = max(20, min(62, int(round(h * 0.056))))
-    margin_v = max(18, int(round(h * 0.052)))
+    font_sz = max(20, min(62, int(round(h * (0.044 if is_lrc else 0.056)))))
+    margin_v = max(18, int(round(h * (0.042 if is_lrc else 0.052))))
     margin_lr = max(28, int(round(w * 0.045)))
     outline_w = max(2.0, round(h_eff * 0.0028, 1))
     header = (
@@ -534,10 +595,27 @@ def subtitles_to_ass(sub_path, width=1280, height=720):
         '[Events]\n'
         'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
     )
-    events = [
-        f'Dialogue: 0,{format_ass_ts(s_ms)},{format_ass_ts(e_ms)},Default,,0,0,0,,{txt}'
-        for s_ms, e_ms, txt in cues
-    ]
+    if is_lrc and cues:
+        events = []
+        lrc_margin_v = max(14, int(round(h * 0.036)))
+        for idx, (s_ms, e_ms, txt) in enumerate(cues):
+            prev_txt = cues[idx - 1][2] if idx > 0 else ''
+            next_txt = cues[idx + 1][2] if (idx + 1) < len(cues) else ''
+            parts = []
+            if prev_txt:
+                parts.append(r'{\fs' + str(max(16, int(font_sz * 0.72))) + r'\c&HB0A394&\alpha&H48&}' + prev_txt)
+            parts.append(r'{\fs' + str(font_sz) + r'\b1\c&HFCF8F8&\3c&H38BDF8&\alpha&H00&}▶ ' + txt)
+            if next_txt:
+                parts.append(r'{\fs' + str(max(16, int(font_sz * 0.76))) + r'\b0\c&HCBD5E1&\alpha&H35&}' + next_txt)
+            karaoke_line = r'\N'.join(parts)
+            events.append(
+                f'Dialogue: 0,{format_ass_ts(s_ms)},{format_ass_ts(e_ms)},Default,,0,0,{lrc_margin_v},,{karaoke_line}'
+            )
+    else:
+        events = [
+            f'Dialogue: 0,{format_ass_ts(s_ms)},{format_ass_ts(e_ms)},Default,,0,0,0,,{txt}'
+            for s_ms, e_ms, txt in cues
+        ]
     return (header + '\n'.join(events) + '\n').encode('utf-8'), spans
 
 

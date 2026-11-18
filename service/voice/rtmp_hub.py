@@ -79,6 +79,7 @@ def run_rtmp_hub(
     preset='veryfast',
     threads=4,
     sub_config_path=None,
+    dj_config_path=None,
     dec_cmd=None,
     no_audio_eof=False,
     realtime=False,
@@ -102,6 +103,8 @@ def run_rtmp_hub(
     shm_mm = None
     state = None
     sub_overlay = None
+    dj_overlay = None
+    dj_analyzer = None
     sub_monitor = None
     dec_proc = None
     enc_proc = None
@@ -136,6 +139,15 @@ def run_rtmp_hub(
         except Exception as err:
             print(f'[rtmp_hub] SubOverlay init skipped: {err}', file=sys.stderr)
             sub_overlay = None
+        if dj_config_path:
+            try:
+                import dj_desk
+                dj_overlay = dj_desk.DjDeskOverlay(dj_config_path, state, w, h, frame_bytes)
+                dj_analyzer = dj_desk.analyze_pcm_into_state
+            except Exception as err:
+                print(f'[rtmp_hub] DjDeskOverlay init skipped: {err}', file=sys.stderr)
+                dj_overlay = None
+                dj_analyzer = None
         if cfg_path is not None:
             try:
                 sub_monitor = sub_align.LiveSubSyncMonitor(
@@ -377,6 +389,10 @@ def run_rtmp_hub(
                     nonlocal tick_idx, total_pcm_written, wall_origin
                     safe_frame = bytes(frame_buf) if type(frame_buf) is not bytes else frame_buf
                     safe_pcm = bytes(pcm_buf) if type(pcm_buf) is not bytes else pcm_buf
+                    if dj_analyzer is not None and safe_pcm:
+                        dj_analyzer(safe_pcm, state, 48000, 2)
+                    if dj_overlay is not None:
+                        safe_frame = dj_overlay.render(safe_frame, _rel_pts(v_media_pts))
                     eff_a_pts = v_media_pts if a_media_pts is None else a_media_pts
                     enc_pts_us = int(round((tick_idx * frame_dur) * 1_000_000.0))
                     with out_cond:
@@ -781,6 +797,8 @@ def run_rtmp_hub(
                             time.sleep(0.01)
                         if state is not None:
                             state.waiting_mask = int(state.waiting_mask) & ~2
+                        if dj_overlay is not None:
+                            frame = dj_overlay.render(frame, v_sec)
                         if sub_overlay is not None:
                             frame = sub_overlay.render(frame, v_sec)
                         av_sync._write_all(v_out, frame)
@@ -834,6 +852,8 @@ def run_rtmp_hub(
                         if state is not None:
                             state.waiting_mask = int(state.waiting_mask) & ~1
                         av_sync._write_all(a_out, body)
+                        if dj_analyzer is not None:
+                            dj_analyzer(body, state, 48000, 2)
                         if sub_monitor is not None:
                             sub_monitor.feed_pcm(a_sec, body)
                         bytes_written += len(body)
@@ -968,6 +988,7 @@ def main():
     p.add_argument('--preset', default=None)
     p.add_argument('--threads', type=int, default=4)
     p.add_argument('--sub-config', default='')
+    p.add_argument('--dj-config', default='')
     p.add_argument('--rtmp-env', default='LANCY_RTMP_TARGET')
     p.add_argument('--rtmp-target', default='')
     p.add_argument('--no-audio-eof', action='store_true')
@@ -989,6 +1010,7 @@ def main():
         preset=args.preset,
         threads=args.threads,
         sub_config_path=args.sub_config or None,
+        dj_config_path=args.dj_config or None,
         dec_cmd=args.dec_cmd,
         no_audio_eof=args.no_audio_eof,
         realtime=args.realtime,

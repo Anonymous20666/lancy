@@ -2,9 +2,11 @@ import { audioUpload, audioFileId } from './preview.js';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { basename } from 'node:path';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { logger } from '../core/logger.js';
 import { getCueAt, mapMediaSecToSubMs } from '../media/subtitles.js';
+import { buildLrcSubtitleText } from './lyrics.js';
 import { resolveAppScreen } from './accounts.js';
 import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback, extractRichPhotoUrl, replaceRichPhotoMedia, extractSentPhotoFileId } from './model.js';
 
@@ -324,6 +326,14 @@ export class QueueManager extends EventEmitter {
     const allowAutoRefill=targetDeck==='music';
     const aiDj=allowAutoRefill?this.app?.music?.aiDj:null;
     const aiDjActive=Boolean(allowAutoRefill&&aiDj?.isEnabled?.(s));
+    if (allowAutoRefill && previous && sameDeckPrevious && aiDjActive && typeof aiDj?.recordSignal === 'function') {
+      const playedSec = Number(s.positionSeconds) || 0;
+      if (manual && playedSec > 0 && playedSec < 25) {
+        aiDj.recordSignal(s, 'skip_early', { track: previous, playedSeconds: playedSec });
+      } else if (!manual) {
+        aiDj.recordSignal(s, 'complete', { track: previous, playedSeconds: playedSec });
+      }
+    }
     if(previous&&!sameDeckPrevious){
       const prevQ=this.#deckQueue(s,prevDeck);
       if(!prevQ.some(t=>t.entryId===previous.entryId)){
@@ -444,22 +454,89 @@ export class QueueManager extends EventEmitter {
           });
           if(proxied){source=proxied;remoteProxy=true;}
         }
+        const eq=s.eqPreset||(s.bass?'bass':'off');
+        const playbackId=randomUUID();calledNative=true;
+        let djDesk = false;
+        let djDeskImage = null;
+        let crossfadeSec = 0;
+        const deskLyricsEnabled = Boolean(s.aiDj?.enabled ? s.aiDj?.deskLyrics !== false : true);
+        if (!isMovieTrack && (s.aiDj?.enabled ? s.aiDj?.visualDesk !== false : Boolean(s.visualDesk))) {
+          djDesk = true;
+          crossfadeSec = s.aiDj?.enabled ? (Number(s.aiDj?.crossfadeSec) || 0) : 0;
+          const sc = this.app?.musicLibrary?.studioCanvas;
+          if (sc && typeof sc.renderFrame === 'function') {
+            let artPath = null;
+            if (track.artwork && typeof this.app?.musicLibrary?.fetchArtwork === 'function' && this.app?.musicLibrary?.root) {
+              const candArt = join(this.app.musicLibrary.root, 'studio-canvas', `art-${createHash('sha1').update(String(track.artwork)).digest('hex').slice(0, 12)}.jpg`);
+              if (existsSync(candArt)) {
+                artPath = candArt;
+              } else {
+                const okArt = await Promise.race([
+                  this.app.musicLibrary.fetchArtwork(track.artwork, candArt).catch(() => false),
+                  new Promise(r => setTimeout(() => r(false), 700))
+                ]);
+                if (okArt) artPath = candArt;
+              }
+            }
+            djDeskImage = await sc.renderFrame({
+              title: track.title,
+              artist: track.artist,
+              album: track.album || '',
+              durationSeconds: track.durationSeconds,
+              provider: track.provider,
+              artworkPath: artPath,
+              isChannel: Boolean(s.isChannel),
+              eqPreset: eq,
+              djNote: s.aiDj?.introNote || '',
+              visualDesk: true,
+              nextTitle: q[0]?.title || '',
+              nextArtist: q[0]?.artist || '',
+              chapterTitle: s.aiDj?.chapterTitle || s.aiDj?.vibe || '',
+              crossfadeSec
+            }).catch(() => null);
+          }
+        }
+        let pendingLyrJob = null;
+        let writeLrcForResult = null;
+        if (!isMovieTrack && !track.subtitlePath && deskLyricsEnabled && this.app?.music?.lyrics?.get && this.app?.musicLibrary?.root) {
+          writeLrcForResult = async (res) => {
+            const lrcText = buildLrcSubtitleText(res, track.durationSeconds || 180);
+            if (!lrcText) return null;
+            const subsDir = join(this.app.musicLibrary.root, 'subs');
+            await mkdir(subsDir, { recursive: true, mode: 0o700 });
+            const lrcPath = join(subsDir, `dj-${createHash('sha1').update(String(track.id || track.title)).digest('hex').slice(0, 16)}.lrc`);
+            await writeFile(lrcPath, lrcText, 'utf8');
+            return lrcPath;
+          };
+          const lyrJob = Promise.resolve(this.app.music.lyrics.get(track)).catch(() => null);
+          const fastLyr = await Promise.race([lyrJob, new Promise(r => setTimeout(() => r('__PENDING__'), 900))]);
+          if (fastLyr && fastLyr !== '__PENDING__') {
+            if (fastLyr.found) {
+              const lrcPath = await writeLrcForResult(fastLyr).catch(() => null);
+              if (lrcPath) {
+                track.subtitlePath = lrcPath;
+                track.subtitleSameRoute = true;
+              }
+              s.cardLyrics = { trackId: track.id, status: 'ready', result: fastLyr };
+            }
+          } else if (fastLyr === '__PENDING__') {
+            pendingLyrJob = lyrJob;
+          }
+        }
         const subMode=s.subtitleMode||'screen';
         const subtitlePath=subMode !== 'off' && track.subtitlePath && existsSync(track.subtitlePath)?track.subtitlePath:null;
-        const subtitleRenderScreen = subMode === 'screen';
+        const subtitleRenderScreen = subMode === 'screen' && (!track.subtitlePath?.endsWith('.lrc') || deskLyricsEnabled);
         const subtitleSameRoute=subtitlePath ? this.#isSameRouteSub(track, subtitlePath) : false;
         const subSaved=track.subtitlePath && existsSync(track.subtitlePath) ? this.#readTrackSubState(track, track.subtitlePath) : { offset: 0, manual: false, driftRate: 0, driftAnchor: 0 };
         const subtitleOffset=subSaved.offset;
         const subtitleManualOverride=subSaved.manual;
         const subDriftRate = Number(subSaved.driftRate || 0) || 0;
         const subDriftAnchor = Number(subSaved.driftAnchor || 0) || 0;
-        const playbackId=randomUUID();calledNative=true;
-        const eq=s.eqPreset||(s.bass?'bass':'off');
-        const isVideo=track.mediaType==='video';
+        const isVideo=track.mediaType==='video' || Boolean(djDesk && djDeskImage);
         const startSeconds=Math.max(0, Number(entry.startOffsetSeconds ?? entry.resumePositionSeconds ?? 0) || 0);
         const vcTitle=String(track.title||'').trim().slice(0, 64) || undefined;
         const volume=Number.isFinite(Number(s.volume)) ? Number(s.volume) : 100;
-        const playOpts={isChannel:s.isChannel,video:isVideo,videoQuality,volume,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset,subtitleSameRoute,subtitleManualOverride,subtitleRenderScreen,subDriftSecPerSec:subDriftRate,subDriftAnchorSec:subDriftAnchor,streamMode,preferredAudioLang:track.preferredAudioLang||null,rejectDub:Boolean(track.preferredAudioLang)};
+        const playOpts={isChannel:s.isChannel,video:isVideo,videoQuality,volume,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset,subtitleSameRoute,subtitleManualOverride,subtitleRenderScreen,subDriftSecPerSec:subDriftRate,subDriftAnchorSec:subDriftAnchor,streamMode,preferredAudioLang:track.preferredAudioLang||null,rejectDub:Boolean(track.preferredAudioLang),...(djDesk?{djDesk:true,djDeskImage,crossfadeSec}:{})};
         let r;
         try {
           r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
@@ -497,6 +574,24 @@ export class QueueManager extends EventEmitter {
         const landedStartPos = (typeof r?.position_seconds === 'number' && Number.isFinite(r.position_seconds) && r.position_seconds >= 0) ? r.position_seconds : (startSeconds > 0 ? startSeconds : 0);
         this.#release(s);s.media=media;media=null;s.currentTrack=track;s.secondaryTile=null;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=landedStartPos;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
         this.#ensureLiveSubTimer(s);
+        if (pendingLyrJob && writeLrcForResult) {
+          void pendingLyrJob.then(async (res) => {
+            if (!res?.found || this.closed || s.playbackId !== playbackId || s.currentTrack?.id !== track.id) return;
+            s.cardLyrics = { trackId: track.id, status: 'ready', result: res };
+            const lrcPath = await writeLrcForResult(res).catch(() => null);
+            if (lrcPath && s.playbackId === playbackId && s.currentTrack?.id === track.id) {
+              track.subtitlePath = lrcPath;
+              track.subtitleSameRoute = true;
+              if (typeof this.voice?.setSubtitle === 'function' && s.connected) {
+                await this.voice.setSubtitle(s.chatId, lrcPath, {
+                  subtitleRenderScreen: (s.subtitleMode || 'screen') === 'screen',
+                  subtitleSameRoute: true
+                }).catch(() => {});
+              }
+              await this.updatePlayerCard(s.chatId).catch(() => {});
+            }
+          }).catch(() => {});
+        }
         this.prefetch(s);
         if(!previous||!s.volumeConfirmed||s.appliedVolume!==s.volume){
           try{this.#assert(await this.voice.setVolume(s.chatId,s.volume));s.volumeConfirmed=true;s.appliedVolume=s.volume;}catch{s.volumeConfirmed=false;s.lastError='Playback started, but output volume could not be confirmed.';}
@@ -1654,8 +1749,16 @@ export class QueueManager extends EventEmitter {
     if (cmd === '!vcmsg' && event?.from_admin && parts.length > 1) {
       return reply(parts.slice(1).join(' '));
     }
+    if ((cmd === '!chapter' || cmd === '!nextchapter') && event?.from_admin && this.app?.music?.aiDj?.dropNextChapter) {
+      const chap = await this.app.music.aiDj.dropNextChapter(s).catch(() => null);
+      if (chap) return reply(`⏭ DJ Chapter: ${chap.chapterTitle || chap.stage}`);
+    }
+    if ((cmd === '!dj' || cmd === '!vibe') && parts.length > 1 && event?.from_admin && this.app?.music?.aiDj?.chatWithDj) {
+      const res = await this.app.music.aiDj.chatWithDj(s, parts.slice(1).join(' '), { apply: true }).catch(() => null);
+      if (res?.reply) return reply(res.reply);
+    }
     if (cmd === '!help') {
-      return reply('Commands: !np (now playing), !queue (up next), !skip (vote skip)');
+      return reply('Commands: !np (now playing), !queue (up next), !skip (vote skip), !chapter, !dj <request>');
     }
   }
   async setSubtitleOffset(id, deltaOrValue = 0, { absolute = false } = {}) {
@@ -2208,6 +2311,7 @@ export class QueueManager extends EventEmitter {
         : effectiveView === 'voteset' ? (screen.renderVoteSettings ? screen.renderVoteSettings(display) : screen.renderOptions(display))
         : effectiveView === 'subsync' ? (screen.renderSubSyncPicker ? screen.renderSubSyncPicker(display) : screen.renderOptions(display))
         : effectiveView === 'seekmenu' ? (screen.renderSeekPicker ? screen.renderSeekPicker(display) : screen.renderOptions(display))
+        : effectiveView === 'djdesk' ? (screen.renderDjDesk ? screen.renderDjDesk(display) : screen.renderPlayer(display))
         : effectiveView === 'dlq' ? (screen.renderCinemaDownloadQuality ? screen.renderCinemaDownloadQuality(display) : screen.renderCinemaPlayer(display))
         : screen.renderPlayer(display);
       if (!rich) return false;

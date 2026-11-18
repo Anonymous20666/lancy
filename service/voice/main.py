@@ -107,6 +107,20 @@ def _write_sub_config(
     return str(cfg_path)
 
 
+def _write_dj_desk_config(sync_id, *, enabled=False, duration_sec=180.0, crossfade_sec=4.0, base_sec=0.0):
+    cfg_path = av_sync.dj_desk_config_path_for(sync_id)
+    payload = {
+        'enabled': bool(enabled),
+        'duration_sec': max(10.0, float(duration_sec or 180.0)),
+        'crossfade_sec': max(0.0, min(12.0, float(crossfade_sec or 0.0))),
+        'base_sec': max(0.0, float(base_sec or 0.0)),
+    }
+    tmp_path = cfg_path.with_name(f'{cfg_path.name}.{os.getpid()}.tmp')
+    tmp_path.write_text(json.dumps(payload), encoding='utf-8')
+    os.replace(tmp_path, cfg_path)
+    return str(cfg_path)
+
+
 def _read_sub_sync_snapshot(sync_id):
     if not sync_id:
         return None, None
@@ -525,6 +539,7 @@ def wrap_av_sync_pair(
     width=0,
     height=0,
     sub_config_path=None,
+    dj_config_path=None,
 ):
     """Wrap matched microphone/camera FFmpeg commands in a synchronized startup barrier and drift monitor."""
     if not audio_cmd or not video_cmd or int(frame_bytes or 0) <= 0:
@@ -541,7 +556,7 @@ def wrap_av_sync_pair(
     shm_dir = Path('/dev/shm') if Path('/dev/shm').is_dir() else Path('/tmp')
     try:
         cutoff = time.time() - 1800
-        for pat in ('lancy-av-*.shm', 'lancy-sub-*.json', 'lancy-substatus-*.json'):
+        for pat in ('lancy-av-*.shm', 'lancy-sub-*.json', 'lancy-djdesk-*.json', 'lancy-substatus-*.json'):
             for p in shm_dir.glob(pat):
                 try:
                     if p.stat().st_mtime < cutoff:
@@ -551,13 +566,19 @@ def wrap_av_sync_pair(
     except Exception:
         pass
     audio_sub_flag = f' --sub-config {shlex.quote(str(sub_config_path))}' if sub_config_path else ''
+    audio_dj_flag = f' --dj-config {shlex.quote(str(dj_config_path))}' if dj_config_path else ''
     wrapped_a = (
         f'{py} {script} --role audio --sync-id {shlex.quote(sid)} '
-        f'--sample-rate {int(sample_rate)} --channels {int(channels)} --fps {eff_fps:.3f}{audio_sub_flag} -- {audio_cmd}'
+        f'--sample-rate {int(sample_rate)} --channels {int(channels)} --fps {eff_fps:.3f}{audio_sub_flag}{audio_dj_flag} -- {audio_cmd}'
     )
     sub_flags = ''
-    if sub_config_path and int(width or 0) > 0 and int(height or 0) > 0:
-        sub_flags = f' --width {int(width)} --height {int(height)} --sub-config {shlex.quote(str(sub_config_path))}'
+    has_geom = int(width or 0) > 0 and int(height or 0) > 0
+    if has_geom and (sub_config_path or dj_config_path):
+        sub_flags = f' --width {int(width)} --height {int(height)}'
+        if sub_config_path:
+            sub_flags += f' --sub-config {shlex.quote(str(sub_config_path))}'
+        if dj_config_path:
+            sub_flags += f' --dj-config {shlex.quote(str(dj_config_path))}'
     wrapped_v = (
         f'{py} {script} --role video --sync-id {shlex.quote(sid)} '
         f'--frame-bytes {int(frame_bytes)} --fps {eff_fps:.3f}{sub_flags} -- {video_cmd}'
@@ -1807,7 +1828,17 @@ class Bridge:
         if not value: return None
         try:
             path = Path(value).resolve(strict=True)
-            if not path.is_file() or not path.is_relative_to(self.root) or path.suffix.lower() not in {'.srt', '.ass', '.vtt'}:
+            if not path.is_file() or not path.is_relative_to(self.root) or path.suffix.lower() not in {'.srt', '.ass', '.vtt', '.lrc'}:
+                return None
+            return str(path)
+        except (ValueError, TypeError, OSError):
+            return None
+
+    def source_dj_image(self, value):
+        if not value: return None
+        try:
+            path = Path(value).resolve(strict=True)
+            if not path.is_file() or not path.is_relative_to(self.root) or path.suffix.lower() not in {'.png', '.jpg', '.jpeg', '.webp'}:
                 return None
             return str(path)
         except (ValueError, TypeError, OSError):
@@ -2015,6 +2046,12 @@ class Bridge:
             if cfg:
                 try:
                     Path(cfg).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            dj_cfg = call.pop('dj_config_path', None)
+            if dj_cfg:
+                try:
+                    Path(dj_cfg).unlink(missing_ok=True)
                 except Exception:
                     pass
             sid = call.get('av_sync_id')
@@ -2828,6 +2865,12 @@ class Bridge:
                 Path(old_sub_cfg).unlink(missing_ok=True)
             except Exception:
                 pass
+        old_dj_cfg = call.pop('dj_config_path', None)
+        if old_dj_cfg:
+            try:
+                Path(old_dj_cfg).unlink(missing_ok=True)
+            except Exception:
+                pass
         old_sid = call.get('av_sync_id')
         if old_sid:
             try:
@@ -2855,9 +2898,19 @@ class Bridge:
                 render_screen=bool(call.get('subtitle_render_screen', True)),
                 pts_anchored=bool(pts_anchor is not None),
             )
+            dj_cfg_path = None
+            if call.get('dj_desk'):
+                dj_cfg_path = _write_dj_desk_config(
+                    sync_id,
+                    enabled=True,
+                    duration_sec=float(call.get('duration') or (info.get('duration') if info else 0) or 180.0),
+                    crossfade_sec=float(call.get('crossfade_sec') or 0.0),
+                    base_sec=float(offset_val or 0.0),
+                )
             _init_sync_state(sync_id, paused=(call.get('status') == 'paused'))
             call['av_sync_id'] = sync_id
             call['sub_config_path'] = cfg_path
+            call['dj_config_path'] = dj_cfg_path
             dec_args = rtmp_streamer.build_rtmp_decoder_args(
                 source_input,
                 has_audio_stream=has_audio_stream,
@@ -2898,6 +2951,7 @@ class Bridge:
                 '--preset', rtmp_preset,
                 '--threads', str(enc_threads),
                 '--sub-config', cfg_path,
+                *(['--dj-config', dj_cfg_path] if dj_cfg_path else []),
                 '--rtmp-env', 'LANCY_RTMP_TARGET',
                 *(['--no-audio-eof'] if not has_audio_stream else []),
                 '--',
@@ -2994,10 +3048,18 @@ class Bridge:
         }
         clean_bass_fallback = 'equalizer=f=55:width_type=q:w=1.1:g=2.8,equalizer=f=105:width_type=q:w=1.2:g=1.8,equalizer=f=240:width_type=q:w=1.4:g=-1.8,acompressor=threshold=-18dB:ratio=1.5:attack=20:release=180:makeup=1,'
         eq_filter = eq_map.get(eq_preset, clean_bass_fallback if call.get('bass') else '')
-        fade_in = 'afade=t=in:st=0:d=0.25,' if not call['offset'] else ''
+        cf_sec = max(0.0, min(8.0, float(call.get('crossfade_sec') or 0.0)))
+        fade_in_dur = min(1.2, cf_sec) if (cf_sec > 0.2 and call.get('dj_desk')) else 0.25
+        fade_in = f'afade=t=in:st=0:d={fade_in_dur:.2f},' if not call['offset'] else ''
+        dur_f = float(call.get('duration') or 0.0)
+        fade_out = (
+            f'afade=t=out:st={max(1.0, dur_f - cf_sec):.2f}:d={min(4.0, cf_sec):.2f},'
+            if (call.get('dj_desk') and cf_sec > 0.5 and dur_f > (cf_sec + 6.0) and not call['offset'])
+            else ''
+        )
         vol_pct = call.get('volume')
         vol_gain = f'volume={max(0, min(200, int(vol_pct))) / 100.0:.4f},' if vol_pct is not None and int(vol_pct) != 100 else ''
-        filters = 'volume=0.5011872336,' + eq_filter + vol_gain + fade_in + 'alimiter=limit=0.89:attack=7:release=80:level=0,aresample=48000:async=1:first_pts=0'
+        filters = 'volume=0.5011872336,' + eq_filter + vol_gain + fade_in + fade_out + 'alimiter=limit=0.89:attack=7:release=80:level=0,aresample=48000:async=1:first_pts=0'
         ff += ' --audio ---mid -af ' + filters
 
         requested_quality = str(call.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p')
@@ -3103,6 +3165,12 @@ class Bridge:
                         Path(old_sub_cfg).unlink(missing_ok=True)
                     except Exception:
                         pass
+                old_dj_cfg = call.pop('dj_config_path', None)
+                if old_dj_cfg:
+                    try:
+                        Path(old_dj_cfg).unlink(missing_ok=True)
+                    except Exception:
+                        pass
                 old_sid = call.get('av_sync_id')
                 if old_sid:
                     try:
@@ -3112,6 +3180,20 @@ class Bridge:
                 call['av_sync_id'] = None
                 sub_drift_rate = float(call.get('sub_drift_sec_per_sec') or 0.0)
                 sub_drift_anchor = float(call.get('sub_drift_anchor_sec') or 0.0)
+                dj_desk_on = bool(call.get('dj_desk'))
+                dj_desk_img = call.get('dj_desk_image') if dj_desk_on else None
+                dj_desk_override = bool(dj_desk_on and dj_desk_img and Path(dj_desk_img).is_file())
+                if dj_desk_on:
+                    desk_fps = 20 if sub_align.host_load_pressure() < 0.70 else 12
+                    target_fps = desk_fps
+                    if hasattr(stream.camera.parameters, 'frame_rate'):
+                        stream.camera.parameters.frame_rate = desk_fps
+                has_paired_av = bool(
+                    getattr(stream, 'microphone', None) is not None
+                    and getattr(stream.microphone, 'path', None)
+                    and (not is_img or dj_desk_on)
+                    and os.path.isfile(AV_SYNC_SCRIPT)
+                )
                 active_sub = (
                     self.shift_subtitle(
                         sub_raw,
@@ -3125,30 +3207,41 @@ class Bridge:
                     else None
                 )
                 eff_video_trim = hls_video_trim_start if (hls_video_trim_start is not None and not is_img) else (sync_trim_start if not is_img else None)
-                eff_video_anchor = None if is_img else sync_pts_anchor
-                skip_scale = bool(info and not is_img and int(info.get('width') or 0) == int(final_w) and int(info.get('height') or 0) == int(final_h))
-                stream.camera.path = rewrite_video_ffmpeg_command(
-                    stream.camera.path,
-                    final_w,
-                    final_h,
-                    subtitle_path=active_sub,
-                    stream_index=info.get('stream_index') if info else None,
-                    video_count=info.get('video_count', 1) if info else 1,
-                    is_image=is_img,
-                    fps=target_fps if not is_img else None,
-                    trim_start=eff_video_trim,
-                    normalize_pts=(sync_normalize_pts or not is_img),
-                    pts_anchor=eff_video_anchor,
-                    pre_seek=sync_pre_seek if not is_img else None,
-                    copyts=sync_copyts if not is_img else False,
-                    input_url=hls_seek_url if not is_img else None,
-                    skip_scale=skip_scale,
-                )
+                eff_video_anchor = None if (is_img or dj_desk_override) else sync_pts_anchor
+                skip_scale = bool(info and not is_img and not dj_desk_override and int(info.get('width') or 0) == int(final_w) and int(info.get('height') or 0) == int(final_h))
+                if dj_desk_override:
+                    dur_pad = min(14400.0, max(30.0, float(call.get('duration') or (info.get('duration') if info else 0) or 300.0) + 12.0))
+                    stream.camera.path = (
+                        f'ffmpeg -nostdin -hide_banner -loglevel error '
+                        f'-loop 1 -framerate {int(target_fps)} -i {shlex.quote(dj_desk_img)} '
+                        f'-t {dur_pad:.2f} -an -sn -dn '
+                        f'-vf scale={int(final_w)}:{int(final_h)}:flags=lanczos,setsar=1,format=yuv420p '
+                        f'-f rawvideo -pix_fmt yuv420p pipe:1'
+                    )
+                else:
+                    stream.camera.path = rewrite_video_ffmpeg_command(
+                        stream.camera.path,
+                        final_w,
+                        final_h,
+                        subtitle_path=active_sub,
+                        stream_index=info.get('stream_index') if info else None,
+                        video_count=info.get('video_count', 1) if info else 1,
+                        is_image=is_img,
+                        fps=target_fps if (not is_img or dj_desk_on) else None,
+                        trim_start=eff_video_trim,
+                        normalize_pts=(sync_normalize_pts or not is_img),
+                        pts_anchor=eff_video_anchor,
+                        pre_seek=sync_pre_seek if not is_img else None,
+                        copyts=sync_copyts if not is_img else False,
+                        input_url=hls_seek_url if not is_img else None,
+                        skip_scale=skip_scale,
+                    )
                 if getattr(stream, 'microphone', None) is not None and getattr(stream.microphone, 'path', None) and getattr(stream.camera, 'path', None):
                     pair_id = f"{call.get('playback_id') or abs(int(chat))}-{uuid.uuid4().hex[:8]}"
                     sid = re.sub(r'[^a-zA-Z0-9_-]', '_', pair_id)[:64]
                     sub_cfg_path = None
-                    if not is_img and os.path.isfile(AV_SYNC_SCRIPT):
+                    dj_cfg_path = None
+                    if (not is_img or dj_desk_on) and os.path.isfile(AV_SYNC_SCRIPT):
                         sub_cfg_path = _write_sub_config(
                             sid,
                             enabled=bool(sub_raw and Path(sub_raw).is_file()),
@@ -3164,15 +3257,24 @@ class Bridge:
                             render_screen=bool(call.get('subtitle_render_screen', True)),
                             pts_anchored=bool(eff_video_anchor is not None),
                         )
+                        if dj_desk_on:
+                            dj_cfg_path = _write_dj_desk_config(
+                                sid,
+                                enabled=True,
+                                duration_sec=float(call.get('duration') or (info.get('duration') if info else 0) or 180.0),
+                                crossfade_sec=float(call.get('crossfade_sec') or 0.0),
+                                base_sec=float(offset_val or 0.0),
+                            )
                         call['av_sync_id'] = sid
                         call['sub_config_path'] = sub_cfg_path
+                        call['dj_config_path'] = dj_cfg_path
                         call['sub_base_sec'] = float(sub_shift_offset)
                         call['_pts_anchored'] = bool(eff_video_anchor is not None)
 
                     wrap_a_in = stream.microphone.path
                     wrap_v_in = stream.camera.path
                     is_real_engine = (not self.factory) and type(a.get('engine')).__module__.startswith('pytgcalls')
-                    if (is_real_engine or getattr(self, 'use_av_hub_in_tests', False)) and not is_img and os.path.isfile(AV_HUB_SCRIPT):
+                    if (is_real_engine or getattr(self, 'use_av_hub_in_tests', False)) and not is_img and not dj_desk_override and os.path.isfile(AV_HUB_SCRIPT):
                         unified_cmd = build_unified_av_ffmpeg_command(wrap_a_in, wrap_v_in, output_format='nut')
                         if unified_cmd:
                             self._cleanup_hub(call)
@@ -3192,11 +3294,12 @@ class Bridge:
                         wrap_a_in,
                         wrap_v_in,
                         frame_bytes=final_w * final_h * 3 // 2,
-                        fps=target_fps if not is_img else 30,
+                        fps=target_fps if (not is_img or dj_desk_on) else 30,
                         sync_id=sid,
-                        width=final_w if sub_cfg_path else 0,
-                        height=final_h if sub_cfg_path else 0,
+                        width=final_w if (sub_cfg_path or dj_cfg_path) else 0,
+                        height=final_h if (sub_cfg_path or dj_cfg_path) else 0,
                         sub_config_path=sub_cfg_path,
+                        dj_config_path=dj_cfg_path,
                     )
             play_stream = Stream(
                 microphone=getattr(stream, 'microphone', None),
@@ -3344,12 +3447,15 @@ class Bridge:
             sub_drift_rate = sub_align.clamp_drift_rate(data.get('sub_drift_sec_per_sec') or 0.0)
             sub_drift_anchor = float(data.get('sub_drift_anchor_sec') or 0.0)
             pref_audio_lang = _norm_lang(data.get('preferred_audio_lang') or data.get('original_language'))
+            dj_desk_on = bool(data.get('dj_desk'))
+            dj_desk_img = self.source_dj_image(data.get('dj_desk_image')) if dj_desk_on else None
+            crossfade_sec = max(0.0, min(12.0, float(data.get('crossfade_sec') or 0.0)))
             created_with_title = False
             if previous:
                 if previous.get('stream_mode') == 'rtmp':
                     await self._stop_rtmp_proc(previous, wait_settle=(stream_mode != 'rtmp'))
                 self._cleanup_sub_overlay(previous)
-            call = {'alias': a['alias'], 'path': path, 'stream_mode': stream_mode, 'preferred_audio_lang': pref_audio_lang, 'reject_dub': bool(data.get('reject_dub')), 'subtitle_path': sub_path, 'subtitle_offset': sub_offset, 'subtitle_same_route': sub_same_route, 'subtitle_render_screen': sub_render_screen, 'sub_drift_sec_per_sec': sub_drift_rate, 'sub_drift_anchor_sec': sub_drift_anchor, 'manual_sub_override': bool(data.get('subtitle_manual_override', False)), 'auto_subtitle_offset': None, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if call.get('bass') else 'off')) if False else str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'remote_proxy': bool(data.get('remote_proxy')), 'duration': call_duration, 'offset': start_sec, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': start_sec if start_sec > 0 else None, 'last_known_position': start_sec, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic(), 'vc_title': vc_title}
+            call = {'alias': a['alias'], 'path': path, 'stream_mode': stream_mode, 'preferred_audio_lang': pref_audio_lang, 'reject_dub': bool(data.get('reject_dub')), 'subtitle_path': sub_path, 'subtitle_offset': sub_offset, 'subtitle_same_route': sub_same_route, 'subtitle_render_screen': sub_render_screen, 'sub_drift_sec_per_sec': sub_drift_rate, 'sub_drift_anchor_sec': sub_drift_anchor, 'manual_sub_override': bool(data.get('subtitle_manual_override', False)), 'auto_subtitle_offset': None, 'dj_desk': dj_desk_on, 'dj_desk_image': dj_desk_img, 'crossfade_sec': crossfade_sec, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'remote_proxy': bool(data.get('remote_proxy')), 'duration': call_duration, 'offset': start_sec, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': start_sec if start_sec > 0 else None, 'last_known_position': start_sec, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic(), 'vc_title': vc_title}
             if previous and previous.get('stream_mode') == 'rtmp' and stream_mode == 'rtmp' and previous.get('_rtmp_target'):
                 call['_rtmp_target'] = previous['_rtmp_target']
             if data.get('volume') is not None:

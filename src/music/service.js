@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { CallSetup } from './setup.js';
 import { SavedChannels, channelReference } from './channels.js';
 import { InfiniteRadio, RADIO_CATEGORIES } from './radio.js';
+import { parseMultiArtistPrompt } from './charts.js';
 import { AiDjEngine } from './aiDj.js';
 import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
@@ -655,16 +656,33 @@ export class MusicService {
       return cfg;
     }
     const rawArgs = args.join(' ').trim();
-    if (sub && !['on', 'start', 'enable', 'off', 'stop', 'disable', 'vibe', 'mood', 'skip', 'next', 'status'].includes(sub) && (/\b(what|who|which|why|how|trend|chart|bass|eq|play|put\s+on|drop|pause|resume)\b|\?/i.test(rawArgs)) && this.aiDj?.chatWithDj) {
+    if (sub === 'desk' || sub === 'live') {
+      s.view = 'djdesk';
+      await this.player(ctx, id);
+      return this.aiDj.getConfig(id);
+    }
+    if (sub === 'chapter' || sub === 'nextchapter') {
+      const chap = await this.aiDj.dropNextChapter(s);
+      s.lastNotice = `⏭ Switched chapter: ${chap.chapterTitle || chap.stage}${chap.added?.length ? ` · Cued "${chap.added[0].title}"` : ''}`;
+      if (chap.added?.length && !['playing', 'paused', 'buffering'].includes(s.status)) {
+        await this.prepare(ctx, id);
+        await qm.ensurePlaying(id);
+      }
+      await this.player(ctx, id);
+      return this.aiDj.getConfig(id);
+    }
+    if (sub && !['on', 'start', 'enable', 'off', 'stop', 'disable', 'vibe', 'mood', 'skip', 'next', 'status', 'desk', 'live', 'chapter', 'nextchapter'].includes(sub) && (/\b(what|who|which|why|how|trend|chart|bass|eq|play|put\s+on|drop|pause|resume)\b|\?/i.test(rawArgs)) && this.aiDj?.chatWithDj) {
       const res = await this.chatDjCommand(ctx, rawArgs);
       return { ...this.aiDj.getConfig(id), kind: 'ai_chat', reply: res.reply, actions: res.actions, added: res.added, intent: res.intent };
     }
     if (sub === 'vibe' || sub === 'mood' || (sub && !['on', 'start', 'enable', 'skip', 'next', 'status'].includes(sub))) {
       const vibeText = ['vibe', 'mood'].includes(sub) ? args.slice(1).join(' ') : args.join(' ');
+      const parsed = parseMultiArtistPrompt(vibeText, RADIO_CATEGORIES);
+      const wantCount = Math.max(3, Math.min(6, parsed.artists?.length || 3));
       const cfg = this.aiDj.setVibe(id, vibeText);
-      const added = await this.aiDj.curateNextTracks(s, { count: 3 }).catch(() => []);
+      const added = await this.aiDj.curateNextTracks(s, { count: wantCount, top: parsed.artists.length >= 2 }).catch(() => []);
       s.lastNotice = added.length
-        ? `🤖 AI DJ vibe "${cfg.vibe}" loaded ${added.length} tracks.`
+        ? `🤖 AI DJ "${cfg.vibe}" loaded ${added.length} tracks.`
         : `🤖 AI DJ vibe locked to "${cfg.vibe}".`;
       if (added.length && !['playing', 'paused', 'buffering'].includes(s.status)) {
         await this.prepare(ctx, id);
@@ -795,7 +813,7 @@ export class MusicService {
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','bass','aidj','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','bass','aidj','djdesk','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
@@ -973,7 +991,7 @@ export class MusicService {
   }
   async _control(ctx,action,args=[]) {
     this.bindQueuePollLifecycle();
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj','djdesk'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isViewerVote=['voteskip','votequeue'].includes(action);
     const isDownloadAct=['downloadnow','downloadq','dlq'].includes(action);
     const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh','autopoll'].includes(action);
@@ -1383,6 +1401,55 @@ export class MusicService {
         s.lastNotice='🤖 AI DJ paused. Existing queue is retained.';
       }
     }
+    else if(action==='djdesk'){
+      const subOp=String(args[0]||'open').toLowerCase();
+      const root=qm.getSession(id);
+      this.aiDj.syncSession(root);
+      if(subOp==='back'){
+        s.view=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')?'cinema':'player';
+      }else if(subOp==='vdesk'){
+        const curV=root.aiDj?.visualDesk!==false;
+        const next=this.aiDj.setDeckOption(id,{visualDesk:!curV});
+        s.visualDesk=next.visualDesk;
+        s.view='djdesk';
+        s.lastNotice=next.visualDesk?'🎛 Animated Visual DJ Desk: ON (next track / seek)':'📺 Visual DJ Desk: OFF (raw video/audio)';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:next.visualDesk?'🎛 Visual DJ Desk ON':'📺 Visual DJ Desk OFF'}).catch(()=>{});
+      }else if(subOp==='dlyrics'){
+        const curL=root.aiDj?.deskLyrics!==false;
+        const next=this.aiDj.setDeckOption(id,{deskLyrics:!curL});
+        s.view='djdesk';
+        if(root.connected && root.currentTrack?.subtitlePath && typeof this.app?.voiceClient?.setSubtitle==='function'){
+          await this.app.voiceClient.setSubtitle(id, root.currentTrack.subtitlePath, {
+            subtitleRenderScreen: Boolean(next.deskLyrics && (root.subtitleMode||'screen')==='screen'),
+            subtitleSameRoute: Boolean(root.currentTrack.subtitleSameRoute)
+          }).catch(()=>{});
+        }
+        s.lastNotice=next.deskLyrics?'📜 Desk Karaoke Lyrics: ON (Live)':'📜 Desk Karaoke Lyrics: OFF';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:next.deskLyrics?'📜 Desk Lyrics ON':'📜 Desk Lyrics OFF'}).catch(()=>{});
+      }else if(subOp==='remix'){
+        const next=this.aiDj.toggleRemixFocus(id);
+        const on=/remix/i.test(next.styleQualifier||'');
+        s.view='djdesk';
+        s.lastNotice=on?'🔀 Remix Focus: ON (next curated cuts prioritize remixes)':'🎵 Remix Focus: OFF (original tracks)';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:on?'🔀 Remix Focus ON':'🎵 Remix Focus OFF'}).catch(()=>{});
+      }else if(subOp==='xfade'){
+        const cycle=[0,4,8];
+        const curCf=Number(root.aiDj?.crossfadeSec??4);
+        const nextCf=cycle[(cycle.indexOf(curCf)+1)%cycle.length];
+        this.aiDj.setDeckOption(id,{crossfadeSec:nextCf});
+        s.view='djdesk';
+        s.lastNotice=nextCf?`🎚 Smooth Crossfade: ${nextCf}s (applies to Deck A→B fade)`:'🎚 Transition: Clean Cut (0s)';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:nextCf?`Crossfade ${nextCf}s`:'Crossfade OFF'}).catch(()=>{});
+      }else if(subOp==='chapter'){
+        const chap=await this.aiDj.dropNextChapter(root);
+        s.view='djdesk';
+        s.lastNotice=`⏭ Switched to ${chap.chapterTitle||chap.stage}${chap.added?.length?` · Cued "${chap.added[0].title}"`:''}`;
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:`⏭ ${chap.chapterTitle||'Next Chapter'}`}).catch(()=>{});
+      }else{
+        s.view='djdesk';
+        if(ctx.query?.id&&ctx.api?.answerCallbackQuery)await ctx.api.answerCallbackQuery(ctx.query.id,{text:'🎛 Live AI DJ Desk'}).catch(()=>{});
+      }
+    }
     else if(action==='eq'){
       const requested=args[0]&&EQ_PRESETS.includes(String(args[0]).toLowerCase())?String(args[0]).toLowerCase():null;
       const cur=EQ_CYCLE_PRESETS.includes(s.eqPreset)?s.eqPreset:(s.bass?'bass':'off');
@@ -1497,8 +1564,8 @@ export class MusicService {
     }
     s.overlayView=null;s.overlayAt=0;
     const isCinema=(s.activeDeck==='movie'||s.currentTrack?.provider==='movie')&&s.view!=='queue';
-    if((['player','stop','leave','seekby','selectaccount'].includes(action)||(action==='seek'&&args.length>0))&&s.view!=='seekmenu')s.view=isCinema?'cinema':'player';
-    else if(s.view!=='queue'&&s.view!=='mqueue'&&s.view!=='seekmenu'&&['pause','resume','skip','previous'].includes(action))s.view=isCinema?'cinema':'player';
+    if((['player','stop','leave','seekby','selectaccount'].includes(action)||(action==='seek'&&args.length>0))&&s.view!=='seekmenu'&&s.view!=='djdesk')s.view=isCinema?'cinema':'player';
+    else if(s.view!=='queue'&&s.view!=='mqueue'&&s.view!=='seekmenu'&&s.view!=='djdesk'&&['pause','resume','skip','previous'].includes(action))s.view=isCinema?'cinema':'player';
     if(action==='player'&&s.status==='stopped'){s.status='idle';s.lastError=null;}
     s.controlRevision=(s.controlRevision||0)+1; await qm.updatePlayerCard(id,{forceEdit:Boolean(ctx.query)});return s;
   }

@@ -671,11 +671,12 @@ export function createMusicScreen({ app }) {
     ]);
     b.buttons([
       s.panelToken ? controls(s, 'Add tracks', 'prompt', defaultMode, { style: 'success' }) : button('Add tracks', 'prompt', defaultMode, { style: 'success' }),
-      controls(s, '🎬 Movie Stream', 'movie', 'hub', { style: 'primary' }),
+      controls(s, '🎛 Live DJ Desk', 'djdesk', 'open', { style: aiDjActive ? 'success' : 'primary' }),
       s.panelToken ? controls(s, '🎙 Chat DJ', 'prompt', 'dj', { style: 'primary' }) : button('🎙 Chat DJ', 'prompt', 'dj', { style: 'primary' }),
       controls(s, bassOn ? '🎛 Bass · ON' : '🎛 Bass · OFF', 'bass', { style: bassOn ? 'success' : 'link' })
     ]);
     b.buttons([
+      controls(s, '🎬 Movie Stream', 'movie', 'hub', { style: 'primary' }),
       s.panelToken ? controls(s, '🎬 Video / vidc', 'prompt', 'video', { style: 'link' }) : button('🎬 Video / vidc', 'prompt', 'video', { style: 'link' }),
       controls(s, '♾️ Infinite & Genres', 'catmenu', defaultMode, { style: 'link' }),
       s.panelToken ? controls(s, 'Listen / download', 'prompt', 'download', { style: 'link' }) : button('Listen / download', 'prompt', 'download', { style: 'link' }),
@@ -912,6 +913,77 @@ export function createMusicScreen({ app }) {
     }
     navRow.push(controls(s, '◀ Back', 'audiolang', 'back'));
     b.buttons(navRow);
+    return finish(b);
+  }
+
+  function renderDjDesk(s) {
+    const t = s.currentTrack;
+    const nextT = s.upcoming?.[0] || null;
+    const dj = s.aiDj || {};
+    const eq = s.eqPreset || (s.bass ? 'bass' : 'off');
+    const pos = Number.isFinite(s.positionSeconds) ? s.positionSeconds : (Number(s.lastKnownPositionSeconds) || 0);
+    const dur = Number(t?.durationSeconds || 0);
+    const ratio = safeProgressRatio(pos, dur);
+    const visualOn = dj.visualDesk !== false;
+    const lyricsOn = dj.deskLyrics !== false;
+    const remixOn = /\bremix\b/i.test(dj.styleQualifier || '');
+    const cfSec = Number(dj.crossfadeSec ?? 4);
+    const chapter = dj.chapterTitle || dj.vibe || 'Studio Mix';
+    const roster = Array.isArray(dj.artistPlan?.artists) && dj.artistPlan.artists.length
+      ? dj.artistPlan.artists.map(a => a.artist).slice(0, 5).join(' → ')
+      : (dj.artistPlan?.artist || dj.vibe || 'Dynamic Mix');
+
+    const b = card('🎛 LANCY SPOTIFY AI DJ · LIVE DESK', `${cut(s.destinationTitle || 'Voice Chat', 34)} · Interactive Mixer & Visual Desk`);
+    if (t) {
+      b.quote(rt.concat(
+        rt.bold(`🟢 DECK A (ON AIR): ${cut(t.title, 70)}`),
+        rt.text(`\nArtist: ${cut(t.artist || 'Studio Artist', 60)} · ${durationText(pos)} / ${durationText(dur)}`)
+      ));
+      if (dur > 0) {
+        b.paragraph(rt.code(`${progressBar(ratio, { width: 14, filled: '█', empty: '░' })}  Deck A ──${cfSec ? '●' : '│'}── Deck B (${cfSec ? `${cfSec}s xfade` : 'cut'})`));
+      }
+      const lyr = s.cardLyrics?.trackId === t.id ? s.cardLyrics.result : null;
+      if (lyr?.syncedLyrics) {
+        const win = currentLyricWindow(lyr.syncedLyrics, pos);
+        if (win) b.blockquote(`🎤 Live Desk Lyrics:\n${win}`);
+      } else if (s.liveSubCue) {
+        b.blockquote(`🎤 Live Desk Lyrics:\n▶ ${cut(s.liveSubCue, 180)}`);
+      }
+    } else {
+      b.quote(rt.text('Deck A is ready — tap Steer DJ or Drop Chapter to start your mix!'));
+    }
+
+    const rows = [
+      ['📀 Deck B · Up Next', nextT ? `${cut(nextT.title, 34)} — ${cut(nextT.artist || '', 24)}` : 'Auto-Curating Next Cut…'],
+      ['🎙 Chapter / Mode', cut(chapter, 46)],
+      ['🔁 Rotation Roster', cut(roster, 46)],
+      ['📺 Visual DJ Desk', visualOn ? '🟢 Animated 20fps + LRC Lyrics' : '⚪ Off (Video / Audio Only)'],
+      ['📜 Screen Lyrics', lyricsOn ? '🟢 Synced LRC Karaoke ON' : '⚪ Off'],
+      ['🔀 Remix Focus', remixOn ? '🟢 ON (Remixes prioritized)' : '⚪ Off (Original Cuts)'],
+      ['🎚 Crossfade / EQ', `${cfSec ? `${cfSec}s Fade` : 'Clean Cut'} · ${eq === 'bass' ? 'Clean Bass' : eq}`]
+    ];
+    b.table(rows, { striped: true, bordered: true, compact: true });
+    if (dj.introNote) b.pullquote(cut(dj.introNote, 180), '🎙 AI DJ Live Note');
+    if (s.lastNotice) b.paragraph(rt.text(cut(s.lastNotice, 220)));
+
+    b.buttons([
+      controls(s, '⏮ Prev', 'previous', { style: 'link' }),
+      controls(s, s.status === 'paused' ? '▶ Resume' : '⏸ Pause', s.status === 'paused' ? 'resume' : 'pause', { style: s.status === 'paused' ? 'success' : 'primary' }),
+      controls(s, '⏭ Next', 'skip', { style: 'link' }),
+      controls(s, '⏭ Drop Chapter', 'djdesk', 'chapter', { style: 'success' })
+    ]);
+    b.buttons([
+      controls(s, visualOn ? '📺 Visual Desk · ON' : '📺 Visual Desk · OFF', 'djdesk', 'vdesk', { style: visualOn ? 'success' : 'link' }),
+      controls(s, lyricsOn ? '📜 Lyrics · ON' : '📜 Lyrics · OFF', 'djdesk', 'dlyrics', { style: lyricsOn ? 'success' : 'link' }),
+      controls(s, remixOn ? '🔀 Remix · ON' : '🔀 Remix · OFF', 'djdesk', 'remix', { style: remixOn ? 'success' : 'link' }),
+      controls(s, `🎚 Xfade · ${cfSec ? `${cfSec}s` : 'Off'}`, 'djdesk', 'xfade', { style: 'primary' })
+    ]);
+    b.buttons([
+      controls(s, `🎛 EQ · ${eq}`, 'eq', { style: 'link' }),
+      s.panelToken ? controls(s, '🎤 Steer / Request DJ', 'prompt', 'dj', { style: 'primary' }) : button('🎤 Steer / Request DJ', 'prompt', 'dj', { style: 'primary' }),
+      controls(s, '🔊 Volume', 'volume', { style: 'link' }),
+      controls(s, '◀ Back to Player', 'djdesk', 'back')
+    ]);
     return finish(b);
   }
 
@@ -3445,6 +3517,7 @@ export function createMusicScreen({ app }) {
     if (s?.view === 'audiolang') return renderAudioLangPicker(s);
     if (s?.view === 'subsync') return renderSubSyncPicker(s);
     if (s?.view === 'seekmenu') return renderSeekPicker(s);
+    if (s?.view === 'djdesk') return renderDjDesk(s);
     if (s?.view === 'dlq') return renderCinemaDownloadQuality(s);
     if (s?.activeDeck === 'movie' || s?.view === 'cinema' || (s?.currentTrack?.provider === 'movie' && s?.view !== 'queue')) {
       return renderCinemaPlayer(s);
@@ -3461,6 +3534,7 @@ export function createMusicScreen({ app }) {
     renderAudioLangPicker,
     renderSubSyncPicker,
     renderSeekPicker,
+    renderDjDesk,
     renderCinemaDownloadQuality,
     renderPlayer: renderDeckPlayer,
     renderMusicPlayer: renderPlayer,

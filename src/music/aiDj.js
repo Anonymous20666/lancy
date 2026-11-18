@@ -1,10 +1,20 @@
 import { MusicError } from './model.js';
 import { RADIO_CATEGORIES, normTrackTitleKey, rankTracksTrendingToOld } from './radio.js';
-import { getArtistCatalogAndRelated, getTrendingCharts, formatTrendingForPrompt, isLikelyArtistQuery } from './charts.js';
+import {
+  getArtistCatalogAndRelated,
+  getMultiArtistCatalogAndRelated,
+  getTrendingCharts,
+  formatTrendingForPrompt,
+  isLikelyArtistQuery,
+  parseMultiArtistPrompt,
+  extractDjStyleQualifier
+} from './charts.js';
+import { isNonMusicOrNews } from '../media/youtubeSearch.js';
 
 const DEFAULT_VIBE = 'Late Night Studio Mix';
 
 const COMPILATION_RE = /\b(24\/7|\d+\s*hours?|full\s*album|compilation|non[\s-]*stop|megamix|long\s*playlist|livestream|\blive\s*(now|stream)?\b|meditation\s*music\b.*relaxing|zen\s*music\b.*relaxing)\b/i;
+const DJ_TALK_NOISE_RE = /\b(type\s*beat|karaoke|instrumental\s*only|reaction|reacts\s*to|interview|podcast|review|explained|how\s*to|tutorial|documentary|trial|verdict|courtroom|sentencing|mugshot|autopsy|arrested|indicted|case\s*update|ai\s*cover|meme\s*version)\b/i;
 const IMAGE_REFUSAL_RE = /\b(?:i'?m\s+sorry|sorry,?\s+but|cannot|can'?t)\b.*\b(?:generate|create|draw|make)\b.*\b(?:image|picture|photo|video|art)\b/i;
 const HALLUCINATED_DJ_RE = /\b(?:girl\s+group|boy\s+band|legendary\s+group\s+from|k-?pop\s+idol|language\s+model|as\s+an\s+ai|cannot\s+access\s+(?:real[\s-]*time|live|internet)|don'?t\s+have\s+access\s+to\s+(?:real[\s-]*time|live|current|internet))\b/i;
 
@@ -98,12 +108,58 @@ export class AiDjEngine {
     return `music.aidj.${Number(chatId)}`;
   }
 
+  deskSettingKey(chatId) {
+    return `music.aidj.desk.${Number(chatId)}`;
+  }
+
+  getDeckConfig(chatId) {
+    const saved = this.app?.db?.getSetting?.(this.deskSettingKey(chatId), null);
+    if (saved && typeof saved === 'object') {
+      const cf = Number(saved.crossfadeSec);
+      return {
+        styleQualifier: cleanLine(saved.styleQualifier || '', 30),
+        visualDesk: saved.visualDesk !== undefined ? Boolean(saved.visualDesk) : true,
+        voiceDrops: saved.voiceDrops !== undefined ? Boolean(saved.voiceDrops) : true,
+        crossfadeSec: [0, 4, 8].includes(cf) ? cf : 4,
+        deskLyrics: saved.deskLyrics !== undefined ? Boolean(saved.deskLyrics) : true
+      };
+    }
+    return {
+      styleQualifier: '',
+      visualDesk: true,
+      voiceDrops: true,
+      crossfadeSec: 4,
+      deskLyrics: true
+    };
+  }
+
+  saveDeckConfig(chatId, patch = {}) {
+    const prev = this.getDeckConfig(chatId);
+    const cf = patch.crossfadeSec !== undefined ? Number(patch.crossfadeSec) : prev.crossfadeSec;
+    const next = {
+      styleQualifier: patch.styleQualifier !== undefined ? cleanLine(patch.styleQualifier, 30) : prev.styleQualifier,
+      visualDesk: patch.visualDesk !== undefined ? Boolean(patch.visualDesk) : prev.visualDesk,
+      voiceDrops: patch.voiceDrops !== undefined ? Boolean(patch.voiceDrops) : prev.voiceDrops,
+      crossfadeSec: [0, 4, 8].includes(cf) ? cf : prev.crossfadeSec,
+      deskLyrics: patch.deskLyrics !== undefined ? Boolean(patch.deskLyrics) : prev.deskLyrics
+    };
+    this.app?.db?.setSetting?.(this.deskSettingKey(chatId), next);
+    const s = this.app?.musicQueueManager?.sessions?.get?.(Number(chatId));
+    if (s) {
+      s.aiDj = { ...(s.aiDj || {}), ...next };
+      if (patch.styleQualifier !== undefined && s.aiDj.artistPlan) {
+        s.aiDj.artistPlan.styleQualifier = next.styleQualifier;
+      }
+    }
+    return next;
+  }
+
   getConfig(chatId) {
     const saved = this.app?.db?.getSetting?.(this.settingKey(chatId), null);
     if (saved && typeof saved === 'object') {
       return {
         enabled: Boolean(saved.enabled),
-        vibe: cleanLine(saved.vibe || DEFAULT_VIBE, 80) || DEFAULT_VIBE
+        vibe: cleanLine(saved.vibe || DEFAULT_VIBE, 120) || DEFAULT_VIBE
       };
     }
     return { enabled: false, vibe: DEFAULT_VIBE };
@@ -113,14 +169,18 @@ export class AiDjEngine {
     const prev = this.getConfig(chatId);
     const next = {
       enabled: patch.enabled !== undefined ? Boolean(patch.enabled) : prev.enabled,
-      vibe: patch.vibe !== undefined ? (cleanLine(patch.vibe, 80) || DEFAULT_VIBE) : prev.vibe
+      vibe: patch.vibe !== undefined ? (cleanLine(patch.vibe, 120) || DEFAULT_VIBE) : prev.vibe
     };
     this.app?.db?.setSetting?.(this.settingKey(chatId), next);
+    if (['styleQualifier', 'visualDesk', 'voiceDrops', 'crossfadeSec', 'deskLyrics'].some(k => patch[k] !== undefined)) {
+      this.saveDeckConfig(chatId, patch);
+    }
     const s = this.app?.musicQueueManager?.sessions?.get?.(Number(chatId));
     if (s) {
       const resetArtistPlan = patch.vibe !== undefined && s.aiDj?.artistPlan?.seed !== next.vibe;
       s.aiDj = {
         ...(s.aiDj || {}),
+        ...this.getDeckConfig(chatId),
         enabled: next.enabled,
         vibe: next.vibe,
         artistPlan: resetArtistPlan ? null : s.aiDj?.artistPlan || null
@@ -132,17 +192,30 @@ export class AiDjEngine {
   syncSession(session) {
     if (!session) return null;
     const cfg = this.getConfig(session.chatId);
+    const deck = this.getDeckConfig(session.chatId);
     if (!session.aiDj) {
       session.aiDj = {
-        enabled: cfg.enabled,
-        vibe: cfg.vibe,
+        ...cfg,
+        ...deck,
         introNote: '',
+        chapterTitle: '',
         seenIds: [],
+        seenTitles: [],
+        bannedArtists: [],
+        signals: { skipsByArtist: {}, likesByArtist: {}, consecutiveSkips: 0 },
         cursor: 0
       };
     } else {
       session.aiDj.enabled = cfg.enabled;
       if (!session.aiDj.vibe) session.aiDj.vibe = cfg.vibe;
+      if (session.aiDj.styleQualifier === undefined) session.aiDj.styleQualifier = deck.styleQualifier;
+      if (session.aiDj.visualDesk === undefined) session.aiDj.visualDesk = deck.visualDesk;
+      if (session.aiDj.voiceDrops === undefined) session.aiDj.voiceDrops = deck.voiceDrops;
+      if (session.aiDj.crossfadeSec === undefined) session.aiDj.crossfadeSec = deck.crossfadeSec;
+      if (session.aiDj.deskLyrics === undefined) session.aiDj.deskLyrics = deck.deskLyrics;
+      if (!session.aiDj.signals) session.aiDj.signals = { skipsByArtist: {}, likesByArtist: {}, consecutiveSkips: 0 };
+      if (!Array.isArray(session.aiDj.bannedArtists)) session.aiDj.bannedArtists = [];
+      if (!Array.isArray(session.aiDj.seenTitles)) session.aiDj.seenTitles = [];
     }
     return session.aiDj;
   }
@@ -173,20 +246,112 @@ export class AiDjEngine {
   }
 
   setVibe(chatId, vibe) {
-    const cleanVibe = cleanLine(vibe, 80);
+    const cleanVibe = cleanLine(vibe, 140);
     if (!cleanVibe) {
       throw new MusicError('AIDJ_VIBE_REQUIRED', 'Specify a vibe or mood, e.g. /aidj vibe Afrobeats Midnight.');
     }
-    const updated = this.saveConfig(chatId, { enabled: true, vibe: cleanVibe });
+    const detectedStyle = extractDjStyleQualifier(cleanVibe);
+    const updated = this.saveConfig(chatId, {
+      enabled: true,
+      vibe: cleanVibe,
+      styleQualifier: detectedStyle
+    });
     const s = this.app?.musicQueueManager?.getSession?.(Number(chatId));
     if (s) {
       this.syncSession(s);
       s.aiDj.vibe = updated.vibe;
+      s.aiDj.styleQualifier = updated.styleQualifier;
       s.aiDj.enabled = true;
       s.aiDj.seenIds = [];
+      s.aiDj.artistPlan = null;
+      s.aiDj.chapterTitle = detectedStyle ? `Ch. 1 · ${detectedStyle.toUpperCase()} Rotation` : `Ch. 1 · ${updated.vibe}`;
       s.aiDj.introNote = `Mood locked to "${updated.vibe}" — curating next wave.`;
     }
     return updated;
+  }
+
+  toggleRemixFocus(chatId, force = null) {
+    const cur = this.getDeckConfig(chatId);
+    const hasRemix = /\bremix\b/i.test(cur.styleQualifier || '');
+    const enable = force === null ? !hasRemix : Boolean(force);
+    const updated = this.saveDeckConfig(chatId, { styleQualifier: enable ? 'remix' : '' });
+    const s = this.app?.musicQueueManager?.sessions?.get?.(Number(chatId));
+    if (s?.aiDj) {
+      s.aiDj.styleQualifier = updated.styleQualifier;
+      if (s.aiDj.artistPlan) s.aiDj.artistPlan.styleQualifier = updated.styleQualifier;
+      s.aiDj.introNote = enable ? 'Remix Focus ON — prioritizing remixes & flips.' : 'Remix Focus OFF — original studio cuts.';
+    }
+    return updated;
+  }
+
+  setDeckOption(chatId, patch = {}) {
+    const updated = this.saveDeckConfig(chatId, patch);
+    const s = this.app?.musicQueueManager?.sessions?.get?.(Number(chatId));
+    if (s) {
+      this.syncSession(s);
+      Object.assign(s.aiDj, updated);
+    }
+    return updated;
+  }
+
+  recordSignal(session, eventType, { track = null, playedSeconds = 0 } = {}) {
+    if (!session) return null;
+    const dj = this.syncSession(session);
+    const artistKey = normArtist(track?.artist);
+    if (!dj.signals) dj.signals = { skipsByArtist: {}, likesByArtist: {}, consecutiveSkips: 0 };
+
+    if (eventType === 'skip_early' || (eventType === 'skip' && playedSeconds > 0 && playedSeconds < 25)) {
+      dj.signals.consecutiveSkips = (dj.signals.consecutiveSkips || 0) + 1;
+      if (artistKey) {
+        dj.signals.skipsByArtist[artistKey] = (dj.signals.skipsByArtist[artistKey] || 0) + 1;
+        if (dj.signals.skipsByArtist[artistKey] >= 2 && !dj.bannedArtists.includes(artistKey)) {
+          dj.bannedArtists.push(artistKey);
+          dj.introNote = `Got the signal — dialing back ${track?.artist || 'that sound'} and pivoting the mix.`;
+        }
+      }
+    } else if (eventType === 'complete' || eventType === 'like') {
+      dj.signals.consecutiveSkips = 0;
+      if (artistKey) {
+        dj.signals.likesByArtist[artistKey] = (dj.signals.likesByArtist[artistKey] || 0) + 1;
+      }
+    }
+    return dj.signals;
+  }
+
+  async dropNextChapter(session) {
+    if (!session) return { stage: 'category', added: [] };
+    const dj = this.syncSession(session);
+    dj.enabled = true;
+    this.saveConfig(session.chatId, { enabled: true });
+    const baseVibe = dj.vibe || DEFAULT_VIBE;
+    const plan = await this.#resolveArtistPlan(session, baseVibe);
+    if (plan?.found) {
+      if (plan.stage === 'artist') {
+        plan.stage = plan.relatedArtists?.length ? 'related' : 'trending';
+      } else if (plan.stage === 'related') {
+        plan.stage = 'trending';
+      } else {
+        plan.stage = 'artist';
+      }
+      dj.chapterTitle = plan.stage === 'related'
+        ? `Ch. 2 · Related Artists (${plan.genre || 'Same Sound'})`
+        : plan.stage === 'trending'
+          ? `Ch. 3 · Live Charts Crossover`
+          : `Ch. 1 · ${plan.styleQualifier ? `${plan.styleQualifier.toUpperCase()} ` : ''}1-by-1 Rotation`;
+    } else {
+      dj.cursor = (dj.cursor || 0) + 3;
+      const chapters = ['Ch. 1 · Trending Heat', 'Ch. 2 · Deep Cuts & Remixes', 'Ch. 3 · Late Night Wave'];
+      dj.chapterTitle = chapters[dj.cursor % chapters.length];
+    }
+
+    // Clear previously auto-picked AI DJ items from upcoming while preserving user requests
+    if (Array.isArray(session.upcoming)) {
+      session.upcoming = session.upcoming.filter(t => t?.requester && !/ai dj/i.test(String(t.requester)));
+    }
+    dj.signals.consecutiveSkips = 0;
+    const added = await this.curateNextTracks(session, { count: 3 }).catch(() => []);
+    dj.introNote = `${dj.chapterTitle} — switching vibe with ${added.length ? `"${added[0].title}"` : 'fresh cuts'}.`;
+    return { stage: plan?.stage || 'category', chapterTitle: dj.chapterTitle, added };
   }
 
   async generateIntroNote(session, nextTrack, prevTrack = null) {
@@ -240,27 +405,86 @@ export class AiDjEngine {
   async #resolveArtistPlan(session, baseVibe) {
     const dj = this.syncSession(session);
     if (dj?.artistPlan?.seed === baseVibe) return dj.artistPlan;
-    if (!isLikelyArtistQuery(baseVibe, RADIO_CATEGORIES)) {
-      dj.artistPlan = { seed: baseVibe, found: false, stage: 'category' };
+    const parsed = parseMultiArtistPrompt(baseVibe, RADIO_CATEGORIES);
+    const activeStyle = parsed.styleQualifier || dj.styleQualifier || '';
+    const resolver = this.artistResolverFn || this.app?.music?.artistResolver || getArtistCatalogAndRelated;
+
+    if (parsed.artists.length >= 2) {
+      const multiRes = await getMultiArtistCatalogAndRelated(parsed.artists, {
+        knownCategories: RADIO_CATEGORIES,
+        resolver: (q) => Promise.resolve(resolver(q, { knownCategories: RADIO_CATEGORIES })).catch(() => null)
+      }).catch(() => null);
+
+      if (multiRes?.found && multiRes.artists?.length) {
+        const roster = multiRes.artists.map(a => ({
+          artist: a.artist,
+          genre: a.genre || multiRes.genre || '',
+          catalog: Array.isArray(a.tracks) ? a.tracks : [],
+          catalogCursor: 0,
+          relatedArtists: Array.isArray(a.relatedArtists) ? a.relatedArtists : [],
+          providerPass: 0
+        }));
+        dj.artistPlan = {
+          seed: baseVibe,
+          found: true,
+          multiArtist: roster.length > 1,
+          artists: roster,
+          rotationCursor: 0,
+          artist: roster[0].artist,
+          genre: multiRes.genre || roster[0].genre || '',
+          styleQualifier: activeStyle,
+          wantsRelated: parsed.wantsRelated,
+          sequenceOneByOne: true,
+          catalog: roster[0].catalog,
+          catalogCursor: 0,
+          relatedArtists: multiRes.relatedArtists || [],
+          relatedCursor: 0,
+          providerPass: 0,
+          stage: 'artist'
+        };
+        dj.chapterTitle = `Ch. 1 · ${activeStyle ? `${activeStyle.toUpperCase()} ` : ''}1-by-1 (${roster.map(r => r.artist).slice(0, 4).join(' → ')})`;
+        return dj.artistPlan;
+      }
+    }
+
+    const singleCandidate = parsed.artists.length === 1 ? parsed.artists[0] : baseVibe;
+    if (!isLikelyArtistQuery(singleCandidate, RADIO_CATEGORIES)) {
+      dj.artistPlan = { seed: baseVibe, found: false, styleQualifier: activeStyle, stage: 'category' };
+      dj.chapterTitle = activeStyle ? `Ch. 1 · ${baseVibe}` : `Ch. 1 · ${baseVibe}`;
       return dj.artistPlan;
     }
-    const resolver = this.artistResolverFn || this.app?.music?.artistResolver || getArtistCatalogAndRelated;
-    const planRes = await Promise.resolve(resolver(baseVibe, { knownCategories: RADIO_CATEGORIES })).catch(() => null);
+
+    const planRes = await Promise.resolve(resolver(singleCandidate, { knownCategories: RADIO_CATEGORIES })).catch(() => null);
     if (planRes?.found && planRes.artist) {
-      dj.artistPlan = {
-        seed: baseVibe,
-        found: true,
+      const slot = {
         artist: planRes.artist,
         genre: planRes.genre || '',
         catalog: Array.isArray(planRes.tracks) ? planRes.tracks : [],
         catalogCursor: 0,
         relatedArtists: Array.isArray(planRes.relatedArtists) ? planRes.relatedArtists : [],
+        providerPass: 0
+      };
+      dj.artistPlan = {
+        seed: baseVibe,
+        found: true,
+        multiArtist: false,
+        artists: [slot],
+        rotationCursor: 0,
+        artist: planRes.artist,
+        genre: planRes.genre || '',
+        styleQualifier: activeStyle,
+        wantsRelated: parsed.wantsRelated,
+        sequenceOneByOne: false,
+        catalog: slot.catalog,
+        catalogCursor: 0,
+        relatedArtists: slot.relatedArtists,
         relatedCursor: 0,
         providerPass: 0,
         stage: 'artist'
       };
+      dj.chapterTitle = `Ch. 1 · ${planRes.artist}${activeStyle ? ` (${activeStyle})` : ''}`;
     } else {
-      dj.artistPlan = { seed: baseVibe, found: false, stage: 'category' };
+      dj.artistPlan = { seed: baseVibe, found: false, styleQualifier: activeStyle, stage: 'category' };
     }
     return dj.artistPlan;
   }
@@ -279,22 +503,32 @@ export class AiDjEngine {
     ].filter(Boolean))].slice(0, 6);
 
     if (relatedMode && Array.isArray(artistPlan.relatedArtists) && artistPlan.relatedArtists.length) {
+      const banned = new Set((dj.bannedArtists || []).map(normArtist));
+      const seedSet = new Set([
+        targetArtistNorm,
+        ...(artistPlan.artists || []).map(a => normArtist(a.artist))
+      ].filter(Boolean));
       const peers = artistPlan.relatedArtists
         .map(a => a?.name || a)
-        .filter(name => normArtist(name) && normArtist(name) !== targetArtistNorm);
+        .filter(name => {
+          const n = normArtist(name);
+          return n && !seedSet.has(n) && !banned.has(n);
+        });
       if (peers.length) {
         const start = artistPlan.relatedCursor || 0;
         const rotatedPeers = [];
+        const sq = artistPlan.styleQualifier || dj.styleQualifier || '';
         for (let i = 0; i < Math.min(4, peers.length); i++) {
-          rotatedPeers.push(peers[(start + i) % peers.length]);
+          const peer = peers[(start + i) % peers.length];
+          rotatedPeers.push(sq ? `${peer} ${sq}` : peer);
         }
         artistPlan.relatedCursor = (start + 2) % peers.length;
         const chartGenre = artistPlan.genre || baseVibe;
         const trending = Array.isArray(trendingItems) ? trendingItems : await this.getCharts(chartGenre, 12);
         const peerCharts = trending
-          .filter(t => t?.artist && t?.title && normArtist(t.artist) !== targetArtistNorm)
+          .filter(t => t?.artist && t?.title && !seedSet.has(normArtist(t.artist)) && !banned.has(normArtist(t.artist)))
           .slice(0, 2)
-          .map(t => cleanLine(`${t.artist} - ${t.title}`, 80));
+          .map(t => cleanLine(`${t.artist} - ${t.title}${sq ? ` ${sq}` : ''}`, 80));
         dj.cursor = (dj.cursor || 0) + 1;
         return [...new Set([...rotatedPeers, ...peerCharts])].slice(0, 6);
       }
@@ -353,8 +587,9 @@ export class AiDjEngine {
   }
 
   #detectChatIntent(text) {
-    const raw = cleanLine(text, 200);
+    const raw = cleanLine(text, 240);
     const lower = raw.toLowerCase();
+    const parsedPrompt = parseMultiArtistPrompt(raw, RADIO_CATEGORIES);
     const wantsBassOff = /\b(bass\s+off|turn\s+off\s+bass|no\s+bass|flat\s+eq|eq\s+off|reset\s+eq)\b/i.test(lower);
     const wantsStudio = /\b(studio\s*(?:eq|sound|mix)?|vocal\s+eq|nightcore|vaporwave|8d)\b/i.test(lower);
     const wantsBassBoost = !wantsBassOff && /\b(bass|sub[\s-]*bass|clean\s+bass|heavy\s+bass|punchy|eq)\b/i.test(lower);
@@ -373,10 +608,18 @@ export class AiDjEngine {
     else if (/^(?:please\s+|can\s+you\s+|dj\s+)?pause(?:\s+(?:music|vc|playback|this))?$/i.test(lower)) playbackOp = 'pause';
     else if (/^(?:please\s+|can\s+you\s+|dj\s+)?(?:resume|unpause|continue)(?:\s+(?:music|vc|playback))?$/i.test(lower)) playbackOp = 'resume';
 
+    const wantsNextChapter = /\b(next\s*chapter|drop\s*(?:the\s+)?next\s*chapter|switch\s*(?:the\s+)?(?:vibe|chapter)|play\s+(?:songs?\s+)?related|related\s+chapter)\b/i.test(lower);
+    let crossfadeSet = null;
+    const cfMatch = lower.match(/\bcrossfade\s*(?:to\s*)?(off|0|4|8)\s*s?\b/i);
+    if (cfMatch) crossfadeSet = cfMatch[1] === 'off' ? 0 : Number(cfMatch[1]);
+    let visualDeskSet = null;
+    if (/\b(?:visual\s*desk|dj\s*desk)\s*(?:on|enable|open)\b/i.test(lower)) visualDeskSet = true;
+    else if (/\b(?:visual\s*desk|dj\s*desk)\s*(?:off|disable|video)\b/i.test(lower)) visualDeskSet = false;
+
     const wantsTrending = /\b(trend(?:ing)?|chart(?:s|ing)?|top\s*\d*|hot\s+(?:right\s+now|today)|what'?s\s+hot|latest\s+(?:hits|songs|music|drops)|new\s+(?:hits|songs|music)|popular\s+(?:now|today))\b/i.test(lower);
-    const explicitPlay = /\b(play|queue|put\s+on|spin|drop|mix|switch(?:\s+to)?|(?:change|set)\s+(?:the\s+)?(?:vibe|mood)(?:\s+to)?|give\s+me|want\s+(?:some|to\s+hear)|listen\s+to)\b/i.test(lower);
+    const explicitPlay = /\b(play|queue|put\s+on|spin|drop|mix|switch(?:\s+to)?|(?:change|set)\s+(?:the\s+)?(?:vibe|mood)(?:\s+to)?|give\s+me|want\s+(?:some|to\s+hear|remix)|listen\s+to)\b/i.test(lower);
     const playImmediate = /\b(play\s+now|right\s+now|immediately|switch\s+to|change\s+(?:song|track)\s+to|play\s+.+\s+(?:right\s+now|immediately|now))\b/i.test(lower);
-    const isConclusion = !explicitPlay && !wantsTrending && !bassPreset && !playbackOp && (
+    const isConclusion = !explicitPlay && !wantsTrending && !bassPreset && !playbackOp && !wantsNextChapter && crossfadeSet === null && visualDeskSet === null && (
       /^(?:ok(?:ay)?|k|cool|nice|great|awesome|perfect|bet|good|all\s*good|sounds?\s*good|i'?m\s+good|we'?re\s+good|thank(?:s|\s*you)(?:\s+so\s+much|\s+dj|\s+lancy|\s+bro|\s+man)?|ty|thx|that'?s\s*(?:all|it)|thats\s*(?:all|it)|that\s+is\s+(?:all|it)|done|bye|peace|stop\s*chat(?:ting)?|leave\s*it(?:\s*like\s*that)?|sorted|appreciate\s*it|no\s+more|nothing\s+else)[.!~\s♡]*$/i.test(lower) ||
       /\b(?:that'?s\s+all\s+for\s+now|thanks?\s+(?:dj|lancy)|all\s+set\s+thanks|you\s+can\s+conclude|we\s+are\s+done)\b/i.test(lower)
     );
@@ -394,21 +637,56 @@ export class AiDjEngine {
       .trim();
     if (/^(?:something|anything|music|it|this|that|up|on|to)$/i.test(topic)) topic = '';
 
-    const shouldQueue = !isConclusion && !playbackOp && !isQuestionOnly && Boolean(explicitPlay || (!bassPreset && !wantsTrending && topic.length >= 2 && !/\?$/.test(raw)));
+    const isMultiArtist = parsedPrompt.artists.length >= 2;
+    const shouldQueue = !isConclusion && !playbackOp && !wantsNextChapter && crossfadeSet === null && visualDeskSet === null && !isQuestionOnly && Boolean(explicitPlay || isMultiArtist || (!bassPreset && !wantsTrending && topic.length >= 2 && !/\?$/.test(raw)));
     return {
       raw,
       bassPreset,
       playbackOp,
       wantsTrending,
+      wantsNextChapter,
+      crossfadeSet,
+      visualDeskSet,
+      isMultiArtist,
+      parsedArtists: parsedPrompt.artists,
+      styleQualifier: parsedPrompt.styleQualifier,
       shouldQueue,
       playImmediate,
       isConclusion,
-      topic: cleanLine(topic, 80),
+      topic: cleanLine(topic, 120),
       wantsStudio
     };
   }
 
-  async #findMatches(session, query, { count = 2, excludedIds = null } = {}) {
+  #isCleanTrack(track, query = '', styleQualifier = '') {
+    if (!track?.id) return false;
+    const title = String(track.title || '');
+    const artist = String(track.artist || '');
+    if (isNonMusicOrNews(title, artist, query)) return false;
+    if (COMPILATION_RE.test(title)) return false;
+    if (DJ_TALK_NOISE_RE.test(title) && !/\b(type\s*beat|karaoke|instrumental|reaction|interview|podcast)\b/i.test(String(query || '') + ' ' + String(styleQualifier || ''))) {
+      return false;
+    }
+    return true;
+  }
+
+  #rankWithStyle(items = [], styleQualifier = '', { isVideo = false } = {}) {
+    const base = rankTracksTrendingToOld(items, { isVideo });
+    if (!styleQualifier || base.length <= 1) return base;
+    const remixWanted = /\bremix\b/i.test(styleQualifier);
+    const tokenRe = remixWanted
+      ? /\b(remix|edit|flip|bootleg|vip|club\s*mix)\b/i
+      : new RegExp(`\\b${styleQualifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s*')}\\b`, 'i');
+    const matched = [];
+    const rest = [];
+    for (const item of base) {
+      if (tokenRe.test(String(item.title || ''))) matched.push(item);
+      else rest.push(item);
+    }
+    return [...matched, ...rest];
+  }
+
+  async #findMatches(session, query, { count = 2, excludedIds = null, styleQualifier = '' } = {}) {
     const providers = this.app?.musicProviders;
     if (!providers || !query) return [];
     const ytEnabled = Boolean(providers.get?.('youtube')?.enabled);
@@ -420,10 +698,8 @@ export class AiDjEngine {
       filterDuration: 'medium'
     }).catch(() => null);
     const excluded = excludedIds || new Set([session.currentTrack?.id, ...(session.upcoming || []).map(t => t.id)].filter(Boolean));
-    const ranked = rankTracksTrendingToOld(
-      (res?.items || []).filter(t => t?.id && !excluded.has(t.id) && !COMPILATION_RE.test(String(t.title || ''))),
-      { isVideo }
-    );
+    const clean = (res?.items || []).filter(t => !excluded.has(t?.id) && this.#isCleanTrack(t, query, styleQualifier));
+    const ranked = this.#rankWithStyle(clean, styleQualifier, { isVideo });
     return ranked.slice(0, count).map(t => ({
       ...t,
       mediaType: isVideo ? 'video' : 'audio',
@@ -492,7 +768,21 @@ export class AiDjEngine {
         actions.push(`EQ: ${session.eqPreset}`);
       }
 
-      if (intent.playbackOp && qm) {
+      if (intent.crossfadeSet !== null) {
+        this.setDeckOption(session.chatId, { crossfadeSec: intent.crossfadeSet });
+        actions.push(`Crossfade: ${intent.crossfadeSet ? `${intent.crossfadeSet}s` : 'Off'}`);
+      }
+
+      if (intent.visualDeskSet !== null) {
+        this.setDeckOption(session.chatId, { visualDesk: intent.visualDeskSet });
+        actions.push(`Visual DJ Desk: ${intent.visualDeskSet ? 'ON' : 'OFF'}`);
+      }
+
+      if (intent.wantsNextChapter) {
+        const chap = await this.dropNextChapter(session);
+        added = chap.added || [];
+        actions.push(`Switched chapter: ${chap.chapterTitle || chap.stage}`);
+      } else if (intent.playbackOp && qm) {
         if (intent.playbackOp === 'skip') {
           this.toggle(session.chatId, true);
           if (!session.upcoming?.length) await this.curateNextTracks(session, { count: 2 }).catch(() => []);
@@ -510,12 +800,30 @@ export class AiDjEngine {
           actions.push('Resumed');
         }
       } else if (intent.shouldQueue || (intent.wantsTrending && /\b(play|queue|spin|drop|put\s+on|mix)\b/i.test(cleanText))) {
-        const nextVibe = intent.topic || (intent.wantsTrending ? 'Global Trending Hits' : dj.vibe);
+        const useStructuredRotation = Boolean(intent.isMultiArtist || (intent.styleQualifier && intent.parsedArtists?.length));
+        const nextVibe = useStructuredRotation
+          ? cleanText
+          : (intent.topic || (intent.wantsTrending ? 'Global Trending Hits' : dj.vibe));
         this.setVibe(session.chatId, nextVibe);
         const needsPrepare = Boolean(!session.connected && ctx && service?.prepare);
         const preparePromise = needsPrepare ? service.prepare(ctx, session.chatId).catch(() => {}) : Promise.resolve();
 
-        if (intent.wantsTrending && trending.length) {
+        if (useStructuredRotation) {
+          const wantCount = Math.max(4, Math.min(6, intent.parsedArtists?.length || 4));
+          const [, curated] = await Promise.all([
+            preparePromise,
+            this.curateNextTracks(session, { count: wantCount, top: true }).catch(() => [])
+          ]);
+          added = curated;
+          if (intent.playImmediate && added.length && qm?.playImmediateAndContinue && ['playing', 'paused', 'buffering'].includes(session.status)) {
+            const first = added[0];
+            if (Array.isArray(session.upcoming)) {
+              const idx = session.upcoming.findIndex(u => u.entryId === first.entryId);
+              if (idx >= 0) session.upcoming.splice(idx, 1);
+            }
+            await qm.playImmediateAndContinue(session.chatId, first).catch(() => {});
+          }
+        } else if (intent.wantsTrending && trending.length) {
           const [, ...matchSets] = await Promise.all([
             preparePromise,
             ...trending.slice(0, 3).map(hit => this.#findMatches(session, `${hit.artist} - ${hit.title}`, { count: 1 }).catch(() => []))
@@ -540,7 +848,7 @@ export class AiDjEngine {
             preparePromise,
             intent.playImmediate && qm?.playImmediateAndContinue && ['playing', 'paused', 'buffering'].includes(session.status)
               ? (async () => {
-                  const picks = await this.#findMatches(session, intent.topic || nextVibe, { count: 1 });
+                  const picks = await this.#findMatches(session, intent.topic || nextVibe, { count: 1, styleQualifier: intent.styleQualifier });
                   if (picks.length) {
                     const entry = await qm.playImmediateAndContinue(session.chatId, picks[0]);
                     return [entry?.track || picks[0]];
@@ -555,7 +863,7 @@ export class AiDjEngine {
           }
         }
         if (added.length) {
-          actions.push(intent.playImmediate ? `Playing "${added[0].title}" immediately (previous playlist continues after)` : `Queued ${added.length} HD video track(s)`);
+          actions.push(intent.playImmediate ? `Playing "${added[0].title}" immediately (previous playlist continues after)` : `Queued ${added.length} HD track(s)`);
           if (!['playing', 'paused', 'buffering'].includes(session.status) && qm) {
             await preparePromise;
             await qm.ensurePlaying(session.chatId).catch(() => {});
@@ -628,7 +936,7 @@ export class AiDjEngine {
     return { reply, actions, added, trending: trending.slice(0, 5), intent };
   }
 
-  async curateNextTracks(session, { count = 3 } = {}) {
+  async curateNextTracks(session, { count = 3, top = false } = {}) {
     if (!session || this.inflight.has(session.chatId)) return [];
     const providers = this.app?.musicProviders;
     const qm = this.app?.musicQueueManager;
@@ -642,6 +950,8 @@ export class AiDjEngine {
       const isVideo = Boolean(session.radio?.video || session.radioVideo || session.currentTrack?.mediaType === 'video' || ytEnabled);
       const baseVibe = dj?.vibe || session.radio?.queries?.[0] || DEFAULT_VIBE;
       const artistPlan = await this.#resolveArtistPlan(session, baseVibe);
+      const styleQ = artistPlan?.styleQualifier || dj.styleQualifier || '';
+      const bannedSet = new Set((dj.bannedArtists || []).map(normArtist));
 
       const excludedIds = new Set([
         session.currentTrack?.id,
@@ -656,90 +966,168 @@ export class AiDjEngine {
       ].map(t => normTrackTitleKey(t?.artist, t?.title)).concat(dj.seenTitles || []).filter(Boolean));
 
       const hasAdapters = Boolean(providers.adapters);
-      const filterCandidate = (t) => {
+      const filterCandidate = (t, activeQ = baseVibe) => {
         if (!t?.id || excludedIds.has(t.id)) return false;
         if (t.availability === 'unavailable' || t.streamable === false || t.isLive || t.duration === 'LIVE') return false;
-        if (COMPILATION_RE.test(String(t.title || ''))) return false;
+        if (!this.#isCleanTrack(t, activeQ, styleQ)) return false;
+        if (bannedSet.size && bannedSet.has(normArtist(t.artist))) return false;
         if (hasAdapters && (!Number.isFinite(t.durationSeconds) || t.durationSeconds < 40 || t.durationSeconds > 720)) return false;
         const tk = normTrackTitleKey(t.artist, t.title);
         if (tk && excludedTitles.has(tk)) return false;
         return true;
       };
 
+      const matchesSlotArtist = (t, slotArtist) => {
+        const targetNorm = normArtist(slotArtist);
+        if (!targetNorm) return true;
+        const ta = normArtist(t?.artist);
+        return !ta || ta.includes(targetNorm) || targetNorm.includes(ta) || normArtist(t?.title).includes(targetNorm);
+      };
+
+      const recordPicked = (chosen, listOut) => {
+        excludedIds.add(chosen.id);
+        const tk = normTrackTitleKey(chosen.artist, chosen.title);
+        if (tk) { excludedTitles.add(tk); dj.seenTitles.push(tk); }
+        dj.seenIds.push(chosen.id);
+        listOut.push(chosen);
+      };
+
       const picked = [];
       let transitionedNotice = '';
 
       if (artistPlan?.found && artistPlan.stage === 'artist') {
-        const targetNorm = normArtist(artistPlan.artist);
-        const matchesPlanArtist = (t) => {
-          const ta = normArtist(t?.artist);
-          return !targetNorm || !ta || ta.includes(targetNorm) || targetNorm.includes(ta) || normArtist(t?.title).includes(targetNorm);
-        };
-
-        for (let round = 0; round < 2 && artistPlan.catalogCursor < artistPlan.catalog.length && picked.length < count; round++) {
-          const batch = [];
-          while (artistPlan.catalogCursor < artistPlan.catalog.length && batch.length < count + 1) {
-            const entry = artistPlan.catalog[artistPlan.catalogCursor++];
-            const tk = normTrackTitleKey(entry.artist || artistPlan.artist, entry.title);
-            if (!entry?.title || (tk && excludedTitles.has(tk))) continue;
-            batch.push(entry);
+        if (artistPlan.multiArtist && Array.isArray(artistPlan.artists) && artistPlan.artists.length > 1) {
+          const roster = artistPlan.artists.filter(r => !bannedSet.has(normArtist(r.artist)));
+          const activeRoster = roster.length ? roster : artistPlan.artists;
+          const totalSlots = activeRoster.length;
+          // Determine the exact 1-by-1 rotation slice for this batch and run searches in parallel
+          const slotJobs = [];
+          const roundsNeeded = Math.min(count, Math.max(count, totalSlots));
+          for (let step = 0; step < roundsNeeded; step++) {
+            const slotIdx = (artistPlan.rotationCursor + step) % totalSlots;
+            const slot = activeRoster[slotIdx];
+            let entry = null;
+            while (slot.catalogCursor < slot.catalog.length) {
+              const cand = slot.catalog[slot.catalogCursor++];
+              const tk = normTrackTitleKey(cand.artist || slot.artist, cand.title);
+              if (!cand?.title || (tk && excludedTitles.has(tk))) continue;
+              entry = cand;
+              break;
+            }
+            const q = entry
+              ? `${slot.artist} ${entry.title}${styleQ ? ` ${styleQ}` : ''}`
+              : `${slot.artist}${styleQ ? ` ${styleQ}` : (slot.providerPass > 0 ? ' top hits' : '')}`;
+            if (!entry) slot.providerPass++;
+            slotJobs.push({ slot, q });
           }
-          if (!batch.length) break;
-          const pages = await Promise.all(
-            batch.map(entry =>
-              providers.search(`${artistPlan.artist} ${entry.title}`, {
+
+          const slotPages = await Promise.all(
+            slotJobs.map(({ q }) =>
+              providers.search(q, {
                 offset: 0,
-                limit: 3,
+                limit: 5,
                 video: isVideo,
                 radio: true,
                 filterDuration: 'medium'
               }).catch(() => null)
             )
           );
-          for (const pg of pages) {
-            if (picked.length >= count) break;
-            const filtered = (pg?.items || []).filter(filterCandidate);
-            const strict = filtered.filter(matchesPlanArtist);
-            const ranked = rankTracksTrendingToOld(strict.length ? strict : filtered, { isVideo });
-            const chosen = ranked[0];
+
+          for (let i = 0; i < slotJobs.length && picked.length < count; i++) {
+            const { slot, q } = slotJobs[i];
+            const filtered = (slotPages[i]?.items || []).filter(t => filterCandidate(t, q));
+            const strict = filtered.filter(t => matchesSlotArtist(t, slot.artist));
+            const ranked = this.#rankWithStyle(strict.length ? strict : filtered, styleQ, { isVideo });
+            let chosen = ranked[0];
+            // Fallback search without catalog title lock if remix/title query was too narrow
+            if (!chosen && q !== `${slot.artist}${styleQ ? ` ${styleQ}` : ''}`) {
+              const fbQ = `${slot.artist}${styleQ ? ` ${styleQ}` : ''}`;
+              const fbPage = await providers.search(fbQ, {
+                offset: 0,
+                limit: 6,
+                video: isVideo,
+                radio: true,
+                filterDuration: 'medium'
+              }).catch(() => null);
+              const fbFiltered = (fbPage?.items || []).filter(t => filterCandidate(t, fbQ));
+              const fbStrict = fbFiltered.filter(t => matchesSlotArtist(t, slot.artist));
+              chosen = this.#rankWithStyle(fbStrict.length ? fbStrict : fbFiltered, styleQ, { isVideo })[0];
+            }
             if (chosen) {
-              excludedIds.add(chosen.id);
-              const tk = normTrackTitleKey(chosen.artist, chosen.title);
-              if (tk) { excludedTitles.add(tk); dj.seenTitles.push(tk); }
-              dj.seenIds.push(chosen.id);
-              picked.push(chosen);
+              recordPicked(chosen, picked);
+            }
+            artistPlan.rotationCursor = (artistPlan.rotationCursor + 1) % totalSlots;
+          }
+
+          if (picked.length) {
+            const curArtist = picked[0]?.artist || activeRoster[0]?.artist || '';
+            dj.chapterTitle = `Ch. 1 · ${styleQ ? `${styleQ.toUpperCase()} ` : ''}1-by-1 (${activeRoster.map(r => r.artist).slice(0, 4).join(' → ')})`;
+            transitionedNotice = `Spinning 1-by-1 ${styleQ || 'set'}: queued ${picked.slice(0, 4).map(t => `${t.artist}`).join(' → ')}${curArtist ? '' : ''}.`;
+          } else {
+            artistPlan.stage = 'related';
+          }
+        } else {
+          for (let round = 0; round < 2 && artistPlan.catalogCursor < artistPlan.catalog.length && picked.length < count; round++) {
+            const batch = [];
+            while (artistPlan.catalogCursor < artistPlan.catalog.length && batch.length < count + 1) {
+              const entry = artistPlan.catalog[artistPlan.catalogCursor++];
+              const tk = normTrackTitleKey(entry.artist || artistPlan.artist, entry.title);
+              if (!entry?.title || (tk && excludedTitles.has(tk))) continue;
+              batch.push(entry);
+            }
+            if (!batch.length) break;
+            const pages = await Promise.all(
+              batch.map(entry => {
+                const q = `${artistPlan.artist} ${entry.title}${styleQ ? ` ${styleQ}` : ''}`;
+                return providers.search(q, {
+                  offset: 0,
+                  limit: 4,
+                  video: isVideo,
+                  radio: true,
+                  filterDuration: 'medium'
+                }).catch(() => null).then(pg => ({ pg, q }));
+              })
+            );
+            for (const { pg, q } of pages) {
+              if (picked.length >= count) break;
+              const filtered = (pg?.items || []).filter(t => filterCandidate(t, q));
+              const strict = filtered.filter(t => matchesSlotArtist(t, artistPlan.artist));
+              const ranked = this.#rankWithStyle(strict.length ? strict : filtered, styleQ, { isVideo });
+              const chosen = ranked[0];
+              if (chosen) recordPicked(chosen, picked);
             }
           }
-        }
 
-        if (picked.length < count && artistPlan.providerPass < 2) {
-          const qDirect = artistPlan.providerPass === 0 ? artistPlan.artist : `${artistPlan.artist} classic hits`;
-          artistPlan.providerPass++;
-          const page = await providers.search(qDirect, {
-            offset: (artistPlan.providerPass - 1) * 6,
-            limit: hasAdapters ? 12 : 6,
-            video: isVideo,
-            radio: true,
-            filterDuration: 'medium'
-          }).catch(() => null);
-          const filtered = (page?.items || []).filter(filterCandidate);
-          const strict = filtered.filter(matchesPlanArtist);
-          const ranked = rankTracksTrendingToOld(strict.length ? strict : filtered, { isVideo });
-          for (const chosen of ranked) {
-            if (picked.length >= count) break;
-            excludedIds.add(chosen.id);
-            const tk = normTrackTitleKey(chosen.artist, chosen.title);
-            if (tk) { excludedTitles.add(tk); dj.seenTitles.push(tk); }
-            dj.seenIds.push(chosen.id);
-            picked.push(chosen);
+          if (picked.length < count && artistPlan.providerPass < 2) {
+            const qDirect = artistPlan.providerPass === 0
+              ? `${artistPlan.artist}${styleQ ? ` ${styleQ}` : ''}`
+              : `${artistPlan.artist} ${styleQ || 'classic hits'}`;
+            artistPlan.providerPass++;
+            const page = await providers.search(qDirect, {
+              offset: (artistPlan.providerPass - 1) * 6,
+              limit: hasAdapters ? 12 : 6,
+              video: isVideo,
+              radio: true,
+              filterDuration: 'medium'
+            }).catch(() => null);
+            const filtered = (page?.items || []).filter(t => filterCandidate(t, qDirect));
+            const strict = filtered.filter(t => matchesSlotArtist(t, artistPlan.artist));
+            const ranked = this.#rankWithStyle(strict.length ? strict : filtered, styleQ, { isVideo });
+            for (const chosen of ranked) {
+              if (picked.length >= count) break;
+              recordPicked(chosen, picked);
+            }
+          }
+
+          if (!picked.length) {
+            artistPlan.stage = 'related';
           }
         }
 
-        if (!picked.length) {
-          artistPlan.stage = 'related';
+        if (!picked.length && artistPlan.stage === 'related') {
           if (!artistPlan.relatedArtists?.length && artistPlan.genre) {
             const chartPeers = await this.getCharts(artistPlan.genre, 15).catch(() => []);
-            const seenNames = new Set([normArtist(artistPlan.artist)]);
+            const seenNames = new Set([normArtist(artistPlan.artist), ...(artistPlan.artists || []).map(a => normArtist(a.artist))]);
             artistPlan.relatedArtists = [];
             for (const x of chartPeers) {
               const name = String(x.artist || '').split(/[,&]|feat\.?|ft\./i)[0].trim();
@@ -750,9 +1138,10 @@ export class AiDjEngine {
             }
           }
           const peerList = (artistPlan.relatedArtists || []).slice(0, 3).map(a => a?.name || a).filter(Boolean).join(', ');
+          dj.chapterTitle = `Ch. 2 · Related Artists (${artistPlan.genre || 'Sound Match'})`;
           transitionedNotice = peerList
-            ? `Finished ${artistPlan.artist}'s run — rolling into related ${artistPlan.genre || 'category'} artists: ${peerList}.`
-            : `Finished ${artistPlan.artist}'s run — expanding into related artists.`;
+            ? `Finished ${artistPlan.multiArtist ? 'artist rotation' : `${artistPlan.artist}'s run`} — rolling into related artists: ${peerList}.`
+            : `Rolling into related artists.`;
         }
       }
 
@@ -775,7 +1164,11 @@ export class AiDjEngine {
             filterDuration: 'medium'
           }).catch(() => null);
 
-          const fresh = rankTracksTrendingToOld((page?.items || []).filter(filterCandidate), { isVideo });
+          const fresh = this.#rankWithStyle(
+            (page?.items || []).filter(t => filterCandidate(t, query)),
+            styleQ,
+            { isVideo }
+          );
 
           // Prefer distinct artists first, relax only if nothing else exists
           const distinctArtist = fresh.filter(t => {
@@ -785,13 +1178,9 @@ export class AiDjEngine {
           const pool = distinctArtist.length ? distinctArtist : fresh;
           for (const item of pool) {
             if (picked.length >= count) break;
-            excludedIds.add(item.id);
             const a = normArtist(item.artist);
             if (a) recentArtists.add(a);
-            const tk = normTrackTitleKey(item.artist, item.title);
-            if (tk) { excludedTitles.add(tk); dj.seenTitles.push(tk); }
-            dj.seenIds.push(item.id);
-            picked.push(item);
+            recordPicked(item, picked);
           }
         }
       }
@@ -799,13 +1188,16 @@ export class AiDjEngine {
       dj.seenIds = (dj.seenIds || []).slice(-350);
       dj.seenTitles = (dj.seenTitles || []).slice(-350);
       const added = [];
-      for (const t of picked) {
+      const enqueueList = top ? [...picked].reverse() : picked;
+      for (const t of enqueueList) {
         const res = qm.enqueue(session.chatId, {
           ...t,
           mediaType: isVideo ? 'video' : 'audio',
-          requester: 'AI DJ'
-        });
-        added.push(res.track);
+          requester: 'AI DJ',
+          djChapter: dj.chapterTitle || dj.vibe || ''
+        }, { top: Boolean(top) });
+        if (top) added.unshift(res.track);
+        else added.push(res.track);
       }
 
       if (transitionedNotice) {

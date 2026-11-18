@@ -10,7 +10,7 @@ function normPrimaryArtist(artist) {
   return String(artist || '')
     .toLowerCase()
     .replace(/\s*-\s*topic$/i, '')
-    .split(/[,&x]|ft\.|feat\./i)[0]
+    .split(/[,&]|\s+x\s+|\b(?:ft|feat)\.?\b/i)[0]
     .replace(/[^a-z0-9]/g, '');
 }
 

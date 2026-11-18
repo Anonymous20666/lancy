@@ -29,16 +29,22 @@ export function parsePublishedAgeDays(text) {
   }
 }
 
-export const NON_MUSIC_TITLE_RE = /\b(breaking\s*news|news\s*(?:update|report|bulletin|live|hour|today|night|channel|room|at\s*\d+|brief|coverage|digest|anchor|desk|headline)|full\s*news|headline\s*news|top\s*stories|press\s*conference|white\s*house|parliament|senate|congress|supreme\s*court|election\s*results?|presidential\s*debate|impeachment|arraigned|efcc|ndlea|police\s*arrest|suspect\s*arrested|court\s*hearing|weather\s*forecast|stock\s*market|crypto\s*news|sports?\s*news|match\s*highlights|post[\s-]*match|pre[\s-]*match|transfer\s*news|full\s*documentary|crime\s*documentary|true\s*crime|full\s*episode|season\s*\d+\s*episode|s\d+e\d+|movie\s*trailer|official\s*trailer|teaser\s*trailer|full\s*movie|nollywood|bollywood\s*movie|sermon|sunday\s*service|bible\s*study|morning\s*devotion|unboxing|tech\s*review|gameplay\s*walkthrough)\b/i;
+export const NON_MUSIC_TITLE_RE = /\b(breaking\s*news|news\s*(?:update|report|bulletin|live|hour|today|night|channel|room|at\s*\d+|brief|coverage|digest|anchor|desk|headline)|full\s*news|headline\s*news|top\s*stories|press\s*conference|white\s*house|parliament|senate|congress|supreme\s*court|election\s*results?|presidential\s*debate|impeachment|arraigned|efcc|ndlea|police\s*(?:arrest|bodycam|report|chase|shooting)|suspect\s*arrested|court\s*(?:hearing|trial|footage|room|update)|courtroom|sentenc(?:ed|ing)|verdict|indict(?:ed|ment)|mugshot|autopsy|coroner|case\s*update|jail\s*call|leaked\s*(?:call|footage|video|audio)|weather\s*forecast|stock\s*market|crypto\s*news|sports?\s*news|match\s*highlights|post[\s-]*match|pre[\s-]*match|transfer\s*news|full\s*documentary|crime\s*documentary|true\s*crime|the\s*story\s*of|rise\s*and\s*fall|what\s*really\s*happened|memorial\s*service|funeral|full\s*episode|season\s*\d+\s*episode|s\d+e\d+|movie\s*trailer|official\s*trailer|teaser\s*trailer|full\s*movie|nollywood|bollywood\s*movie|sermon|sunday\s*service|bible\s*study|morning\s*devotion|unboxing|tech\s*review|gameplay\s*walkthrough|podcast|full\s*interview|sit[\s-]*down\s*interview)\b/i;
 
-export const NEWS_CHANNEL_RE = /\b(bbc\s*news|cnn|arise\s*news|channels\s*television|channels\s*tv|tvc\s*news|ait\s*live|nta\s*news|sky\s*news|fox\s*news|msnbc|cnbc|nbc\s*news|abc\s*news|cbs\s*news|al\s*jazeera|reuters|associated\s*press|dw\s*news|france\s*24|wion|ndtv|india\s*today|times\s*now|citizen\s*tv|ktn\s*news|ntv\s*kenya|sabc\s*news|enca|joy\s*news|citi\s*tube|utv\s*ghana|bloomberg|financial\s*times|wall\s*street\s*journal|washington\s*post|new\s*york\s*times|guardian\s*news|telegraph|daily\s*mail|tmz|inside\s*edition|law\s*&\s*crime|court\s*tv|espn|sky\s*sports|supersport|bein\s*sports|dazn)\b/i;
+export const NEWS_CHANNEL_RE = /\b(bbc\s*news|cnn|arise\s*news|channels\s*television|channels\s*tv|tvc\s*news|ait\s*live|nta\s*news|sky\s*news|fox\s*news|msnbc|cnbc|nbc\s*news|abc\s*news|cbs\s*news|al\s*jazeera|reuters|associated\s*press|dw\s*news|france\s*24|wion|ndtv|india\s*today|times\s*now|citizen\s*tv|ktn\s*news|ntv\s*kenya|sabc\s*news|enca|joy\s*news|citi\s*tube|utv\s*ghana|bloomberg|financial\s*times|wall\s*street\s*journal|washington\s*post|new\s*york\s*times|guardian\s*news|telegraph|daily\s*mail|tmz|inside\s*edition|law\s*&\s*crime|court\s*tv|espn|sky\s*sports|supersport|bein\s*sports|dazn|dj\s*akademiks|akademiks\s*tv|vladtv|djvlad|no\s*jumper|say\s*cheese|trap\s*lore\s*ross|domislive|the\s*shade\s*room|complex\s*news|genius\s*news|hollywood\s*unlocked|hiphopdx|hotnewhiphop\s*news|breakfast\s*club|joe\s*budden|patrick\s*cc|explore\s*with\s*us)\b/i;
+
+const MUSIC_TALK_SPAM_RE = /\b(reaction|reacts\s*to|interview|podcast|review|explained|tutorial|breakdown|tier\s*list|top\s*10|ranking|documentary|ai\s*cover|ai\s*version|type\s*beat|karaoke|1\s*hour|2\s*hours|\d+\s*hours|megamix|full\s*album)\b/i;
 
 export function isNonMusicOrNews(title, author = '', query = '') {
   const q = String(query || '').toLowerCase();
   if (/\b(news|documentary|trailer|sermon|podcast|interview)\b/i.test(q)) return false;
   const t = String(title || '');
   const a = String(author || '');
-  return NON_MUSIC_TITLE_RE.test(t) || NEWS_CHANNEL_RE.test(a) || NEWS_CHANNEL_RE.test(t);
+  if (NON_MUSIC_TITLE_RE.test(t) || NEWS_CHANNEL_RE.test(a) || NEWS_CHANNEL_RE.test(t)) return true;
+  if (MUSIC_TALK_SPAM_RE.test(t) && !/\b(reaction|interview|podcast|review|explained|tutorial|documentary|ai\s*cover|type\s*beat|karaoke|full\s*album|megamix)\b/i.test(q)) {
+    return true;
+  }
+  return false;
 }
 
 /**

@@ -348,10 +348,74 @@ const PURE_GENRE_OR_MOOD_RE = /^(?:afrobeats?|afropop|afro[\s-]*fusion|afro[\s-]
 const GENERIC_PHRASE_RE = /\b(?:studio\s*mix|late\s*night|sunset|sunrise|midnight|groove|session|chill(?:\s*mix|\s*vibes)?|workout|party\s*mix|study\s*beats|sleep\s*music|gaming\s*mix|meditation|relaxing|soundtrack|throwback|hot\s*\d+|top\s*\d+|chart|trending|lofi|lo-fi|vibes?)\b/i;
 
 export function stripArtistSearchNoise(query = '') {
-  return cleanField(query, 80)
-    .replace(/\b(?:all\s*songs?|a\s*to\s*z|full\s*catalog|discography|top\s*hits|best\s*songs?|songs?|tracks?|playlist|radio|mix|music)\b/gi, ' ')
+  return cleanField(query, 120)
+    .replace(/\b(?:i\s+want|give\s+me|play\s+me|play|queue|spin|drop|all\s*songs?|every\s*song|one\s*by\s*one|1\s*by\s*1|a\s*to\s*z|full\s*catalog|discography|top\s*hits|best\s*songs?|related\s*(?:songs?|artists?|tracks?)?|remix(?:es)?|acoustic|slowed|reverb|sped\s*up|nightcore|songs?|tracks?|playlist|radio|mix|music|only|please)\b/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+export function extractDjStyleQualifier(query = '') {
+  const q = String(query || '').toLowerCase();
+  if (/\bjersey\s*(?:club\s*)?remix(?:es)?\b/i.test(q)) return 'jersey remix';
+  if (/\bdrill\s*remix(?:es)?\b/i.test(q)) return 'drill remix';
+  if (/\b(?:house|club|edm|afro)\s*remix(?:es)?\b/i.test(q)) return 'club remix';
+  if (/\bremix(?:es)?\b/i.test(q)) return 'remix';
+  if (/\bslowed(?:\s*\+?\s*reverb)?\b/i.test(q)) return 'slowed reverb';
+  if (/\bacoustic\b/i.test(q)) return 'acoustic';
+  if (/\bnightcore\b/i.test(q)) return 'nightcore';
+  if (/\bsped\s*up\b/i.test(q)) return 'sped up';
+  return '';
+}
+
+export function parseMultiArtistPrompt(query = '', knownCategories = []) {
+  const clean = cleanField(query, 240);
+  const styleQualifier = extractDjStyleQualifier(clean);
+  const wantsRelated = /\b(related|similar|like\s+(?:them|these)|and\s+more|plus\s+related|radio)\b/i.test(clean);
+  const explicitOneByOne = /\b(1\s*by\s*1|one\s*by\s*one|rotate|each)\b/i.test(clean);
+
+  // Strip conversational lead-in / trailing instructions while preserving artist names & conjunctions
+  const body = clean
+    .replace(/^(?:hey\s+dj|yo\s+dj|lancy|dj|play|queue|spin|drop|i\s+want(?:\s+to\s+hear)?|give\s+me|put\s+on|listen\s+to)\b[\s,:]*/gi, '')
+    .replace(/\b(?:1\s*by\s*1|one\s*by\s*one|and\s+(?:all|also\s+play)?|even\s+be\s+able\s+to\s+play|songs?\s+related|related\s+songs?|plus\s+related|remixes?|remix|songs?|tracks?|music|which\s+i\s+expect.*$)/gi, (m) => {
+      if (/^(?:and|plus)$/i.test(m.trim())) return m;
+      return ' ';
+    })
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const stopParts = new Set([
+    'i', 'me', 'my', 'want', 'all', 'some', 'the', 'a', 'an', 'to', 'of', 'for', 'with',
+    'in', 'on', 'by', 'one', '1', 'songs', 'song', 'tracks', 'track', 'music', 'remix',
+    'remixes', 'related', 'similar', 'please', 'real', 'good', 'more', 'even', 'play'
+  ]);
+  const rawParts = body
+    .split(/\s*(?:,|&|\+|\band\b|\bplus\b|\bwith\b|\bft\.?\b|\bfeat\.?\b|\bvs\.?\b)\s*/i)
+    .map(p => stripArtistSearchNoise(p))
+    .map(p => cleanField(p, 60))
+    .filter(p => {
+      if (!p || p.length < 2) return false;
+      if (stopParts.has(p.toLowerCase())) return false;
+      if (PURE_GENRE_OR_MOOD_RE.test(p)) return false;
+      if (Array.isArray(knownCategories) && knownCategories.some(c => String(c || '').toLowerCase() === p.toLowerCase())) return false;
+      return p.split(/\s+/).length <= 4;
+    });
+
+  const seen = new Set();
+  const artists = [];
+  for (const part of rawParts) {
+    const n = normStr(part);
+    if (!n || seen.has(n)) continue;
+    seen.add(n);
+    artists.push(part);
+  }
+
+  return {
+    raw: clean,
+    artists,
+    styleQualifier,
+    wantsRelated: wantsRelated || artists.length >= 2,
+    sequenceOneByOne: explicitOneByOne || artists.length >= 2
+  };
 }
 
 export function isLikelyArtistQuery(query = '', knownCategories = []) {
@@ -397,6 +461,25 @@ export async function getArtistCatalogAndRelated(
       ? dzSearchRes.value.data
       : [];
 
+    const bigramDice = (s1, s2) => {
+      if (s1.length < 3 || s2.length < 3) return 0;
+      const b1 = new Map();
+      for (let i = 0; i < s1.length - 1; i++) {
+        const bg = s1.slice(i, i + 2);
+        b1.set(bg, (b1.get(bg) || 0) + 1);
+      }
+      let inter = 0;
+      for (let i = 0; i < s2.length - 1; i++) {
+        const bg = s2.slice(i, i + 2);
+        const cnt = b1.get(bg) || 0;
+        if (cnt > 0) {
+          inter++;
+          b1.set(bg, cnt - 1);
+        }
+      }
+      return (2 * inter) / ((s1.length - 1) + (s2.length - 1));
+    };
+
     let matchedDzArtist = null;
     let bestScore = -1;
     for (const a of dzArtists) {
@@ -407,6 +490,7 @@ export async function getArtistCatalogAndRelated(
       if (aNorm === candNorm) score = 1_000_000_000 + fans;
       else if ((aNorm.startsWith(candNorm) || candNorm.startsWith(aNorm)) && fans >= 1000) score = 100_000_000 + fans;
       else if ((aNorm.includes(candNorm) || candNorm.includes(aNorm)) && fans >= 5000) score = 10_000_000 + fans;
+      else if (fans >= 10000 && bigramDice(aNorm, candNorm) >= 0.72) score = 5_000_000 + fans;
       if (score > bestScore) {
         bestScore = score;
         matchedDzArtist = a;
@@ -510,6 +594,64 @@ export async function getArtistCatalogAndRelated(
   } catch {
     return { found: false, artist: '', genre: '', tracks: [], relatedArtists: [] };
   }
+}
+
+export async function getMultiArtistCatalogAndRelated(
+  artistQueries = [],
+  { fetcher = defaultFetchJson, limit = 40, cacheTtlMs = DEFAULT_CACHE_TTL_MS, useCache = fetcher === defaultFetchJson, knownCategories = [], resolver = null } = {}
+) {
+  const candidates = (Array.isArray(artistQueries) ? artistQueries : [])
+    .map(a => cleanField(a, 60))
+    .filter(Boolean)
+    .slice(0, 8);
+  if (!candidates.length) {
+    return { found: false, artists: [], relatedArtists: [], genre: '' };
+  }
+  const resolveOne = resolver || ((q) => getArtistCatalogAndRelated(q, { fetcher, limit, cacheTtlMs, useCache, knownCategories }));
+  const settled = await Promise.allSettled(candidates.map(q => resolveOne(q)));
+  const artists = [];
+  const artistNorms = new Set();
+  const genreCounts = new Map();
+
+  for (let i = 0; i < settled.length; i++) {
+    const res = settled[i].status === 'fulfilled' ? settled[i].value : null;
+    if (res?.found && res.artist) {
+      const an = normStr(res.artist);
+      if (an && !artistNorms.has(an)) {
+        artistNorms.add(an);
+        artists.push({
+          artist: res.artist,
+          genre: res.genre || '',
+          tracks: Array.isArray(res.tracks) ? res.tracks : [],
+          relatedArtists: Array.isArray(res.relatedArtists) ? res.relatedArtists : []
+        });
+        if (res.genre) genreCounts.set(res.genre, (genreCounts.get(res.genre) || 0) + 1);
+      }
+    }
+  }
+
+  const combinedGenre = [...genreCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || artists[0]?.genre || '';
+  const relatedMap = new Map();
+  // Interleave related artists across each seed artist (1 from A, 1 from B, ...)
+  const maxRelLen = artists.reduce((m, a) => Math.max(m, a.relatedArtists.length), 0);
+  for (let idx = 0; idx < maxRelLen; idx++) {
+    for (const a of artists) {
+      const rel = a.relatedArtists[idx];
+      if (!rel?.name) continue;
+      const rn = normStr(rel.name);
+      if (!rn || artistNorms.has(rn) || relatedMap.has(rn)) continue;
+      relatedMap.set(rn, { name: rel.name, fanCount: rel.fanCount || 0, genre: rel.genre || a.genre || combinedGenre, seedArtist: a.artist });
+      if (relatedMap.size >= 24) break;
+    }
+    if (relatedMap.size >= 24) break;
+  }
+
+  return {
+    found: artists.length > 0,
+    artists,
+    relatedArtists: [...relatedMap.values()],
+    genre: combinedGenre
+  };
 }
 
 export function formatTrendingForPrompt(items = [], maxItems = 10) {

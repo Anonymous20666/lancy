@@ -84,7 +84,7 @@ export class YouTubeProvider {
             }
             const matchesSong = titlePartTokens.length === 0 || titleHits > 0;
             if (!matchesSong) s -= 45;
-            if (!queryAsksInst && /\b(instrumental|karaoke|type\s*beat|reaction|interview|podcast|review|explained|how to|tutorial|cover\s*by|sped\s*up|slowed)\b/i.test(title)) s -= 35;
+            if (!queryAsksInst && /\b(instrumental|karaoke|type\s*beat|reaction|interview|podcast|review|explained|how to|tutorial|cover\s*by|sped\s*up|slowed|documentary|court|trial|verdict|news|ai\s*cover|snippet)\b/i.test(title)) s -= 45;
 
             const isOfficialMV = /\b(official\s*(music\s*)?video|\bmusic\s*video\b|\bofficial\s*video\b|\bm\/?v\b)\b/i.test(title);
             const isVisualizer = /\b(official\s*visualizer|visualizer|performance\s*video|live\s*performance)\b/i.test(title);
@@ -120,7 +120,9 @@ export class YouTubeProvider {
     }
     const { stdout } = await this.runner('yt-dlp', ['--ignore-config', '--no-warnings', '--skip-download', '--flat-playlist', '--dump-single-json', '--playlist-start', String(offset + 1), '--playlist-end', String(end), '--socket-timeout', '10', '--', target], { timeout: 30000, maxBuffer: 4 * 1024 * 1024 });
     const info = JSON.parse(stdout); const entries = info.entries || [info];
-    const items = entries.filter(x => /^[\w-]{11}$/.test(x?.id || '')).map(x => normalizeTrack({ providerId: x.id, title: x.track || x.title, artist: x.artist || x.uploader || x.channel, durationSeconds: x.duration, viewCount: Number(x.view_count) || 0, mediaType: video ? 'video' : 'audio', artwork: x.thumbnail || x.thumbnails?.at(-1)?.url || `https://i.ytimg.com/vi/${x.id}/hqdefault.jpg`, sourceRef: `https://www.youtube.com/watch?v=${x.id}`, availability: 'unresolved' }, this.id));
+    const items = entries
+      .filter(x => /^[\w-]{11}$/.test(x?.id || '') && !x?.is_live && !isNonMusicOrNews(x?.track || x?.title, x?.artist || x?.uploader || x?.channel, query))
+      .map(x => normalizeTrack({ providerId: x.id, title: x.track || x.title, artist: x.artist || x.uploader || x.channel, durationSeconds: x.duration, viewCount: Number(x.view_count) || 0, mediaType: video ? 'video' : 'audio', artwork: x.thumbnail || x.thumbnails?.at(-1)?.url || `https://i.ytimg.com/vi/${x.id}/hqdefault.jpg`, sourceRef: `https://www.youtube.com/watch?v=${x.id}`, availability: 'unresolved' }, this.id));
     return { items: items.slice(0, limit), nextOffset: !direct && items.length > limit && offset + limit < 30 ? offset + limit : null };
   }
   async download(track, path, { video = false, maxBytes = 48 * 1024 * 1024 } = {}) {
@@ -172,7 +174,7 @@ export class AudiusProvider {
   async search(query, { offset = 0, limit = 5 } = {}) {
     if (/^https?:/i.test(query)) throw new MusicError('UNSUPPORTED_URL', 'For Audius, search by title and artist.');
     const data = await this.request(`/tracks/search?query=${encodeURIComponent(query)}&offset=${offset}&limit=${limit + 1}`);
-    const items = (data || []).map(x => this.normalize(x)).filter(x => x.availability !== 'unavailable' && x.streamable !== false);
+    const items = (data || []).map(x => this.normalize(x)).filter(x => x.availability !== 'unavailable' && x.streamable !== false && !isNonMusicOrNews(x.title, x.artist, query));
     return { items: items.slice(0, limit), nextOffset: items.length > limit && offset + limit < 100 ? offset + limit : null };
   }
   async media(track, { download = false } = {}) {
@@ -212,6 +214,7 @@ export class PlayMusicProvider {
     const items = [];
     const seen = new Set();
     const pushItem = (norm) => {
+      if (isNonMusicOrNews(norm.title, norm.artist, clean)) return;
       const dedupKey = `${norm.artist}|${norm.title}`.toLowerCase().replace(/[^a-z0-9|]/g, '');
       if (seen.has(dedupKey)) return;
       seen.add(dedupKey);
