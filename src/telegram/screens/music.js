@@ -1,4 +1,5 @@
 import { RADIO_CATEGORIES } from '../../music/radio.js';
+import { MUSIC_CATEGORIES_2026, getCategoryFamily, getSubgenreById, searchCategories } from '../../music/categories.js';
 import { PANEL_ACTIONS } from '../../music/channelPanels.js';
 import { TemporaryBotMessages } from '../../music/messages.js';
 import { audioInput, audioFileId } from '../../music/preview.js';
@@ -216,9 +217,8 @@ export function createMusicScreen({ app }) {
   }
 
   function defaultMediaMode(sOrPanel = null) {
-    let ytEnabled = false;
-    try { ytEnabled = Boolean(app.musicProviders?.get?.('youtube')?.enabled); } catch {}
-    return ytEnabled ? 'video' : 'queue';
+    if (sOrPanel?.radioVideo === true) return 'video';
+    return 'queue';
   }
 
   function resolveGenre(ref, s = null) {
@@ -226,6 +226,10 @@ export function createMusicScreen({ app }) {
       const qmSession = (s?.destination || s?.chatId) ? app.musicQueueManager?.getSession?.(s.destination || s.chatId) : null;
       return s?.radioCustom || qmSession?.radioCustom || 'Afrobeats';
     }
+    const sub2026 = getSubgenreById(ref);
+    if (sub2026) return sub2026.name;
+    const fam2026 = getCategoryFamily(ref);
+    if (fam2026) return fam2026.title;
     const qMatch = typeof ref === 'string' && ref.match(/^q(\d+)$/);
     if (qMatch && QUICK_GENRES[Number(qMatch[1])]) {
       return QUICK_GENRES[Number(qMatch[1])];
@@ -694,10 +698,11 @@ export function createMusicScreen({ app }) {
       s.panelToken ? controls(s, '🎙 Chat DJ', 'prompt', 'dj', { style: 'primary' }) : button('🎙 Chat DJ', 'prompt', 'dj', { style: 'primary' }),
       controls(s, bassOn ? '🎛 Bass · ON' : '🎛 Bass · OFF', 'bass', { style: bassOn ? 'success' : 'link' })
     ]);
+    const movieQCount = Array.isArray(s.movieUpcoming) ? s.movieUpcoming.length : 0;
     b.buttons([
-      controls(s, '🎬 Movie Stream', 'movie', 'hub', { style: 'primary' }),
+      controls(s, `🎬 Flip to Movie Deck${movieQCount ? ` (${movieQCount})` : ''}`, 'switchdeck', 'movie', { style: 'primary' }),
       s.panelToken ? controls(s, '🎬 Video / vidc', 'prompt', 'video', { style: 'link' }) : button('🎬 Video / vidc', 'prompt', 'video', { style: 'link' }),
-      controls(s, '♾️ Infinite & Genres', 'catmenu', defaultMode, { style: 'link' }),
+      controls(s, '🎧 Categories (2026)', 'catmenu', defaultMode, { style: 'link' }),
       s.panelToken ? controls(s, 'Listen / download', 'prompt', 'download', { style: 'link' }) : button('Listen / download', 'prompt', 'download', { style: 'link' }),
       controls(s, 'More', 'options', { style: 'link' })
     ]);
@@ -1210,95 +1215,238 @@ export function createMusicScreen({ app }) {
     return state;
   }
 
+  function renderVcModeSelector(s = null, ctx = null) {
+    const destLabel = cut(s?.destinationTitle || ctx?.message?.chat?.title || (isChannelCtx(ctx) ? 'Channel' : 'Voice Chat'), 40);
+    const musicQCount = Array.isArray(s?.upcoming) ? s.upcoming.length : 0;
+    const movieQCount = Array.isArray(s?.movieUpcoming) ? s.movieUpcoming.length : 0;
+    const musicTrack = s?.activeDeck === 'music' ? s?.currentTrack : s?.musicCurrentTrack;
+    const movieTrack = s?.activeDeck === 'movie' ? s?.currentTrack : s?.movieCurrentTrack;
+    const b = card(
+      '🎛 LANCY VC · STREAMING MODE SELECTOR',
+      `${destLabel} · Choose Movie Cinema or Music Streaming`
+    );
+    b.table([
+      ['🎧 Music Deck', musicTrack ? `▶ ${cut(musicTrack.title, 34)} (${musicQCount} queued · RTMP)` : `Ready · ${musicQCount} queued · RTMP Default`],
+      ['🎬 Movie Deck', movieTrack ? `▶ ${cut(movieTrack.title, 34)} (${movieQCount} queued · RTMP)` : `Ready · ${movieQCount} queued · RTMP Default`],
+      ['♾️ Infinite Radio', s?.radio?.enabled ? `ON · ${(s.radio.queries || []).slice(0, 3).join(' · ') || 'Smart Cluster'}` : 'Standby']
+    ], { striped: true, bordered: true, compact: true });
+    b.blockquote(rt.text('Select a streaming deck below. Music and Movie decks maintain independent queues and player cards so switching never mixes or loses your queue.'));
+    b.buttons([
+      button('🎧 Music Streaming', 'vcmode', 'music', { style: 'success' }),
+      button('🎬 Movie Streaming', 'vcmode', 'movie', { style: 'primary' })
+    ]);
+    b.buttons([
+      button('🎙️ AI DJ Chat', 'prompt', 'dj', { style: 'primary' }),
+      button('🤖 AI Movie Concierge', 'aichat', { style: 'primary' })
+    ]);
+    if (s?.currentTrack || musicQCount || movieQCount) {
+      b.buttons([
+        button(`🎚️ Open ${s?.activeDeck === 'movie' ? 'Cinema' : 'Music'} Player Card`, 'openplayer', { style: 'link' })
+      ]);
+    }
+    return finish(b);
+  }
+
+  function renderMusicStreamingHub(s = null, ctx = null) {
+    const destLabel = cut(s?.destinationTitle || ctx?.message?.chat?.title || (isChannelCtx(ctx) ? 'Channel' : 'Voice Chat'), 40);
+    const musicQCount = Array.isArray(s?.upcoming) ? s.upcoming.length : 0;
+    const movieQCount = Array.isArray(s?.movieUpcoming) ? s.movieUpcoming.length : 0;
+    const musicTrack = (s?.activeDeck !== 'movie' ? s?.currentTrack : s?.musicCurrentTrack) || null;
+    const streamMode = s?.musicStreamMode || 'rtmp';
+    const b = card(
+      '🎧 LANCY · MUSIC STREAMING HUB',
+      `${destLabel} · ${streamMode === 'rtmp' ? '🔒 RTMP Studio Default' : '🎙 Interactive VC'} · Multi-Source Engine`
+    );
+    b.table([
+      ['🎵 Active Track', musicTrack ? `${cut(musicTrack.title, 36)}${musicTrack.artist ? ` — ${cut(musicTrack.artist, 22)}` : ''}` : 'None playing'],
+      ['📡 Sources', 'Spotify · Deezer · Apple Music · Saavn 320k · Audiomack · SoundCloud'],
+      ['📋 Music Queue', `${musicQCount} track(s) · ♾️ Infinite Mode: ${s?.radio?.enabled ? 'ON' : 'OFF'}`]
+    ], { striped: true, bordered: true, compact: true });
+    b.blockquote(rt.text(
+      '• 🎧 Categories: Browse all 8 2026 Genre Families (95+ subgenres) or search categories directly.\n' +
+      '• 🔍 Search Music: Search any song, artist, album, or genre with audio/video & 30s previews.\n' +
+      '• 🎙️ AI DJ Chat: Instant conversational DJ with live search preview cards.'
+    ));
+    b.buttons([
+      button('🎧 Categories (2026)', 'catmenu', 'queue', '0', { style: 'success' }),
+      button('🔍 Search Music', 'prompt', 'queue', { style: 'primary' }),
+      button('🎙️ AI DJ Chat', 'prompt', 'dj', { style: 'primary' })
+    ]);
+    b.buttons([
+      button('🔎 Search Categories', 'prompt', 'cat_search', { style: 'link' }),
+      button('🎬 Search Music Video', 'prompt', 'video', { style: 'link' }),
+      button(s?.radio?.enabled ? '♾️ Infinite: ON' : '♾️ Infinite: OFF', 'infinitetoggle', { style: s?.radio?.enabled ? 'success' : 'link' })
+    ]);
+    b.buttons([
+      button(`🎚️ Music Player Card${musicQCount ? ` (${musicQCount})` : ''}`, 'switchdeck', 'music', { style: 'success' }),
+      button(`🎬 Flip to Movie Deck${movieQCount ? ` (${movieQCount})` : ''}`, 'switchdeck', 'movie', { style: 'primary' })
+    ]);
+    b.buttons([
+      button('« Back to /vc Mode Selector', 'vcmode', 'select', { style: 'link' })
+    ]);
+    return finish(b);
+  }
+
+  function renderCategoryFamily2026(familyId, mode = 'queue', panelToken = null) {
+    const fam = getCategoryFamily(familyId) || MUSIC_CATEGORIES_2026[0];
+    const b = card(
+      `${fam.emoji} 2026 CATEGORIES · ${fam.title.toUpperCase()}`,
+      `${fam.subtitle} · ${mode === 'video' ? '🎬 Video + Audio (RTMP)' : '🎧 Studio Audio (RTMP)'}`
+    );
+    const subNames = fam.subgenres.map(s => s.name).join(' · ');
+    b.blockquote(rt.text(`${fam.emoji} ${fam.title}\n${subNames}`));
+    for (let i = 0; i < fam.subgenres.length; i += 2) {
+      const s1 = fam.subgenres[i];
+      const s2 = fam.subgenres[i + 1];
+      const row = [];
+      if (panelToken) {
+        row.push(button(s1.name, 'pc', panelToken, PANEL_ACTIONS.indexOf('genresub').toString(36), mode, s1.id, { style: 'primary' }));
+        if (s2) row.push(button(s2.name, 'pc', panelToken, PANEL_ACTIONS.indexOf('genresub').toString(36), mode, s2.id, { style: 'primary' }));
+      } else {
+        row.push(button(s1.name, 'genresub', mode, s1.id, { style: 'primary' }));
+        if (s2) row.push(button(s2.name, 'genresub', mode, s2.id, { style: 'primary' }));
+      }
+      b.buttons(row);
+    }
+    const altMode = mode === 'video' ? 'queue' : 'video';
+    b.buttons([
+      button(`▶️ Play ${cut(fam.shortLabel, 14)} Non-Stop`, 'infinact', mode, 'start', fam.subgenres[0]?.id || fam.id, { style: 'success' }),
+      button(mode === 'video' ? '🔊 Switch to Audio' : '🎬 Switch to Video', 'catfam', fam.id, altMode, { style: 'link' })
+    ]);
+    b.buttons([
+      button('🔎 Search Categories', 'prompt', 'cat_search', { style: 'link' }),
+      panelToken
+        ? button('« All 2026 Categories', 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), mode, '0')
+        : button('« All 2026 Categories', 'catmenu', mode, '0')
+    ]);
+    return finish(b);
+  }
+
+  function renderCategorySearchResults(query, matches = [], mode = 'queue') {
+    const b = card(
+      '🔎 2026 CATEGORY & GENRE SEARCH',
+      `Query: "${cut(query, 40)}" · ${matches.length} matching subgenres`
+    );
+    if (!matches.length) {
+      b.blockquote(rt.text(`No exact 2026 category matched "${cut(query, 40)}". You can still search it directly across all music sources or browse all 8 genre families below.`));
+    } else {
+      const lines = matches.slice(0, 10).map((m, idx) =>
+        `${idx + 1}. ${m.familyEmoji} ${m.name} (${m.familyTitle}) — e.g. ${(m.artists || []).slice(0, 3).join(', ')}`
+      );
+      b.blockquote(rt.text(lines.join('\n')));
+      for (let i = 0; i < Math.min(matches.length, 10); i += 2) {
+        const m1 = matches[i];
+        const m2 = matches[i + 1];
+        const row = [button(`${m1.familyEmoji} ${m1.name}`, 'genresub', mode, m1.id, { style: 'primary' })];
+        if (m2) row.push(button(`${m2.familyEmoji} ${m2.name}`, 'genresub', mode, m2.id, { style: 'primary' }));
+        b.buttons(row);
+      }
+    }
+    b.buttons([
+      button(`🔍 Search "${cut(query, 18)}" Tracks`, 'catpick', mode, cut(query, 32), { style: 'success' }),
+      button('🔎 Search Another Category', 'prompt', 'cat_search', { style: 'primary' })
+    ]);
+    b.buttons([
+      button('« Back to 2026 Categories', 'catmenu', mode, '0'),
+      button('« Music Hub', 'vcmode', 'music')
+    ]);
+    return finish(b);
+  }
+
   function renderGenreSubmenu(genre, mode = 'queue', panelToken = null, isCustom = false) {
-    const cleanGenre = resolveGenre(genre);
-    const refArg = genreRefFor(cleanGenre, isCustom);
-    const b = card(`Lancy · ${cut(cleanGenre, 50)}`, 'Infinite non-stop streaming or queueing');
-    b.quote(rt.text(`🎵 ${cleanGenre}\nChoose whether to stream non-stop now or add to upcoming queue:`));
+    const sub2026 = getSubgenreById(genre);
+    const cleanGenre = sub2026 ? sub2026.name : resolveGenre(genre);
+    const refArg = sub2026 ? sub2026.id : genreRefFor(cleanGenre, isCustom);
+    const fam = sub2026 ? getCategoryFamily(sub2026.familyId) : null;
+    const b = card(
+      `🎧 2026 GENRE · ${cut(cleanGenre.toUpperCase(), 44)}`,
+      `${fam ? `${fam.emoji} ${fam.title} · ` : ''}${mode === 'video' ? '🎬 Video + Audio (RTMP)' : '🎧 Studio Audio (RTMP)'}`
+    );
+    const artistPreview = sub2026?.artists?.length ? `\nFeatured Artists: ${sub2026.artists.slice(0, 6).join(' · ')}` : '';
+    b.quote(rt.text(`🎵 ${cleanGenre}${artistPreview}\nStream non-stop with Smart Infinite Mode, add to Music Queue, or browse & preview tracks:`));
     if (panelToken) {
       b.buttons([
         button(`▶ Start Non-stop ${cut(cleanGenre, 12)}`, 'pc', panelToken, PANEL_ACTIONS.indexOf('infinact').toString(36), mode, 'start', refArg, { style: 'success' }),
-        button(`➕ Queue ${cut(cleanGenre, 12)}`, 'pc', panelToken, PANEL_ACTIONS.indexOf('infinact').toString(36), mode, 'queue', refArg)
+        button(`➕ Queue ${cut(cleanGenre, 12)}`, 'pc', panelToken, PANEL_ACTIONS.indexOf('infinact').toString(36), mode, 'queue', refArg, { style: 'primary' })
       ]);
       b.buttons([
-        button('🔍 Browse Songs', 'pc', panelToken, PANEL_ACTIONS.indexOf('catpick').toString(36), mode, refArg),
-        button('🎨 Custom Artist', 'pc', panelToken, PANEL_ACTIONS.indexOf('prompt').toString(36), 'radio')
+        button('🔍 Browse & Preview Tracks', 'pc', panelToken, PANEL_ACTIONS.indexOf('catpick').toString(36), mode, refArg, { style: 'primary' }),
+        button('🎙️ Ask AI DJ', 'pc', panelToken, PANEL_ACTIONS.indexOf('prompt').toString(36), 'dj')
       ]);
       b.buttons([
-        button('« All Genres', 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), mode),
-        button('Back to player', 'pc', panelToken, PANEL_ACTIONS.indexOf('player').toString(36))
+        button('« All 2026 Categories', 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), mode),
+        button('🎚️ Music Player', 'pc', panelToken, PANEL_ACTIONS.indexOf('player').toString(36))
       ]);
     } else {
       b.buttons([
-        button(`▶ Start Non-stop ${cut(cleanGenre, 12)}`, 'infinact', mode, 'start', refArg, { style: 'success' }),
-        button(`➕ Queue ${cut(cleanGenre, 12)}`, 'infinact', mode, 'queue', refArg)
+        button(`▶ Start Non-stop ${cut(cleanGenre, 14)}`, 'infinact', mode, 'start', refArg, { style: 'success' }),
+        button(`➕ Queue ${cut(cleanGenre, 14)}`, 'infinact', mode, 'queue', refArg, { style: 'primary' })
       ]);
       b.buttons([
-        button('🔍 Browse Songs', 'catpick', mode, refArg),
-        button('🎨 Custom Artist', 'prompt', 'radio')
+        button('🔍 Browse & Preview Tracks', 'catpick', mode, refArg, { style: 'primary' }),
+        button(mode === 'video' ? '🔊 Switch to Audio Mode' : '🎬 Switch to Video Mode', 'genresub', mode === 'video' ? 'queue' : 'video', refArg)
       ]);
+      if (sub2026?.artists?.length) {
+        const artistBtns = sub2026.artists.slice(0, 4).map(art =>
+          button(`🎤 ${cut(art, 14)}`, 'catpick', mode, cut(art, 24), { style: 'link' })
+        );
+        b.buttons(artistBtns.slice(0, 2));
+        if (artistBtns.length > 2) b.buttons(artistBtns.slice(2, 4));
+      }
       b.buttons([
-        button('« All Genres', 'catmenu', mode),
-        button('Back to player', 'openplayer')
+        ...(fam ? [button(`« ${fam.shortLabel}`, 'catfam', fam.id, mode)] : []),
+        button('« All 2026 Genres', 'catmenu', mode, '0'),
+        button('« Music Hub', 'vcmode', 'music')
       ]);
     }
-    b.paragraph(rt.italic('▶ Start Non-stop plays immediately with continuous refill. ➕ Queue adds tracks behind your current song.'));
     return finish(b);
   }
 
   function renderCategoryPicker(mode = 'queue', panelToken = null, page = 0) {
-    const totalPages = 1 + Math.ceil(RADIO_CATEGORIES.length / 10);
-    const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
+    const safePage = Math.max(0, Number(page) || 0);
     const b = card(
-      'Lancy · Categories & Non-stop',
-      mode === 'video' ? `🎬 Real Music Videos · Trending → Old · page ${safePage + 1}/${totalPages}` : `Tap any genre for trending → classic hits · page ${safePage + 1}/${totalPages}`
+      '🎧 MUSIC GENRES & CATEGORIES · 2026',
+      `POPULAR · MAINSTREAM · UNDERGROUND · GLOBAL · ${mode === 'video' ? '🎬 Video Mode' : '🎧 Studio Audio (RTMP)'}`
     );
-    b.quote(rt.text(safePage === 0
-      ? '🔥 Fast 1-Tap Genres — tap to start non-stop, queue, or search:'
-      : `🎛 Catalog Genres (${(safePage - 1) * 10 + 1}–${Math.min(RADIO_CATEGORIES.length, safePage * 10)} of ${RADIO_CATEGORIES.length}):`));
-    const list = safePage === 0
-      ? QUICK_GENRES
-      : RADIO_CATEGORIES.slice((safePage - 1) * 10, safePage * 10);
+    const overviewLines = MUSIC_CATEGORIES_2026.map(fam =>
+      `${fam.emoji} ${fam.title}:\n${fam.subgenres.map(s => s.name).join(' · ')}`
+    );
+    b.blockquote(rt.text(overviewLines.slice(0, 4).join('\n\n')));
+    b.expandableBlockquote(rt.text(overviewLines.slice(4).join('\n\n')));
 
-    for (let i = 0; i < list.length; i += 2) {
-      const g1 = list[i];
-      const g2 = list[i + 1];
-      const ref1 = safePage === 0 ? `q${i}` : String((safePage - 1) * 10 + i);
-      const ref2 = g2 ? (safePage === 0 ? `q${i + 1}` : String((safePage - 1) * 10 + i + 1)) : null;
-      const row = [];
-      if (panelToken) {
-        row.push(button(g1, 'pc', panelToken, PANEL_ACTIONS.indexOf('genresub').toString(36), mode, ref1));
-        if (g2) row.push(button(g2, 'pc', panelToken, PANEL_ACTIONS.indexOf('genresub').toString(36), mode, ref2));
-      } else {
-        row.push(button(g1, 'genresub', mode, ref1));
-        if (g2) row.push(button(g2, 'genresub', mode, ref2));
+    // 8 Genre Family Buttons (2 per row)
+    for (let i = 0; i < MUSIC_CATEGORIES_2026.length; i += 2) {
+      const f1 = MUSIC_CATEGORIES_2026[i];
+      const f2 = MUSIC_CATEGORIES_2026[i + 1];
+      const row = [
+        button(`${f1.emoji} ${f1.title}`, 'catfam', f1.id, mode, { style: i === 0 ? 'success' : 'primary' })
+      ];
+      if (f2) {
+        row.push(button(`${f2.emoji} ${f2.title}`, 'catfam', f2.id, mode, { style: 'primary' }));
       }
       b.buttons(row);
     }
 
-    const navRow = [];
-    if (safePage > 0) {
-      navRow.push(panelToken
-        ? button('◀ Previous', 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), mode, String(safePage - 1))
-        : button('◀ Previous', 'catmenu', mode, String(safePage - 1)));
-    }
-    if (safePage + 1 < totalPages) {
-      navRow.push(panelToken
-        ? button(`More Genres (${safePage + 1}/${totalPages}) ▶`, 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), mode, String(safePage + 1))
-        : button(`More Genres (${safePage + 1}/${totalPages}) ▶`, 'catmenu', mode, String(safePage + 1)));
-    }
-    if (navRow.length) b.buttons(navRow);
     b.buttons([
-      panelToken ? button('🎨 Custom Artist / Genre', 'pc', panelToken, PANEL_ACTIONS.indexOf('prompt').toString(36), 'radio') : button('🎨 Custom Artist / Genre', 'prompt', 'radio'),
-      panelToken ? button('🔍 Search Specific Title', 'pc', panelToken, PANEL_ACTIONS.indexOf('prompt').toString(36), mode) : button('🔍 Search Specific Title', 'prompt', mode)
+      button('🔎 Search Categories / Genres', 'prompt', 'cat_search', { style: 'success' }),
+      panelToken
+        ? button('🔍 Search Any Track / Artist', 'pc', panelToken, PANEL_ACTIONS.indexOf('prompt').toString(36), mode, { style: 'primary' })
+        : button('🔍 Search Any Track / Artist', 'prompt', mode, { style: 'primary' })
     ]);
     const altMode = mode === 'video' ? 'queue' : 'video';
-    const modeToggleLabel = mode === 'video' ? '🔊 Switch to Audio Mode' : '🎬 Switch to Real Video';
+    const modeToggleLabel = mode === 'video' ? '🔊 Switch to Studio Audio (RTMP)' : '🎬 Switch to Music Video (RTMP)';
     b.buttons([
-      panelToken ? button(modeToggleLabel, 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), altMode, String(safePage)) : button(modeToggleLabel, 'catmenu', altMode, String(safePage)),
-      panelToken ? button('Back to player', 'pc', panelToken, PANEL_ACTIONS.indexOf('player').toString(36)) : button('Back to player', 'openplayer')
+      panelToken
+        ? button(modeToggleLabel, 'pc', panelToken, PANEL_ACTIONS.indexOf('catmenu').toString(36), altMode, String(safePage))
+        : button(modeToggleLabel, 'catmenu', altMode, String(safePage)),
+      button('🎙️ AI DJ Chat', 'prompt', 'dj', { style: 'primary' })
     ]);
-    b.paragraph(rt.italic('Categories play trending & popular hits first, then progress into older classics without repeats.'));
+    b.buttons([
+      button('« Back to Music Hub', 'vcmode', 'music'),
+      panelToken
+        ? button('🎚️ Player Card', 'pc', panelToken, PANEL_ACTIONS.indexOf('player').toString(36))
+        : button('🎚️ Player Card', 'openplayer')
+    ]);
     return finish(b);
   }
 
@@ -1338,17 +1486,19 @@ export function createMusicScreen({ app }) {
     }
     p.items.forEach((t, i) => {
       const selected = s.selected.has(t.id);
+      const badgeStr = t.sourceBadge ? ` · ${t.sourceBadge}` : '';
       b.list([{
         has_checkbox: true,
         ...(selected ? { is_checked: true } : {}),
         blocks: [
           block.paragraph(rt.bold(cut(t.title, 100))),
-          block.paragraph(rt.text(`${cut(t.artist || 'Artist not supplied', 65)} · ${durationText(t.durationSeconds)}`))
+          block.paragraph(rt.text(`${cut(t.artist || 'Artist not supplied', 65)} · ${durationText(t.durationSeconds)}${badgeStr}`))
         ]
       }]);
       const itemButtons = [{ ...button(selected ? 'Deselect' : 'Select', 'pick', s.id, s.revision, i), style: selected ? 'success' : 'primary' }];
       if (isVcMode) {
         itemButtons.push(button('⚡ Play Now', 'qnow', s.id, s.revision, i, { style: 'success' }));
+        itemButtons.push(button('🎧 Preview', 'tprev', s.id, s.revision, i, { style: 'link' }));
       }
       b.buttons(itemButtons);
     });
@@ -1362,13 +1512,55 @@ export function createMusicScreen({ app }) {
         button(`Add selected · ${s.selected.size}`, 'submit', s.id, s.revision, { style: 'primary' }),
         button('Clear', 'sclear', s.id, s.revision, { style: 'danger' })
       ]);
+      b.buttons([
+        button('🎧 Categories', 'catmenu', s.mode, '0'),
+        button('« Music Hub', 'vcmode', 'music'),
+        button('🎚️ Player Card', 'openplayer')
+      ]);
     } else {
       b.buttons([
         button(s.mode === 'lyrics' ? 'Show matched lyrics' : `Download selected · ${s.selected.size}`, 'submit', s.id, s.revision, { style: 'success' }),
         button('Clear', 'sclear', s.id, s.revision, { style: 'danger' })
       ]);
+      b.buttons([
+        button('« Back to Hub', 'vcmode', 'music')
+      ]);
     }
-    b.paragraph(rt.italic('Use Select / Deselect to change a native checkbox, or tap ⚡ Play Now to play immediately. Selected tracks stay selected across pages.'));
+    b.paragraph(rt.italic('Use Select / Deselect to change a native checkbox, tap ⚡ Play Now to play immediately, or tap 🎧 Preview for track details & 30s audio preview.'));
+    return finish(b);
+  }
+
+  function renderTrackPreviewCard(s, itemIndex = 0) {
+    const p = s?.pages?.[s.index];
+    const t = p?.items?.[itemIndex];
+    if (!t) return renderSearch(s);
+    const b = card(
+      '🎧 LANCY · TRACK PREVIEW & SOURCE',
+      `${cut(t.title, 48)} · ${cut(t.artist || 'Studio Artist', 32)}`
+    );
+    attachSafeArtworkPhoto(b, t.artwork, `${t.title} — ${t.artist || 'Music'}`);
+    b.table([
+      ['🎵 Title', cut(t.title, 48)],
+      ['🎤 Artist', cut(t.artist || 'Studio Artist', 44)],
+      ...(t.album ? [['💿 Album', cut(t.album, 44)]] : []),
+      ...(t.genre ? [['🏷️ Genre', cut(t.genre, 36)]] : []),
+      ['⏱ Duration', durationText(t.durationSeconds)],
+      ['📡 Source', t.sourceBadge || 'Spotify · Deezer · Saavn 320k · RTMP']
+    ], { striped: true, bordered: true, compact: true });
+    b.buttons([
+      button('▶️ Play Audio (RTMP)', 'qnow', s.id, s.revision, itemIndex, { style: 'success' }),
+      button('🎬 Play Music Video (RTMP)', 'tprevact', s.id, s.revision, itemIndex, 'video', { style: 'primary' })
+    ]);
+    b.buttons([
+      button('➕ Add to Music Queue', 'tprevact', s.id, s.revision, itemIndex, 'queue', { style: 'primary' }),
+      button('♾️ Start Infinite Radio', 'tprevact', s.id, s.revision, itemIndex, 'infinite', { style: 'success' })
+    ]);
+    const extraRow = [];
+    if (t.previewUrl) {
+      extraRow.push(button('🔊 Send 30s Audio Clip', 'tprevact', s.id, s.revision, itemIndex, 'clip', { style: 'link' }));
+    }
+    extraRow.push(button('« Back to Search Results', 'tprevact', s.id, s.revision, itemIndex, 'back'));
+    b.buttons(extraRow);
     return finish(b);
   }
 
@@ -1635,29 +1827,25 @@ export function createMusicScreen({ app }) {
     let djGreeting = null;
     let djRichCard = null;
     if (mode === 'dj') {
-      const ind = ctx.api?.sendChatAction ? new ActionIndicator(ctx.api, ctx.chatId, 'typing') : null;
-      ind?.start();
-      try {
-        if (app.lancyAgent?.generatePersonalizedGreeting) {
-          djGreeting = await app.lancyAgent.generatePersonalizedGreeting(ctx, { chatId: destForGreeting, mode: 'dj' });
-          if (!isChan && ctx.api?.sendRichMessage) {
-            djRichCard = app.lancyAgent.buildConversationRichCard({
-              title: '🎙️ Lancy · Chat DJ',
-              subtitle: `${djGreeting.timeCtx?.greeting || 'Hey'} · Personalized DJ & Cinema Chat`,
-              bodyText: djGreeting.greetingText,
-              mention: djGreeting.mention,
-              mode: 'dj',
-              includeQuickStarters: true
-            });
-          }
+      if (app.lancyAgent?.generatePersonalizedGreeting) {
+        djGreeting = await app.lancyAgent.generatePersonalizedGreeting(ctx, { chatId: destForGreeting, mode: 'dj', fast: true });
+        if (!isChan && ctx.api?.sendRichMessage) {
+          djRichCard = app.lancyAgent.buildConversationRichCard({
+            title: '🎙️ Lancy · Chat DJ',
+            subtitle: `${djGreeting.timeCtx?.greeting || 'Hey'} · Personalized DJ & Cinema Chat`,
+            bodyText: djGreeting.greetingText,
+            mention: djGreeting.mention,
+            mode: 'dj',
+            includeQuickStarters: true
+          });
         }
-      } finally {
-        ind?.stop();
       }
     }
 
     const text = mode === 'channel'
       ? 'Send a channel link, @name or negative ID, or forward an original channel post. Lancy and you must be channel administrators. /cancel closes setup.'
+      : mode === 'cat_search'
+        ? `${canMentionUser ? `${name}, ` : ''}send any music genre, category, subgenre, or artist style (e.g. Amapiano, Emo Rap, Fuji, Drift Phonk, Neo-Soul, K-pop, Highlife)${group && !isChan ? ' as a reply to this message' : ''}. /cancel closes.`
       : mode === 'radio'
         ? 'Send an artist name or style (e.g. Burna Boy, Drake, Wizkid, Trap sad songs) to stream or queue infinite non-stop music. /cancel closes this input.'
         : mode === 'dj'
@@ -2236,6 +2424,149 @@ export function createMusicScreen({ app }) {
           return await sendOrEditMenu(ctx, finish(promptCard), { ttlMs: 120000 });
         }
         return await app.music.queueListen(ctx, c.token, { playNow: action === 'listennow', fromCatalog: action !== 'listenq' });
+      }
+      if (action === 'vcmode') {
+        const sub = String(args[0] || 'select').toLowerCase();
+        let s = null;
+        try {
+          const dest = app.music.destination(ctx);
+          s = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+        } catch {}
+        if (sub === 'movie') {
+          if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎬 Opening Movie Streaming Hub…' }).catch(() => {});
+          }
+          return await movieUi.openHub(ctx);
+        }
+        if (sub === 'music') {
+          if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎧 Opening Music Streaming Hub…' }).catch(() => {});
+          }
+          const rich = renderMusicStreamingHub(s, ctx);
+          return await sendOrEditMenu(ctx, rich);
+        }
+        if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+          await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🎛 /vc Mode Selector' }).catch(() => {});
+        }
+        const rich = renderVcModeSelector(s, ctx);
+        return await sendOrEditMenu(ctx, rich);
+      }
+      if (action === 'catfam') {
+        const [familyId, modeArg] = args;
+        let s = null;
+        try {
+          const dest = app.music.destination(ctx);
+          s = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+        } catch {}
+        const mode = modeArg || defaultMediaMode(s || { isChannel: isChannelCtx(ctx) });
+        const rich = renderCategoryFamily2026(familyId, mode, null);
+        if (ctx.query && ctx.messageId) await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, rich);
+        else await sendOrEditMenu(ctx, rich);
+        return;
+      }
+      if (action === 'infinitetoggle') {
+        let s = null;
+        let dest = null;
+        try {
+          dest = app.music.destination(ctx);
+          s = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+        } catch {}
+        if (s) {
+          if (s.radio?.enabled) {
+            s.radio.enabled = false;
+            if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+              await ctx.api.answerCallbackQuery(ctx.query.id, { text: '♾️ Infinite Mode: OFF' }).catch(() => {});
+            }
+          } else {
+            const seedTrack = s.currentTrack || s.musicCurrentTrack || s.upcoming?.[0] || s.history?.at(-1);
+            if (seedTrack && typeof app.music?.radio?.seedFromTrack === 'function') {
+              app.music.radio.seedFromTrack(s, seedTrack);
+            } else if (typeof app.music?.radio?.configure === 'function') {
+              app.music.radio.configure(s, ['Afrobeats', 'Hip-Hop / Rap', 'Pop']);
+            }
+            if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+              await ctx.api.answerCallbackQuery(ctx.query.id, { text: '♾️ Smart Infinite Mode: ON!' }).catch(() => {});
+            }
+          }
+        }
+        const rich = renderMusicStreamingHub(s, ctx);
+        if (ctx.query && ctx.messageId) await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, rich);
+        else await sendOrEditMenu(ctx, rich);
+        return;
+      }
+      if (action === 'switchdeck') {
+        const targetDeck = args[0] === 'movie' ? 'movie' : 'music';
+        const dest = await app.music.authorize(ctx, true, null, { allowDj: true });
+        if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+          await ctx.api.answerCallbackQuery(ctx.query.id, {
+            text: targetDeck === 'movie' ? '🎬 Flipped to Movie Cinema Deck!' : '🎧 Flipped to Music Player Deck!'
+          }).catch(() => {});
+        }
+        if (typeof app.musicQueueManager?.switchDeck === 'function') {
+          await app.musicQueueManager.switchDeck(dest, targetDeck);
+        }
+        const s = app.musicQueueManager?.getSession?.(dest);
+        if (s && ctx.messageId && ctx.messageId !== s.screenMessageId) {
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, renderDeckPlayer(s)).catch(() => {});
+        }
+        return true;
+      }
+      if (action === 'tprev') {
+        const [token, revision, index] = args;
+        let state = null;
+        await app.music.search.action(token, revision, ctx, async s => {
+          state = s;
+        });
+        if (state) {
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, renderTrackPreviewCard(state, Number(index) || 0));
+        }
+        return;
+      }
+      if (action === 'tprevact') {
+        const [token, revision, index, op] = args;
+        let state = null;
+        await app.music.search.action(token, revision, ctx, async s => {
+          state = s;
+        });
+        if (!state) return;
+        const idxNum = Number(index) || 0;
+        const t = state.pages?.[state.index]?.items?.[idxNum];
+        if (op === 'back' || !t) {
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, renderSearch(state));
+          return;
+        }
+        if (op === 'clip') {
+          if (t.previewUrl && ctx.api?.sendAudio) {
+            if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+              await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🔊 Sending 30s studio preview…' }).catch(() => {});
+            }
+            await ctx.api.sendAudio(ctx.chatId, t.previewUrl, {
+              title: `${t.title} (30s Preview)`,
+              performer: t.artist || 'Studio Preview',
+              caption: `🎧 30s Preview · ${t.title} — ${t.artist || 'Artist'} (${t.sourceBadge || 'Studio'})`
+            }).catch(() => {});
+          }
+          return;
+        }
+        if (op === 'video') {
+          state.mode = 'video';
+          t.mediaType = 'video';
+          return await handle(ctx, 'qnow', [token, revision, String(idxNum)]);
+        }
+        if (op === 'infinite') {
+          const dest = state.destination || app.music.destination(ctx);
+          const qmSession = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+          if (qmSession && typeof app.music?.radio?.seedFromTrack === 'function') {
+            app.music.radio.seedFromTrack(qmSession, t, { video: state.mode === 'video' });
+          }
+          return await handle(ctx, 'qnow', [token, revision, String(idxNum)]);
+        }
+        if (op === 'queue') {
+          state.selected.clear();
+          state.selected.set(t.id, t);
+          return await handle(ctx, 'submit', [token, revision]);
+        }
+        return;
       }
       if (action === 'catmenu') {
         let [mode, page = 0] = args;
@@ -2882,11 +3213,34 @@ export function createMusicScreen({ app }) {
         if (ctx.replyTo && [ctx.replyTo.audio, ctx.replyTo.voice, ctx.replyTo.video, ctx.replyTo.video_note, ctx.replyTo.document, audioFileId(ctx.replyTo)].some(Boolean)) {
           await app.music.streamReply(ctx, ctx.replyTo, { video: command === '/vidc' });
         } else if (args.length || command === '/vidc') {
-          await search(ctx, args.join(' '), command === '/vidc' ? 'video' : defaultMediaMode(isChan ? { isChannel: true } : null));
+          const arg0 = String(args[0] || '').toLowerCase();
+          if (command === '/vc' && args.length === 1 && ['music', 'movie', 'movies', 'select', 'hub'].includes(arg0)) {
+            await app.music.prepare(ctx);
+            const dest = app.music.destination(ctx);
+            const s = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+            if (arg0 === 'movie' || arg0 === 'movies') {
+              await movieUi.openHub(ctx);
+            } else if (arg0 === 'music') {
+              await sendOrEditMenu(ctx, renderMusicStreamingHub(s, ctx));
+            } else {
+              await sendOrEditMenu(ctx, renderVcModeSelector(s, ctx));
+            }
+          } else {
+            await search(ctx, args.join(' '), command === '/vidc' ? 'video' : defaultMediaMode(isChan ? { isChannel: true } : null));
+          }
         } else {
           await app.music.prepare(ctx);
-          const s = await app.music.player(channelPlayerCtx());
-          await adoptChannelPlayerResult(ctx, s);
+          let s = null;
+          try {
+            const dest = app.music.destination(ctx);
+            s = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+          } catch {}
+          if (ctx.api?.sendRichMessage && !isChan) {
+            await sendOrEditMenu(ctx, renderVcModeSelector(s, ctx));
+          } else {
+            const playerSess = await app.music.player(channelPlayerCtx());
+            await adoptChannelPlayerResult(ctx, playerSess);
+          }
         }
       } else if (command === '/random') {
         const dest = await app.music.authorize(ctx, true);
@@ -3382,6 +3736,12 @@ export function createMusicScreen({ app }) {
               originMessageId: message?.message_id ?? ctx.directMessageId ?? null,
               forceNewCard: Boolean(!isChan && !panel)
             });
+          } else if (mode === 'cat_search') {
+            if (isChan) record.context.reusedInChannel = true;
+            await sm.reset(stateKey);
+            const matches = searchCategories(message.text, { limit: 12 });
+            const rich = renderCategorySearchResults(message.text, matches, 'queue');
+            await sendOrEditMenu(panel ? { ...ctx, musicPanel: panel } : ctx, rich);
           } else {
             if (isChan) record.context.reusedInChannel = true;
             await sm.reset(stateKey);
@@ -3796,8 +4156,13 @@ export function createMusicScreen({ app }) {
     renderQueue: (s, page = 0) => (s?.activeDeck === 'movie' || s?.view === 'mqueue') ? renderMovieQueue(s, page) : renderQueue(s, page),
     renderVolumePicker,
     renderRadio,
+    renderVcModeSelector,
+    renderMusicStreamingHub,
+    renderCategoryFamily2026,
+    renderCategorySearchResults,
     renderCategoryPicker,
     renderGenreSubmenu,
+    renderTrackPreviewCard,
     renderChannels,
     renderSearch,
     renderLyrics,

@@ -200,7 +200,7 @@ export class PlayMusicProvider {
     const apiBatch = 25;
     const apiOffset = Math.floor(safeOffset / apiBatch) * apiBatch;
     const sliceStart = safeOffset - apiOffset;
-    const [itRes, dzRes] = await Promise.allSettled([
+    const [itRes, dzRes, jioRes] = await Promise.allSettled([
       fetch(`https://itunes.apple.com/search?term=${encodeURIComponent(clean)}&entity=song&limit=${apiBatch}&offset=${apiOffset}`, {
         headers: { 'User-Agent': UA },
         signal: AbortSignal.timeout(4500)
@@ -208,6 +208,10 @@ export class PlayMusicProvider {
       fetch(`https://api.deezer.com/search?q=${encodeURIComponent(clean)}&index=${apiOffset}&limit=${apiBatch}`, {
         headers: { 'User-Agent': UA },
         signal: AbortSignal.timeout(4500)
+      }).then(r => (r.ok ? r.json() : null)),
+      fetch(`https://www.jiosaavn.com/api.php?__call=search.getResults&_format=json&_marker=0&api_version=4&ctx=web6dot0&n=12&q=${encodeURIComponent(clean)}`, {
+        headers: { 'User-Agent': UA },
+        signal: AbortSignal.timeout(4000)
       }).then(r => (r.ok ? r.json() : null)),
     ]);
 
@@ -234,9 +238,11 @@ export class PlayMusicProvider {
           durationSeconds: dur || 180,
           viewCount: Number(d.rank) || 0,
           artwork: d.album?.cover_xl || d.album?.cover_big || d.album?.cover_medium || null,
+          previewUrl: d.preview || null,
+          sourceBadge: 'Deezer · Studio',
           sourceRef: d.link || null,
           availability: 'unresolved',
-          capabilities: { stream: true, download: true, seek: true, video: false }
+          capabilities: { stream: true, download: true, seek: true, video: true }
         }, this.id));
       }
     }
@@ -251,12 +257,36 @@ export class PlayMusicProvider {
           title: t.trackName,
           artist: t.artistName,
           album: t.collectionName || null,
+          genre: t.primaryGenreName || null,
           durationSeconds: Math.round(t.trackTimeMillis / 1000),
           publishedAgeDays,
           artwork: t.artworkUrl100?.replace('100x100bb', '600x600bb') || t.artworkUrl100 || null,
+          previewUrl: t.previewUrl || null,
+          sourceBadge: 'Apple Music · Studio',
           sourceRef: t.trackViewUrl || null,
           availability: 'unresolved',
-          capabilities: { stream: true, download: true, seek: true, video: false }
+          capabilities: { stream: true, download: true, seek: true, video: true }
+        }, this.id));
+      }
+    }
+
+    if (jioRes.status === 'fulfilled' && Array.isArray(jioRes.value?.results)) {
+      for (const j of jioRes.value.results) {
+        const jTitle = String(j?.title || '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim();
+        const jArtist = String(j?.primaryArtists || j?.singers || '').replace(/&quot;/g, '"').replace(/&amp;/g, '&').trim();
+        const jDur = Number(j?.duration || 0);
+        if (!jTitle || !jArtist || (jDur > 0 && (jDur < 40 || jDur > 900))) continue;
+        pushItem(normalizeTrack({
+          providerId: String(j.id || createHash('sha256').update(`${jArtist}-${jTitle}`).digest('hex').slice(0, 16)),
+          title: jTitle,
+          artist: jArtist,
+          album: j.album ? String(j.album).replace(/&quot;/g, '"') : null,
+          durationSeconds: jDur || 180,
+          artwork: String(j.image || '').replace('150x150', '500x500') || null,
+          sourceBadge: 'Saavn · 320kbps',
+          sourceRef: j.perma_url || null,
+          availability: 'unresolved',
+          capabilities: { stream: true, download: true, seek: true, video: true }
         }, this.id));
       }
     }
@@ -396,32 +426,57 @@ export class PlayMusicProvider {
           capabilities: { stream: true, download: true, seek: true, video }
         }, this.id);
       }
-      try {
-        if (!matchedVideoId && this.runner === exec) {
-          throw new Error('no matched youtube video id — use multi-source resolver');
-        }
-        await this.runner('yt-dlp', buildArgs(targetUrl, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
-        if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
-          throw new Error('yt-dlp produced no output file');
-        }
-      } catch (ytErr) {
-        const rescue = await resolveAndDownloadAudio({
+
+      // When using real exec runner (production), try Multi-Source Audio Engines FIRST (JioSaavn 320kbps -> Spotify/Apple/Audiomack social-dl -> Audius -> SoundCloud)
+      let resolvedMultiSource = false;
+      if (this.runner === exec) {
+        const multiRes = await resolveAndDownloadAudio({
           query: cleanQuery,
           trackId: matchedVideoId,
           tempPath: path,
           ffmpegPath: ffmpegBin,
           minSeconds: 30,
-          meta: { title: track.title, artist: track.artist || 'Music' },
+          meta: {
+            title: track.title,
+            artist: track.artist || 'Music',
+            sourceRef: track.sourceRef || '',
+            durationSeconds: track.durationSeconds
+          },
           skipYouTube: true,
         }).catch(() => null);
-        if (!rescue?.ok || (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000))) {
-          try {
-            await this.runner('yt-dlp', buildArgs(`scsearch1:${cleanQuery}`, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
-            if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
-              throw new Error('scsearch1 produced no output file');
+        if (multiRes?.ok && existsSync(path) && statSync(path).size >= 15000) {
+          resolvedMultiSource = true;
+        }
+      }
+
+      if (!resolvedMultiSource) {
+        try {
+          if (!matchedVideoId && this.runner === exec) {
+            throw new Error('no matched youtube video id — use soundcloud fallback');
+          }
+          await this.runner('yt-dlp', buildArgs(targetUrl, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+          if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
+            throw new Error('yt-dlp produced no output file');
+          }
+        } catch (ytErr) {
+          const rescue = this.runner !== exec ? await resolveAndDownloadAudio({
+            query: cleanQuery,
+            trackId: matchedVideoId,
+            tempPath: path,
+            ffmpegPath: ffmpegBin,
+            minSeconds: 30,
+            meta: { title: track.title, artist: track.artist || 'Music' },
+            skipYouTube: true,
+          }).catch(() => null) : null;
+          if (!rescue?.ok || (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000))) {
+            try {
+              await this.runner('yt-dlp', buildArgs(`scsearch1:${cleanQuery}`, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+              if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
+                throw new Error('scsearch1 produced no output file');
+              }
+            } catch {
+              throw ytErr;
             }
-          } catch {
-            throw ytErr;
           }
         }
       }

@@ -2046,7 +2046,7 @@ export function createMovieUi({
     }
 
     const gInfo = app.lancyAgent?.generatePersonalizedGreeting
-      ? await app.lancyAgent.generatePersonalizedGreeting(ctx, { chatId: dest, mode: 'movie' }).catch(() => null)
+      ? await app.lancyAgent.generatePersonalizedGreeting(ctx, { chatId: dest, mode: 'movie', fast: true }).catch(() => null)
       : null;
     const intro = gInfo?.greetingText || '🤖 AI Movie & Song Agent ready!\nAsk for any song mood, trending chart, movie recommendation, or TV series (e.g. "recommend a thriller movie", "play Breaking Bad", "trending Afrobeats", "surprise me"). Say "done" or tap Finish anytime.';
     const rich = (app.lancyAgent?.buildConversationRichCard && !isChan)

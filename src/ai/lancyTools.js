@@ -132,12 +132,13 @@ export const LANCY_TOOLS_SCHEMA = [
     type: 'function',
     function: {
       name: 'search_and_play_music',
-      description: 'Search songs or artists, play or queue tracks, or ask Spotify-style AI DJ for remixes, artist rotations, or vibes.',
+      description: 'Search songs, artists, or 2026 genres across Spotify/Deezer/Apple Music/JioSaavn/SoundCloud/Audius, show search results cleanly, play or queue tracks (audio or video over RTMP), or enable Infinite Radio from an artist/genre.',
       parameters: {
         type: 'object',
         properties: {
-          query: { type: 'string', description: 'Song title, artist(s), remix request, or vibe description.' },
-          action: { type: 'string', enum: ['play_now', 'queue', 'search', 'ai_dj'] }
+          query: { type: 'string', description: 'Song title, artist(s), 2026 genre/category, or vibe description.' },
+          action: { type: 'string', enum: ['play_now', 'queue', 'search', 'ai_dj', 'infinite_radio'] },
+          video: { type: 'boolean', description: 'True only if user explicitly asked for the music video; false (default) for studio master audio over RTMP.' }
         },
         required: ['query', 'action']
       }
@@ -956,9 +957,32 @@ export class LancyToolExecutor {
         } else if (action === 'trending' && typeof movieApi?.trending === 'function') {
           const res = await movieApi.trending({ window: 'day', type: mediaType === 'multi' ? 'all' : mediaType });
           items = res?.results || res?.items || (Array.isArray(res) ? res : []);
-        } else if (action === 'random' && typeof movieApi?.random === 'function') {
-          const pick = await movieApi.random({ type: mediaType === 'multi' ? 'all' : mediaType });
-          if (pick) items = [pick];
+          if (query) {
+            const qLow = query.toLowerCase();
+            const filtered = items.filter(m => `${m.title || ''} ${m.overview || ''} ${(m.genres || []).join(' ')}`.toLowerCase().includes(qLow));
+            if (filtered.length) items = filtered;
+          }
+        } else if (action === 'random') {
+          if (typeof movieApi?.random === 'function') {
+            const pick = await movieApi.random({ type: mediaType === 'multi' ? 'all' : mediaType, query: query || undefined }).catch(() => null);
+            if (pick) items = Array.isArray(pick) ? pick : [pick];
+          }
+          if (!items.length && typeof movieApi?.trending === 'function') {
+            const res = await movieApi.trending({ window: 'week', type: mediaType === 'multi' ? 'all' : mediaType }).catch(() => null);
+            const pool = res?.results || res?.items || (Array.isArray(res) ? res : []);
+            if (pool.length) {
+              const shuffled = [...pool].sort(() => Math.random() - 0.5);
+              items = shuffled.slice(0, 5);
+            }
+          }
+          if (!items.length && query && typeof movieApi?.search === 'function') {
+            const res = await movieApi.search(query, { type: mediaType, limit: 10 }).catch(() => null);
+            const pool = res?.results || res?.items || (Array.isArray(res) ? res : []);
+            if (pool.length) {
+              const shuffled = [...pool].sort(() => Math.random() - 0.5);
+              items = shuffled.slice(0, 5);
+            }
+          }
         } else if (query && typeof movieApi?.search === 'function') {
           const res = await movieApi.search(query, { type: mediaType, limit: 6 });
           items = res?.results || res?.items || (Array.isArray(res) ? res : []);
@@ -1207,31 +1231,71 @@ export class LancyToolExecutor {
       case 'search_and_play_music': {
         const query = String(args.query || '').trim();
         const action = String(args.action || 'play_now').toLowerCase();
+        const wantsVideo = Boolean(args.video || /\b(?:music\s*video|official\s*video|with\s+video|\bmv\b)\b/i.test(query));
         if (!query) return { ok: false, error: 'missing_query' };
 
         if (action === 'ai_dj' && this.#music()?.aiDj && s) {
           const djRes = await this.#music().aiDj.chatWithDj(s, query, { apply: true }).catch(() => null);
-          if (djRes) return { ok: true, action: 'ai_dj', reply: djRes.reply || null, addedCount: djRes.added?.length || 0 };
+          if (djRes) return { ok: true, action: 'ai_dj', reply: djRes.reply || null, addedCount: djRes.added?.length || 0, results: (djRes.added || []).slice(0, 5).map((t, i) => ({ index: i + 1, title: t.title, artist: t.artist || null, sourceBadge: t.sourceBadge || 'Studio' })) };
         }
 
         const providers = this.app?.musicProviders;
-        const searchProvider = providers?.get?.('youtube') || providers?.get?.('spotify');
-        const results = typeof this.#music()?.search?.find === 'function'
-          ? await this.#music().search.find(query).catch(() => [])
-          : (typeof searchProvider?.search === 'function' ? await searchProvider.search(query).catch(() => []) : []);
+        const searchProvider = providers?.get?.('music') || providers?.get?.('spotify') || providers?.get?.('youtube');
+        const results = typeof searchProvider?.search === 'function'
+          ? await searchProvider.search(query, { limit: 6, video: wantsVideo }).catch(() => [])
+          : (typeof this.#music()?.search?.find === 'function' ? await this.#music().search.find(query).catch(() => []) : []);
 
         const tracks = Array.isArray(results) ? results : (results?.items || []);
         if (!tracks.length) return { ok: false, error: 'no_music_found', query };
-        if (action === 'search') {
-          return { ok: true, action: 'search', cardKind: 'music_list', results: tracks.slice(0, 5).map((t, i) => ({ index: i + 1, title: t.title, artist: t.artist || t.channel || null })) };
+
+        const formattedResults = tracks.slice(0, 5).map((t, i) => ({
+          index: i + 1,
+          title: t.title,
+          artist: t.artist || t.channel || null,
+          album: t.album || null,
+          durationSeconds: t.durationSeconds || null,
+          sourceBadge: t.sourceBadge || (t.provider === 'music' ? 'Spotify · Deezer · Saavn' : t.provider),
+          previewUrl: t.previewUrl || null
+        }));
+        if (s) {
+          s.lastMusicSearch = {
+            query,
+            timestamp: Date.now(),
+            results: tracks.slice(0, 8)
+          };
         }
-        const pick = { ...tracks[0], mediaType: 'video', requester: context.senderName || 'Lancy AI' };
+
+        if (action === 'search') {
+          return { ok: true, action: 'search', cardKind: 'music_list', query, results: formattedResults };
+        }
+
+        const pick = {
+          ...tracks[0],
+          mediaType: wantsVideo ? 'video' : 'audio',
+          requester: context.senderName || 'Lancy AI'
+        };
+
         if (qm && chatId) {
-          if (action === 'play_now' && typeof qm.playImmediateAndContinue === 'function') {
-            await qm.playImmediateAndContinue(chatId, pick);
-          } else {
-            await qm.addMany(chatId, [pick]);
+          // Enable Smart Infinite Radio from this artist/genre cluster when requested or when radio is enabled
+          if ((action === 'infinite_radio' || s?.radio?.enabled) && typeof this.#music()?.radio?.seedFromTrack === 'function' && s) {
+            this.#music().radio.seedFromTrack(s, pick, { video: wantsVideo });
           }
+
+          const shouldAwait = Boolean(context.awaitPlayback);
+          const launchPlayback = async () => {
+            if ((action === 'play_now' || action === 'infinite_radio') && typeof qm.playImmediateAndContinue === 'function') {
+              await qm.playImmediateAndContinue(chatId, pick);
+            } else {
+              await qm.addMany(chatId, [pick]);
+            }
+          };
+
+          if (shouldAwait) {
+            await launchPlayback();
+          } else {
+            void launchPlayback().catch(() => {});
+          }
+
           this.app?.lancyAgent?.taste?.recordPreference?.({
             userId: context.userId,
             chatId,
@@ -1239,7 +1303,20 @@ export class LancyToolExecutor {
             artist: pick.artist || pick.channel || query,
             requestText: query
           });
-          return { ok: true, action, cardKind: 'music', title: pick.title, artist: pick.artist || null, results: tracks.slice(0, 4).map((t, i) => ({ index: i + 1, title: t.title, artist: t.artist || t.channel || null })) };
+          return {
+            ok: true,
+            action,
+            cardKind: 'music',
+            query,
+            title: pick.title,
+            artist: pick.artist || null,
+            album: pick.album || null,
+            sourceBadge: pick.sourceBadge || 'Studio Master · RTMP',
+            mediaType: pick.mediaType,
+            infiniteRadio: Boolean(s?.radio?.enabled),
+            infiniteSeeds: s?.radio?.queries || [],
+            results: formattedResults
+          };
         }
         return { ok: false, error: 'music_unavailable' };
       }

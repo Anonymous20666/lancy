@@ -1,8 +1,14 @@
 import {MusicError} from './model.js';
 import {getArtistCatalogAndRelated, isLikelyArtistQuery, getTrendingCharts} from './charts.js';
 import {isNonMusicOrNews} from '../media/youtubeSearch.js';
-// A broad, paginated catalog, not a claim to enumerate every musical category.
-export const RADIO_CATEGORIES=['Afrobeats','Afropop','Amapiano','Afro house','Highlife','Fuji','Gospel','Hip hop','Rap','Trap','Drill','R&B','Soul','Pop','Dance pop','K-pop','J-pop','Latin pop','Reggaeton','Dancehall','Reggae','Rock','Alternative rock','Indie rock','Metal','Punk','Jazz','Blues','Funk','Disco','House','Deep house','Techno','Trance','EDM','Dubstep','Drum and bass','UK garage','Lo-fi','Chillhop','Ambient','Classical','Piano','Instrumental','Acoustic','Country','Folk','World music','Bossa nova','Sad songs','Love songs','Heartbreak','Workout','Party','Sleep','Study','Gaming','Throwbacks','Phonk','Soundtracks'];
+import {MUSIC_CATEGORIES_2026, inferArtistGenreCluster} from './categories.js';
+// A broad, paginated 2026 catalog covering all 8 genre families and 95+ subgenres.
+export const RADIO_CATEGORIES=[
+  ...new Set([
+    ...MUSIC_CATEGORIES_2026.flatMap(f => f.subgenres.map(s => s.name)),
+    'Afrobeats','Afropop','Amapiano','Afro house','Highlife','Fuji','Gospel','Hip hop','Rap','Trap','Drill','R&B','Soul','Pop','Dance pop','K-pop','J-pop','Latin pop','Reggaeton','Dancehall','Reggae','Rock','Alternative rock','Indie rock','Metal','Punk','Jazz','Blues','Funk','Disco','House','Deep house','Techno','Trance','EDM','Dubstep','Drum and bass','UK garage','Lo-fi','Chillhop','Ambient','Classical','Piano','Instrumental','Acoustic','Country','Folk','World music','Bossa nova','Sad songs','Love songs','Heartbreak','Workout','Party','Sleep','Study','Gaming','Throwbacks','Phonk','Soundtracks'
+  ])
+];
 const STATIC_OR_TALK_RE = /\b(official\s*audio|audio\s*only|lyric\s*video|lyrics|visualizer|reaction|interview|podcast|review|explained|how to|tutorial)\b/i;
 const OFFICIAL_MV_RE = /\b(official\s*(music\s*)?video|\bmusic\s*video\b|\bofficial\s*video\b|\bm\/?v\b)\b/i;
 
@@ -126,7 +132,47 @@ export class InfiniteRadio {
  stop(s){if(s.radio)s.radio.enabled=false;}
  async #resolveArtist(query){
   const resolver=this.app?.music?.artistResolver||this.artistResolver||getArtistCatalogAndRelated;
-  return await Promise.resolve(resolver(query,{knownCategories:RADIO_CATEGORIES})).catch(()=>null);
+  const res = await Promise.resolve(resolver(query,{knownCategories:RADIO_CATEGORIES})).catch(()=>null);
+  if (res?.found && res.artist) {
+   const cluster = inferArtistGenreCluster(res.artist, '', res.genre || '');
+   const existingRel = new Set((res.relatedArtists || []).map(a => normPrimaryArtist(a?.name || a)));
+   existingRel.add(normPrimaryArtist(res.artist));
+   const mergedRelated = [...(res.relatedArtists || [])];
+   for (const ca of cluster.relatedArtists || []) {
+    const k = normPrimaryArtist(ca);
+    if (k && !existingRel.has(k)) {
+     existingRel.add(k);
+     mergedRelated.push({ name: ca, fanCount: 0, genre: cluster.primarySubgenre?.name || res.genre || '' });
+    }
+   }
+   return {
+    ...res,
+    genre: res.genre || cluster.primarySubgenre?.name || '',
+    clusterLabel: cluster.clusterLabel || res.genre || '',
+    relatedArtists: mergedRelated
+   };
+  }
+  return res;
+ }
+ seedFromTrack(s, track, { video = null } = {}) {
+  if (!s || !track) return;
+  const artist = String(track.artist || '').trim();
+  const title = String(track.title || '').trim();
+  const cluster = inferArtistGenreCluster(artist, title, track.genre || '');
+  const seeds = [];
+  if (artist && artist.toLowerCase() !== 'music' && artist.toLowerCase() !== 'unknown') {
+   seeds.push(artist);
+  }
+  for (const rel of (cluster.relatedArtists || []).slice(0, 2)) {
+   if (rel && !seeds.includes(rel)) seeds.push(rel);
+  }
+  if (cluster.primarySubgenre?.name && !seeds.includes(cluster.primarySubgenre.name)) {
+   seeds.push(cluster.primarySubgenre.name);
+  }
+  if (!seeds.length && title) seeds.push(title);
+  if (seeds.length) {
+   this.configure(s, seeds.slice(0, 5), { video: video !== null ? video : (track.mediaType === 'video') });
+  }
  }
  #enqueueItems(s,r,items,isVideo,excluded,excludedTitles){
   let added=0;const remaining=[];
@@ -148,6 +194,10 @@ export class InfiniteRadio {
   return {added,remaining};
  }
  async refill(s){
+  if (s.radio?.enabled && (!Array.isArray(s.radio.queries) || !s.radio.queries.length)) {
+   const seedTrack = s.currentTrack || s.musicCurrentTrack || s.history?.at(-1);
+   if (seedTrack) this.seedFromTrack(s, seedTrack);
+  }
   const r=s.radio;if(!r?.enabled||s.upcoming.length>=4)return;
   if(!r.passCounts)r.passCounts={};
   if(!r.buffers)r.buffers={};

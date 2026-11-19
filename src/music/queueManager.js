@@ -34,7 +34,7 @@ export class QueueManager extends EventEmitter {
     if (d === 'music') {
       const legacy = this.db?.getSetting?.(`music.streamMode.${id}`, null);
       if (legacy === 'rtmp' || legacy === 'interactive') return legacy;
-      return 'interactive';
+      return 'rtmp';
     }
     return 'rtmp';
   }
@@ -53,7 +53,7 @@ export class QueueManager extends EventEmitter {
       const defaultBass = savedBass !== null && savedBass !== undefined ? Boolean(savedBass) : true;
       const defaultEq = savedEq || (defaultBass ? 'bass' : 'off');
       this.sessions.set(id, {
-        chatId: id, status: 'idle', currentTrack: null, upcoming: [], history: [], movieUpcoming: [], movieHistory: [], activeDeck: 'music', loopMode: 'off', volume: 100, isChannel: false,
+        chatId: id, status: 'idle', currentTrack: null, musicCurrentTrack: null, movieCurrentTrack: null, upcoming: [], history: [], movieUpcoming: [], movieHistory: [], activeDeck: 'music', loopMode: 'off', volume: 100, isChannel: false,
         screenMessageId: null, playerChatId: id, pinned: false, pinnedMessageId: null, idleTimeout: null, generation: 0, playbackId: null, positionSeconds: null, lastKnownPositionSeconds: 0, positionUpdatedAt: 0, callEnded: false,
         connected: false, accountAlias: null, preferredAccount: null, lastError: null, view: 'player', page: 0, bass: defaultBass, eqPreset: defaultEq,
         streamMode: musicStreamMode,
@@ -157,6 +157,14 @@ export class QueueManager extends EventEmitter {
         s.activeDeck = 'music';
         if (s.view === 'cinema' || s.view === 'mqueue') s.view = 'player';
         await this.#next(s, { manual: true, deck: 'music' });
+      }
+      if (s.radio?.enabled && (!Array.isArray(s.radio.queries) || !s.radio.queries.length) && tracks[0]) {
+        const seedQ = tracks[0].artist ? `${tracks[0].artist}` : `${tracks[0].title}`;
+        if (seedQ && typeof this.app?.music?.radio?.configure === 'function') {
+          try {
+            this.app.music.radio.configure(s, [seedQ], { video: tracks[0].mediaType === 'video' });
+          } catch {}
+        }
       }
       await this.updatePlayerCard(id); return result;
     });
@@ -337,8 +345,11 @@ export class QueueManager extends EventEmitter {
     }
     if(previous&&!sameDeckPrevious){
       const prevQ=this.#deckQueue(s,prevDeck);
+      const savedPos=Number.isFinite(s.positionSeconds)?s.positionSeconds:(previous.resumePositionSeconds||0);
+      const savedPrev={...previous,resumePositionSeconds:savedPos,startOffsetSeconds:savedPos};
+      if(prevDeck==='movie')s.movieCurrentTrack=savedPrev; else s.musicCurrentTrack=savedPrev;
       if(!prevQ.some(t=>t.entryId===previous.entryId)){
-        prevQ.unshift({...previous,resumePositionSeconds:Number.isFinite(s.positionSeconds)?s.positionSeconds:(previous.resumePositionSeconds||0)});
+        prevQ.unshift(savedPrev);
       }
     }else if(previous && !targetEntryId){
       if(!manual&&s.loopMode==='track')q.unshift(previous);
@@ -575,7 +586,7 @@ export class QueueManager extends EventEmitter {
           }
         }
         const landedStartPos = (typeof r?.position_seconds === 'number' && Number.isFinite(r.position_seconds) && r.position_seconds >= 0) ? r.position_seconds : (startSeconds > 0 ? startSeconds : 0);
-        this.#release(s);s.media=media;media=null;s.currentTrack=track;s.secondaryTile=null;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=landedStartPos;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
+        this.#release(s);s.media=media;media=null;s.currentTrack=track;if(targetDeck==='movie')s.movieCurrentTrack=track;else s.musicCurrentTrack=track;s.secondaryTile=null;s.subtitleTrackIndex=trackIdx>=0?trackIdx:0;s.subtitleSyncOffset=subtitleOffset;s.subtitleManualOverride=subtitleManualOverride;s.subtitleAutoOffset=null;s.subtitleAutoVerified=false;s.subtitleSyncStatus=null;s.subtitleDriftRate=subDriftRate;s.subtitleDriftAnchor=subDriftAnchor;s.rtmpPipelineDelaySec=Number(r?.rtmp_pipeline_delay_sec)||0;s.avSync=r?.av_sync||null;s.activeDeck=targetDeck;if(targetDeck==='movie'){if(s.view==='player'||!s.view)s.view='cinema';}else if(s.view==='cinema'||s.view==='mqueue'){s.view='player';}s.playbackId=playbackId;s.status='playing';s.connected=true;s.callEnded=false;s.lastError=null;s.lastNotice=null;s.liveSubCue='';s.accountAlias=r.account_alias||s.preferredAccount;s.positionSeconds=landedStartPos;s.lastKnownPositionSeconds=s.positionSeconds;s.positionUpdatedAt=Date.now();s.failures=0;s.skipVotes=[];
         this.#ensureLiveSubTimer(s);
         if (pendingLyrJob && writeLrcForResult) {
           void pendingLyrJob.then(async (res) => {
@@ -1021,16 +1032,27 @@ export class QueueManager extends EventEmitter {
       return {track:played,replaced,interrupted:replaced};
     });
   }
-  async switchDeck(id, targetDeck) {
+  async switchDeck(id, targetDeck, { autoResume = true } = {}) {
     const target = targetDeck === 'movie' ? 'movie' : 'music';
     this.sessions.get(Number(id))?.prepareAbort?.abort();
     return this.locks.run(Number(id), async () => {
       const s = this.getSession(id);
-      if (s.activeDeck !== target && s.currentTrack) {
-        const curDeck = this.#deckForTrack(s.currentTrack);
+      const curDeck = s.currentTrack ? this.#deckForTrack(s.currentTrack) : (s.activeDeck === 'movie' ? 'movie' : 'music');
+      if (curDeck !== target && s.currentTrack) {
         const curQ = this.#deckQueue(s, curDeck);
-        if (!curQ.some(t => t.entryId === s.currentTrack.entryId)) {
-          curQ.unshift({ ...s.currentTrack, resumePositionSeconds: Number.isFinite(s.positionSeconds) ? s.positionSeconds : (s.currentTrack.resumePositionSeconds || 0) });
+        const savedPos = this.getEstimatedPosition(id);
+        const savedTrack = {
+          ...s.currentTrack,
+          resumePositionSeconds: savedPos,
+          startOffsetSeconds: savedPos
+        };
+        if (curDeck === 'movie') s.movieCurrentTrack = savedTrack;
+        else s.musicCurrentTrack = savedTrack;
+        if (!curQ.some(t => t.entryId === savedTrack.entryId)) {
+          curQ.unshift(savedTrack);
+        } else {
+          const idx = curQ.findIndex(t => t.entryId === savedTrack.entryId);
+          if (idx >= 0) curQ[idx] = savedTrack;
         }
         try { if (s.connected && this.voice?.idle) await this.voice.idle(id); } catch {}
         this.#release(s);
@@ -1060,7 +1082,7 @@ export class QueueManager extends EventEmitter {
           s.vcUrl = swRes.call_invite_link;
         }
       }
-      if (!s.currentTrack && targetQ.length && (s.connected || s.prepared)) {
+      if (autoResume && !s.currentTrack && targetQ.length && (s.connected || s.prepared)) {
         await this.#next(s, { manual: true, deck: target });
       } else {
         await this.updatePlayerCard(id, { forceEdit: true });

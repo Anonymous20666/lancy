@@ -614,7 +614,7 @@ export class LancyAgent {
     ].filter(Boolean).join('\n');
   }
 
-  async generatePersonalizedGreeting(ctx, { chatId = 0, mode = 'dj' } = {}) {
+  async generatePersonalizedGreeting(ctx, { chatId = 0, mode = 'dj', fast = false } = {}) {
     const ident = extractUserIdentity(ctx);
     const cleanName = ident.cleanName;
     const mention = buildTelegramMention(ctx, cleanName);
@@ -630,7 +630,7 @@ export class LancyAgent {
     const favMovie = profile.recentMovies[0] || null;
 
     let aiLine = '';
-    if (typeof this.app?.ai?.generate === 'function') {
+    if (!fast && typeof this.app?.ai?.generate === 'function') {
       const openerPrompt = [
         `Write ONE short warm personalized opening greeting (2 sentences max) to ${cleanName}.`,
         `Time of day: ${tCtx.greeting} (${tCtx.localTimeStr}, ${tCtx.vibeHint}).`,
@@ -687,8 +687,18 @@ export class LancyAgent {
     for (const step of executed || []) {
       const out = step?.out || {};
       if (!out.ok) continue;
-      if (out.cardKind === 'music' || step.name === 'search_and_play_music') {
-        if (out.title) actionLines.push(`🎵 Queued/Playing: ${out.title}${out.artist ? ` — ${out.artist}` : ''}`);
+      if (out.cardKind === 'music' || out.cardKind === 'music_list' || step.name === 'search_and_play_music') {
+        if (out.title) {
+          actionLines.push(`🎵 ${out.action === 'play_now' ? 'Playing Now (RTMP)' : 'Queued'}: ${out.title}${out.artist ? ` — ${out.artist}` : ''}${out.sourceBadge ? ` [${out.sourceBadge}]` : ''}`);
+        }
+        if (out.infiniteRadio && Array.isArray(out.infiniteSeeds) && out.infiniteSeeds.length) {
+          actionLines.push(`♾️ Smart Infinite Radio: ${out.infiniteSeeds.slice(0, 4).join(' · ')}`);
+        }
+        if (Array.isArray(out.results) && out.results.length) {
+          for (const tr of out.results.slice(0, 4)) {
+            actionLines.push(`🔎 #${tr.index} ${tr.title}${tr.artist ? ` — ${tr.artist}` : ''}${tr.sourceBadge ? ` · ${tr.sourceBadge}` : ''}`);
+          }
+        }
       } else if (out.cardKind === 'video' || out.cardKind === 'video_list' || step.name === 'search_videos') {
         if (out.title && out.action !== 'search') {
           actionLines.push(`🎥 Video #${out.index || 1}: ${out.title}${out.duration ? ` (${out.duration})` : ''}`);
@@ -1128,9 +1138,9 @@ export class LancyAgent {
         return { reply: '', executed, aborted: true, clarificationAsked: null, finishedState: null, persona: activePersona };
       }
 
-      // VC turns default to GPT (gpt-6.2-astra:free) for fast real-time interaction,
-      // escalating to Gemini 4 Neon on vision/research/stories/deep recall; Chat turns default to Neon.
-      const useDeep = Boolean(hasImages || !isVc || wantsStorytelling || decision.action === DECISION.DEEP_REASON || step >= 2);
+      // Both VC turns and Chat DJ / AI Movie Chat turns default to fast GPT (gpt-6.2-astra:free) for immediate response (<800ms),
+      // escalating to Gemini 4 Neon only on vision/images, long-form storytelling, or explicit deep research.
+      const useDeep = Boolean(hasImages || wantsStorytelling || decision.action === DECISION.DEEP_REASON);
       const tModelStart = Date.now();
       let res = null;
       try {
@@ -1263,6 +1273,17 @@ export class LancyAgent {
       }
       if (finishedState) {
         finalReply = finishedState.closingLine || '';
+        break;
+      }
+
+      // Immediate progressive response for Chat DJ / AI Movie Chat turns once music/movie search or playback is triggered
+      const hasImmediateMediaResult = !isVc && step === 0 && executed.some(e =>
+        (e.name === 'search_and_play_music' || e.name === 'search_movies_series' || e.name === 'search_videos' || e.name === 'control_playback' || e.name === 'adjust_volume' || e.name === 'seek_playback')
+        && e.out?.ok
+      );
+      if (hasImmediateMediaResult) {
+        const userName = context.senderName ? normalizeDisplayName(context.senderName, 'friend') : 'friend';
+        finalReply = String(res?.text || '').trim() || this.#formatDeskSummary(executed, userName);
         break;
       }
     }

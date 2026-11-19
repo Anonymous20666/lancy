@@ -330,6 +330,93 @@ async function audiusDownload(track, tempPath) {
     return false;
 }
 
+/** ── source 4: Spotify / Apple Music / Audiomack / SoundCloud (social-dl & btch-downloader) ── */
+export async function resolveSocialOrSpotifyAudio(trackOrUrl, tempPath, { minSeconds = 35, ffmpegPath = 'ffmpeg', onProgress = null } = {}) {
+    try {
+        const socialDl = await import('social-dl').catch(() => null);
+        const btchMod = await import('btch-downloader').catch(() => null);
+        const btch = btchMod?.default || btchMod;
+
+        const sourceRef = String(typeof trackOrUrl === 'string' ? trackOrUrl : (trackOrUrl?.sourceRef || '')).trim();
+        const title = String(trackOrUrl?.title || '').trim();
+        const artist = String(trackOrUrl?.artist || '').trim();
+
+        // 1. Direct Spotify URL via social-dl or btch-downloader
+        if (/open\.spotify\.com\/track\/|spotify\.link\/|spoti\.fi\//i.test(sourceRef)) {
+            onProgress?.('Resolving Spotify track stream… ♡');
+            if (btch?.spotify) {
+                const sp = await Promise.race([
+                    btch.spotify(sourceRef),
+                    sleep(10000).then(() => null)
+                ]).catch(() => null);
+                const audioUrl = sp?.res_data?.formats?.[0]?.url || sp?.res_data?.url || sp?.result?.url || sp?.url;
+                if (audioUrl && /^https?:\/\//i.test(audioUrl)) {
+                    const res = await fetch(audioUrl, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(45000) });
+                    if (res.ok && res.body) {
+                        await pipeline(Readable.fromWeb(res.body), createWriteStream(tempPath));
+                        if (existsSync(tempPath) && statSync(tempPath).size > 100000) return { ok: true, source: 'spotify-btch' };
+                    }
+                }
+            }
+            if (socialDl?.spotifySave) {
+                await socialDl.spotifySave(sourceRef, tempPath).catch(() => null);
+                if (existsSync(tempPath) && statSync(tempPath).size > 100000) return { ok: true, source: 'spotify-social-dl' };
+            }
+        }
+
+        // 2. Direct Apple Music URL via social-dl
+        if (/music\.apple\.com\//i.test(sourceRef) && socialDl?.applemusicSave) {
+            onProgress?.('Resolving Apple Music stream… ♡');
+            await socialDl.applemusicSave(sourceRef, tempPath).catch(() => null);
+            if (existsSync(tempPath) && statSync(tempPath).size > 100000) return { ok: true, source: 'applemusic-social-dl' };
+        }
+
+        // 3. Direct Audiomack URL via social-dl
+        if (/audiomack\.com\//i.test(sourceRef) && socialDl?.audiomackSave) {
+            onProgress?.('Resolving Audiomack stream… ♡');
+            await socialDl.audiomackSave(sourceRef, tempPath).catch(() => null);
+            if (existsSync(tempPath) && statSync(tempPath).size > 100000) return { ok: true, source: 'audiomack-social-dl' };
+        }
+
+        // 4. Direct SoundCloud URL via btch-downloader
+        if (/soundcloud\.com\//i.test(sourceRef) && btch?.soundcloud) {
+            onProgress?.('Resolving SoundCloud stream… ♡');
+            const sc = await Promise.race([
+                btch.soundcloud(sourceRef),
+                sleep(10000).then(() => null)
+            ]).catch(() => null);
+            const audioUrl = sc?.result?.audio || sc?.result?.url || sc?.url;
+            if (audioUrl && /^https?:\/\//i.test(audioUrl)) {
+                const res = await fetch(audioUrl, { headers: { 'user-agent': UA }, signal: AbortSignal.timeout(45000) });
+                if (res.ok && res.body) {
+                    await pipeline(Readable.fromWeb(res.body), createWriteStream(tempPath));
+                    if (existsSync(tempPath) && statSync(tempPath).size > 100000) return { ok: true, source: 'soundcloud-btch' };
+                }
+            }
+        }
+
+        // 5. Catalog Metadata Confidence Match via social-dl matchAudioSource + saveMatchedAudio
+        if (title && socialDl?.matchAudioSource && socialDl?.saveMatchedAudio) {
+            onProgress?.(`Matching studio audio source for "${artist ? `${artist} - ` : ''}${title}"… ♡`);
+            const match = await Promise.race([
+                socialDl.matchAudioSource({
+                    title,
+                    artist: artist || 'Music',
+                    durationSeconds: Number(trackOrUrl?.durationSeconds) || undefined
+                }),
+                sleep(12000).then(() => null)
+            ]).catch(() => null);
+            if (match?.url) {
+                await socialDl.saveMatchedAudio({ matchedSource: match }, tempPath).catch(() => null);
+                if (existsSync(tempPath) && statSync(tempPath).size > 100000) {
+                    return { ok: true, source: `spotify-match:${match.platform || 'studio'}` };
+                }
+            }
+        }
+    } catch {}
+    return { ok: false, source: null };
+}
+
 /** ── duration validation (preview killer) ──────────────────────────── */
 async function durationOf(file, ffmpeg = 'ffmpeg') {
     try {
@@ -390,6 +477,64 @@ export async function resolveAndDownloadAudio({
     const attempts = [];
     const triedYtIds = new Set();
 
+    // 1. Primary Multi-Source Audio Engines: JioSaavn 320kbps CDN -> Spotify/Apple/Audiomack (social-dl & btch-downloader) -> Audius -> SoundCloud
+    attempts.push({
+        name: 'jiosaavn',
+        run: async () => {
+            onProgress?.(`Resolving 320kbps studio master on JioSaavn for "${searchQuery || rawQuery}"… ♡`);
+            const t = await jiosaavnPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await jiosaavnPick(rawQuery) : null);
+            if (!t) return false;
+            onProgress?.(`Downloading 320kbps studio track "${t.title}"… ♡`);
+            const ok = await jiosaavnDownload(t, tempPath, resolvedFfmpeg);
+            if (ok) {
+                try {
+                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.artist}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
+                    unlinkSync(tempPath);
+                    renameSync(`${tempPath}.tag.mp3`, tempPath);
+                } catch {}
+            }
+            return ok;
+        },
+    });
+
+    attempts.push({
+        name: 'spotify-social',
+        run: async () => {
+            const res = await resolveSocialOrSpotifyAudio({
+                title: meta?.title || rawQuery,
+                artist: meta?.artist || '',
+                sourceRef: meta?.sourceRef || '',
+                durationSeconds: meta?.durationSeconds || meta?.duration || undefined
+            }, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg, onProgress });
+            return Boolean(res?.ok);
+        }
+    });
+
+    attempts.push({
+        name: 'audius',
+        run: async () => {
+            onProgress?.(`Resolving media on Audius for "${searchQuery || rawQuery}"… ♡`);
+            const t = await audiusPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await audiusPick(rawQuery) : null);
+            if (!t) return false;
+            onProgress?.(`Downloading full track "${t.title}"… ♡`);
+            const ok = await audiusDownload(t, tempPath);
+            if (ok) {
+                try {
+                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.user?.name || 'Unknown'}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
+                    unlinkSync(tempPath);
+                    renameSync(`${tempPath}.tag.mp3`, tempPath);
+                } catch {}
+            }
+            return ok;
+        },
+    });
+
+    attempts.push({
+        name: 'soundcloud',
+        run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg }),
+    });
+
+    // 2. Last-resort fallback only if direct music engines miss
     if (!skipYouTube || proxyUp) {
         if (hasValidYtId) {
             triedYtIds.add(trackId);
@@ -418,49 +563,6 @@ export async function resolveAndDownloadAudio({
             });
         }
     }
-
-    attempts.push({
-        name: 'jiosaavn',
-        run: async () => {
-            onProgress?.(`Resolving media on JioSaavn for "${searchQuery || rawQuery}"… ♡`);
-            const t = await jiosaavnPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await jiosaavnPick(rawQuery) : null);
-            if (!t) return false;
-            onProgress?.(`Downloading full track "${t.title}"… ♡`);
-            const ok = await jiosaavnDownload(t, tempPath, resolvedFfmpeg);
-            if (ok) {
-                try {
-                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.artist}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
-                    unlinkSync(tempPath);
-                    renameSync(`${tempPath}.tag.mp3`, tempPath);
-                } catch {}
-            }
-            return ok;
-        },
-    });
-
-    attempts.push({
-        name: 'audius',
-        run: async () => {
-            onProgress?.(`Resolving media on Audius for "${searchQuery || rawQuery}"… ♡`);
-            const t = await audiusPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await audiusPick(rawQuery) : null);
-            if (!t) return false;
-            onProgress?.(`Downloading full track "${t.title}"… ♡`);
-            const ok = await audiusDownload(t, tempPath);
-            if (ok) {
-                try {
-                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.user?.name || 'Unknown'}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
-                    unlinkSync(tempPath);
-                    renameSync(`${tempPath}.tag.mp3`, tempPath);
-                } catch {}
-            }
-            return ok;
-        },
-    });
-
-    attempts.push({
-        name: 'soundcloud',
-        run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg }),
-    });
 
     for (const attempt of attempts) {
         try {
