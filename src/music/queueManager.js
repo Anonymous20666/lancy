@@ -2556,12 +2556,13 @@ export class QueueManager extends EventEmitter {
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
       const curRenderStateKey = `${s.currentTrack?.entryId || s.currentTrack?.id || 'idle'}:${s.status}:${effectiveView}:${s.volume}:${s.loopMode}:${s.upcoming?.length || 0}:${s.movieUpcoming?.length || 0}:${s.subtitleMode || ''}:${s.vcQuality || ''}:${s.streamMode || ''}:${s.pinned ? 1 : 0}`;
-      const editStripsHere = Boolean(
+      if (
         !preview
+        && !forceEdit
         && s._editStripsCustomEmoji
         && s._editStripsCustomEmojiMsgId === s.screenMessageId
-      );
-      if (editStripsHere && !forceEdit && s._editStripsCustomEmojiTrackId === curRenderStateKey) {
+        && s._editStripsCustomEmojiTrackId === curRenderStateKey
+      ) {
         return true;
       }
       const rawPhotoUrl = extractRichPhotoUrl(rich);
@@ -2588,23 +2589,6 @@ export class QueueManager extends EventEmitter {
         const files = preview ? await audioUpload(preview.media) : null;
         // A track/control can change while reading the file. Never upload stale audio.
         if (preview && (!previews.current(s, preview.request) || s.view !== 'player')) return false;
-        if (editStripsHere && typeof api.sendRichMessage === 'function') {
-          const replaced = await this.#replacePlayerCardWithSend(
-            s,
-            api,
-            effectiveRich,
-            files,
-            content,
-            {
-              oldMsgId: s.screenMessageId,
-              wasPinned: Boolean(s.pinned),
-              markStripped: true,
-              trackKey: curRenderStateKey,
-              rawPhotoUrl
-            }
-          );
-          if (replaced?.message_id) return true;
-        }
         let sent;
         let renderedHasPhoto = nextHasPhoto;
         let usedEdit = false;
@@ -2710,31 +2694,13 @@ export class QueueManager extends EventEmitter {
               throw editErr;
             }
           }
-          if (usedEdit && !preview && sent) {
-            if (didEditStripCustomEmojis(editedPayload, sent) && typeof api.sendRichMessage === 'function') {
-              const targetChatId = Number(s.playerChatId || s.chatId);
-              const canTryReanchor = Boolean(
-                targetChatId < 0
-                && !s.isChannel
-                && s._customEmojiReanchoredMsgId !== s.screenMessageId
-              );
-              const replaced = await this.#replacePlayerCardWithSend(
-                s,
-                api,
-                editedPayload,
-                files,
-                content,
-                {
-                  oldMsgId: s.screenMessageId,
-                  wasPinned: Boolean(s.pinned),
-                  markReanchored: canTryReanchor,
-                  markStripped: !canTryReanchor,
-                  trackKey: curRenderStateKey,
-                  rawPhotoUrl
-                }
-              );
-              if (replaced?.message_id) return true;
-            } else if (Array.isArray(sent.rich_message?.blocks) && !didEditStripCustomEmojis(editedPayload, sent)) {
+          if (usedEdit && !preview && sent && Array.isArray(sent.rich_message?.blocks)) {
+            if (didEditStripCustomEmojis(editedPayload, sent)) {
+              // Edit succeeded in place; never delete/resend a fresh card mid-playback (prevents group card/pin spam).
+              s._editStripsCustomEmoji = true;
+              s._editStripsCustomEmojiMsgId = s.screenMessageId;
+              s._editStripsCustomEmojiTrackId = curRenderStateKey;
+            } else {
               s._editStripsCustomEmoji = false;
               s._editStripsCustomEmojiMsgId = null;
               s._editStripsCustomEmojiTrackId = null;
@@ -2767,7 +2733,7 @@ export class QueueManager extends EventEmitter {
           const oldMsgId = s.screenMessageId;
           const wasPinned = Boolean(s.pinned);
           const now = Date.now();
-          if (oldMsgId && (forceEdit || now - (s._lastCardReplaceAt || 0) >= 8000) && typeof api.sendRichMessage === 'function') {
+          if (oldMsgId && (forceEdit || now - (s._lastCardReplaceAt || 0) >= 30000) && typeof api.sendRichMessage === 'function') {
             s._lastCardReplaceAt = now;
             try {
               const replacement = await this.#replacePlayerCardWithSend(

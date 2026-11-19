@@ -730,41 +730,28 @@ test('QueueManager.updatePlayerView self-heals standalone custom-emoji strips an
 
   assert.equal(hasRichCustomEmoji(screen.renderPlayer(s)), true);
 
-  // 1) First indicator move on standalone card -> edit stripped -> self-heal ONCE with reply_parameters
+  // 1) Indicator move when edit response strips custom_emoji -> stays in-place (zero delete/resend spam) and suppresses future cosmetic ticks
   s.positionSeconds = 30;
   await qm.updatePlayerView(s);
   assert.equal(edits.length, 1);
-  assert.equal(sends.length, 1);
-  assert.deepEqual(sends[0].extra?.reply_parameters, { message_id: 10, allow_sending_without_reply: true });
-  assert.deepEqual(deletes, [{ chatId: -100888, msgId: 10 }]);
-  assert.deepEqual(pins, [{ chatId: -100888, msgId: 11, extra: { disable_notification: true } }]);
-  assert.equal(s.screenMessageId, 11);
-  assert.equal(s._customEmojiReanchoredMsgId, 11);
-  assert.equal(Boolean(s._editStripsCustomEmoji), false);
-
-  // 2) Second indicator move where server STILL strips -> immediately restore via sendRichMessage & mark stripped
-  s.positionSeconds = 75;
-  await qm.updatePlayerView(s);
-  assert.equal(edits.length, 2);
-  assert.equal(sends.length, 2);
-  assert.equal(sends[1].message_id, 12);
-  assert.deepEqual(deletes[1], { chatId: -100888, msgId: 11 });
-  assert.equal(s.screenMessageId, 12);
+  assert.equal(sends.length, 0);
+  assert.equal(deletes.length, 0);
+  assert.equal(s.screenMessageId, 10);
   assert.equal(s._editStripsCustomEmoji, true);
 
-  // 3) Third cosmetic indicator move -> skipped completely (zero edits, zero message spam)
-  s.positionSeconds = 120;
+  // 2) Subsequent cosmetic indicator move -> skipped completely (zero edits, zero message spam)
+  s.positionSeconds = 75;
   await qm.updatePlayerView(s);
-  assert.equal(edits.length, 2);
-  assert.equal(sends.length, 2);
+  assert.equal(edits.length, 1);
+  assert.equal(sends.length, 0);
 
-  // 4) Real state change (paused + forceEdit) -> replaces cleanly via sendRichMessage without destructive edit
+  // 3) Real state change (paused + forceEdit) -> edits the existing card in-place without spamming a new message
   s.status = 'paused';
   await qm.updatePlayerView(s, { forceEdit: true });
   assert.equal(edits.length, 2);
-  assert.equal(sends.length, 3);
-  assert.equal(s.screenMessageId, 13);
-  assert.deepEqual(deletes[2], { chatId: -100888, msgId: 12 });
+  assert.equal(sends.length, 0);
+  assert.equal(deletes.length, 0);
+  assert.equal(s.screenMessageId, 10);
 });
 
 test('TelegramApi sendMessage, editMessageText, sendPhoto, and setMessageReaction automatically apply custom emojis', async () => {

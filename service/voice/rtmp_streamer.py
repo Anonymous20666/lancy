@@ -35,8 +35,12 @@ def build_eq_af_filters(eq_preset='off', *, bass=False, volume=100, video_active
     preset = str(eq_preset or ('bass' if bass else 'off')).strip().lower()
     if preset == 'off' and bass:
         preset = 'bass'
-    # -5 dB input headroom + subsonic highpass prevent EQ/AAC inter-sample clipping and DAC cracking.
-    filters = ['highpass=f=24', 'volume=0.56234133']
+    has_eq = preset in {'bass', 'studio', 'vocal', 'nightcore', 'vaporwave', '8d'}
+    filters = []
+    # Only apply headroom attenuation + subsonic highpass when additive EQ/dynamics are active;
+    # keep clean 'off' mode at unity gain so commercial tracks retain natural fullness and clarity.
+    if has_eq:
+        filters.extend(['highpass=f=24', 'volume=0.75'])
     if preset == 'bass':
         filters.extend([
             'equalizer=f=48:width_type=h:w=50:g=2.5',
@@ -74,8 +78,9 @@ def build_eq_af_filters(eq_preset='off', *, bass=False, volume=100, video_active
     vol = max(0, min(200, vol))
     if vol != 100:
         filters.append(f'volume={vol / 100.0:.3f}')
-    # Brickwall soft limiter with level=0 (no auto-gain pump) keeps decoded AAC peaks below -1.5 dBFS.
-    filters.append('alimiter=limit=0.84:attack=7:release=80:level=0')
+    # Brickwall safety ceiling only when EQ/boost > 100% can push peaks; leave clean 100% uncolored.
+    if has_eq or vol > 100:
+        filters.append('alimiter=limit=0.84:attack=7:release=80:level=0')
     return filters
 
 
@@ -182,10 +187,12 @@ def _build_video_demux_parts(
         vf_parts.append('setsar=1')
 
     af_parts.extend(build_eq_af_filters(eq, bass=bass, volume=volume, video_active=True))
+    # Only enable async=1 timestamp stretching on live HLS proxies; clean files keep pure pitch-locked resampling.
+    resample_expr = 'aresample=48000:async=1' if is_hls_proxy else 'aresample=48000'
     if preserve_nut_pts and strip_first_pts_zero and pts_anchor is None:
-        af_parts.append('aresample=48000:async=1')
+        af_parts.append(resample_expr)
     else:
-        af_parts.append('aresample=48000:async=1:first_pts=0')
+        af_parts.append(f'{resample_expr}:first_pts=0')
 
     v_map = f'0:{int(video_stream_index)}' if (video_stream_index is not None and video_count > 1) else '0:v:0'
     if has_audio_stream:
@@ -333,7 +340,7 @@ def build_rtmp_encoder_args(
         '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p',
         '-r', fps_str, '-g', str(max(15, fps_int * 2)), '-keyint_min', str(max(10, fps_int)), '-sc_threshold', '0',
         '-b:v', eff_vb, '-maxrate', eff_vmax, '-bufsize', eff_vbuf,
-        '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000',
+        '-c:a', 'aac', '-b:a', '256k', '-ac', '2', '-ar', '48000',
         '-max_interleave_delta', '0',
         '-fflags', '+flush_packets',
         '-flvflags', 'no_duration_filesize',
@@ -389,6 +396,7 @@ def build_rtmp_ffmpeg_args(
             *base,
             '-re', '-readrate_initial_burst', '1.5',
             '-f', 'lavfi', '-i', f'color=c=0x0b0f17:s={canvas_w}x{canvas_h}:r=15',
+            '-re', '-readrate_initial_burst', '1.5',
         ]
         if is_http and not is_hls_proxy:
             args.extend(['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '4'])
@@ -401,7 +409,7 @@ def build_rtmp_ffmpeg_args(
             af_parts.append(f'atrim=start={float(audio_trim_start):.3f}')
             af_parts.append('asetpts=PTS-STARTPTS')
         af_parts.extend(build_eq_af_filters(eq, bass=bass, volume=volume, video_active=False))
-        af_parts.append('aresample=48000:async=1:first_pts=0')
+        af_parts.append('aresample=48000:async=1:first_pts=0' if is_hls_proxy else 'aresample=48000:first_pts=0')
 
         audio_map = f'1:{int(audio_stream_index)}' if (audio_stream_index is not None and audio_count > 1) else '1:a:0'
         args.extend([
@@ -413,7 +421,7 @@ def build_rtmp_ffmpeg_args(
             '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency', '-threads', '2',
             '-pix_fmt', 'yuv420p', '-r', '15', '-g', '30', '-keyint_min', '15', '-sc_threshold', '0',
             '-b:v', '450k', '-maxrate', '600k', '-bufsize', '1200k',
-            '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000',
+            '-c:a', 'aac', '-b:a', '256k', '-ac', '2', '-ar', '48000',
             '-flvflags', 'no_duration_filesize',
             '-f', 'flv', str(rtmp_target),
         ])
@@ -462,7 +470,7 @@ def build_rtmp_ffmpeg_args(
         '-profile:v', 'high', '-level:v', '4.1', '-pix_fmt', 'yuv420p',
         '-r', fps_str, '-g', str(max(15, fps_int * 2)), '-keyint_min', str(max(10, fps_int)), '-sc_threshold', '0',
         '-b:v', vb, '-maxrate', vmax, '-bufsize', vbuf,
-        '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '48000',
+        '-c:a', 'aac', '-b:a', '256k', '-ac', '2', '-ar', '48000',
         '-flvflags', 'no_duration_filesize',
         '-f', 'flv', str(rtmp_target),
     ])

@@ -2884,10 +2884,14 @@ export function createMusicScreen({ app }) {
           }
           return p;
         }
-        const p = await app.music.player({ ...ctx, forceNew: true });
-        if (Number(ctx.chatId) < 0 && ctx.messageId && qmSession?.screenMessageId && ctx.messageId !== qmSession.screenMessageId) {
-          await ctx.api?.deleteMessage?.(ctx.chatId, ctx.messageId).catch(() => {});
+        if (qmSession?.screenMessageId) {
+          const p = await app.music.player(ctx);
+          if (Number(ctx.chatId) < 0 && ctx.messageId && ctx.messageId !== qmSession.screenMessageId) {
+            await ctx.api?.deleteMessage?.(ctx.chatId, ctx.messageId).catch(() => {});
+          }
+          return p;
         }
+        const p = await app.music.player({ ...ctx, ...(ctx.messageId ? { reuseMessageId: ctx.messageId } : { forceNew: true }) });
         return p;
       }
       if (['pick', 'spage', 'sclear', 'submit', 'playnow_s', 'qnow'].includes(action)) {

@@ -821,7 +821,7 @@ def rewrite_audio_ffmpeg_command(
         af_parts.append(f'asetpts=PTS-{float(pts_anchor):.3f}/TB')
     elif normalize_pts or trim_start is not None:
         af_parts.append('asetpts=PTS-STARTPTS')
-    base_af = af_value or 'aresample=48000:async=1'
+    base_af = af_value or ('aresample=48000:async=1' if copyts else 'aresample=48000')
     if strip_first_pts_zero:
         base_af = re.sub(r':first_pts=0\b', '', base_af)
     if af_parts:
@@ -3163,7 +3163,11 @@ class Bridge:
         )
         vol_pct = call.get('volume')
         vol_gain = f'volume={max(0, min(200, int(vol_pct))) / 100.0:.4f},' if vol_pct is not None and int(vol_pct) != 100 else ''
-        filters = 'volume=0.5011872336,' + eq_filter + vol_gain + fade_in + fade_out + 'alimiter=limit=0.89:attack=7:release=80:level=0,aresample=48000:async=1:first_pts=0'
+        headroom_prefix = 'volume=0.5011872336,' if (eq_filter or vol_gain) else ''
+        limiter_suffix = 'alimiter=limit=0.89:attack=7:release=80:level=0,' if (eq_filter or vol_gain) else ''
+        is_hls_src = bool(call.get('_is_hls_proxy') or '/movie-proxy/' in str(call.get('path') or ''))
+        resample_mode = 'aresample=48000:async=1:first_pts=0' if is_hls_src else 'aresample=48000:first_pts=0'
+        filters = headroom_prefix + eq_filter + vol_gain + fade_in + fade_out + limiter_suffix + resample_mode
         ff += ' --audio ---mid -af ' + filters
 
         requested_quality = str(call.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p')

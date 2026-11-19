@@ -84,7 +84,7 @@ export class YouTubeProvider {
             }
             const matchesSong = titlePartTokens.length === 0 || titleHits > 0;
             if (!matchesSong) s -= 45;
-            if (!queryAsksInst && /\b(instrumental|karaoke|type\s*beat|reaction|interview|podcast|review|explained|how to|tutorial|cover\s*by|sped\s*up|slowed|documentary|court|trial|verdict|news|ai\s*cover|snippet)\b/i.test(title)) s -= 45;
+            if (!queryAsksInst && /\b(instrumental|karaoke|type\s*beat|reaction|interview|podcast|review|explained|how to|tutorial|cover\s*by|sped\s*up|slowed|reverb|nightcore|pitched|8d\s*audio|bass\s*boosted|tiktok\s*version|documentary|court|trial|verdict|news|ai\s*cover|snippet)\b/i.test(title)) s -= 45;
 
             const isOfficialMV = /\b(official\s*(music\s*)?video|\bmusic\s*video\b|\bofficial\s*video\b|\bm\/?v\b)\b/i.test(title);
             const isVisualizer = /\b(official\s*visualizer|visualizer|performance\s*video|live\s*performance)\b/i.test(title);

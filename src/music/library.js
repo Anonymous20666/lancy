@@ -185,17 +185,19 @@ export class MediaLibrary {
             }
           }
           const args = ['-nostdin', '-hide_banner', '-loglevel', 'error', '-y'];
+          const needsLoudnorm = Boolean(isChannel || eqPreset === 'studio');
+          const afVideoArgs = needsLoudnorm ? ['-af', 'loudnorm=I=-16:TP=-1.5:LRA=11'] : [];
           if (needsVideo) {
             if (hasVideoInSource && canStreamCopyVideo) {
-              args.push('-i', input, '-t', '14400', '-map', '0:v:0', '-map', '0:a:0', '-c:v', 'copy', '-c:a', canStreamCopyAudio ? 'copy' : 'aac', ...(canStreamCopyAudio ? [] : ['-b:a', '192k', '-ar', '48000', '-ac', '2']), '-movflags', '+faststart');
+              args.push('-i', input, '-t', '14400', '-map', '0:v:0', '-map', '0:a:0', '-c:v', 'copy', '-c:a', canStreamCopyAudio ? 'copy' : 'aac', ...(canStreamCopyAudio ? [] : ['-b:a', '256k', '-ar', '48000', '-ac', '2']), '-movflags', '+faststart');
             } else if (hasVideoInSource) {
-              args.push('-i', input, '-t', '14400', '-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '19', '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-movflags', '+faststart');
+              args.push('-i', input, '-t', '14400', '-map', '0:v:0', '-map', '0:a:0', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '19', ...afVideoArgs, '-c:a', 'aac', '-b:a', '256k', '-ar', '48000', '-ac', '2', '-movflags', '+faststart');
             } else if (typeof canvasFile === 'string' && existsSync(canvasFile)) {
-              args.push('-loop', '1', '-framerate', '2', '-i', canvasFile, '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=1280:720:flags=lanczos,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '20', '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
+              args.push('-loop', '1', '-framerate', '2', '-i', canvasFile, '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=1280:720:flags=lanczos,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '20', ...afVideoArgs, '-c:a', 'aac', '-b:a', '256k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
             } else if (artworkFile && existsSync(artworkFile)) {
-              args.push('-loop', '1', '-framerate', '2', '-i', artworkFile, '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '20', '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
+              args.push('-loop', '1', '-framerate', '2', '-i', artworkFile, '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-vf', 'scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '20', ...afVideoArgs, '-c:a', 'aac', '-b:a', '256k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
             } else {
-              args.push('-f', 'lavfi', '-i', 'color=c=0x0b1021:s=1280x720:r=2', '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '22', '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
+              args.push('-f', 'lavfi', '-i', 'color=c=0x0b1021:s=1280x720:r=2', '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '22', ...afVideoArgs, '-c:a', 'aac', '-b:a', '256k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
             }
           } else {
             let canCopyMp3 = false;
@@ -205,13 +207,13 @@ export class MediaLibrary {
                 const aJson = JSON.parse(probeAudio.stdout || '{}');
                 const aSt = aJson.streams?.find(s => s.codec_type === 'audio');
                 const vSt = aJson.streams?.find(s => s.codec_type === 'video');
-                canCopyMp3 = Boolean(!vSt && aSt?.codec_name === 'mp3' && Number(aSt?.sample_rate) === 48000 && Number(aSt?.channels) === 2);
+                canCopyMp3 = Boolean(!vSt && aSt?.codec_name === 'mp3' && [44100, 48000].includes(Number(aSt?.sample_rate)) && Number(aSt?.channels) === 2);
               } catch {}
             }
             if (canCopyMp3) {
               args.push('-i', input, '-t', '14400', '-map', '0:a:0', '-vn', '-c:a', 'copy');
             } else {
-              args.push('-i', input, '-t', '14400', '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2', '-ar', '48000', '-ac', '2');
+              args.push('-i', input, '-t', '14400', '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '0', '-ar', '48000', '-ac', '2');
             }
           }
           args.push('-metadata', `title=${meta.title}`, '-metadata', `artist=${meta.artist || ''}`, '-fs', String(limit), output);

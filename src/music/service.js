@@ -172,7 +172,7 @@ export class MusicService {
   }
   listenCard(ctx,token,{requireMessage=true}={}){const c=this.listenCards.get(token);if(!c||c.expires<Date.now()||c.user!==String(ctx.tgId)||c.bot!==this.botKey(ctx)||c.chat!==Number(ctx.chatId)||(requireMessage&&c.messageId!==ctx.messageId))throw new MusicError('LISTEN_CARD_EXPIRED','Use your own /play card in its original chat, or search again.');if(c.consumed)throw new MusicError('ALREADY_QUEUED','This recording was already added from this card.');return c;}
   hasYoutubeVideo(){return Boolean(this.app?.musicProviders?.get?.('youtube')?.enabled);}
-  syncEqSettings(s,id){const savedBass=this.app.db?.getSetting?.(`music.bass.${id}`,null);const savedEq=this.app.db?.getSetting?.(`music.eq.${id}`,null);s.bass=savedBass!==null&&savedBass!==undefined?Boolean(savedBass):true;s.eqPreset=savedEq||(s.bass?'bass':'off');this.aiDj?.syncSession?.(s);}
+  syncEqSettings(s,id){const savedBass=this.app.db?.getSetting?.(`music.bass.${id}`,null);const savedEq=this.app.db?.getSetting?.(`music.eq.${id}`,null);s.bass=savedBass!==null&&savedBass!==undefined?Boolean(savedBass):false;s.eqPreset=savedEq||(s.bass?'bass':'off');this.aiDj?.syncSession?.(s);}
   async queueListen(ctx,token,{destination=null,fromCatalog=false,playNow=false}={}){return this.cardLocks.run(token,async()=>{const c=this.listenCard(ctx,token,{requireMessage:!fromCatalog}),id=c.destination||destination;if(!id)throw new MusicError('DESTINATION_REQUIRED','Choose a saved channel, or use /play inside your group.');if(c.destination&&destination&&c.destination!==destination)throw new MusicError('DESTINATION_CHANGED','That recording belongs to its original destination.');const generation=this.queueGeneration(id);await this.authorize(ctx,true,id,{allowDj:true});this.assertQueueGeneration(id,generation);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);this.app.musicQueueManager.getSession(id);const mediaType=(ctx.mode==='video'||this.hasYoutubeVideo())?'video':'audio';const trackObj={...c.track,mediaType,requester:ctx.user?.first_name||'Member'};if(playNow&&typeof this.app.musicQueueManager.playImmediateAndContinue==='function'){await this.app.musicQueueManager.playImmediateAndContinue(id,trackObj);}else{await this.app.musicQueueManager.addMany(id,[trackObj]);}c.consumed=true;return this.player(ctx,id);});}
   async streamReply(ctx,message,{video=null}={}){
     this.rate(ctx);const id=this.destination(ctx),generation=this.queueGeneration(id);await this.authorize(ctx,true,id,{allowDj:true});this.assertQueueGeneration(id,generation);await this.prepare(ctx,id);this.assertQueueGeneration(id,generation);
@@ -773,8 +773,7 @@ export class MusicService {
             && !edited.rich_message.blocks.some((bl) => bl?.type === 'photo')
             && !edited.photo
           );
-          const strippedEmojis = isGroupTarget && didEditStripCustomEmojis(rich, edited);
-          if (!strippedByEdit && !strippedEmojis) {
+          if (!strippedByEdit) {
             sent = edited?.message_id ? edited : { message_id: ctx.reuseMessageId };
           }
         } catch (editErr) {
