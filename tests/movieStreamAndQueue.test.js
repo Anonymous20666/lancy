@@ -1293,15 +1293,14 @@ test('MovieDownloader delivers single MP4 with spoiler option and paginated Bot 
   assert.equal(page0.count, 3);
   const p0Json = JSON.stringify(sentRich.at(-1).rich);
   assert.match(p0Json, /"type":"slideshow"/);
-  assert.match(p0Json, /Next \(4–5\) ▶/);
+  assert.ok(sentRich.at(-1).rich.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons).some((b) => /Next \(4–5\) ▶/.test(richTextToString(b.text))));
 
   const page1 = await downloader.deliverAlbumSlidePage(ctx, ms, 1, {
     buildNavCallback: (p) => `s:mv:ds:${p}`
   });
   assert.equal(page1.ok, true);
   assert.equal(page1.count, 2);
-  const p1Json = JSON.stringify(sentRich.at(-1).rich);
-  assert.match(p1Json, /◀ Prev \(1–3\)/);
+  assert.ok(sentRich.at(-1).rich.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons).some((b) => /◀ Prev \(1–3\)/.test(richTextToString(b.text))));
 });
 
 test('MovieStreamResolver rejects wrong sequels, short-title substrings, Episode-1 fallbacks, short HLS teasers, and Stage-1 subtitle leaks', async (t) => {
@@ -2035,7 +2034,7 @@ test('Call-end resume preserves exact movie position across idle, paused/playing
   const endedCard = h.screen.renderCinemaPlayer(s);
   assert.equal(endedCard.blocks.find((b) => b.type === 'photo')?.photo?.media, 'https://image.tmdb.org/t/p/w500/edge.jpg');
   assert.match(JSON.stringify(endedCard), /Saved at 30:45/);
-  assert.match(JSON.stringify(endedCard), /▶ Resume/);
+  assert.ok(endedCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons).some((b) => richTextToString(b.text).includes('▶ Resume')));
 
   // 2. Bot restarts while call-ended -> restores idle resumable queue & 1845s without auto-creating closed VC
   const playCountBeforeBoot = h.voiceCalls.play.length;
@@ -3412,11 +3411,11 @@ test('Player card pin button, broken remote poster fallback, and restart card re
   const ctx = h.makeCtx(-10055);
   const unpinnedCard = h.screen.renderPlayer({ ...s, pinned: false, currentTrack: { provider: 'youtube', title: 'Track', artist: 'Artist', mediaType: 'audio', durationSeconds: 180, capabilities: {} } });
   const unpinnedBtns = unpinnedCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
-  assert.ok(unpinnedBtns.some((b) => b.text === '📌 Pin' && decodeCallback(b.callback_data)?.action === 'pin'));
+  assert.ok(unpinnedBtns.some((b) => richTextToString(b.text) === '📌 Pin' && decodeCallback(b.callback_data)?.action === 'pin'));
 
   const pinnedCard = h.screen.renderPlayer({ ...s, pinned: true, currentTrack: { provider: 'youtube', title: 'Track', artist: 'Artist', mediaType: 'audio', durationSeconds: 180, capabilities: {} } });
   const pinnedBtns = pinnedCard.blocks.filter((b) => b.type === 'buttons').flatMap((b) => b.buttons);
-  assert.ok(pinnedBtns.some((b) => b.text === '📍 Pinned' && decodeCallback(b.callback_data)?.action === 'pin'));
+  assert.ok(pinnedBtns.some((b) => richTextToString(b.text) === '📍 Pinned' && decodeCallback(b.callback_data)?.action === 'pin'));
 
   // 2. Broken remote artwork triggers stripRemotePhotoBlocks fallback instead of silently dropping Player Card
   let failRemotePhotos = true;

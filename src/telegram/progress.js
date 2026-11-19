@@ -2,6 +2,7 @@ import { throttle } from '../utils/time.js';
 import { logger } from '../core/logger.js';
 import { ActionIndicator } from './indicator.js';
 import { isPermissionError, recordChatPermissionRestriction, formatMediaRestrictedNotice } from './permissions.js';
+import { sendRichWithPhotoFallback, didEditStripMedia, didEditStripCustomEmojis } from '../music/model.js';
 
 /**
  * ProgressTracker — ONE editable Rich Message that streams live progress.
@@ -64,7 +65,7 @@ export class ProgressTracker {
     this.chatId = chatId;
     this.messageId = messageId;
     this.replyToMessageId = replyToMessageId;
-    this.heartbeatMs = Math.max(3000, Number(heartbeatMs) || 3500);
+    this.heartbeatMs = Math.max(4000, Number(heartbeatMs) || 4500);
     this.action = action;
     this.log = log ?? logger().child({ module: 'progress' });
     this.indicator = action && api && chatId ? new ActionIndicator(api, chatId, action) : null;
@@ -105,15 +106,19 @@ export class ProgressTracker {
     const prevMsgId = this.messageId;
     if (this.messageId) {
       try {
-        await this.api.editMessageRich(this.chatId, this.messageId, richMessage);
+        const edited = await this.api.editMessageRich(this.chatId, this.messageId, richMessage);
+        if (Number(this.chatId) < 0 && didEditStripCustomEmojis(richMessage, edited)) {
+          throw new Error('Telegram editMessageText stripped custom emojis from progress card');
+        }
         this.lastRender = JSON.stringify(richMessage);
         return this.messageId;
       } catch {
         // Fall back to sending a new message if editing fails
       }
     }
-    const sendExtra = this.replyToMessageId
-      ? { reply_to_message_id: this.replyToMessageId, allow_sending_without_reply: true }
+    const anchorId = this.replyToMessageId || (Number(this.chatId) < 0 ? prevMsgId : null);
+    const sendExtra = anchorId
+      ? { reply_parameters: { message_id: Number(anchorId), allow_sending_without_reply: true } }
       : {};
     const message = await this.api.sendRichMessage(this.chatId, richMessage, sendExtra);
     if (prevMsgId && message?.message_id && message.message_id !== prevMsgId) {
@@ -177,9 +182,24 @@ export class ProgressTracker {
 
   /** Throttled edit (leading + trailing) — stays safely under Telegram's ~20 edits/min limit. */
   #edit = throttle(async (richMessage) => {
-    if (this.closed) return;
+    if (this.closed || this._editStripsCustomEmoji) return;
     try {
-      await this.api.editMessageRich(this.chatId, this.messageId, richMessage, { dropOnFloodWait: true });
+      const edited = await this.api.editMessageRich(this.chatId, this.messageId, richMessage, { dropOnFloodWait: true });
+      if (Number(this.chatId) < 0 && didEditStripCustomEmojis(richMessage, edited) && typeof this.api.sendRichMessage === 'function') {
+        this._editStripsCustomEmoji = true;
+        const anchorId = Number(this.replyToMessageId || this.messageId || 0) || null;
+        const replyExtra = anchorId
+          ? { reply_parameters: { message_id: anchorId, allow_sending_without_reply: true } }
+          : {};
+        const prevId = this.messageId;
+        const replacement = await this.api.sendRichMessage(this.chatId, richMessage, replyExtra).catch(() => null);
+        if (replacement?.message_id) {
+          if (prevId && replacement.message_id !== prevId) {
+            await this.api.call?.('deleteMessage', { chat_id: this.chatId, message_id: prevId })?.catch?.(() => {});
+          }
+          this.messageId = replacement.message_id;
+        }
+      }
     } catch (error) {
       const errText = `${error?.code || ''} ${error?.description || ''} ${error?.message || ''}`;
       if (!BENIGN_EDIT_ERRORS.test(errText)) {
@@ -227,21 +247,45 @@ export class ProgressTracker {
   /** Final edit + unthrottle. Optional files for media-bearing final cards. */
   async finish(richMessage, files = null) {
     this.#stop();
-    const sendExtra = this.replyToMessageId
-      ? { reply_to_message_id: this.replyToMessageId, allow_sending_without_reply: true }
+    const anchorId = this.replyToMessageId || (Number(this.chatId) < 0 ? this.messageId : null);
+    const sendExtra = anchorId
+      ? { reply_parameters: { message_id: Number(anchorId), allow_sending_without_reply: true } }
       : {};
-    if (!this.messageId) {
-      const sent = await this.api.sendRichMessage(this.chatId, richMessage, sendExtra, files).catch(async (err) => {
+    const safeSend = async () => {
+      try {
+        const out = await sendRichWithPhotoFallback(this.api, this.chatId, richMessage, sendExtra, files);
+        return out?.sent || null;
+      } catch (err) {
+        this.log.warn({ err }, 'final progress send failed');
         if (isPermissionError(err)) {
           return await this.#handlePermissionDenied();
         }
         return null;
-      });
+      }
+    };
+    if (!this.messageId) {
+      const sent = await safeSend();
       this.messageId = sent?.message_id ?? null;
       return sent;
     }
+    const wantsMediaBlock = Array.isArray(richMessage?.blocks)
+      && richMessage.blocks.some((bl) => ['photo', 'video', 'audio', 'animation', 'slideshow', 'collage', 'document'].includes(bl?.type));
+    const hasReturnedMedia = (msg) => {
+      if (!msg || typeof msg !== 'object') return true;
+      if (msg.photo || msg.video || msg.audio || msg.animation || msg.document) return true;
+      const blocks = msg.rich_message?.blocks;
+      if (!Array.isArray(blocks)) return true; // Minimal mock responses like { message_id } count as uninspected/ok
+      if (didEditStripMedia(richMessage, msg)) return false;
+      return blocks.some((bl) => ['photo', 'video', 'audio', 'animation', 'slideshow', 'collage', 'document'].includes(bl?.type));
+    };
     try {
-      const res = await this.api.editMessageRich(this.chatId, this.messageId, richMessage, sendExtra, files);
+      const res = await this.api.editMessageRich(this.chatId, this.messageId, richMessage, {}, files);
+      if (wantsMediaBlock && !hasReturnedMedia(res)) {
+        throw new Error('Telegram editMessageText stripped media blocks from progress card');
+      }
+      if (Number(this.chatId) < 0 && didEditStripCustomEmojis(richMessage, res)) {
+        throw new Error('Telegram editMessageText stripped custom emojis from progress card');
+      }
       this.lastRender = JSON.stringify(richMessage);
       return res;
     } catch (error) {
@@ -249,15 +293,9 @@ export class ProgressTracker {
       if (isPermissionError(error)) {
         return await this.#handlePermissionDenied();
       }
-      // Message vanished (user deleted it) or could not be edited with media → send a fresh one.
+      // Message vanished, stripped media, or remote URL failed → send un-failing replacement card.
       const prevMsgId = this.messageId;
-      const sent = await this.api.sendRichMessage(this.chatId, richMessage, sendExtra, files).catch(async (err) => {
-        this.log.warn({ err }, 'final progress edit failed');
-        if (isPermissionError(err)) {
-          return await this.#handlePermissionDenied();
-        }
-        return null;
-      });
+      const sent = await safeSend();
       if (prevMsgId && sent?.message_id && sent.message_id !== prevMsgId) {
         await this.api.call?.('deleteMessage', { chat_id: this.chatId, message_id: prevMsgId })?.catch?.(() => {});
       }

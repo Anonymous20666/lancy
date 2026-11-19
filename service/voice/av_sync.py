@@ -37,7 +37,7 @@ PTS_DISCONTINUITY_SEC = 0.035
 SYNC_STARVATION_SEC = 0.380
 STALL_HEARTBEAT_TIMEOUT_SEC = 12.0
 F_SETPIPE_SZ = 1031
-TARGET_AUDIO_PIPE_BYTES = 32768    # ~170ms PCM (>1x 100ms ntgcalls burst) without starving readers
+TARGET_AUDIO_PIPE_BYTES = 24576    # ~128ms PCM (6x 4KB pages, >1x 100ms ntgcalls burst) for responsive barge-in without starving readers
 TIMED_PKT_MAGIC = b'LNF1'
 TIMED_PKT_STRUCT = struct.Struct('<4sqQI')
 _FIONREAD_BUF = ctypes.c_int(0)
@@ -71,12 +71,35 @@ class SyncState(ctypes.Structure):
         ('pipeline_delay_sec', ctypes.c_double),
         ('eq_bands', ctypes.c_uint8 * 16), # 16-band real-time PCM FFT meter for Visual DJ Desk
         ('bass_pulse', ctypes.c_uint8),    # smoothed low-bass beat envelope (0..255)
+        ('tts_hold', ctypes.c_int32),      # 1 = pause-hold allows TTS / silence keepalive on audio pipe
     ]
 
 
 def shm_path_for(sync_id):
     safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(sync_id or 'default'))[:64]
     return SHM_DIR / f'lancy-av-{safe}.shm'
+
+
+def tts_queue_dir_for(sync_id):
+    safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(sync_id or 'default'))[:64]
+    return SHM_DIR / f'lancy-tts-{safe}'
+
+
+def clear_tts_queue(sync_id):
+    """Immediately flush pending & buffered TTS speech for instant voice barge-in."""
+    q_dir = tts_queue_dir_for(sync_id)
+    try:
+        q_dir.mkdir(parents=True, exist_ok=True)
+        for p in q_dir.glob('*.pcm'):
+            p.unlink(missing_ok=True)
+        (q_dir / '.clear').write_text(str(time.monotonic()), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def vchud_config_path_for(sync_id):
+    safe = ''.join(ch if ch.isalnum() or ch in '-_' else '_' for ch in str(sync_id or 'default'))[:64]
+    return SHM_DIR / f'lancy-vchud-{safe}.json'
 
 
 def sub_config_path_for(sync_id):
@@ -233,15 +256,159 @@ def _open_input_adapter(stream):
     return False, None, _PrefixStream(head4 + rest, stream)
 
 
-def _wait_if_paused(state, stop_ev):
+class TtsAudioFeeder:
+    """Thread-safe reader for 48kHz stereo PCM TTS chunks queued into SHM dir with forced poll & smooth ducking."""
+
+    def __init__(self, sync_id, sample_rate=48000, channels=2):
+        self.queue_dir = tts_queue_dir_for(sync_id)
+        self.sample_rate = int(sample_rate or 48000)
+        self.channels = int(channels or 2)
+        self.sample_align = max(2, self.channels * 2)
+        self._buf = bytearray()
+        self._last_scan = 0.0
+        self.duck_gain = 1.0
+
+    def _poll_files(self, *, force: bool = False):
+        now = time.monotonic()
+        if not force and (now - self._last_scan) < 0.012:
+            return
+        self._last_scan = now
+        if not self.queue_dir.is_dir():
+            return
+        clear_flag = self.queue_dir / '.clear'
+        if clear_flag.is_file():
+            try:
+                clear_flag.unlink(missing_ok=True)
+                self._buf.clear()
+                self.duck_gain = 1.0
+            except Exception:
+                pass
+        try:
+            files = sorted(p for p in self.queue_dir.iterdir() if p.name.endswith('.pcm') and p.is_file())
+            for f in files:
+                try:
+                    data = f.read_bytes()
+                    f.unlink(missing_ok=True)
+                    usable = len(data) - (len(data) % self.sample_align)
+                    if usable > 0:
+                        self._buf.extend(data[:usable])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def check_clear(self):
+        clear_flag = self.queue_dir / '.clear'
+        if clear_flag.is_file():
+            try:
+                clear_flag.unlink(missing_ok=True)
+                self._buf.clear()
+                self.duck_gain = 1.0
+                return True
+            except Exception:
+                pass
+        return False
+
+    def pop_chunk(self, size_bytes):
+        self.check_clear()
+        if len(self._buf) < size_bytes:
+            self._poll_files(force=True)
+        if not self._buf:
+            return b'', False
+        take = min(len(self._buf), size_bytes)
+        take -= (take % self.sample_align)
+        if take <= 0:
+            return b'', False
+        chunk = bytes(self._buf[:take])
+        del self._buf[:take]
+        if len(chunk) < size_bytes:
+            chunk = chunk + (b'\x00' * (size_bytes - len(chunk)))
+        return chunk, True
+
+    def mix_media_packet(self, media_pcm, tts_chunk, tts_active, duck_factor=0.22):
+        """Smoothly ramp duck gain between 1.0 and `duck_factor` over chunks without harsh audio steps."""
+        start_gain = float(self.duck_gain)
+        target_gain = float(duck_factor) if (tts_active and tts_chunk) else 1.0
+        if not tts_active and start_gain >= 0.995:
+            self.duck_gain = 1.0
+            return media_pcm
+        step = 0.28 if target_gain < start_gain else 0.18
+        end_gain = target_gain if abs(target_gain - start_gain) <= step else (start_gain + step * (1.0 if target_gain > start_gain else -1.0))
+        self.duck_gain = end_gain
+        return mix_pcm_with_tts(
+            media_pcm,
+            tts_chunk if tts_active else b'',
+            duck_factor=duck_factor,
+            start_gain=start_gain,
+            end_gain=end_gain,
+        )
+
+
+def mix_pcm_with_tts(media_pcm, tts_pcm, duck_factor=0.22, *, start_gain=None, end_gain=None):
+    """Attenuate active media smoothly with envelope ramp and overlay crystal-clear TTS voice."""
+    if not tts_pcm and start_gain is None and end_gain is None:
+        return media_pcm
+    try:
+        import numpy as np
+        m = np.frombuffer(media_pcm, dtype='<i2').astype(np.float32)
+        if len(m) == 0:
+            return media_pcm
+        if start_gain is not None and end_gain is not None:
+            env = np.linspace(float(start_gain), float(end_gain), len(m), dtype=np.float32)
+        else:
+            env = float(duck_factor)
+        out_sig = m * env
+        if tts_pcm:
+            t = np.frombuffer(tts_pcm, dtype='<i2').astype(np.float32)
+            n = min(len(out_sig), len(t))
+            if n > 0:
+                out_sig[:n] = out_sig[:n] + t[:n]
+        return np.clip(out_sig, -32768.0, 32767.0).astype('<i2').tobytes()
+    except Exception:
+        return tts_pcm[:len(media_pcm)] if tts_pcm else media_pcm
+
+
+def _wait_if_paused(state, stop_ev, *, out=None, bps=PCM_BYTES_PER_SEC, sample_align=4, tts_feeder=None, on_video_hold=None):
+    chunk_sz = max(sample_align, (int(bps) // 50) - ((int(bps) // 50) % sample_align))
+    silence = b'\x00' * chunk_sz
+    next_audio_tick = time.monotonic()
+    last_vid_tick = time.monotonic() - 0.25
     while int(state.paused) == 1 and not stop_ev.is_set():
         now_m = time.monotonic()
         state.audio_hb_mono = now_m
         state.video_hb_mono = now_m
+        if int(state.tts_hold) == 1:
+            if out is not None:
+                if now_m >= next_audio_tick:
+                    chunk = silence
+                    if tts_feeder is not None:
+                        tts_chunk, active = tts_feeder.pop_chunk(chunk_sz)
+                        if active and tts_chunk:
+                            chunk = tts_chunk
+                    try:
+                        _write_all(out, chunk)
+                    except BrokenPipeError:
+                        stop_ev.set()
+                        break
+                    next_audio_tick += 0.020
+                    if (now_m - next_audio_tick) > 0.08:
+                        next_audio_tick = now_m + 0.020
+                time.sleep(0.004)
+                continue
+            if on_video_hold is not None:
+                if (now_m - last_vid_tick) >= 0.25:
+                    try:
+                        on_video_hold()
+                    except BrokenPipeError:
+                        stop_ev.set()
+                        break
+                    last_vid_tick = time.monotonic()
+                time.sleep(0.020)
+                continue
         time.sleep(0.025)
 
 
-def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, *, sub_monitor=None, dj_analyzer=None):
+def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, *, sub_monitor=None, dj_analyzer=None, tts_feeder=None, music_freerun=False):
     bps = max(1, int(sample_rate) * int(channels) * 2)
     sample_align = max(2, int(channels) * 2)
 
@@ -398,7 +565,7 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
 
         while not stop_ev.is_set():
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
                 continue
             silence_sz = max(sample_align, (bps // 50) - ((bps // 50) % sample_align))
             silence_buf = b'\x00' * silence_sz
@@ -418,21 +585,22 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                             if proc.poll() is None:
                                 state.audio_hb_mono = now_m
                             cur_a_clk = _update_audio_clock(last_emitted_end)
-                            state.skew_ms = int(round((cur_a_clk - float(state.video_sec)) * 1000.0))
+                            state.skew_ms = 0 if music_freerun else int(round((cur_a_clk - float(state.video_sec)) * 1000.0))
                             need_starve_hold = (
-                                int(state.video_state) == 1
+                                (not music_freerun)
+                                and int(state.video_state) == 1
                                 and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC
                             )
                         cond.wait(timeout=0.02 if (dq_wait_started is not None and int(state.paused) != 1) else 0.03)
                     if int(state.paused) == 1:
                         state.sync_flags = int(state.sync_flags) & ~1
-                        _wait_if_paused(state, stop_ev)
+                        _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
                         continue
                     with cond:
                         if dq or eof_flag or stop_ev.is_set():
                             break
                     now_m = time.monotonic()
-                    if int(state.video_state) == 1 and dq_wait_started is not None and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC:
+                    if (not music_freerun) and int(state.video_state) == 1 and dq_wait_started is not None and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC:
                         state.sync_flags = int(state.sync_flags) | 1
                         if (now_m - last_sync_silence) >= 0.020:
                             pre_unread = _pipe_unread_bytes(out_fd)
@@ -446,7 +614,7 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                     if not dq:
                         continue
                     pkt_pts, pkt_body = dq.popleft()
-                    if int(state.video_state) == 1:
+                    if (not music_freerun) and int(state.video_state) == 1:
                         v_live = float(state.video_sec)
                         pkt_end_cand = pkt_pts + (len(pkt_body) / float(bps))
                         if (v_live - pkt_end_cand) > VIDEO_CATCHUP_LAG_SEC:
@@ -459,9 +627,9 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
             wait_started = None
             pkt_end = pkt_pts + (len(pkt_body) / float(bps))
             try:
-                while not stop_ev.is_set() and int(state.video_state) == 1:
+                while (not music_freerun) and not stop_ev.is_set() and int(state.video_state) == 1:
                     if int(state.paused) == 1:
-                        _wait_if_paused(state, stop_ev)
+                        _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
                         wait_started = None
                         continue
                     consumed_a = _update_audio_clock(last_emitted_end)
@@ -494,10 +662,14 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                 pass
 
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
             if stop_ev.is_set():
                 break
-            _write_all(out, pkt_body)
+            emit_pkt = pkt_body
+            if tts_feeder is not None:
+                tts_chunk, tts_active = tts_feeder.pop_chunk(len(pkt_body))
+                emit_pkt = tts_feeder.mix_media_packet(pkt_body, tts_chunk, tts_active, duck_factor=0.22)
+            _write_all(out, emit_pkt)
             silence_since_last_real = 0
             if dj_analyzer is not None:
                 dj_analyzer(pkt_body, state, sample_rate, channels)
@@ -506,7 +678,7 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
             last_emitted_end = pkt_end
             cur_a_clk = _update_audio_clock(last_emitted_end)
             state.audio_hb_mono = time.monotonic()
-            state.skew_ms = int(round((cur_a_clk - float(state.video_sec)) * 1000.0))
+            state.skew_ms = 0 if music_freerun else int(round((cur_a_clk - float(state.video_sec)) * 1000.0))
     except BrokenPipeError:
         stop_ev.set()
         with cond:
@@ -518,10 +690,10 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
         t_reader.join(timeout=0.5)
 
 
-def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None, dj_analyzer=None):
+def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None, dj_analyzer=None, tts_feeder=None, music_freerun=False):
     is_timed, first_pkt, stream = _open_input_adapter(proc.stdout)
     if is_timed:
-        return _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, sub_monitor=sub_monitor, dj_analyzer=dj_analyzer)
+        return _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, channels, sub_monitor=sub_monitor, dj_analyzer=dj_analyzer, tts_feeder=tts_feeder, music_freerun=music_freerun)
     bps = max(1, int(sample_rate) * int(channels) * 2)
     sample_align = max(2, int(channels) * 2)
     first_chunks = bytearray()
@@ -599,7 +771,7 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None,
 
         while not stop_ev.is_set():
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
                 continue
             with cond:
                 while not dq and not eof_flag and not stop_ev.is_set():
@@ -612,7 +784,7 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None,
                 if not dq:
                     continue
                 pkt = dq.popleft()
-                if int(state.video_state) == 1 and float(state.video_sec or 0.0) > 0.0:
+                if (not music_freerun) and int(state.video_state) == 1 and float(state.video_sec or 0.0) > 0.0:
                     cur_pkt_sec = (bytes_sent + len(pkt)) / float(bps)
                     if (float(state.video_sec) - cur_pkt_sec) > VIDEO_CATCHUP_LAG_SEC:
                         while dq and (float(state.video_sec) - ((bytes_sent + len(pkt)) / float(bps))) > VIDEO_TARGET_LAG_SEC:
@@ -620,15 +792,15 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None,
                             pkt = dq.popleft()
                 cond.notify_all()
 
-            # Bidirectional lead clamp: hold audio cleanly whenever video is still alive & trailing
+            # Bidirectional lead clamp: hold audio cleanly whenever video is still alive & trailing (movies only; music free-runs)
             wait_started = None
             silence_sz = max(sample_align, (bps // 50) - ((bps // 50) % sample_align))
             silence_buf = b'\x00' * silence_sz
             last_sync_silence = 0.0
             silence_bytes = 0
-            while not stop_ev.is_set() and int(state.video_state) == 1:
+            while (not music_freerun) and not stop_ev.is_set() and int(state.video_state) == 1:
                 if int(state.paused) == 1:
-                    _wait_if_paused(state, stop_ev)
+                    _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
                     wait_started = None
                     continue
                 consumed_a = max(0.0, (bytes_sent - max(0, _pipe_unread_bytes(out_fd) - silence_bytes)) / float(bps))
@@ -656,10 +828,14 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None,
                 time.sleep(0.005)
 
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
             if stop_ev.is_set():
                 break
-            _write_all(out, pkt)
+            emit_pkt = pkt
+            if tts_feeder is not None:
+                tts_chunk, tts_active = tts_feeder.pop_chunk(len(pkt))
+                emit_pkt = tts_feeder.mix_media_packet(pkt, tts_chunk, tts_active, duck_factor=0.22)
+            _write_all(out, emit_pkt)
             if dj_analyzer is not None:
                 dj_analyzer(pkt, state, sample_rate, channels)
             if sub_monitor is not None:
@@ -667,7 +843,7 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None,
             bytes_sent += len(pkt)
             state.audio_sec = max(0.0, (bytes_sent - max(0, _pipe_unread_bytes(out_fd) - silence_bytes)) / float(bps))
             state.audio_hb_mono = time.monotonic()
-            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
+            state.skew_ms = 0 if music_freerun else int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
     except BrokenPipeError:
         stop_ev.set()
         with cond:
@@ -728,10 +904,107 @@ def _format_hud_clock(sec):
     return f'{h}:{m:02d}:{s:02d}' if h > 0 else f'{m:02d}:{s:02d}'
 
 
-def _build_hud_ass_bytes(width, height, *, mode, pos_sec):
+VC_HUD_THEMES = {
+    'neon_rose': {
+        'back': '&HC8140C1E',
+        'outline': '&H00642A4A',
+        'badge_color': '&H00FFFFFF',
+        'user_color': '&H00FCD37D',   # sky cyan in ASS BGR
+        'lancy_color': '&H00A87CFF',  # vibrant rose-pink in ASS BGR
+        'border_style': 3,
+    },
+    'cinema_gold': {
+        'back': '&HC80B0F17',
+        'outline': '&H00263240',
+        'badge_color': '&H00EAEAEA',
+        'user_color': '&H00E0E0E0',
+        'lancy_color': '&H0048C6FF',  # warm amber-gold in ASS BGR
+        'border_style': 3,
+    },
+    'frosted_cyan': {
+        'back': '&HC81D130A',
+        'outline': '&H0045351E',
+        'badge_color': '&H00FFFFFF',
+        'user_color': '&H00E8FCE0',
+        'lancy_color': '&H00F8E050',  # electric cyan in ASS BGR
+        'border_style': 3,
+    },
+    'minimal': {
+        'back': '&H80000000',
+        'outline': '&H00000000',
+        'badge_color': '&H00FFFFFF',
+        'user_color': '&H00DDDDDD',
+        'lancy_color': '&H009DF0FF',
+        'border_style': 1,
+    },
+}
+
+
+def _escape_ass_text(raw):
+    s = str(raw or '').replace('\\', '').replace('{', '(').replace('}', ')')
+    s = ' '.join(s.splitlines()).strip()
+    return s
+
+
+def _wrap_hud_lines(text, max_chars=46, max_lines=3):
+    import textwrap
+    clean = _escape_ass_text(text)
+    if not clean:
+        return []
+    wrapped = textwrap.wrap(clean, width=max_chars, break_long_words=True, break_on_hyphens=True)
+    if len(wrapped) > max_lines:
+        wrapped = wrapped[:max_lines]
+        if len(wrapped[-1]) > 3:
+            wrapped[-1] = wrapped[-1][:-1].rstrip() + '…'
+    return wrapped
+
+
+def _build_hud_ass_bytes(width, height, *, mode, pos_sec, vchud=None):
     w = max(320, int(width))
     h = max(180, int(height))
-    is_pause = (mode == 'paused')
+    is_pause = (mode in {'paused', 'vchud'})
+    v_data = vchud if (isinstance(vchud, dict) and vchud.get('active')) else None
+    if v_data:
+        theme_key = str(v_data.get('theme') or 'neon_rose').lower()
+        pal = VC_HUD_THEMES.get(theme_key, VC_HUD_THEMES['neon_rose'])
+        base_sz = max(16, min(38, int(round(h * 0.036))))
+        margin_v = max(24, int(round(h * (0.14 if is_pause else 0.08))))
+        border_w = max(8, int(round(base_sz * 0.34))) if pal['border_style'] == 3 else 2
+
+        sp_name = _escape_ass_text(v_data.get('speaker_name') or 'User')[:20]
+        u_lines = _wrap_hud_lines(v_data.get('user_text') or '', max_chars=50, max_lines=3)
+        l_lines = _wrap_hud_lines(v_data.get('lancy_text') or '', max_chars=54, max_lines=4)
+
+        body_parts = []
+        if u_lines:
+            joined_u = r'\N'.join(u_lines)
+            body_parts.append(f'{{\\c{pal["user_color"]}\\b1}}{sp_name}:{{\\b0}}  {joined_u}')
+        if l_lines:
+            joined_l = r'\N'.join(l_lines)
+            body_parts.append(f'{{\\c{pal["lancy_color"]}\\b1}}Lancy:{{\\b0}}  {joined_l}')
+        if not body_parts:
+            body_parts.append(f'{{\\c{pal["lancy_color"]}\\b1}}Lancy:{{\\b0}}  Listening…')
+
+        chat_dialogue = r'\N'.join(body_parts)
+        chat_align = 5 if is_pause else 2  # center dialogue cleanly when paused; bottom-center otherwise
+        ass = (
+            '[Script Info]\n'
+            'ScriptType: v4.00+\n'
+            f'PlayResX: {w}\n'
+            f'PlayResY: {h}\n'
+            'WrapStyle: 2\n'
+            'ScaledBorderAndShadow: yes\n\n'
+            '[V4+ Styles]\n'
+            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, '
+            'Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, '
+            'Alignment, MarginL, MarginR, MarginV, Encoding\n'
+            f'Style: HUDEcho,DejaVu Sans,{base_sz},{pal["lancy_color"]},{pal["lancy_color"]},{pal["outline"]},{pal["back"]},0,0,0,0,100,100,0.2,0,{pal["border_style"]},{border_w},0,{chat_align},36,36,{margin_v},1\n\n'
+            '[Events]\n'
+            'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
+            f'Dialogue: 11,0:00:00.00,9:59:59.00,HUDEcho,,0,0,0,,{chat_dialogue}\n'
+        )
+        return ass.encode('utf-8'), chat_dialogue
+
     font_sz = max(18, min(54, int(round(h * (0.044 if is_pause else 0.030)))))
     margin_v = max(12, int(round(h * 0.05)))
     border_w = max(8, int(round(font_sz * 0.36)))
@@ -759,8 +1032,10 @@ def _build_hud_ass_bytes(width, height, *, mode, pos_sec):
 class SubOverlay:
     """Zero-restart libass YUV420p compositor hot-reloaded from shm state & JSON config."""
 
-    def __init__(self, config_path, state, width, height, frame_bytes):
+    def __init__(self, config_path, state, width, height, frame_bytes, *, sync_id=None):
         self.config_path = Path(config_path)
+        self.sync_id = sync_id
+        self.vchud_path = vchud_config_path_for(sync_id) if sync_id else None
         self.state = state
         self.width = int(width)
         self.height = int(height)
@@ -771,6 +1046,8 @@ class SubOverlay:
         self._last_gen = -1
         self._last_stat_mono = 0.0
         self._cfg_sig = None
+        self._vchud_sig = None
+        self._vchud_data = None
         self._active = False
         self._loaded_path = ''
         self._loaded_mtime = -1
@@ -849,38 +1126,79 @@ class SubOverlay:
 
         self._active = bool(self._loaded_spans)
 
+    def _refresh_vchud(self):
+        if not self.vchud_path:
+            self._vchud_data = None
+            self._vchud_sig = None
+            return None
+        try:
+            st = self.vchud_path.stat()
+        except OSError:
+            self._vchud_data = None
+            self._vchud_sig = None
+            return None
+        sig = (st.st_mtime_ns, st.st_size)
+        if sig != self._vchud_sig:
+            try:
+                data = json.loads(self.vchud_path.read_text(encoding='utf-8'))
+                self._vchud_data = data if isinstance(data, dict) else None
+                self._vchud_sig = sig
+            except Exception:
+                self._vchud_data = None
+        if self._vchud_data:
+            exp = float(self._vchud_data.get('expires_at') or 0.0)
+            if not self._vchud_data.get('active') or (exp > 0.0 and time.time() > exp):
+                return None
+        return self._vchud_data
+
+    def has_active_vchud(self):
+        return bool(self._refresh_vchud())
+
     def _rel_pts_adjusted(self, rel_pts_sec):
         epoch = max(0.0, float(getattr(self.state, 'epoch_pts_sec', 0.0) or 0.0)) if self.state is not None else 0.0
         return max(0.0, float(rel_pts_sec) - epoch)
 
     def render(self, frame_buf, rel_pts_sec):
         self._refresh()
-        if not self._active or not self._ctx or self._c_buf is None:
-            return frame_buf
+        vchud = self._refresh_vchud()
+        has_sub = False
         eff_rel = self._rel_pts_adjusted(rel_pts_sec)
-        pts_ms = self._sa.map_media_sec_to_sub_ms(
-            self._base_sec + eff_rel,
-            subtitle_offset=self._sub_offset,
-            drift_sec_per_sec=self._drift_rate,
-            drift_anchor_sec=self._drift_anchor,
-        )
-        if pts_ms < 0 or not self._sa.has_active_cue_near(self._loaded_spans, pts_ms, margin_ms=40):
+        pts_ms = -1
+        if self._active and self._ctx and self._c_buf is not None:
+            pts_ms = self._sa.map_media_sec_to_sub_ms(
+                self._base_sec + eff_rel,
+                subtitle_offset=self._sub_offset,
+                drift_sec_per_sec=self._drift_rate,
+                drift_anchor_sec=self._drift_anchor,
+            )
+            has_sub = bool(pts_ms >= 0 and self._sa.has_active_cue_near(self._loaded_spans, pts_ms, margin_ms=40))
+
+        if (not has_sub and not vchud) or not self._ctx or self._c_buf is None or len(frame_buf) != self.frame_bytes:
             return frame_buf
-        if len(frame_buf) != self.frame_bytes:
-            return frame_buf
+
         ctypes.memmove(self._c_buf, frame_buf, self.frame_bytes)
-        rc = self._lib.sub_render_yuv420(
-            self._ctx,
-            ctypes.cast(self._c_buf, ctypes.c_void_p),
-            self.width,
-            self.height,
-            pts_ms,
-        )
-        return self._c_buf if rc == 1 else frame_buf
+        c_ptr = ctypes.cast(self._c_buf, ctypes.c_void_p)
+        rendered = False
+        if has_sub:
+            rc = self._lib.sub_render_yuv420(self._ctx, c_ptr, self.width, self.height, pts_ms)
+            rendered = (rc == 1)
+        if vchud:
+            hud_load = getattr(self._lib, 'sub_load_hud_ass_mem', None)
+            hud_render = getattr(self._lib, 'sub_render_hud_yuv420', None)
+            if hud_load is not None and hud_render is not None:
+                cache_key = ('live_vchud', self._vchud_sig, self.width, self.height)
+                if cache_key != self._hud_key:
+                    ass_bytes, _ = _build_hud_ass_bytes(self.width, self.height, mode='live_vchud', pos_sec=eff_rel, vchud=vchud)
+                    if hud_load(self._ctx, ass_bytes, len(ass_bytes)) == 0:
+                        self._hud_key = cache_key
+                hud_render(self._ctx, c_ptr, self.width, self.height, 1000)
+                rendered = True
+        return self._c_buf if rendered else frame_buf
 
     def render_hud(self, frame_buf, rel_pts_sec=0.0, *, mode='paused', dim_factor=None):
-        """Render dimmed frame + frozen subtitle (if any) + crisp PAUSED/SYNCING pill overlay."""
+        """Render dimmed frame + frozen subtitle (if any) + crisp PAUSED/VC-CHAT/SYNCING overlay."""
         self._refresh()
+        vchud = self._refresh_vchud()
         if not self._ctx or self._c_buf is None or len(frame_buf) != self.frame_bytes:
             return frame_buf
         hud_load = getattr(self._lib, 'sub_load_hud_ass_mem', None)
@@ -893,7 +1211,7 @@ class SubOverlay:
         ctypes.memmove(self._c_buf, frame_buf, self.frame_bytes)
         c_ptr = ctypes.cast(self._c_buf, ctypes.c_void_p)
         if dim_fn is not None:
-            eff_dim = int(dim_factor) if dim_factor is not None else (164 if mode == 'paused' else 212)
+            eff_dim = int(dim_factor) if dim_factor is not None else (152 if (mode in {'paused', 'vchud'}) else 212)
             dim_fn(c_ptr, self.width, self.height, eff_dim)
         if self._active and self._sa is not None:
             pts_ms = self._sa.map_media_sec_to_sub_ms(
@@ -906,9 +1224,9 @@ class SubOverlay:
                 self._lib.sub_render_yuv420(self._ctx, c_ptr, self.width, self.height, pts_ms)
 
         shown_sec = max(0.0, self._base_sec + eff_rel)
-        cache_key = (mode, int(shown_sec) if mode == 'paused' else 0, self.width, self.height)
+        cache_key = (mode, int(shown_sec) if mode in {'paused', 'vchud'} else 0, self._vchud_sig if vchud else None, self.width, self.height)
         if cache_key != self._hud_key:
-            ass_bytes, _ = _build_hud_ass_bytes(self.width, self.height, mode=mode, pos_sec=shown_sec)
+            ass_bytes, _ = _build_hud_ass_bytes(self.width, self.height, mode=mode, pos_sec=shown_sec, vchud=vchud)
             if hud_load(self._ctx, ass_bytes, len(ass_bytes)) == 0:
                 self._hud_key = cache_key
         hud_render(self._ctx, c_ptr, self.width, self.height, 1000)
@@ -920,7 +1238,7 @@ def _compose_frame(dj_overlay, sub_overlay, frame_buf, pts):
     return sub_overlay.render(out, pts) if sub_overlay is not None else out
 
 
-def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_overlay=None):
+def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_overlay=None, music_freerun=False):
     eff_fps = max(1.0, float(fps or 30))
     default_dur = 1.0 / eff_fps
     first_pts, first_dur, first_frame = first_pkt if first_pkt is not None else (0.0, default_dur, b'')
@@ -1009,10 +1327,17 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
         tail_wall_anchor = None
         tail_pts_anchor = None
         last_sync_hud = 0.0
+        def _emit_hold_frame():
+            if sub_overlay is not None and sub_overlay.has_active_vchud():
+                buf = sub_overlay.render_hud(last_raw_frame, last_raw_pts, mode='vchud')
+            else:
+                buf = _compose_frame(dj_overlay, sub_overlay, last_raw_frame, last_raw_pts)
+            _write_all(out, buf)
+
         while not stop_ev.is_set():
             _maybe_emit_paused_hud()
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
                 tail_wall_anchor = None
                 continue
 
@@ -1024,7 +1349,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                         state.sync_flags = int(state.sync_flags) & ~2
                         sync_flag_held = False
                     if int(state.paused) == 1:
-                        _wait_if_paused(state, stop_ev)
+                        _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
                         tail_wall_anchor = None
                     dq_wait_started = None
                     continue
@@ -1040,7 +1365,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                     is_done = (not dq) and (eof_flag or stop_ev.is_set())
                     if has_item:
                         item_pts, item_dur, item_buf = dq.popleft()
-                        if int(state.audio_state) == 1:
+                        if (not music_freerun) and int(state.audio_state) == 1:
                             a_live = float(state.audio_sec)
                             if (a_live - item_pts) > VIDEO_CATCHUP_LAG_SEC:
                                 while dq and (float(state.audio_sec) - item_pts) > VIDEO_TARGET_LAG_SEC:
@@ -1065,7 +1390,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                         state.sync_flags = int(state.sync_flags) & ~2
                     break
                 now_m = time.monotonic()
-                if int(state.audio_state) == 1 and dq_wait_started is not None and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC:
+                if (not music_freerun) and int(state.audio_state) == 1 and dq_wait_started is not None and (now_m - dq_wait_started) >= SYNC_STARVATION_SEC:
                     state.sync_flags = int(state.sync_flags) | 2
                     sync_flag_held = True
                     state.skew_ms = int(round((float(state.audio_sec) - last_raw_pts) * 1000.0))
@@ -1084,11 +1409,11 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
             state.video_target_sec = item_pts
             wait_started = None
             try:
-                while not stop_ev.is_set() and int(state.audio_state) == 1:
+                while (not music_freerun) and not stop_ev.is_set() and int(state.audio_state) == 1:
                     _maybe_emit_paused_hud()
                     if int(state.paused) == 1:
                         state.waiting_mask = int(state.waiting_mask) & ~2
-                        _wait_if_paused(state, stop_ev)
+                        _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
                         wait_started = None
                         continue
                     a_live = float(state.audio_sec)
@@ -1117,13 +1442,13 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
 
             _maybe_emit_paused_hud()
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
                 tail_wall_anchor = None
             if stop_ev.is_set():
                 break
 
-            # Once audio finishes (EOF), keep video paced smoothly at 1x realtime instead of bursting
-            if int(state.audio_state) == 2:
+            # Once audio finishes (EOF) or in music_freerun mode, keep video paced smoothly at 1x realtime instead of bursting or chasing audio
+            if music_freerun or int(state.audio_state) == 2:
                 now_m = time.monotonic()
                 if tail_wall_anchor is None:
                     tail_wall_anchor = now_m
@@ -1136,7 +1461,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
 
             _maybe_emit_paused_hud()
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
                 tail_wall_anchor = None
             if stop_ev.is_set():
                 break
@@ -1147,7 +1472,7 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
             unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
             state.video_sec = max(0.0, item_pts - (unread_f * item_dur))
             state.video_hb_mono = time.monotonic()
-            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
+            state.skew_ms = 0 if music_freerun else int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
     except BrokenPipeError:
         stop_ev.set()
         with cond:
@@ -1159,10 +1484,10 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
         t_reader.join(timeout=0.5)
 
 
-def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_overlay=None):
+def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_overlay=None, music_freerun=False):
     is_timed, first_pkt, stream = _open_input_adapter(proc.stdout)
     if is_timed:
-        return _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=sub_overlay, dj_overlay=dj_overlay)
+        return _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, sub_overlay=sub_overlay, dj_overlay=dj_overlay, music_freerun=music_freerun)
     eff_fps = max(1.0, float(fps or 30))
     first_frame = _read_exact(stream, frame_bytes)
     has_full = len(first_frame) == frame_bytes
@@ -1211,16 +1536,28 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_over
     t_reader.start()
 
     try:
-        first_frame = _compose_frame(dj_overlay, sub_overlay, first_frame, 0.0)
-        _write_all(out, first_frame)
+        raw_last_frame = bytes(first_frame)
+        raw_last_sec = 0.0
+        first_out = _compose_frame(dj_overlay, sub_overlay, first_frame, 0.0)
+        _write_all(out, first_out)
         unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
         state.video_sec = max(0.0, (1.0 - unread_f) / eff_fps)
         state.video_hb_mono = time.monotonic()
 
+        def _emit_hold_frame():
+            if sub_overlay is not None and sub_overlay.has_active_vchud():
+                buf = sub_overlay.render_hud(raw_last_frame, raw_last_sec, mode='vchud')
+            else:
+                buf = _compose_frame(dj_overlay, sub_overlay, raw_last_frame, raw_last_sec)
+            _write_all(out, buf)
+
         catchup_skips = 0
+        wall_anchor = None
+        wall_pts_anchor = 0.0
         while not stop_ev.is_set():
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
+                wall_anchor = None
                 continue
             with cond:
                 while not dq and not eof_flag and not stop_ev.is_set():
@@ -1232,7 +1569,7 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_over
                 if not dq:
                     continue
                 item_sec, item_buf = dq.popleft()
-                if int(state.audio_state) == 1:
+                if (not music_freerun) and int(state.audio_state) == 1:
                     a_live = float(state.audio_sec)
                     if (a_live - item_sec) > VIDEO_CATCHUP_LAG_SEC:
                         while dq and (float(state.audio_sec) - item_sec) > VIDEO_TARGET_LAG_SEC:
@@ -1247,14 +1584,14 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_over
                 catchup_skips = 0
                 cond.notify_all()
 
-            # Bidirectional lead clamp: if audio stalled or lagged behind, hold video until audio catches up
+            # Bidirectional lead clamp: movies clamp video to audio; music free-runs at 1x wall-clock fps
             state.video_target_sec = item_sec
             wait_started = None
             try:
-                while not stop_ev.is_set() and int(state.audio_state) == 1:
+                while (not music_freerun) and not stop_ev.is_set() and int(state.audio_state) == 1:
                     if int(state.paused) == 1:
                         state.waiting_mask = int(state.waiting_mask) & ~2
-                        _wait_if_paused(state, stop_ev)
+                        _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
                         wait_started = None
                         continue
                     a_live = float(state.audio_sec)
@@ -1272,17 +1609,31 @@ def _run_video(proc, state, stop_ev, frame_bytes, fps, sub_overlay=None, dj_over
             finally:
                 state.waiting_mask = int(state.waiting_mask) & ~2
 
+            if music_freerun:
+                now_m = time.monotonic()
+                if wall_anchor is None:
+                    wall_anchor = now_m
+                    wall_pts_anchor = item_sec
+                else:
+                    target_wall = wall_anchor + max(0.0, item_sec - wall_pts_anchor)
+                    rem = target_wall - now_m
+                    if rem > 0.005:
+                        time.sleep(min(rem, 0.25))
+
             if int(state.paused) == 1:
-                _wait_if_paused(state, stop_ev)
+                _wait_if_paused(state, stop_ev, on_video_hold=_emit_hold_frame)
+                wall_anchor = None
             if stop_ev.is_set():
                 break
 
-            item_buf = _compose_frame(dj_overlay, sub_overlay, item_buf, max(0.0, item_sec - (1.0 / eff_fps)))
+            raw_last_frame = bytes(item_buf)
+            raw_last_sec = max(0.0, item_sec - (1.0 / eff_fps))
+            item_buf = _compose_frame(dj_overlay, sub_overlay, item_buf, raw_last_sec)
             _write_all(out, item_buf)
             unread_f = _pipe_unread_bytes(out_fd) / float(max(1, frame_bytes))
             state.video_sec = max(0.0, item_sec - (unread_f / eff_fps))
             state.video_hb_mono = time.monotonic()
-            state.skew_ms = int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
+            state.skew_ms = 0 if music_freerun else int(round((float(state.audio_sec) - float(state.video_sec)) * 1000.0))
     except BrokenPipeError:
         stop_ev.set()
         with cond:
@@ -1306,6 +1657,8 @@ def main():
     parser.add_argument('--height', type=int, default=0)
     parser.add_argument('--sub-config', default='')
     parser.add_argument('--dj-config', default='')
+    parser.add_argument('--music-freerun', action='store_true')
+    parser.add_argument('--audio-only', action='store_true')
     parser.add_argument('cmd', nargs=argparse.REMAINDER)
     args = parser.parse_args()
 
@@ -1349,6 +1702,9 @@ def main():
             close_fds=True,
         )
         if args.role == 'audio':
+            if args.audio_only:
+                state.video_state = 2
+                state.done_mask = int(state.done_mask) | 2
             if dj_cfg_path is not None and dj_cfg_path.is_file():
                 try:
                     voice_dir = str(Path(__file__).resolve().parent)
@@ -1375,7 +1731,7 @@ def main():
                 except Exception as err:
                     print(f'[av_sync] LiveSubSyncMonitor init skipped: {err}', file=sys.stderr)
                     sub_monitor = None
-            _run_audio(proc, state, stop_ev, args.sample_rate, args.channels, sub_monitor=sub_monitor, dj_analyzer=dj_analyzer)
+            _run_audio(proc, state, stop_ev, args.sample_rate, args.channels, sub_monitor=sub_monitor, dj_analyzer=dj_analyzer, tts_feeder=TtsAudioFeeder(args.sync_id, args.sample_rate, args.channels), music_freerun=bool(args.music_freerun))
         else:
             if args.frame_bytes <= 0:
                 sys.exit(2)
@@ -1396,8 +1752,8 @@ def main():
                 except Exception as err:
                     print(f'[av_sync] DjDeskOverlay init skipped: {err}', file=sys.stderr)
             if sub_cfg_path is not None and valid_geom:
-                sub_overlay = SubOverlay(sub_cfg_path, state, args.width, args.height, args.frame_bytes)
-            _run_video(proc, state, stop_ev, args.frame_bytes, args.fps, sub_overlay=sub_overlay, dj_overlay=dj_overlay)
+                sub_overlay = SubOverlay(sub_cfg_path, state, args.width, args.height, args.frame_bytes, sync_id=args.sync_id)
+            _run_video(proc, state, stop_ev, args.frame_bytes, args.fps, sub_overlay=sub_overlay, dj_overlay=dj_overlay, music_freerun=bool(args.music_freerun))
     finally:
         stop_ev.set()
         if sub_monitor is not None:
@@ -1441,11 +1797,16 @@ def main():
         except Exception:
             pass
         if should_unlink:
-            for p in (shm_path, sub_cfg_path or sub_config_path_for(args.sync_id), dj_cfg_path or dj_desk_config_path_for(args.sync_id), substatus_path_for(args.sync_id)):
+            for p in (shm_path, sub_cfg_path or sub_config_path_for(args.sync_id), dj_cfg_path or dj_desk_config_path_for(args.sync_id), substatus_path_for(args.sync_id), vchud_config_path_for(args.sync_id)):
                 try:
                     p.unlink(missing_ok=True)
                 except Exception:
                     pass
+            try:
+                import shutil
+                shutil.rmtree(tts_queue_dir_for(args.sync_id), ignore_errors=True)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

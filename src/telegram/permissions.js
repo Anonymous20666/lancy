@@ -84,6 +84,20 @@ export function getBotSuperAdminIds(settingsOrApp = null) {
 }
 
 /**
+ * True if the user is a Platform / Main Bot Owner (`general.ownerIds` or controller.isMainOwner).
+ * Distinguishes platform-wide owner from per-clone owners.
+ */
+export function isPlatformOwner(settingsOrApp, tgId, { controller = null } = {}) {
+  const uid = Number(tgId);
+  if (!Number.isSafeInteger(uid) || uid <= 0) return false;
+  if (typeof controller?.isMainOwner === 'function' && controller.isMainOwner(uid)) return true;
+  if (typeof controller?.isOwner === 'function' && !controller?.botContext?.isClone && controller.isOwner(uid)) {
+    return true;
+  }
+  return getBotOwnerIds(settingsOrApp).has(uid);
+}
+
+/**
  * True if the user is a Bot Owner (including clone owner if controller provided) or Team Super Admin.
  */
 export function isBotSuperAdmin(settingsOrApp, tgId, { controller = null } = {}) {
@@ -532,52 +546,176 @@ export async function verifyChannelAdmin({
   }
 }
 
+function isDefinitiveNegativeChatError(err) {
+  const msg = String(err?.description || err?.message || '').toLowerCase();
+  const code = Number(err?.error_code ?? err?.status ?? 0);
+  if (code === 400 || code === 403 || code === 404) {
+    return /chat not found|bot was kicked|not a member|forbidden|have no rights|channel_private|kicked|deactivated|chat_id is empty/.test(msg);
+  }
+  return false;
+}
+
+function isLedgerEntryFresh(entry, maxAgeMs = 120_000) {
+  if (!entry?.verified_at) return false;
+  const raw = String(entry.verified_at).trim();
+  const iso = raw.includes('T') ? raw : `${raw.replace(' ', 'T')}Z`;
+  const parsed = Date.parse(iso);
+  if (!Number.isFinite(parsed)) return false;
+  return (Date.now() - parsed) <= maxAgeMs;
+}
+
 /**
- * Verify that the ACTIVE bot (main or clone) is an administrator/creator of a Telegram channel
- * AND has permission to post messages (`can_post_messages !== false`).
- * Also rejects non-channel chats (`chat.type !== 'channel'`).
+ * Verify that the ACTIVE bot (main or clone) can post in a Telegram channel, group, or supergroup.
+ * - Channels (`chat.type === 'channel'`): bot must be creator or administrator with `can_post_messages !== false`.
+ * - Groups / Supergroups (`chat.type === 'group' | 'supergroup'`, when `allowGroups` is true):
+ *   bot must be present (not `left` / `kicked`) and able to send messages.
  */
-export async function verifyBotCanPostInChannel(api, chatOrInput) {
+export async function verifyBotCanPostInTarget(api, chatOrInput, { allowGroups = true, catchErrors = false } = {}) {
   if (!api?.getChat || !api?.getMe || !api?.getChatMember) {
-    return { ok: false, reason: 'missing_api', canPost: false };
+    return { ok: false, reason: 'missing_api', canPost: false, definitive: false };
   }
-  const chat = (chatOrInput && typeof chatOrInput === 'object' && chatOrInput.id)
-    ? chatOrInput
-    : await api.getChat(chatOrInput);
-  if (!chat?.id) {
-    return { ok: false, reason: 'chat_not_found', canPost: false };
+  let me = api.me;
+  try {
+    if (!me?.id) {
+      me = await api.getMe();
+      if (me?.id && !api.me) api.me = me;
+    }
+  } catch (err) {
+    if (!catchErrors) throw err;
+    return { ok: false, reason: 'bot_identity_unavailable', canPost: false, definitive: false };
   }
-  if (chat.type !== 'channel') {
-    return { ok: false, reason: 'not_a_channel', chat, canPost: false };
-  }
-  const me = api.me || await api.getMe();
   if (!me?.id) {
-    return { ok: false, reason: 'bot_identity_unavailable', chat, canPost: false };
+    return { ok: false, reason: 'bot_identity_unavailable', canPost: false, definitive: false };
   }
-  const member = await api.getChatMember(chat.id, me.id);
-  const isCreator = member?.status === 'creator';
-  const isAdmin = member?.status === 'administrator';
-  const canPost = Boolean(isCreator || (isAdmin && member?.can_post_messages !== false));
-  if (!isCreator && !isAdmin) {
+
+  let chat = null;
+  try {
+    chat = (chatOrInput && typeof chatOrInput === 'object' && chatOrInput.id)
+      ? chatOrInput
+      : await api.getChat(chatOrInput);
+  } catch (err) {
+    if (!catchErrors) throw err;
     return {
       ok: false,
-      reason: 'bot_not_admin',
+      reason: 'chat_not_found',
       botId: String(me.id),
       botUsername: me.username || null,
-      chat,
       isAdmin: false,
-      canPost: false
+      canPost: false,
+      definitive: isDefinitiveNegativeChatError(err)
     };
   }
-  if (!canPost) {
+
+  if (!chat?.id) {
+    return { ok: false, reason: 'chat_not_found', canPost: false, definitive: true };
+  }
+  const chatType = chat.type;
+  const isChannel = chatType === 'channel';
+  const isGroup = chatType === 'group' || chatType === 'supergroup';
+  if (!isChannel && !(allowGroups && isGroup)) {
     return {
       ok: false,
-      reason: 'missing_post_permission',
+      reason: 'not_a_channel',
       botId: String(me.id),
       botUsername: me.username || null,
       chat,
+      chatType,
+      isAdmin: false,
+      canPost: false,
+      definitive: true
+    };
+  }
+
+  let member = null;
+  try {
+    member = await api.getChatMember(chat.id, me.id);
+  } catch (err) {
+    if (!catchErrors) throw err;
+    return {
+      ok: false,
+      reason: isChannel ? 'bot_not_admin' : 'bot_not_in_chat',
+      botId: String(me.id),
+      botUsername: me.username || null,
+      chat,
+      chatType,
+      isAdmin: false,
+      canPost: false,
+      definitive: isDefinitiveNegativeChatError(err)
+    };
+  }
+
+  const status = member?.status;
+  const isCreator = status === 'creator';
+  const isAdmin = status === 'administrator';
+
+  if (isChannel) {
+    if (!isCreator && !isAdmin) {
+      return {
+        ok: false,
+        reason: 'bot_not_admin',
+        botId: String(me.id),
+        botUsername: me.username || null,
+        chat,
+        chatType,
+        isAdmin: false,
+        canPost: false,
+        definitive: true
+      };
+    }
+    const canPost = Boolean(isCreator || (isAdmin && member?.can_post_messages !== false));
+    if (!canPost) {
+      return {
+        ok: false,
+        reason: 'missing_post_permission',
+        botId: String(me.id),
+        botUsername: me.username || null,
+        chat,
+        chatType,
+        isAdmin: true,
+        canPost: false,
+        definitive: true
+      };
+    }
+    return {
+      ok: true,
+      reason: 'ok',
+      botId: String(me.id),
+      botUsername: me.username || null,
+      chat,
+      chatType,
       isAdmin: true,
-      canPost: false
+      canPost: true,
+      definitive: true
+    };
+  }
+
+  // Group / supergroup rules
+  if (status === 'left' || status === 'kicked' || !status) {
+    return {
+      ok: false,
+      reason: 'bot_not_in_chat',
+      botId: String(me.id),
+      botUsername: me.username || null,
+      chat,
+      chatType,
+      isAdmin: false,
+      canPost: false,
+      definitive: true
+    };
+  }
+  const restrictedCannotSend = status === 'restricted' && member?.can_send_messages === false;
+  const memberCannotSend = status === 'member' && chat?.permissions?.can_send_messages === false;
+  if (restrictedCannotSend || memberCannotSend) {
+    return {
+      ok: false,
+      reason: 'missing_send_permission',
+      botId: String(me.id),
+      botUsername: me.username || null,
+      chat,
+      chatType,
+      isAdmin: false,
+      canPost: false,
+      definitive: true
     };
   }
   return {
@@ -586,15 +724,26 @@ export async function verifyBotCanPostInChannel(api, chatOrInput) {
     botId: String(me.id),
     botUsername: me.username || null,
     chat,
-    isAdmin: true,
-    canPost: true
+    chatType,
+    isAdmin: isCreator || isAdmin,
+    canPost: true,
+    definitive: true
   };
 }
 
 /**
- * Return all known Telegram channels in `tg_channels` that `userId` is currently verified
- * to administer (any creator/administrator or Bot Super Admin), regardless of who originally added the bot.
- * Optionally attaches live/stored per-bot `botVerified` status when `db` + `api` are provided.
+ * Verify that the ACTIVE bot (main or clone) is an administrator/creator of a Telegram channel
+ * AND has permission to post messages (`can_post_messages !== false`).
+ * Also rejects non-channel chats (`chat.type !== 'channel'`).
+ */
+export async function verifyBotCanPostInChannel(api, chatOrInput) {
+  return verifyBotCanPostInTarget(api, chatOrInput, { allowGroups: false, catchErrors: false });
+}
+
+/**
+ * Return all known Telegram channels (and optionally groups/supergroups when `includeGroups: true`)
+ * where BOTH `userId` is authorized (creator/admin or Bot Super Admin) AND the active bot
+ * can actually post (`requireBotCanPost: true`, verified via cached ledger or live Telegram API).
  */
 export async function listVerifiedAdminChannels({
   db = null,
@@ -603,10 +752,17 @@ export async function listVerifiedAdminChannels({
   controller = null,
   userId = null,
   isSuperAdmin = null,
-  botId = null
+  botId = null,
+  includeGroups = false,
+  requireBotCanPost = true,
+  forceRefresh = false,
+  probeKnownGroups = false,
+  maxCacheAgeMs = 120_000
 } = {}) {
-  const allChannels = db?.getTelegramChannels?.() || [];
-  if (!allChannels.length) return [];
+  const uid = Number(userId);
+  const superAdmin = isSuperAdmin != null
+    ? Boolean(isSuperAdmin)
+    : isBotSuperAdmin(settings, uid, { controller });
 
   let resolvedBotId = botId ? String(botId) : (api?.me?.id ? String(api.me.id) : null);
   if (!resolvedBotId && api?.getMe) {
@@ -616,48 +772,280 @@ export async function listVerifiedAdminChannels({
       if (!api.me) api.me = me;
     }
   }
+
+  // Optionally probe existing known negative group chat IDs (from chat_settings / group_members)
+  // so group chats already using the bot appear seamlessly alongside channels.
+  if (includeGroups && probeKnownGroups && superAdmin && db?.getKnownGroupChatIds && api?.getChat && api?.getChatMember && resolvedBotId) {
+    const existingIds = new Set(
+      (db.getTelegramChannels?.(null, { includeGroups: true }) || []).map((r) => Number(r.channel_id))
+    );
+    const knownGroupIds = db.getKnownGroupChatIds().filter((cid) => !existingIds.has(Number(cid)));
+    const batch = knownGroupIds.slice(0, 25);
+    await Promise.all(
+      batch.map(async (gid) => {
+        const res = await verifyBotCanPostInTarget(api, gid, { allowGroups: true, catchErrors: true }).catch(() => null);
+        if (res?.ok && res.chat) {
+          db.recordTelegramChannel?.({
+            channel_id: res.chat.id,
+            title: res.chat.title || 'Telegram Group',
+            username: res.chat.username || null,
+            chat_type: res.chat.type || 'group',
+            can_post: 1,
+            added_by: uid > 0 ? uid : null
+          });
+          db.recordBotChannelVerification?.({
+            bot_id: res.botId || resolvedBotId,
+            channel_id: res.chat.id,
+            bot_username: res.botUsername || api?.me?.username || null,
+            is_admin: res.isAdmin ? 1 : 0,
+            can_post: 1
+          });
+        }
+      })
+    );
+  }
+
+  const allChannels = db?.getTelegramChannels?.(null, { includeGroups }) || [];
+  if (!allChannels.length) return [];
+
   const botLedger = new Map(
     (resolvedBotId && db?.getBotChannelVerifications ? db.getBotChannelVerifications(resolvedBotId) : [])
       .map((row) => [Number(row.channel_id), row])
   );
-  const attachBotStatus = (ch) => {
-    const entry = botLedger.get(Number(ch.channel_id));
-    if (!entry) return { ...ch, botVerified: resolvedBotId ? null : undefined };
+
+  const attachBotStatus = (ch, overrideEntry = null) => {
+    const entry = overrideEntry || botLedger.get(Number(ch.channel_id));
+    if (!entry) {
+      return {
+        ...ch,
+        chat_type: ch.chat_type || 'channel',
+        botVerified: resolvedBotId ? null : undefined,
+        botCanPost: ch.can_post !== 0
+      };
+    }
     return {
       ...ch,
-      botVerified: Boolean(entry.is_admin && entry.can_post),
+      chat_type: ch.chat_type || 'channel',
+      botVerified: Boolean(entry.can_post),
       botCanPost: Boolean(entry.can_post),
+      botIsAdmin: Boolean(entry.is_admin),
       botUsername: entry.bot_username || api?.me?.username || null
     };
   };
 
-  const uid = Number(userId);
-  const superAdmin = isSuperAdmin != null
-    ? Boolean(isSuperAdmin)
-    : isBotSuperAdmin(settings, uid, { controller });
-  if (superAdmin) return allChannels.map(attachBotStatus);
+  const canVerifyBotLive = Boolean(api?.getChat && api?.getChatMember && resolvedBotId);
+  const adminIds = getBotAdminIds(settings);
+  const isOwnerFn = controller ? (id) => controller.isOwner(id) : null;
+
+  const verifyTargetForBot = async (ch) => {
+    let entry = botLedger.get(Number(ch.channel_id)) || null;
+    const ledgerFresh = entry && isLedgerEntryFresh(entry, maxCacheAgeMs);
+
+    if (requireBotCanPost) {
+      // Offline negative cache still excludes known-unpostable targets unless forcing refresh
+      if (!forceRefresh && entry && Number(entry.can_post) === 0) {
+        return null;
+      }
+      if (!forceRefresh && Number(ch.can_post) === 0 && !entry) {
+        return null;
+      }
+      if (canVerifyBotLive && (forceRefresh || !ledgerFresh || Number(ch.can_post) === 0)) {
+        const check = await verifyBotCanPostInTarget(api, ch.channel_id, {
+          allowGroups: includeGroups,
+          catchErrors: true
+        }).catch(() => ({ ok: false, definitive: false }));
+
+        if (check?.definitive) {
+          const nextEntry = {
+            bot_id: check.botId || resolvedBotId,
+            channel_id: ch.channel_id,
+            bot_username: check.botUsername || api?.me?.username || null,
+            is_admin: check.isAdmin ? 1 : 0,
+            can_post: check.canPost ? 1 : 0,
+            verified_at: new Date().toISOString()
+          };
+          botLedger.set(Number(ch.channel_id), nextEntry);
+          db?.recordBotChannelVerification?.(nextEntry);
+          if (check.chat) {
+            db?.recordTelegramChannel?.({
+              channel_id: check.chat.id,
+              title: check.chat.title || ch.title,
+              username: check.chat.username || ch.username || null,
+              chat_type: check.chat.type || ch.chat_type || 'channel',
+              can_post: check.canPost ? 1 : 0,
+              added_by: ch.added_by || null
+            });
+            ch = {
+              ...ch,
+              title: check.chat.title || ch.title,
+              username: check.chat.username ?? ch.username,
+              chat_type: check.chat.type || ch.chat_type || 'channel'
+            };
+          } else if (!check.canPost) {
+            db?.markBotChannelUnavailable?.(resolvedBotId, ch.channel_id, { bot_username: api?.me?.username || null });
+          }
+          entry = nextEntry;
+          if (!check.ok) return null;
+        } else if (entry && Number(entry.can_post) === 0) {
+          return null;
+        }
+      }
+    }
+
+    return attachBotStatus(ch, entry);
+  };
+
+  if (superAdmin) {
+    const checked = await Promise.all(allChannels.map((ch) => verifyTargetForBot(ch)));
+    return checked.filter(Boolean);
+  }
 
   if (!Number.isSafeInteger(uid) || uid <= 0) return [];
   if (!api?.getChatMember) {
-    // Offline fallback only when no Telegram API client exists
-    return (db?.getTelegramChannels?.(uid) || []).map(attachBotStatus);
+    const fallback = (db?.getTelegramChannels?.(uid, { includeGroups }) || [])
+      .filter((ch) => !requireBotCanPost || Number(ch.can_post) !== 0);
+    return fallback.map((ch) => attachBotStatus(ch));
   }
 
-  const adminIds = getBotAdminIds(settings);
-  const isOwnerFn = controller ? (id) => controller.isOwner(id) : null;
   const checks = await Promise.all(
     allChannels.map(async (ch) => {
-      const ok = await verifyChannelAdmin({
+      const userOk = await verifyChannelAdmin({
         chatId: ch.channel_id,
         fromUser: { id: uid },
         api,
         isOwner: isOwnerFn,
         adminIds
       });
-      return ok ? attachBotStatus(ch) : null;
+      if (!userOk) return null;
+      return verifyTargetForBot(ch);
     })
   );
   return checks.filter(Boolean);
+}
+
+/**
+ * Discover and live-verify ALL Channels + Groups across the Main Bot and Cloned Bots
+ * accessible to `userId`.
+ * - Platform / Main Owner sees ALL clones + ALL verified channels & GCs across main & every clone.
+ * - Clone owners only see their own clone(s) and targets accessible via their clone(s).
+ */
+export async function listCrossBotVerifiedTargets({
+  db = null,
+  settings = null,
+  controller = null,
+  multiBotManager = null,
+  mainApi = null,
+  userId = null,
+  includeGroups = true,
+  forceRefresh = false,
+  probeKnownGroups = true
+} = {}) {
+  const uid = Number(userId);
+  const platformOwner = isPlatformOwner(settings, uid, { controller });
+  const superAdmin = isBotSuperAdmin(settings, uid, { controller });
+
+  const botEntries = [];
+  const mainBotId = mainApi?.me?.id ? String(mainApi.me.id) : (await mainApi?.getMe?.().catch(() => null))?.id;
+  if (mainApi && mainBotId) {
+    botEntries.push({
+      botId: String(mainBotId),
+      botUsername: mainApi.me?.username || mainApi.botUsername || 'MainBot',
+      botName: settings?.get?.('branding.botName') || 'Lancy',
+      isMain: true,
+      ownerTgId: null,
+      api: mainApi,
+      status: 'active'
+    });
+  }
+
+  const cloneRecords = platformOwner
+    ? (multiBotManager?.getAllBots?.() || [])
+    : (multiBotManager?.getBotsForOwner?.(uid) || []);
+
+  for (const rec of cloneRecords) {
+    const running = multiBotManager?.runningBots?.get?.(rec.id);
+    const cloneApi = running?.api || null;
+    let cloneTgId = cloneApi?.me?.id ? String(cloneApi.me.id) : null;
+    if (!cloneTgId && cloneApi?.getMe) {
+      const me = await cloneApi.getMe().catch(() => null);
+      if (me?.id) {
+        cloneTgId = String(me.id);
+        if (!cloneApi.me) cloneApi.me = me;
+      }
+    }
+    const resolvedId = cloneTgId || `clone_${rec.id}`;
+    botEntries.push({
+      botId: resolvedId,
+      cloneRowId: rec.id,
+      botUsername: rec.bot_username || cloneApi?.me?.username || `clone_${rec.id}`,
+      botName: rec.bot_name || rec.bot_username || 'Clone Bot',
+      isMain: false,
+      ownerTgId: Number(rec.owner_tg_id),
+      api: cloneApi,
+      controller: running?.controller || null,
+      status: rec.status || 'inactive'
+    });
+  }
+
+  const mergedTargets = new Map();
+  await Promise.all(
+    botEntries.map(async (bot) => {
+      if (!bot.api) return;
+      const canUseAllOnBot = platformOwner || (bot.isMain && superAdmin) || (!bot.isMain && Number(bot.ownerTgId) === uid);
+      const verified = await listVerifiedAdminChannels({
+        db,
+        api: bot.api,
+        settings,
+        controller: bot.controller || controller,
+        userId: uid,
+        isSuperAdmin: canUseAllOnBot,
+        botId: bot.botId,
+        includeGroups,
+        requireBotCanPost: true,
+        forceRefresh,
+        probeKnownGroups
+      });
+
+      for (const target of verified) {
+        const cid = Number(target.channel_id);
+        let agg = mergedTargets.get(cid);
+        if (!agg) {
+          agg = {
+            ...target,
+            chat_type: target.chat_type || 'channel',
+            verifiedBots: []
+          };
+          mergedTargets.set(cid, agg);
+        } else {
+          if (target.title && target.title !== 'Untitled Channel') agg.title = target.title;
+          if (target.username) agg.username = target.username;
+          if (target.chat_type && target.chat_type !== 'channel') agg.chat_type = target.chat_type;
+        }
+        if (!agg.verifiedBots.some((b) => String(b.botId) === String(bot.botId))) {
+          agg.verifiedBots.push({
+            botId: bot.botId,
+            cloneRowId: bot.cloneRowId ?? null,
+            botUsername: bot.botUsername,
+            botName: bot.botName,
+            isMain: bot.isMain,
+            ownerTgId: bot.ownerTgId ?? null,
+            api: bot.api
+          });
+        }
+      }
+    })
+  );
+
+  // Also include clone-ledger entries in case a paused clone previously verified a channel/GC
+  // that no active bot currently sees (skipping paused bots so UI shows only currently sendable targets).
+  const targets = [...mergedTargets.values()].sort((a, b) => {
+    const typeScore = (t) => (t === 'channel' ? 0 : 1);
+    const diff = typeScore(a.chat_type) - typeScore(b.chat_type);
+    if (diff !== 0) return diff;
+    return String(a.title || '').localeCompare(String(b.title || ''));
+  });
+
+  return { bots: botEntries, targets };
 }
 
 /**

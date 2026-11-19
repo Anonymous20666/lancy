@@ -77,29 +77,32 @@ export class LancyAssistant {
       extra.link_preview_options = { is_disabled: false, prefer_large_media: true };
     }
 
+    let sent = null;
     if (typeof ctx.reply === 'function') {
       try {
-        return await ctx.reply(cleanText, extra);
+        sent = await ctx.reply(cleanText, extra);
       } catch {
         try {
-          return await ctx.reply(cleanText, msgId ? { reply_to_message_id: msgId, allow_sending_without_reply: true } : {});
+          sent = await ctx.reply(cleanText, msgId ? { reply_to_message_id: msgId, allow_sending_without_reply: true } : {});
         } catch {
-          return await ctx.reply(cleanText);
+          sent = await ctx.reply(cleanText);
         }
       }
-    }
-
-    if (api) {
+    } else if (api) {
       try {
-        return await api.sendMessage(chatId, cleanText, extra);
+        sent = await api.sendMessage(chatId, cleanText, extra);
       } catch {
         try {
-          return await api.sendMessage(chatId, cleanText, msgId ? { reply_to_message_id: msgId, allow_sending_without_reply: true } : {});
+          sent = await api.sendMessage(chatId, cleanText, msgId ? { reply_to_message_id: msgId, allow_sending_without_reply: true } : {});
         } catch {
-          return await api.sendMessage(chatId, cleanText);
+          sent = await api.sendMessage(chatId, cleanText);
         }
       }
     }
+    if (sent?.message_id) {
+      (this.app?.telegram || ctx.controller)?.markAiMessage?.(chatId, sent.message_id);
+    }
+    return sent;
   }
 
   #getScreen(ctx, name) {
@@ -158,7 +161,7 @@ export class LancyAssistant {
     const id = String(payload.ctx?.tgId || payload.message?.from?.id || 'unknown');
     return this.turns.run(id, () => this.#handleMessage(payload));
   }
-  async #handleMessage({ ctx, message, text }) {
+  async #handleMessage({ ctx, message, text, images = null, voiceMode = false }) {
     if (message && !ctx.message) {
       ctx.message = message;
     }
@@ -201,7 +204,9 @@ export class LancyAssistant {
     }
 
     const rawText = String(text ?? message?.text ?? message?.caption ?? '').trim();
-    if (!rawText || /^[/.!][a-z][\w]*(?:@\w+)?(?:\s|$)/i.test(rawText)) return;
+    const hasImages = Boolean(Array.isArray(images) && images.length > 0);
+    if ((!rawText && !hasImages) || /^[/.!][a-z][\w]*(?:@\w+)?(?:\s|$)/i.test(rawText)) return;
+    const effectiveRawText = rawText || 'Please look at this image/screenshot and respond helpfully.';
 
     const botName = ctx.botName || ctx.bot?.botName || this.app?.telegram?.botName || 'Lancy';
     const cleanBotName = String(botName).replace(/[^\p{L}\p{N}_]/gu, ' ').trim();
@@ -220,7 +225,7 @@ export class LancyAssistant {
     const botUsername = (ctx.botUsername || ctx.bot?.botUsername || this.app?.telegram?.botUsername || 'Lancy_easy_bot').replace(/^@/, '');
 
     // Strip bot @username mentions anywhere in the text
-    let cleanText = rawText.replace(new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '').trim();
+    let cleanText = effectiveRawText.replace(new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '').trim();
 
     // Remove leading salutation if present (e.g., "hey lancy, ", "lancy ", "rina ", "hey rina, ")
     const nameRegex = new RegExp(
@@ -235,71 +240,73 @@ export class LancyAssistant {
       'i'
     );
     cleanText = cleanText.replace(trailingNameRegex, '').trim();
-    if (!cleanText) cleanText = rawText;
+    if (!cleanText) cleanText = effectiveRawText;
 
-    // In Group Chat (GC): general AI triggers are turned off.
-    // ONLY trigger allowed in GC: quoting her message with a "play" command (play music only).
+    // In Group Chat (GC): general AI triggers stay OFF by default unless /vcai group on is enabled.
+    // Literal "play <song>" reply to bot is ALWAYS allowed.
     const isChannel = Boolean(ctx.isChannel || ctx.message?.chat?.type === 'channel');
     const isGroup = !isChannel && Boolean(ctx.isGroup || ctx.message?.chat?.type === 'group' || ctx.message?.chat?.type === 'supergroup' || (chatId && Number(chatId) < 0));
     const replyMsg = message?.reply_to_message;
     const quotedText = replyMsg?.text || replyMsg?.caption || '';
 
-    // Defense in depth: no group LLM/tool routing. Only a literal play request
-    // replying to THIS bot may enter the canonical /play download workflow.
     if (isGroup) {
       const identity = ctx.api?.me || this.app?.telegram?.api?.me;
       const from = replyMsg?.from;
       const replyIsThisBot = Boolean(from && ((identity?.id && Number(from.id) === Number(identity.id)) || (from.username && from.username.toLowerCase() === botUsername.toLowerCase())));
-      if (!replyIsThisBot || !/^play(?:\s|$)/i.test(rawText)) return;
-      const query = rawText.replace(/^play\s*/i, '').trim();
-      const music = this.#getScreen(ctx, 'music');
-      if (music?.search) return music.search(ctx, query, 'download');
-      // Compatibility for installations without the music composition root.
-      const downloader = this.#getScreen(ctx, 'downloader');
-      return downloader?.executeDownload?.(ctx, query);
+      if (replyIsThisBot && /^play(?:\s|$)/i.test(effectiveRawText)) {
+        const query = effectiveRawText.replace(/^play\s*/i, '').trim();
+        const music = this.#getScreen(ctx, 'music');
+        if (music?.search) return music.search(ctx, query, 'download');
+        const downloader = this.#getScreen(ctx, 'downloader');
+        return downloader?.executeDownload?.(ctx, query);
+      }
+      if (!this.app?.lancyAgent?.isGroupAiEnabled?.(chatId) && !voiceMode) return;
     }
-    if (/^[/.!][a-z][\w]*(?:@\w+)?(?:\s|$)/i.test(rawText)) return;
+    if (!isChannel && replyMsg && ctx.isNonAiReply && !ctx.isTag) return;
+    if (/^[/.!][a-z][\w]*(?:@\w+)?(?:\s|$)/i.test(effectiveRawText)) return;
 
     // 1. Record user turn
-    this.saveMessage(userId, 'user', rawText);
+    this.saveMessage(userId, 'user', cleanText);
 
-    if (this.app.music && !isChannel && /^(?:play|stream|music|song|download song)\s+/i.test(cleanText)) {
+    if (!hasImages && !voiceMode && this.app.music && !isChannel && !isGroup && /^(?:play|stream|music|song|download song)\s+/i.test(cleanText)) {
       return this.#getScreen(ctx, 'music')?.search(ctx, cleanText.replace(/^(?:play|stream|music|song|download song)\s+/i, ''), 'download');
     }
     // Send live indicator
     const api = ctx.api ?? this.app?.telegram?.api;
-    const indicator = new ActionIndicator(api, chatId, 'typing');
+    const indicator = new ActionIndicator(api, chatId, voiceMode ? 'record_voice' : 'typing');
     indicator.start();
 
     try {
-      // Check for Direct Menu / Screen Intent ("open my menu", "open stickers", "open whatsapp", "dashboard", "cancel")
-      if (this.#isMenuIntent(cleanText)) {
-        const handled = await this.#handleMenu(ctx, userId, cleanText);
-        if (handled) return;
-      }
+      if (!hasImages) {
+        // Check for Direct Menu / Screen Intent ("open my menu", "open stickers", "open whatsapp", "dashboard", "cancel")
+        if (this.#isMenuIntent(cleanText)) {
+          const handled = await this.#handleMenu(ctx, userId, cleanText);
+          if (handled) return;
+        }
 
-      // 2. Check for Drop Navigation ("next", "show more", "i don't like this one")
-      if (this.#isNavigationIntent(cleanText)) {
-        const handled = await this.#handleNavigation(ctx, userId);
-        if (handled) return;
-      }
+        // 2. Check for Drop Navigation ("next", "show more", "i don't like this one")
+        if (this.#isNavigationIntent(cleanText)) {
+          const handled = await this.#handleNavigation(ctx, userId);
+          if (handled) return;
+        }
 
-      // 3. Check for WhatsApp Publishing ("post this on wa", "publish to channel")
-      if (this.#isPublishIntent(cleanText)) {
-        const handled = await this.#handlePublish(ctx, userId);
-        if (handled) return;
-      }
+        // 3. Check for WhatsApp Publishing ("post this on wa", "publish to channel")
+        if (this.#isPublishIntent(cleanText)) {
+          const handled = await this.#handlePublish(ctx, userId);
+          if (handled) return;
+        }
 
-      // 4. Check for Scheduling ("post random aura farming stickers twice per day for 30 days")
-      if (this.#isScheduleIntent(cleanText)) {
-        const handled = await this.#handleSchedule(ctx, userId, cleanText);
-        if (handled) return;
-      }
+        // 4. Check for Scheduling ("post random aura farming stickers twice per day for 30 days")
+        if (this.#isScheduleIntent(cleanText)) {
+          const handled = await this.#handleSchedule(ctx, userId, cleanText);
+          if (handled) return;
+        }
 
-      // 5. Check for 18+ / Adult / NSFW Search & Studio Intent ("search nsfw", "nsfw video random", "hentai tifa")
-      if (this.#isNsfwIntent(cleanText)) {
-        const handled = await this.#handleNsfw(ctx, userId, cleanText);
-        if (handled) return;
+        // 5. Check for 18+ / Adult / NSFW Search & Studio Intent ("search nsfw", "nsfw video random", "hentai tifa")
+        if (this.#isNsfwIntent(cleanText)) {
+          const handled = await this.#handleNsfw(ctx, userId, cleanText);
+          if (handled) return;
+        }
       }
 
       // 6. Check for Direct Music Capability Inquiry ("I need a song not url can u download")
@@ -393,8 +400,8 @@ export class LancyAssistant {
         }
       }
 
-      // 7. Conversational response with memory, bot self-knowledge, anti-refusal persona, and tool action parsing
-      await this.#handleChat(ctx, userId, cleanText, quotedText);
+      // 7. Conversational response with memory, bot self-knowledge, vision, voice-note, and unified 16-tool agent
+      await this.#handleChat(ctx, userId, cleanText, quotedText, { images, isGroup, chatId, voiceMode });
     } finally {
       indicator.stop();
     }
@@ -912,7 +919,9 @@ export class LancyAssistant {
 
   // ── Conversational Chat & Prompt Architecture ─────────────────────────────
 
-  async #handleChat(ctx, userId, cleanText, quotedText = '') {
+  async #handleChat(ctx, userId, cleanText, quotedText = '', { images = null, isGroup = false, chatId = 0, voiceMode = false } = {}) {
+    const targetChatId = Number(chatId || ctx?.chatId || userId);
+    const hasImages = Boolean(Array.isArray(images) && images.length > 0);
     const rawHistory = this.getHistory(userId, 10);
     // Filter out the current user message so history isn't duplicated in multi-turn
     const history = rawHistory.filter((h, idx, arr) => {
@@ -930,6 +939,59 @@ export class LancyAssistant {
     let quoteContext = '';
     if (quoteStr) {
       quoteContext = `\n[Context: The user is quoting this previous message from ${quotedFrom || 'Lancy'}: "${quoteStr.slice(0, 200)}"]\n`;
+    }
+
+    // Unified LancyAgent conversational path (16 native tools, 3-scope memory, vision, citations)
+    if (typeof this.app?.lancyAgent?.handleBotTurn === 'function') {
+      const draftId = (!isGroup && targetChatId > 0) ? ((Date.now() % 2000000000) || 1) : null;
+      const api = ctx.api ?? this.app?.telegram?.api;
+      if (draftId && typeof api?.sendMessageDraft === 'function') {
+        void api.sendMessageDraft(targetChatId, draftId, hasImages ? '👀 Checking that image...' : '✨ Thinking...').catch(() => {});
+      }
+      try {
+        const promptText = quoteStr
+          ? `[Replying to ${quotedFrom || 'Lancy'}: "${quoteStr.slice(0, 220)}"]\n${cleanText}`
+          : cleanText;
+        const turnRes = await this.app.lancyAgent.handleBotTurn(ctx, promptText, {
+          mode: isGroup ? 'dj' : 'companion',
+          images: hasImages ? images : null,
+          surface: isGroup ? 'group_text' : 'dm_text',
+          includeUserPrivate: !isGroup && targetChatId > 0
+        });
+        if (turnRes?.reply) {
+          this.saveMessage(userId, 'assistant', turnRes.reply);
+          if (voiceMode && typeof api?.sendVoice === 'function' && typeof this.app?.voiceClient?.synthesizeVoiceNote === 'function') {
+            const ttsVoice = turnRes?.persona?.edgeTtsVoice || this.db?.getSetting?.(`voiceai.voice.${targetChatId}`, null) || undefined;
+            const oggBuf = await this.app.voiceClient.synthesizeVoiceNote(turnRes.reply, { voice: ttsVoice }).catch(() => null);
+            if (oggBuf && oggBuf.length > 0) {
+              await api.sendVoice(targetChatId, oggBuf, {
+                filename: `${turnRes?.persona?.id || 'pappy'}_reply.ogg`,
+                ...(ctx.message?.message_id ? { reply_to_message_id: ctx.message.message_id } : {})
+              }).catch(async () => {
+                await this.#reply(ctx, turnRes.reply);
+              });
+              if (turnRes.executed?.length > 0 && turnRes.card && typeof ctx.sendRichMessage === 'function') {
+                await ctx.sendRichMessage(turnRes.card, {
+                  ...(isGroup && ctx.message?.message_id ? { reply_to_message_id: ctx.message.message_id } : {})
+                }).catch(() => {});
+              }
+              return;
+            }
+          }
+          if (turnRes.executed?.length > 0 && turnRes.card && typeof ctx.sendRichMessage === 'function') {
+            await ctx.sendRichMessage(turnRes.card, {
+              ...(isGroup && ctx.message?.message_id ? { reply_to_message_id: ctx.message.message_id } : {})
+            }).catch(async () => {
+              await this.#reply(ctx, turnRes.reply);
+            });
+          } else {
+            await this.#reply(ctx, turnRes.reply);
+          }
+          return;
+        }
+      } catch (err) {
+        this.log?.warn?.({ err: err?.message }, 'lancyAgent.handleBotTurn failed in assistant; falling back');
+      }
     }
 
     // Check if web browsing research or live music charts would elevate the response

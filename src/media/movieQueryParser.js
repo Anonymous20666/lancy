@@ -38,6 +38,49 @@ export function lookupMovieCategory(raw) {
 }
 
 /**
+ * Extracts explicit season/episode markers (e.g. "S02E02", "S2 E2", "Season 2 Episode 2", "Ep 5")
+ * and returns `{ title, season, episode }`.
+ */
+export function extractSeasonEpisodeHint(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return { title: '', season: null, episode: null };
+  let season = null;
+  let episode = null;
+
+  const seMatch = s.match(/(?:^|\s)[[(]?\bS(\d{1,2})[\s._-]*E(?:P)?(\d{1,3})\b[\])]?(?=\s|$)/i);
+  if (seMatch) {
+    season = Number(seMatch[1]);
+    episode = Number(seMatch[2]);
+    s = s.replace(seMatch[0], ' ');
+  } else {
+    const longSeMatch = s.match(/\bseason[\s:-]*(\d{1,2})[\s,:-]*(?:episode|ep)[\s:-]*(\d{1,3})\b/i);
+    if (longSeMatch) {
+      season = Number(longSeMatch[1]);
+      episode = Number(longSeMatch[2]);
+      s = s.replace(longSeMatch[0], ' ');
+    } else {
+      const seasonOnly = s.match(/\bseason[\s:-]*(\d{1,2})\b/i);
+      const epOnly = s.match(/\b(?:episode|ep)[\s.:#-]*(\d{1,3})\b/i);
+      if (seasonOnly) {
+        season = Number(seasonOnly[1]);
+        s = s.replace(seasonOnly[0], ' ');
+      }
+      if (epOnly) {
+        episode = Number(epOnly[1]);
+        s = s.replace(epOnly[0], ' ');
+      }
+    }
+  }
+
+  const cleanTitle = s.replace(/\s+/g, ' ').replace(/^[\s:,-]+|[\s:,-]+$/g, '').trim();
+  return {
+    title: cleanTitle || String(raw || '').trim(),
+    season: Number.isFinite(season) && season >= 0 ? season : null,
+    episode: Number.isFinite(episode) && episode >= 1 ? episode : null
+  };
+}
+
+/**
  * Normalizes conversational movie prompts ("give me Romance movies", "me Romance movies")
  * into either a structured genre/category browse intent or a clean title search string.
  */
@@ -87,5 +130,15 @@ export function parseMovieSearchIntent(raw) {
     };
   }
 
-  return { kind: 'search', query: cleaned };
+  const epHint = extractSeasonEpisodeHint(cleaned);
+  if ((epHint.season != null || epHint.episode != null) && epHint.title && epHint.title.length >= 2) {
+    return {
+      kind: 'search',
+      query: epHint.title,
+      season: epHint.season,
+      episode: epHint.episode
+    };
+  }
+
+  return { kind: 'search', query: cleaned, season: null, episode: null };
 }

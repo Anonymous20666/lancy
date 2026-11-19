@@ -104,11 +104,10 @@ export function createAutoPostScreen({ app }) {
     const sel = getSelection(tgId);
 
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 AUTO POST SCHEDULER 𓆩♡𓆪',
-      'step 1 of 5 — choose destination platform ♡'
-    ])));
-    b.divider();
+      'step 1 of 5 — choose destination platform'
+    ], { size: 1 });
     b.paragraph(rt.italic('Schedule automated sticker drops across your channels! Pick where to post:'));
 
     const isTg = sel.platform === 'telegram';

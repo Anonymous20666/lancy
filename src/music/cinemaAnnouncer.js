@@ -1,6 +1,7 @@
 import { RichMessageBuilder, rt, richButton, encodeCallback } from '../telegram/rich.js';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
+import { sendRichWithPhotoFallback } from './model.js';
 
 const DEFAULT_ANNOUNCE_COOLDOWN_MS = 6 * 60 * 60 * 1000; // 6 hours per (bot, group, baseTitle)
 const DM_PACING_MS = 40; // ~25 msgs/sec, well under Telegram's global 30 msgs/sec cap
@@ -275,7 +276,7 @@ export class CinemaVcAnnouncer {
   async #deliverRichDm(api, userId, richCard, fallbackText) {
     try {
       if (typeof api.sendRichMessage === 'function') {
-        await api.sendRichMessage(userId, richCard);
+        await sendRichWithPhotoFallback(api, userId, richCard);
         return { ok: true };
       }
       if (typeof api.sendMessage === 'function') {
@@ -289,7 +290,7 @@ export class CinemaVcAnnouncer {
         await sleep((retryAfter + 1) * 1000);
         try {
           if (typeof api.sendRichMessage === 'function') {
-            await api.sendRichMessage(userId, richCard);
+            await sendRichWithPhotoFallback(api, userId, richCard);
             return { ok: true };
           }
         } catch (retryErr) {

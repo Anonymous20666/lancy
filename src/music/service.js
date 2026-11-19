@@ -8,7 +8,7 @@ import { ChannelPanels } from './channelPanels.js';
 import { FullTrackPreviews, audioUpload, audioFileId } from './preview.js';
 import { originalPlayDelivery } from './originalPlayCard.js';
 import { isMusicOwner, isMusicSuperAdmin, resolveAppScreen, isSameMusicBot } from './accounts.js';
-import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback, extractRichPhotoUrl, extractSentPhotoFileId } from './model.js';
+import { KeyedLock, MusicError, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, didEditStripCustomEmojis, sendRichWithPhotoFallback, editOrSendRichWithFallback, extractRichPhotoUrl, extractSentPhotoFileId } from './model.js';
 import { checkChatMediaPermissions, isGroupSuperAdminMember, isAnonymousGroupAdmin } from '../telegram/permissions.js';
 import { ProgressTracker } from '../telegram/progress.js';
 import { RichMessageBuilder, rt } from '../telegram/rich.js';
@@ -133,6 +133,10 @@ export class MusicService {
       } else if(chat.invite_link){
         s.groupInviteLink=chat.invite_link;
       }
+    }
+    if (Number(ctx?.chatId) < 0 && !s.isChannel && ctx?.chatType !== 'channel' && ctx?.message?.chat?.type !== 'channel' && ctx?.query?.message?.chat?.type !== 'channel') {
+      if (ctx?.message?.message_id) s.replyAnchorMessageId = Number(ctx.message.message_id);
+      else if (!s.replyAnchorMessageId && ctx?.query?.message?.message_id) s.replyAnchorMessageId = Number(ctx.query.message.message_id);
     }
     if(s.callInviteLink&&/^https:\/\/t\.me\//i.test(s.callInviteLink)){
       s.vcUrl=s.callInviteLink;
@@ -610,9 +614,12 @@ export class MusicService {
         const lyrics=await Promise.resolve(this.lyrics?.get?.(media.track)).catch(()=>null);
         const uploaded=await audioUpload(media);
         const {rich,files}=await originalPlayDelivery({app:this.app,ctx,track:media.track,audio:uploaded.music_full_audio,lyrics,allowArtwork:permission?.canSendPhotos!==false});
-        const sent=s.messageId && s.messageId===ctx.messageId
-          ? await ctx.api.editMessageRich(ctx.chatId,s.messageId,rich,{},files)
-          : await ctx.api.sendRichMessage(ctx.chatId,rich,{},files);
+        const targetEditId = (s.messageId && s.messageId === ctx.messageId) ? s.messageId : null;
+        const delivered = await editOrSendRichWithFallback(ctx.api, ctx.chatId, targetEditId, rich, {}, files, {
+          deleteReplaced: true,
+          fallbackArtworkUrls: [media.track?.artwork, media.track?.thumbnailUrl].filter(Boolean)
+        });
+        const sent = delivered?.sent || null;
         this.previews.remember(ctx.api,media.track,audioFileId(sent));
         s.consumed=true; s.deliveryMessageId=sent?.message_id || s.messageId;listen.messageId=s.deliveryMessageId;
       } finally { media.release(); }
@@ -742,15 +749,34 @@ export class MusicService {
     const sendFreshPlayerCard = async () => {
       const oldMessageId = s.screenMessageId;
       const oldPlayerChatId = prevPlayerChatId || Number(ctx.chatId);
+      const isGroupTarget = Number(ctx.chatId) < 0 && !s.isChannel;
+      const replyAnchorId = isGroupTarget
+        ? (Number(ctx.message?.message_id || ctx.query?.message?.message_id || s.replyAnchorMessageId || oldMessageId || 0) || null)
+        : null;
+      if (replyAnchorId) s.replyAnchorMessageId = replyAnchorId;
+      const sendExtra = replyAnchorId
+        ? { reply_parameters: { message_id: replyAnchorId, allow_sending_without_reply: true } }
+        : {};
       const screen = resolveAppScreen(this.app, 'music', { ctx, session: s });
       const rich = isCinemaDeck && typeof screen.renderCinemaPlayer === 'function' ? screen.renderCinemaPlayer(s) : screen.renderPlayer(s);
       const wantPhoto = hasRichPhotoPayload(rich);
       let sent = null;
       let sentHasPhoto = wantPhoto;
+      let usedFreshSend = false;
       if (ctx.reuseMessageId && Number(ctx.chatId) === Number(id) && typeof ctx.api.editMessageRich === 'function') {
         try {
           const edited = await ctx.api.editMessageRich(ctx.chatId, ctx.reuseMessageId, rich);
-          sent = edited?.message_id ? edited : { message_id: ctx.reuseMessageId };
+          const strippedByEdit = Boolean(
+            wantPhoto
+            && edited?.rich_message
+            && Array.isArray(edited.rich_message.blocks)
+            && !edited.rich_message.blocks.some((bl) => bl?.type === 'photo')
+            && !edited.photo
+          );
+          const strippedEmojis = isGroupTarget && didEditStripCustomEmojis(rich, edited);
+          if (!strippedByEdit && !strippedEmojis) {
+            sent = edited?.message_id ? edited : { message_id: ctx.reuseMessageId };
+          }
         } catch (editErr) {
           if (!wantPhoto || !isRemotePhotoError(editErr)) {
             // Fall through cleanly to sendRichMessage if message can't be edited in place
@@ -758,7 +784,8 @@ export class MusicService {
         }
       }
       if (!sent) {
-        const out = await sendRichWithPhotoFallback(ctx.api, ctx.chatId, rich);
+        usedFreshSend = true;
+        const out = await sendRichWithPhotoFallback(ctx.api, ctx.chatId, rich, sendExtra);
         sent = out.sent;
         sentHasPhoto = out.hasPhoto;
         if (sent?.message_id && ctx.reuseMessageId && sent.message_id !== ctx.reuseMessageId && typeof ctx.api.deleteMessage === 'function') {
@@ -786,17 +813,21 @@ export class MusicService {
       s.lastRender = JSON.stringify(rich);
       s.lastRenderHasPhoto = sentHasPhoto;
       s.editAfter = 0;
+      s._editStripsCustomEmoji = false;
+      s._editStripsCustomEmojiMsgId = null;
+      s._editStripsCustomEmojiTrackId = null;
+      s._customEmojiReanchoredMsgId = (usedFreshSend && replyAnchorId && sent?.message_id) ? sent.message_id : null;
       if (oldMessageId && oldMessageId !== sent.message_id && sameBot && typeof ctx.api?.deleteMessage === 'function') {
         await ctx.api.deleteMessage(oldPlayerChatId, oldMessageId).catch(() => {});
       }
       await qm.autoPinPlayerCard?.(id, sent.message_id, Number(ctx.chatId), ctx.api);
     };
+    const trackArt = s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop || s.currentTrack?.thumbnailUrl || s.currentTrack?.thumb || null;
     const needFreshForPhoto = Boolean(
       s.lastRenderHasPhoto === false
-      && isCinemaDeck
-      && (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop)
-      && s._photoUpgradeAttemptedUrl !== (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop)
-      && s._photoBlockedUrl !== (s.currentTrack?.artwork || s.currentTrack?.poster || s.currentTrack?.backdrop)
+      && trackArt
+      && s._photoUpgradeAttemptedUrl !== trackArt
+      && s._photoBlockedUrl !== trackArt
     );
     let created = Boolean(!s.screenMessageId || ctx.forceNew || !sameBot || needFreshForPhoto || (prevPlayerChatId && prevPlayerChatId !== Number(ctx.chatId)));
     if(created){
@@ -813,7 +844,7 @@ export class MusicService {
     return s;
   }
   async control(ctx,action,args=[]) {
-    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','bass','aidj','djdesk','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry'].includes(action))this.rate(ctx);
+    if(!['player','queue','qpage','playnow','mqueue','mqpage','mplaynow','switchdeck','lyrics','lypage','accounts','volume','setvol','options','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','bass','aidj','djdesk','seek','seekby','seekmenu','setseekstep','pause','resume','skip','previous','loop','shuffle','pin','retry','toggleguide'].includes(action))this.rate(ctx);
     const destination=this.destination(ctx);
     // Urgent Stop must reach the queue cancellation path even when an older
     // Skip/radio control is still waiting for source preparation. _control still
@@ -991,7 +1022,7 @@ export class MusicService {
   }
   async _control(ctx,action,args=[]) {
     this.bindQueuePollLifecycle();
-    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj','djdesk'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
+    if(!['player','pause','resume','skip','previous','stop','leave','setvol','seek','seekby','seekmenu','setseekstep','shuffle','loop','clear','remove','volume','accounts','queue','qpage','mqueue','mqpage','mplaynow','mremove','mclear','switchdeck','lyrics','lypage','bass','eq','streammode','vcquality','switchsource','audiolang','submode','subsync','subtrack','subcheck','vcmsg','voteskip','votequeue','voteset','setvotethresh','autopoll','launchpoll','downloadnow','downloadq','dlq','selectaccount','pin','options','preview','playnow','radio','rpage','rpick','rstart','roff','retry','catmenu','catpick','genresub','infinact','aidj','djdesk','toggleguide'].includes(action))throw new MusicError('STALE_PLAYER','That control is no longer supported. Open /player.');
     const isViewerVote=['voteskip','votequeue'].includes(action);
     const isDownloadAct=['downloadnow','downloadq','dlq'].includes(action);
     const allowDj=!['stop','leave','accounts','selectaccount','pin','voteset','setvotethresh','autopoll'].includes(action);
@@ -1322,6 +1353,21 @@ export class MusicService {
     }
     else if(action==='remove'){let entry=args[0];if(s.panelToken){const matches=s.upcoming.filter(t=>t.entryId.replaceAll('-','').slice(0,12)===entry);if(matches.length!==1)throw new MusicError('STALE_PLAYER','That queued recording is no longer available.');entry=matches[0].entryId;}qm.removeTrack(id,entry);}
     else if(action==='options'){s.view='options';}
+    else if(action==='toggleguide'){
+      const sub=String(args[0]||'').toLowerCase();
+      const curHidden=Boolean(this.app?.db?.getSetting?.(`music.hideGuide.${id}`,false));
+      const nextHidden=(sub==='hide'||sub==='off') ? true : ((sub==='show'||sub==='on') ? false : !curHidden);
+      this.app?.db?.setSetting?.(`music.hideGuide.${id}`,nextHidden);
+      s.guideHidden=nextHidden;
+      const qmSess=qm?.sessions?.get?.(id);
+      if(qmSess)qmSess.guideHidden=nextHidden;
+      s.lastNotice=nextHidden
+        ? '🙈 Guide hidden permanently for this chat (restore anytime via ⚙ Options or /vcguide show).'
+        : '📖 Voice Chat Guide is now shown on player cards.';
+      if(ctx.query?.id&&ctx.api?.answerCallbackQuery){
+        await ctx.api.answerCallbackQuery(ctx.query.id,{text:nextHidden?'🙈 Guide hidden permanently':'📖 Guide shown again'}).catch(()=>{});
+      }
+    }
     else if(action==='preview'){if(this.previews.pending.has(id))throw new MusicError('PREVIEW_BUSY','The full preview is already being prepared.');s.fullPreview=null;s.view='player';}
     else if(action==='volume'){
       s.view='volume';

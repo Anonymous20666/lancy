@@ -1,5 +1,5 @@
-import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
-import { banner, kvTable, statusDot } from '../ui.js';
+import { RichMessageBuilder, rt, block, richButton, encodeCallback } from '../rich.js';
+import { kvTable, statusDot } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { logger } from '../../core/logger.js';
 import { escapeHtml } from '../../media/lyrics.js';
@@ -10,20 +10,19 @@ export function createCloneScreen({ app }) {
 
   function renderWelcomeCard(ctx) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 BRING YOUR OWN BOT 𓆩♡𓆪',
-      'clone your own aesthetic bot in 60 seconds ♡'
-    ])));
-    b.divider();
+      'clone your own aesthetic bot in 60 seconds'
+    ], { size: 1 });
 
-    b.heading('୨୧ what is bot cloning?', 3);
-    b.quote(rt.concat(
-      rt.text('• 🌸 '), rt.bold('Custom Branding: '), rt.text('Your bot replaces "Lancy" everywhere with your chosen name!\n'),
-      rt.text('• 🎵 '), rt.bold('All Features Included: '), rt.text('High-speed music, universal downloader & Pinterest search.\n'),
-      rt.text('• 👥 '), rt.bold('Group Chats: '), rt.text('Add your bot to groups for music & media with member tagging.\n'),
-      rt.text('• 🌍 '), rt.bold('Multi-Language: '), rt.text('Supports 7 languages with custom audience tracking.\n'),
-      rt.text('• 📢 '), rt.bold('Broadcasts: '), rt.text('Send announcements directly to all users of your bot.')
-    ));
+    b.details('୨୧ What Is Included in Your Clone Bot', [
+      block.list([
+        rt.concat(rt.bold('🌸 Custom Branding — '), rt.text('Replaces "Lancy" with your own bot name & identity.')),
+        rt.concat(rt.bold('🎵 Cinema, Music & Downloader — '), rt.text('Full Voice Chat, HD downloads, Pinterest & games included.')),
+        rt.concat(rt.bold('📡 Channels, GCs & Broadcasts — '), rt.text('Knows its channels & groups and sends 10-slide rich broadcasts.')),
+        rt.concat(rt.bold('🌍 Multi-Language Audience — '), rt.text('7 built-in languages + Force-Join channel locks.'))
+      ])
+    ], true);
     b.divider();
 
     b.buttons([
@@ -37,11 +36,10 @@ export function createCloneScreen({ app }) {
 
   function renderBotsList(ctx, bots) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 YOUR CLONED BOTS 𓆩♡𓆪',
-      'manage your personal bot empire ♡'
-    ])));
-    b.divider();
+      'manage your personal bot empire'
+    ], { size: 1 });
 
     b.heading('୨୧ active bot instances', 3);
     const rows = bots.map((bot) => {
@@ -74,11 +72,10 @@ export function createCloneScreen({ app }) {
 
   function renderRmPicker(ctx, bots) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '🗑 REMOVE A CLONED BOT 🗑',
       'select which bot to delete ♡'
-    ])));
-    b.divider();
+    ], { size: 2 });
     b.quote(rt.concat(
       rt.bold('Choose which bot you want to remove:\n\n'),
       rt.text('Its polling process will stop immediately and its token will be removed.')
@@ -99,11 +96,10 @@ export function createCloneScreen({ app }) {
 
   function renderNamePrompt() {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 STEP 1: NAME YOUR BOT 𓆩♡𓆪',
       'choose your custom bot identity ♡'
-    ])));
-    b.divider();
+    ], { size: 2 });
     b.quote(rt.concat(
       rt.bold('🌸 What name would you like your bot to have?\n\n'),
       rt.text('Instead of "Lancy", this name will appear in greetings, banners, and delivery cards!\n'),
@@ -120,11 +116,10 @@ export function createCloneScreen({ app }) {
 
   function renderTokenPrompt(botName) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 STEP 2: GET BOT TOKEN 𓆩♡𓆪',
       `connect @BotFather for ${botName} ♡`
-    ])));
-    b.divider();
+    ], { size: 2 });
 
     b.heading('୨୧ follow these quick steps in @BotFather:', 3);
     b.quote(rt.concat(
@@ -158,11 +153,10 @@ export function createCloneScreen({ app }) {
     } catch {}
 
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       `𓆩♡𓆪 MANAGE @${botRecord.bot_username.toUpperCase()} 𓆩♡𓆪`,
-      `${botRecord.bot_name} control panel ♡`
-    ])));
-    b.divider();
+      `${botRecord.bot_name} control panel`
+    ], { size: 1 });
 
     b.table(kvTable([
       ['🏷 Bot Name', botRecord.bot_name],
@@ -176,12 +170,12 @@ export function createCloneScreen({ app }) {
     b.divider();
 
     if (!supportsInline) {
-      b.quote(rt.concat(
-        rt.bold('💡 Enable Live @bot Search in Chats:\n'),
-        rt.text('To allow users to type '), rt.code(`@${botRecord.bot_username}`),
-        rt.text(' anywhere for live music search, send '), rt.code('/setinline'),
-        rt.text(' to @BotFather and set placeholder to '), rt.code('Search music...')
-      ));
+      b.details('💡 How to Enable Live @bot Search', [
+        block.paragraph(rt.concat(
+          rt.text('Send '), rt.code('/setinline'), rt.text(' to @BotFather for '), rt.code(`@${botRecord.bot_username}`), rt.text(' and set placeholder: '), rt.code('Search music...')
+        )),
+        block.buttons([richButton.copy('📋 Copy /setinline', '/setinline')])
+      ], false);
       b.divider();
     }
 
@@ -209,10 +203,19 @@ export function createCloneScreen({ app }) {
     return b.toJSON();
   }
 
+  function canManageBot(ctx, botRecord) {
+    if (!botRecord) return false;
+    if (Number(botRecord.owner_tg_id) === Number(ctx.tgId)) return true;
+    const ownerIds = (app.settings?.get?.('general.ownerIds') ?? []).map(Number);
+    return ownerIds.includes(Number(ctx.tgId)) || Boolean(ctx.controller?.isMainOwner?.(ctx.tgId));
+  }
+
   return {
     id,
     async open(ctx) {
-      const bots = app.multiBotManager?.getBotsForOwner(ctx.tgId) ?? [];
+      const bots = app.multiBotManager?.getAccessibleBots?.(ctx.tgId, { controller: ctx.controller })
+        ?? app.multiBotManager?.getBotsForOwner(ctx.tgId)
+        ?? [];
       if (bots.length === 0) {
         return ctx.editScreen(renderWelcomeCard(ctx));
       }
@@ -232,12 +235,14 @@ export function createCloneScreen({ app }) {
         case 'manage': {
           const botId = Number(args[0]);
           const botRecord = app.multiBotManager?.getBotById(botId);
-          if (!botRecord) return this.open(ctx);
+          if (!canManageBot(ctx, botRecord)) return this.open(ctx);
           return ctx.editScreen(renderManageScreen(ctx, botRecord));
         }
 
         case 'pause': {
           const botId = Number(args[0]);
+          const botRecordCheck = app.multiBotManager?.getBotById(botId);
+          if (!canManageBot(ctx, botRecordCheck)) return this.open(ctx);
           await app.multiBotManager?.pauseBot(botId);
           const botRecord = app.multiBotManager?.getBotById(botId);
           return ctx.editScreen(renderManageScreen(ctx, botRecord));
@@ -245,13 +250,17 @@ export function createCloneScreen({ app }) {
 
         case 'resume': {
           const botId = Number(args[0]);
+          const botRecordCheck = app.multiBotManager?.getBotById(botId);
+          if (!canManageBot(ctx, botRecordCheck)) return this.open(ctx);
           await app.multiBotManager?.resumeBot(botId);
           const botRecord = app.multiBotManager?.getBotById(botId);
           return ctx.editScreen(renderManageScreen(ctx, botRecord));
         }
 
         case 'rm_picker': {
-          const bots = app.multiBotManager?.getBotsForOwner(ctx.tgId) ?? [];
+          const bots = app.multiBotManager?.getAccessibleBots?.(ctx.tgId, { controller: ctx.controller })
+            ?? app.multiBotManager?.getBotsForOwner(ctx.tgId)
+            ?? [];
           if (bots.length === 0) return this.open(ctx);
           if (bots.length === 1) return this.handle(ctx, 'delete_confirm', [bots[0].id]);
           if (ctx.fromMedia || ctx.forceNew) return ctx.replyRich(renderRmPicker(ctx, bots));
@@ -265,11 +274,10 @@ export function createCloneScreen({ app }) {
           if (!botRecord) return this.open(ctx);
 
           const b = new RichMessageBuilder();
-          b.paragraph(rt.bold(banner([
+          b.bannerHeader([
             '⚠️ CONFIRM DELETE BOT ⚠️',
             `delete @${botRecord.bot_username} permanently?`
-          ])));
-          b.divider();
+          ], { size: 2 });
           b.quote(rt.concat(
             rt.text('Are you sure you want to stop and delete '),
             rt.bold(`@${botRecord.bot_username}`),
@@ -302,20 +310,24 @@ export function createCloneScreen({ app }) {
         case 'broadcast': {
           const botId = Number(args[0]);
           const botRecord = app.multiBotManager?.getBotById(botId);
-          if (!botRecord) return this.open(ctx);
+          if (!canManageBot(ctx, botRecord)) return this.open(ctx);
+
+          const broadcastScreen = app.screens?.get?.('broadcast');
+          if (broadcastScreen?.handle) {
+            return broadcastScreen.handle(ctx, 'open_bot', [botId]);
+          }
 
           await ctx.sm?.transition(ctx.tgId, States.CLONE_BOT_BROADCAST_INPUT, {
             context: { botId, botUsername: botRecord.bot_username }
           });
 
           const b = new RichMessageBuilder();
-          b.paragraph(rt.bold(banner([
+          b.bannerHeader([
             '📢 BROADCAST TO BOT USERS',
             `sending message via @${botRecord.bot_username} ♡`
-          ])));
-          b.divider();
+          ], { size: 2 });
           b.quote(rt.concat(
-            rt.bold('👇 Type and send the announcement message you want to broadcast:\n\n'),
+            rt.bold('👇 Send text, photo, video, audio, document, sticker, or poll to broadcast:\n\n'),
             rt.text('It will be delivered to all active users who started your bot ♡')
           ));
           b.divider();
@@ -393,11 +405,10 @@ export function createCloneScreen({ app }) {
             }
 
             const b = new RichMessageBuilder();
-            b.paragraph(rt.bold(banner([
+            b.bannerHeader([
               '🎉 YOUR BOT IS NOW LIVE! 🎉',
               `@${botRecord.bot_username} is running ♡`
-            ])));
-            b.divider();
+            ], { size: 2 });
             b.quote(rt.concat(
               rt.text('✨ '), rt.bold('Congratulations!'), rt.text(' Your bot '), rt.bold(`@${botRecord.bot_username}`), rt.text(' has been successfully cloned and launched!\n\n'),
               rt.text('• 🏷 '), rt.bold('Brand Name: '), rt.text(`${botRecord.bot_name}\n`),
@@ -444,14 +455,16 @@ export function createCloneScreen({ app }) {
         }
       });
 
-      // 3. Broadcast input handler
+      // 3. Broadcast input handler (supports text, media, audio, stickers, docs, polls)
       sm.register(States.CLONE_BOT_BROADCAST_INPUT, {
         timeoutMs: 10 * 60 * 1000,
         async onMessage(ctx, message) {
-          const text = String(message.text || '').trim();
-          if (!text || text.startsWith('/cancel')) return false;
+          const rawText = String(message.text || '').trim();
+          if (rawText.startsWith('/cancel')) return false;
+          const hasContent = Boolean(rawText || message.caption || message.photo || message.video || message.animation || message.audio || message.voice || message.document || message.sticker || message.poll);
+          if (!hasContent) return false;
 
-          const api = app.telegram?.api;
+          const api = ctx.api || app.telegram?.api;
           const chatId = ctx.chatId || message.chat?.id;
 
           const botId = ctx.context?.botId || sm.context(ctx.tgId)?.botId;
@@ -464,7 +477,10 @@ export function createCloneScreen({ app }) {
           ).catch(() => null);
 
           try {
-            const res = await app.multiBotManager.broadcast(botId, ctx.tgId, text);
+            const payload = rawText && !message.photo && !message.video && !message.audio && !message.voice && !message.document && !message.animation && !message.sticker && !message.poll && !message.entities?.length
+              ? rawText
+              : message;
+            const res = await app.multiBotManager.broadcast(botId, ctx.tgId, payload, { sourceApi: api });
             await sm.reset(ctx.tgId, { reason: 'broadcast_done' });
 
             if (statusMsg?.message_id && typeof api?.deleteMessage === 'function') {
@@ -472,11 +488,10 @@ export function createCloneScreen({ app }) {
             }
 
             const b = new RichMessageBuilder();
-            b.paragraph(rt.bold(banner([
+            b.bannerHeader([
               '📢 BROADCAST COMPLETED',
               'messages delivered successfully ♡'
-            ])));
-            b.divider();
+            ], { size: 2 });
             b.table(kvTable([
               ['✅ Sent Successfully', `${res.sentCount} users`],
               ['✕ Failed / Blocked', `${res.failedCount} users`],

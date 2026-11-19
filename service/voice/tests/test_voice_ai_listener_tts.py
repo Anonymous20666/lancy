@@ -1,0 +1,273 @@
+import asyncio
+import ctypes
+from pathlib import Path
+import sys
+import tempfile
+import time
+import unittest
+from unittest.mock import AsyncMock, MagicMock
+import numpy as np
+
+VOICE_DIR = Path(__file__).resolve().parents[1]
+if str(VOICE_DIR) not in sys.path:
+    sys.path.insert(0, str(VOICE_DIR))
+
+import av_sync
+import main as bridge_main
+from stt_engine import normalize_nigerian_speech, TranscriptResult
+from tts_engine import sanitize_spoken_text, resolve_voice_name
+from voice_listener import VoiceListenerManager
+
+
+class VoiceAiListenerAndTtsTests(unittest.TestCase):
+    def test_nigerian_pidgin_and_phonetic_normalization(self):
+        norm1, wake1 = normalize_nigerian_speech('nancy listen lower d volume', active_session=False)
+        self.assertTrue(wake1)
+        self.assertIn('Lancy', norm1)
+        self.assertIn('the volume', norm1.lower())
+
+        norm2, _ = normalize_nigerian_speech('send dis video to the chat and move to next que', active_session=True)
+        self.assertIn('this video', norm2.lower())
+        self.assertIn('next queue', norm2.lower())
+
+        norm3, _ = normalize_nigerian_speech('abeg gi to d middle and pause am', active_session=True)
+        self.assertIn('go to the middle', norm3.lower())
+        self.assertIn('pause it', norm3.lower())
+
+        # Normal conversation saying unrelated word should not falsely wake without command
+        _, wake4 = normalize_nigerian_speech('i talked to nancy yesterday at work', active_session=False)
+        self.assertFalse(wake4)
+
+    def test_tts_sanitization_and_voice_aliases(self):
+        cleaned = sanitize_spoken_text('🎙️ **Volume** is now `60%`! See https://t.me/test ♡✨')
+        self.assertNotIn('https://', cleaned)
+        self.assertNotIn('**', cleaned)
+        self.assertIn('Volume is now 60%!', cleaned)
+        self.assertEqual(resolve_voice_name('ng_female'), 'en-NG-EzinneNeural')
+        self.assertEqual(resolve_voice_name('uk_female'), 'en-GB-SoniaNeural')
+
+    def test_avsync_tts_feeder_and_duck_mix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sync_id = f'test_tts_{int(time.time() * 1000)}'
+            qdir = av_sync.tts_queue_dir_for(sync_id)
+            qdir.mkdir(parents=True, exist_ok=True)
+            try:
+                tts_samples = np.full(1920, 12000, dtype='<i2').tobytes()  # 3840 bytes = 20ms stereo 48kHz
+                (qdir / '0001.pcm').write_bytes(tts_samples)
+                feeder = av_sync.TtsAudioFeeder(sync_id, sample_rate=48000, channels=2)
+                chunk, active = feeder.pop_chunk(3840)
+                self.assertTrue(active)
+                self.assertEqual(len(chunk), 3840)
+
+                media_pcm = np.full(1920, 10000, dtype='<i2').tobytes()
+                mixed = av_sync.mix_pcm_with_tts(media_pcm, chunk, duck_factor=0.2)
+                arr = np.frombuffer(mixed, dtype='<i2')
+                # 10000 * 0.2 + 12000 = 14000
+                self.assertEqual(int(arr[0]), 14000)
+            finally:
+                for p in qdir.glob('*'):
+                    p.unlink(missing_ok=True)
+                if qdir.exists():
+                    qdir.rmdir()
+
+    def test_voice_listener_ssrc_mapping_echo_guard_and_utterance(self):
+        async def run():
+            events = asyncio.Queue(maxsize=20)
+            engine = MagicMock()
+            engine.record = AsyncMock()
+            part_admin = MagicMock(user_id=501, source=11111)
+            part_viewer = MagicMock(user_id=999, source=22222)
+            engine.get_participants = AsyncMock(return_value=[part_admin, part_viewer])
+
+            bridge = MagicMock()
+            bridge.factory = None
+            bridge.events = events
+            bridge.calls = {-100123: {'vc_title': 'Inception'}}
+            bridge.accounts = {'main': {'uid': 777, 'engine': engine}}
+
+            stt = MagicMock()
+            # 1. Idle mic speech WITHOUT "Lancy listen" must be ignored completely
+            stt.transcribe = AsyncMock(return_value=TranscriptResult(
+                text='Lancy lower the volume to 50',
+                raw_text='Lancy lower the volume to 50',
+                confidence=0.92,
+                avg_logprob=-0.22,
+                no_speech_prob=0.05,
+                is_wake=True,
+                is_listen_command=False,
+                low_confidence=False,
+                duration_sec=1.2,
+            ))
+
+            listener = VoiceListenerManager(bridge=bridge, stt_engine=stt)
+            st = await listener.start_chat(-100123, 'main', enabled=True, authorized_user_ids=[501], enforce_auth=True)
+            await listener.refresh_participants(-100123, force=True)
+            self.assertEqual(st.ssrc_to_uid[11111], 501)
+
+            loud_pcm = np.full(7200, 4000, dtype='<i2').tobytes()
+            quiet_pcm = np.zeros(7200, dtype='<i2').tobytes()
+            f_loud = MagicMock(ssrc=11111, frame=loud_pcm, info=MagicMock(sample_rate=36000, channels=1))
+            f_unauth = MagicMock(ssrc=22222, frame=loud_pcm, info=MagicMock(sample_rate=36000, channels=1))
+            f_quiet = MagicMock(ssrc=11111, frame=quiet_pcm, info=MagicMock(sample_rate=36000, channels=1))
+
+            listener.handle_incoming_frames('main', -100123, [f_loud, f_loud, f_unauth])
+            self.assertNotIn(22222, st.buffers)  # unauthorized speaker ignored cleanly
+            st.buffers[11111].last_voice_mono = time.monotonic() - 1.0
+            listener.handle_incoming_frames('main', -100123, [f_quiet])
+            await asyncio.sleep(0.08)
+            self.assertTrue(events.empty())  # non-listen idle utterance ignored!
+
+            # 2. Explicit "Lancy listen" wakes idle mic cleanly
+            stt.transcribe = AsyncMock(return_value=TranscriptResult(
+                text='Lancy listen',
+                raw_text='Lancy listen',
+                confidence=0.94,
+                avg_logprob=-0.20,
+                no_speech_prob=0.04,
+                is_wake=True,
+                is_listen_command=True,
+                low_confidence=False,
+                duration_sec=0.9,
+            ))
+            listener.handle_incoming_frames('main', -100123, [f_loud, f_loud])
+            st.buffers[11111].last_voice_mono = time.monotonic() - 1.0
+            listener.handle_incoming_frames('main', -100123, [f_quiet])
+            await asyncio.sleep(0.08)
+            self.assertFalse(events.empty())
+            ev = events.get_nowait()
+            self.assertEqual(ev['type'], 'vc_voice_transcript')
+            self.assertEqual(ev['sender_id'], 501)
+            self.assertTrue(ev['is_listen_command'])
+
+            # 3. Echo guard blocks idle tail, whereas strong active-session speech triggers barge-in
+            listener.set_listening_window(-100123, active=False)
+            listener.set_echo_guard(-100123, 1.5)
+            listener.handle_incoming_frames('main', -100123, [f_loud])
+            self.assertFalse(st.buffers[11111].in_speech)
+
+            listener.set_listening_window(-100123, active=True, duration_sec=20.0, active_user_id=501)
+            listener.set_echo_guard(-100123, 2.0)
+            listener.handle_incoming_frames('main', -100123, [f_loud, f_loud, f_loud])
+            self.assertTrue(st.buffers[11111].in_speech)  # barge-in interrupted TTS echo guard cleanly
+            await listener.stop_all()
+
+        asyncio.run(run())
+
+    def test_bridge_speak_and_listen_endpoints(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as tmp:
+                bridge = bridge_main.Bridge(tmp, factory=lambda a, s: None)
+                sync_id = f'bridge_tts_{int(time.time() * 1000)}'
+                shm = av_sync.shm_path_for(sync_id)
+                fd, mm, st = av_sync._open_sync_state(shm)
+                try:
+                    st.paused = 0
+                    st.tts_hold = 0
+                    bridge.calls[-100555] = {
+                        'alias': 'main',
+                        'status': 'playing',
+                        'stream_mode': 'interactive',
+                        'av_sync_id': sync_id,
+                        'offset': 10.0,
+                        'last_known_position': 10.0,
+                    }
+                    bridge.accounts['main'] = {'alias': 'main', 'engine': None, 'client': None, 'uid': 99}
+                    bridge._call_elapsed_seconds = AsyncMock(return_value=12.0)
+
+                    # Mock TTS synthesis so test stays offline and fast
+                    bridge.tts.synthesize_pcm = AsyncMock(return_value=np.full(9600, 3000, dtype='<i2').tobytes())
+
+                    res_listen = await bridge.set_listen_state({
+                        'chat_id': -100555,
+                        'mode': 'start',
+                        'active': True,
+                        'pause_media': True,
+                        'active_user_id': 501,
+                    })
+                    self.assertTrue(res_listen['ok'])
+                    self.assertEqual(st.paused, 1)
+                    self.assertEqual(st.tts_hold, 1)
+                    self.assertEqual(bridge.calls[-100555]['status'], 'paused')
+
+                    res_speak = await bridge.speak_in_call({
+                        'chat_id': -100555,
+                        'text': 'Hi Pappy, you good?',
+                        'speaker_name': 'Pappy',
+                        'user_text': 'hey',
+                        'lancy_text': 'Hi Pappy, you good?',
+                        'hud_theme': 'neon_rose',
+                    })
+                    self.assertTrue(res_speak['ok'])
+                    self.assertEqual(res_speak['mode'], 'av_sync_mix')
+                    q_files = list(av_sync.tts_queue_dir_for(sync_id).glob('*.pcm'))
+                    self.assertEqual(len(q_files), 1)
+                    hud_path = av_sync.vchud_config_path_for(sync_id)
+                    self.assertTrue(hud_path.is_file())
+                    import json as _json
+                    hud_data = _json.loads(hud_path.read_text(encoding='utf-8'))
+                    self.assertEqual(hud_data['speaker_name'], 'Pappy')
+                    self.assertEqual(hud_data['user_text'], 'hey')
+                    self.assertEqual(hud_data['lancy_text'], 'Hi Pappy, you good?')
+
+                    # Verify ASS generator & clean dialogue-only HUD (user text + Lancy response only, no top clock/status banner)
+                    ass_bytes, chat_txt = av_sync._build_hud_ass_bytes(1280, 720, mode='vchud', pos_sec=42.0, vchud=hud_data)
+                    ass_str = ass_bytes.decode('utf-8')
+                    self.assertIn('Pappy:', ass_str)
+                    self.assertIn('Hi Pappy, you good?', ass_str)
+                    self.assertNotIn('HUDTop', ass_str)
+                    self.assertNotIn('LANCY SPEAKING', ass_str)
+                    self.assertNotIn('LANCY LISTENING', ass_str)
+
+                    res_done = await bridge.set_listen_state({
+                        'chat_id': -100555,
+                        'mode': 'stop',
+                        'active': False,
+                        'resume_media': True,
+                    })
+                    self.assertTrue(res_done['ok'])
+                    self.assertEqual(st.paused, 0)
+                    self.assertEqual(st.tts_hold, 0)
+                    self.assertEqual(bridge.calls[-100555]['status'], 'playing')
+                    self.assertFalse(hud_path.exists())
+                    await bridge.voice_listener.stop_all()
+                finally:
+                    del st
+                    mm.close()
+                    os.close(fd) if 'os' in globals() else None
+                    shm.unlink(missing_ok=True)
+                    for p in av_sync.tts_queue_dir_for(sync_id).glob('*'):
+                        p.unlink(missing_ok=True)
+                    if av_sync.tts_queue_dir_for(sync_id).exists():
+                        av_sync.tts_queue_dir_for(sync_id).rmdir()
+
+        import os
+        asyncio.run(run())
+
+    def test_music_freerun_flag_and_sync_monitor_bypass(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bridge = bridge_main.Bridge(tmpdir, factory=lambda _s, _m: None)
+            wrapped_a, wrapped_v = bridge_main.wrap_av_sync_pair(
+                'ffmpeg -i a.mp3 -f s16le pipe:1',
+                'ffmpeg -i bg.jpg -f rawvideo pipe:1',
+                frame_bytes=1280 * 720 * 3 // 2,
+                fps=20,
+                sync_id='music-freerun-test',
+                music_freerun=True,
+            )
+            self.assertIn('--music-freerun', wrapped_a)
+            self.assertIn('--music-freerun', wrapped_v)
+
+            call_music = {'status': 'playing', 'dj_desk': True, 'is_music': True, 'music_freerun': True}
+            m_out, reason = bridge._evaluate_call_sync(
+                -100999,
+                call_music,
+                metrics={'sync_health': 'drifted', 'skew_ms': -520, 'hb_age_sec': 0.1, 'sync_flags': 0, 'paused': False},
+            )
+            self.assertIsNone(reason)
+            self.assertEqual(m_out['sync_health'], 'locked')
+            self.assertEqual(m_out['skew_ms'], 0)
+            self.assertEqual(call_music['_sync_mon']['skew_streak'], 0)
+
+
+if __name__ == '__main__':
+    unittest.main()

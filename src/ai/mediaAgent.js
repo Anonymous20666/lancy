@@ -151,6 +151,20 @@ export class MediaAiAgent {
       return { reply, action: fastIntent, concluded: true };
     }
 
+    // Route deck control, send-video, relative seek, or general multi-tool dialogue to unified LancyAgent when available
+    if (!fastIntent && this.app?.lancyAgent && this.app?.ai?.chatWithTools && !this.app?.ai?._isMockGenerate) {
+      const botRes = await this.app.lancyAgent.handleBotTurn(ctx || { chatId, tgId: userId }, cleanText).catch(() => null);
+      if (botRes?.reply) {
+        const concluded = CONCLUDE_RE.test(cleanText);
+        if (concluded) this.clearHistory(chatId, userId);
+        else {
+          this.#pushHistory(chatId, userId, 'user', cleanText);
+          this.#pushHistory(chatId, userId, 'assistant', botRes.reply);
+        }
+        return { reply: botRes.reply, action: null, concluded, toolExecuted: botRes.executed };
+      }
+    }
+
     const qm = this.app?.musicQueueManager;
     const s = chatId ? qm?.sessions?.get(Number(chatId)) : null;
     const nowPlaying = s?.currentTrack ? `${s.currentTrack.title} (${s.currentTrack.mediaType === 'video' ? 'Video/Movie' : 'Audio'})` : 'Nothing playing right now';

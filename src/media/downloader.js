@@ -1535,7 +1535,15 @@ export class MediaDownloader {
         if (spMeta.thumbnail) {
           try {
             const imgRes = await fetch(spMeta.thumbnail, { signal: AbortSignal.timeout(10000) });
-            if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+            if (imgRes.ok) {
+              const rawCover = Buffer.from(await imgRes.arrayBuffer());
+              const meta = await sharp(rawCover, { failOn: 'none', animated: false }).metadata().catch(() => null);
+              if (meta?.width >= 8 && meta?.height >= 8) {
+                coverBuf = await sharp(rawCover, { failOn: 'none', animated: false })
+                  .rotate().resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
+                  .flatten({ background: '#0b1021' }).jpeg({ quality: 90 }).toBuffer().catch(() => rawCover);
+              }
+            }
           } catch {}
         }
       }
@@ -1571,7 +1579,15 @@ export class MediaDownloader {
           if (oembedData.title && title === 'Spotify Track') title = oembedData.title;
           if (oembedData.thumbnail_url && !coverBuf) {
             const imgRes = await fetch(oembedData.thumbnail_url, { signal: AbortSignal.timeout(10000) });
-            if (imgRes.ok) coverBuf = Buffer.from(await imgRes.arrayBuffer());
+            if (imgRes.ok) {
+              const rawCover = Buffer.from(await imgRes.arrayBuffer());
+              const meta = await sharp(rawCover, { failOn: 'none', animated: false }).metadata().catch(() => null);
+              if (meta?.width >= 8 && meta?.height >= 8) {
+                coverBuf = await sharp(rawCover, { failOn: 'none', animated: false })
+                  .rotate().resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
+                  .flatten({ background: '#0b1021' }).jpeg({ quality: 90 }).toBuffer().catch(() => rawCover);
+              }
+            }
           }
         }
       } catch {}
@@ -2376,13 +2392,30 @@ export class MediaDownloader {
       onProgress?.(`Downloading full audio track for "${trackTitle}"… ♡`);
 
       // Pre-fetch thumbnail in background while audio downloads
+      const normalizeThumb = async (rawThumb) => {
+        if (!rawThumb || rawThumb.length < 64) return null;
+        try {
+          const meta = await sharp(rawThumb, { failOn: 'none', animated: false }).metadata();
+          if (!meta?.width || !meta?.height || meta.width < 8 || meta.height < 8) return null;
+          return await sharp(rawThumb, { failOn: 'none', animated: false })
+            .rotate()
+            .resize(1280, 1280, { fit: 'inside', withoutEnlargement: true })
+            .flatten({ background: '#0b1021' })
+            .jpeg({ quality: 90 })
+            .toBuffer();
+        } catch {
+          return null;
+        }
+      };
+
       const coverPromise = (async () => {
         if (trackThumbnailUrl) {
           try {
             const imgRes = await fetch(trackThumbnailUrl, { signal: AbortSignal.timeout(8000) });
             if (imgRes.ok) {
               const rawThumb = Buffer.from(await imgRes.arrayBuffer());
-              return await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer().catch(() => rawThumb);
+              const norm = await normalizeThumb(rawThumb);
+              if (norm) return norm;
             }
           } catch {}
         }
@@ -2391,7 +2424,8 @@ export class MediaDownloader {
             const imgRes = await fetch(`https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`, { signal: AbortSignal.timeout(5000) });
             if (imgRes.ok) {
               const rawThumb = Buffer.from(await imgRes.arrayBuffer());
-              return await sharp(rawThumb).jpeg({ quality: 90 }).toBuffer().catch(() => rawThumb);
+              const norm = await normalizeThumb(rawThumb);
+              if (norm) return norm;
             }
           } catch {}
         }

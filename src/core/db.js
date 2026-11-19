@@ -129,6 +129,7 @@ export class Database {
           channel_id INTEGER NOT NULL UNIQUE,
           title TEXT NOT NULL,
           username TEXT,
+          chat_type TEXT NOT NULL DEFAULT 'channel',
           can_post INTEGER NOT NULL DEFAULT 1,
           added_by INTEGER,
           created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -202,6 +203,78 @@ export class Database {
         CREATE INDEX IF NOT EXISTS idx_pokemon_captures_user ON pokemon_captures(user_id, best_cp DESC);
         CREATE INDEX IF NOT EXISTS idx_pokemon_captures_chat ON pokemon_captures(chat_id);
       `);
+    } catch {}
+    try {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS user_taste_profiles (
+          user_id INTEGER NOT NULL,
+          chat_id INTEGER NOT NULL DEFAULT 0,
+          display_name TEXT,
+          favorite_artists_json TEXT NOT NULL DEFAULT '{}',
+          favorite_genres_json TEXT NOT NULL DEFAULT '{}',
+          favorite_movies_json TEXT NOT NULL DEFAULT '[]',
+          recent_requests_json TEXT NOT NULL DEFAULT '[]',
+          interaction_count INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          PRIMARY KEY (user_id, chat_id)
+        );
+      `);
+    } catch {}
+    try {
+      const aiCols = this.db.prepare('PRAGMA table_info(ai_conversations)').all();
+      if (!aiCols.some((c) => c.name === 'chat_id')) {
+        this.db.exec('ALTER TABLE ai_conversations ADD COLUMN chat_id INTEGER');
+      }
+      if (!aiCols.some((c) => c.name === 'surface')) {
+        this.db.exec("ALTER TABLE ai_conversations ADD COLUMN surface TEXT NOT NULL DEFAULT 'dm'");
+      }
+      if (!aiCols.some((c) => c.name === 'speaker_name')) {
+        this.db.exec('ALTER TABLE ai_conversations ADD COLUMN speaker_name TEXT');
+      }
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_ai_conversations_chat ON ai_conversations(chat_id, created_at);
+        CREATE TABLE IF NOT EXISTS ai_memories (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope TEXT NOT NULL,
+          scope_key TEXT NOT NULL,
+          user_id INTEGER,
+          chat_id INTEGER,
+          fact_key TEXT NOT NULL,
+          category TEXT NOT NULL DEFAULT 'fact',
+          content TEXT NOT NULL,
+          confidence REAL NOT NULL DEFAULT 0.9,
+          salience REAL NOT NULL DEFAULT 1.0,
+          source TEXT NOT NULL DEFAULT 'inferred',
+          access_count INTEGER NOT NULL DEFAULT 0,
+          expires_at INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(scope, scope_key, fact_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ai_memories_lookup ON ai_memories(scope, scope_key, salience DESC, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS ai_session_context (
+          session_key TEXT PRIMARY KEY,
+          chat_id INTEGER NOT NULL,
+          surface TEXT NOT NULL DEFAULT 'vc',
+          current_topic TEXT,
+          previous_topics_json TEXT NOT NULL DEFAULT '[]',
+          speaker_turns_json TEXT NOT NULL DEFAULT '[]',
+          unanswered_questions_json TEXT NOT NULL DEFAULT '[]',
+          pending_references_json TEXT NOT NULL DEFAULT '[]',
+          active_speaker_id INTEGER,
+          active_speaker_name TEXT,
+          mode TEXT NOT NULL DEFAULT 'IDLE',
+          summary TEXT,
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+      `);
+    } catch {}
+    try {
+      const cols = this.db.prepare('PRAGMA table_info(tg_channels)').all();
+      if (!cols.some((c) => c.name === 'chat_type')) {
+        this.db.exec("ALTER TABLE tg_channels ADD COLUMN chat_type TEXT NOT NULL DEFAULT 'channel'");
+      }
+      this.db.exec('CREATE INDEX IF NOT EXISTS idx_tg_channels_type ON tg_channels(chat_type)');
     } catch {}
     const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get('schema_version');
     const current = row ? Number(row.value) : 0;
@@ -745,24 +818,29 @@ export class Database {
     this.setUserSetting(Number(userId), 'prefix', clean);
   }
 
-  recordTelegramChannel({ channel_id, title, username = null, can_post = 1, added_by = null }) {
+  recordTelegramChannel({ channel_id, title, username = null, chat_type = 'channel', can_post = 1, added_by = null }) {
     if (!channel_id) return;
     const cid = Number(channel_id);
-    const cleanTitle = String(title || 'Telegram Channel').trim();
+    const cleanType = ['channel', 'group', 'supergroup'].includes(String(chat_type))
+      ? String(chat_type)
+      : 'channel';
+    const cleanTitle = String(title || (cleanType === 'channel' ? 'Telegram Channel' : 'Telegram Group')).trim();
     const cleanUsername = username ? String(username).replace(/^@/, '').trim() : null;
     const uid = added_by ? Number(added_by) : null;
     this.run(
-      `INSERT INTO tg_channels (channel_id, title, username, can_post, added_by, updated_at)
-       VALUES (?, ?, ?, ?, ?, datetime('now'))
+      `INSERT INTO tg_channels (channel_id, title, username, chat_type, can_post, added_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
        ON CONFLICT(channel_id) DO UPDATE SET
          title = excluded.title,
          username = COALESCE(excluded.username, tg_channels.username),
+         chat_type = COALESCE(excluded.chat_type, tg_channels.chat_type),
          can_post = excluded.can_post,
          added_by = COALESCE(excluded.added_by, tg_channels.added_by),
          updated_at = datetime('now')`,
       cid,
       cleanTitle,
       cleanUsername,
+      cleanType,
       can_post ? 1 : 0,
       uid
     );
@@ -773,6 +851,32 @@ export class Database {
     const cid = Number(channel_id);
     this.run('DELETE FROM tg_channels WHERE channel_id = ?', cid);
     try { this.run('DELETE FROM tg_bot_channels WHERE channel_id = ?', cid); } catch {}
+  }
+
+  markBotChannelUnavailable(bot_id, channel_id, { bot_username = null } = {}) {
+    if (!channel_id) return;
+    const cid = Number(channel_id);
+    if (bot_id) {
+      this.recordBotChannelVerification({
+        bot_id,
+        channel_id: cid,
+        bot_username,
+        is_admin: 0,
+        can_post: 0
+      });
+    }
+    try {
+      const anyOtherPostable = bot_id
+        ? this.get(
+          'SELECT 1 AS ok FROM tg_bot_channels WHERE channel_id = ? AND bot_id != ? AND can_post = 1 LIMIT 1',
+          cid,
+          String(bot_id)
+        )
+        : null;
+      if (!anyOtherPostable) {
+        this.run('DELETE FROM tg_channels WHERE channel_id = ?', cid);
+      }
+    } catch {}
   }
 
   recordBotChannelVerification({ bot_id, channel_id, bot_username = null, is_admin = 1, can_post = 1 }) {
@@ -815,15 +919,46 @@ export class Database {
     }
   }
 
-  getTelegramChannels(userId = null) {
+  getAllBotChannelVerifications() {
     try {
+      return this.all('SELECT * FROM tg_bot_channels');
+    } catch {
+      return [];
+    }
+  }
+
+  getKnownGroupChatIds() {
+    const ids = new Set();
+    const collect = (rows) => {
+      for (const r of rows || []) {
+        const cid = Number(r?.chat_id ?? r?.channel_id);
+        if (Number.isSafeInteger(cid) && cid < 0) ids.add(cid);
+      }
+    };
+    try { collect(this.all('SELECT channel_id FROM tg_channels WHERE chat_type IN (\'group\', \'supergroup\')')); } catch {}
+    try { collect(this.all('SELECT DISTINCT chat_id FROM chat_settings WHERE chat_id < 0')); } catch {}
+    try { collect(this.all('SELECT DISTINCT chat_id FROM group_members WHERE chat_id < 0')); } catch {}
+    try { collect(this.all('SELECT DISTINCT chat_id FROM music_queues WHERE chat_id < 0')); } catch {}
+    return [...ids];
+  }
+
+  getTelegramChannels(userId = null, { includeGroups = false, chatTypes = null } = {}) {
+    try {
+      const types = Array.isArray(chatTypes) && chatTypes.length
+        ? chatTypes
+        : (includeGroups ? ['channel', 'group', 'supergroup'] : ['channel']);
+      const placeholders = types.map(() => '?').join(', ');
       if (userId) {
         return this.all(
-          'SELECT * FROM tg_channels WHERE added_by = ? OR added_by IS NULL ORDER BY updated_at DESC',
+          `SELECT * FROM tg_channels WHERE COALESCE(chat_type, 'channel') IN (${placeholders}) AND (added_by = ? OR added_by IS NULL) ORDER BY updated_at DESC`,
+          ...types,
           Number(userId)
         );
       }
-      return this.all('SELECT * FROM tg_channels ORDER BY updated_at DESC');
+      return this.all(
+        `SELECT * FROM tg_channels WHERE COALESCE(chat_type, 'channel') IN (${placeholders}) ORDER BY updated_at DESC`,
+        ...types
+      );
     } catch {
       return [];
     }

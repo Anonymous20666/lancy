@@ -493,7 +493,7 @@ export class VideoStreamingServer {
     return downloadPromise;
   }
 
-  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000, maxHeight = 720, videoQuality = null, preferredAudioLang = null } = {}) {
+  registerRemoteStream({ url, headers = {}, contentType = 'video/mp4', isHls = false, isDash = false, ttlMs = 8 * 3600 * 1000, maxHeight = 720, videoQuality = null, preferredAudioLang = null, preferH264 = null } = {}) {
     if (!url || !/^https?:\/\//i.test(String(url))) return null;
     const now = Date.now();
     for (const [k, v] of this.remoteStreams) {
@@ -505,6 +505,7 @@ export class VideoStreamingServer {
     const qualityCap = videoQuality === 'SD_480p' ? 480 : (videoQuality === 'HD_720p' ? 720 : capHeight);
     const effectiveMaxHeight = Math.min(capHeight, qualityCap);
     const prefAudio = normalizeLangCode(preferredAudioLang);
+    const shouldPreferH264 = preferH264 !== null ? Boolean(preferH264) : (effectiveMaxHeight <= 720);
     const detectedDash = Boolean(isDash || /dash\+xml/i.test(String(contentType || '')) || /\.mpd(\?|$)/i.test(urlStr));
     const detectedHls = !detectedDash && Boolean(isHls || /mpegurl/i.test(String(contentType || '')) || /\.m3u8(\?|$)/i.test(urlStr));
     this.remoteStreams.set(token, {
@@ -522,6 +523,7 @@ export class VideoStreamingServer {
       slowFetchStreak: 0,
       selectedVideoBandwidthBps: 0,
       preferredAudioLang: prefAudio,
+      preferH264: shouldPreferH264,
       forceContentType: null,
       childTokens: new Map(),
       hlsPlaylistCache: new Map(),
@@ -565,6 +567,7 @@ export class VideoStreamingServer {
       effectiveMaxHeight: parentEntry.effectiveMaxHeight || parentEntry.maxHeight || 720,
       rootToken: parentEntry.rootToken || null,
       preferredAudioLang: parentEntry.preferredAudioLang || '',
+      preferH264: Boolean(parentEntry.preferH264),
       forceContentType,
       isChildSegment: !isHls && !isBasePrefix,
       createdAt: now,
@@ -576,13 +579,17 @@ export class VideoStreamingServer {
     return childToken;
   }
 
-  #selectBestVideoVariant(variants, maxHeight = 720) {
+  #selectBestVideoVariant(variants, maxHeight = 720, { preferH264 = false } = {}) {
     if (!Array.isArray(variants) || variants.length <= 1) return variants?.[0] || null;
     const cap = Number.isFinite(Number(maxHeight)) && Number(maxHeight) > 0 ? Number(maxHeight) : 720;
     const withHeight = variants.filter((v) => Number(v.height) > 0);
     if (withHeight.length) {
       const within = withHeight.filter((v) => v.height <= cap);
-      const pool = within.length ? within : withHeight;
+      let pool = within.length ? within : withHeight;
+      if (preferH264) {
+        const nonHevc = pool.filter((v) => !v.isHevc && !/h265|hevc/i.test(String(v.uri || '')));
+        if (nonHevc.length) pool = nonHevc;
+      }
       return pool.reduce((best, cur) => {
         if (!best) return cur;
         if (within.length) {
@@ -907,7 +914,7 @@ export class VideoStreamingServer {
     return score;
   }
 
-  #pruneHlsMasterLines(lines, maxHeight = 720, preferredAudioLang = '') {
+  #pruneHlsMasterLines(lines, maxHeight = 720, preferredAudioLang = '', { preferH264 = false } = {}) {
     const prefLang = normalizeLangCode(preferredAudioLang);
     const audioTracks = [];
     for (let i = 0; i < lines.length; i++) {
@@ -956,6 +963,9 @@ export class VideoStreamingServer {
       const resMatch = tr.match(/\bRESOLUTION=(\d+)x(\d+)/i);
       const bwMatch = tr.match(/\b(?:AVERAGE-BANDWIDTH|BANDWIDTH)=(\d+)/i);
       const audioMatch = tr.match(/\bAUDIO="([^"]+)"/i);
+      const codecsMatch = tr.match(/\bCODECS="([^"]+)"/i);
+      const codecs = codecsMatch?.[1] || '';
+      const uriStr = lines[uriIdx].trim();
       const audioGroup = audioMatch?.[1] || null;
       variants.push({
         infIdx: i,
@@ -963,9 +973,11 @@ export class VideoStreamingServer {
         width: Number(resMatch?.[1] || 0),
         height: Number(resMatch?.[2] || 0),
         bandwidth: Number(bwMatch?.[1] || 0),
+        codecs,
+        isHevc: /\b(?:hvc1|hev1|h265|hevc)\b/i.test(codecs) || /(?:_h265|hevc|x265)/i.test(uriStr),
         audioGroup,
         audioScore: audioGroup && groupBestScore.has(audioGroup) ? groupBestScore.get(audioGroup) : 0,
-        uri: lines[uriIdx].trim()
+        uri: uriStr
       });
     }
 
@@ -977,7 +989,7 @@ export class VideoStreamingServer {
     }
 
     const winner = candidateVariants.length > 1
-      ? this.#selectBestVideoVariant(candidateVariants, maxHeight)
+      ? this.#selectBestVideoVariant(candidateVariants, maxHeight, { preferH264 })
       : candidateVariants[0] || variants[0] || null;
 
     const dropIndices = new Set();
@@ -1123,7 +1135,8 @@ export class VideoStreamingServer {
       const pruned = this.#pruneHlsMasterLines(
         lines,
         targetCap,
-        parentEntry?.preferredAudioLang || ''
+        parentEntry?.preferredAudioLang || '',
+        { preferH264: Boolean(parentEntry?.preferH264 || targetCap <= 720) }
       );
       lines = pruned.lines;
       const rootEntry = parentEntry?.rootToken ? this.remoteStreams.get(parentEntry.rootToken) : parentEntry;

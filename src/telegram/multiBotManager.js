@@ -17,10 +17,13 @@ import { createSettingsScreen } from './screens/settings.js';
 import { createHelpScreen } from './screens/help.js';
 import { createDownloaderScreen } from './screens/downloader.js';
 import { createCloneScreen } from './screens/clone.js';
+import { createBroadcastScreen } from './screens/broadcast.js';
 import { createChannelPostScreen } from './screens/channelPost.js';
 import { createAutoPostScreen } from './screens/autoPost.js';
 import { createNsfwScreen } from './screens/nsfw.js';
 import { createMusicScreen } from './screens/music.js';
+import { isPlatformOwner } from './permissions.js';
+import { extractBroadcastItemFromMessage, deliverBroadcastToTarget } from './broadcastEngine.js';
 
 const SCREEN_FACTORIES = [
   createDashboardScreen,
@@ -33,6 +36,7 @@ const SCREEN_FACTORIES = [
   createHelpScreen,
   createDownloaderScreen,
   createCloneScreen,
+  createBroadcastScreen,
   createChannelPostScreen,
   createAutoPostScreen,
   createNsfwScreen,
@@ -174,7 +178,10 @@ export class MultiBotManager {
       createContext: (...args) => controller?.createContext?.(...args),
       markMediaDeliveryMessage: (id) => controller?.markMediaDeliveryMessage?.(id),
       isMediaDeliveryMessage: (msg) => controller?.isMediaDeliveryMessage?.(msg),
-      isMediaDeliveryMessageId: (id) => controller?.isMediaDeliveryMessageId?.(id)
+      isMediaDeliveryMessageId: (id) => controller?.isMediaDeliveryMessageId?.(id),
+      markAiMessage: (id) => controller?.markAiMessage?.(id),
+      isAiMessage: (msg) => controller?.isAiMessage?.(msg),
+      isAiMessageId: (id) => controller?.isAiMessageId?.(id)
     };
 
     const cloneStickerService = new TelegramStickerService({
@@ -272,8 +279,19 @@ export class MultiBotManager {
    */
   async deleteBot(botId, ownerTgId) {
     await this.stopBot(botId);
-    this.db.run('DELETE FROM cloned_bots WHERE id = ? AND owner_tg_id = ?', botId, Number(ownerTgId));
+    if (isPlatformOwner(this.settings, ownerTgId)) {
+      this.db.run('DELETE FROM cloned_bots WHERE id = ?', botId);
+    } else {
+      this.db.run('DELETE FROM cloned_bots WHERE id = ? AND owner_tg_id = ?', botId, Number(ownerTgId));
+    }
     return true;
+  }
+
+  /**
+   * Get all cloned bots across the platform.
+   */
+  getAllBots() {
+    return this.db.all('SELECT * FROM cloned_bots ORDER BY id DESC');
   }
 
   /**
@@ -281,6 +299,16 @@ export class MultiBotManager {
    */
   getBotsForOwner(ownerTgId) {
     return this.db.all('SELECT * FROM cloned_bots WHERE owner_tg_id = ? ORDER BY id DESC', Number(ownerTgId));
+  }
+
+  /**
+   * Get cloned bots accessible to `userId` (Platform Owners see all clones; clone owners see their own).
+   */
+  getAccessibleBots(userId, { controller = null } = {}) {
+    if (isPlatformOwner(this.settings, userId, { controller })) {
+      return this.getAllBots();
+    }
+    return this.getBotsForOwner(userId);
   }
 
   getBotById(botId) {
@@ -297,40 +325,93 @@ export class MultiBotManager {
   }
 
   /**
-   * Broadcast a message to all users of a specific cloned bot.
-   * Can be targeted to all languages or a specific language.
+   * Broadcast rich content (plain/formatted text, media, albums, audio, documents, stickers, polls)
+   * or a plain string to a cloned bot's users and/or explicit channels/groups.
+   * Allowed for the clone's owner AND Platform Owners.
    */
-  async broadcast(botId, senderTgId, text, targetLanguage = null) {
+  async broadcast(botId, senderTgId, payloadOrText, targetLanguageOrOpts = null) {
     const running = this.runningBots.get(botId);
     const botRecord = this.db.get('SELECT * FROM cloned_bots WHERE id = ?', botId);
     if (!botRecord) throw new Error('Bot not found.');
-    if (Number(botRecord.owner_tg_id) !== Number(senderTgId)) {
+    const isOwner = Number(botRecord.owner_tg_id) === Number(senderTgId)
+      || isPlatformOwner(this.settings, senderTgId);
+    if (!isOwner) {
       throw new Error('Only the owner can broadcast to this bot.');
     }
 
+    const opts = (targetLanguageOrOpts && typeof targetLanguageOrOpts === 'object' && !Array.isArray(targetLanguageOrOpts))
+      ? targetLanguageOrOpts
+      : { targetLanguage: typeof targetLanguageOrOpts === 'string' ? targetLanguageOrOpts : null };
+
     const api = running?.api || new TelegramAPI(botRecord.token);
-    let users = [];
-    if (targetLanguage) {
-      users = this.db.all(
-        'SELECT tg_id FROM bot_users WHERE bot_id = ? AND language = ? AND is_banned = 0',
-        botId,
-        targetLanguage
-      );
-    } else {
-      users = this.db.all(
-        'SELECT tg_id FROM bot_users WHERE bot_id = ? AND is_banned = 0',
-        botId
-      );
+    if (!api.me && api.getMe) {
+      await api.getMe().then((me) => { if (me?.id) api.me = me; }).catch(() => {});
+    }
+
+    let items = [];
+    let summaryText = '';
+    if (typeof payloadOrText === 'string') {
+      items = [{ kind: 'text', text: payloadOrText, html: payloadOrText }];
+      summaryText = payloadOrText;
+    } else if (Array.isArray(payloadOrText)) {
+      items = payloadOrText;
+      summaryText = `[${items.length} media/content item(s)]`;
+    } else if (payloadOrText && Array.isArray(payloadOrText.items)) {
+      items = payloadOrText.items;
+      summaryText = payloadOrText.summary || `[${items.length} media/content item(s)]`;
+    } else if (payloadOrText && typeof payloadOrText === 'object') {
+      const extracted = payloadOrText.kind
+        ? payloadOrText
+        : extractBroadcastItemFromMessage(payloadOrText, { sourceApi: opts.sourceApi || api, sourceBotId: api.me?.id });
+      if (extracted) {
+        items = [extracted];
+        summaryText = extracted.text || extracted.caption || `[${extracted.kind}]`;
+      }
+    }
+
+    if (!items.length) throw new Error('Broadcast content is empty.');
+
+    const targetLanguage = opts.targetLanguage || null;
+    const includeDmUsers = opts.includeDmUsers !== false;
+    const extraChatIds = Array.isArray(opts.targetChatIds) ? opts.targetChatIds : [];
+    const richCard = Boolean(opts.richCard);
+    const bufferCache = new Map();
+
+    const targetIds = [];
+    for (const cid of extraChatIds) {
+      const num = Number(cid);
+      if (Number.isSafeInteger(num) && !targetIds.includes(num)) targetIds.push(num);
+    }
+
+    if (includeDmUsers) {
+      const users = targetLanguage
+        ? this.db.all('SELECT tg_id FROM bot_users WHERE bot_id = ? AND language = ? AND is_banned = 0', botId, targetLanguage)
+        : this.db.all('SELECT tg_id FROM bot_users WHERE bot_id = ? AND is_banned = 0', botId);
+      for (const u of users) {
+        const uid = Number(u.tg_id);
+        if (Number.isSafeInteger(uid) && !targetIds.includes(uid)) targetIds.push(uid);
+      }
     }
 
     let sentCount = 0;
     let failedCount = 0;
 
-    for (const u of users) {
+    for (const chatId of targetIds) {
       try {
-        await api.sendMessage(u.tg_id, text, { parse_mode: 'HTML' });
+        if (items.length === 1 && items[0].kind === 'text' && !richCard && typeof payloadOrText === 'string') {
+          await api.sendMessage(chatId, payloadOrText, { parse_mode: 'HTML' });
+        } else {
+          await deliverBroadcastToTarget({
+            targetApi: api,
+            targetBotId: api.me?.id != null ? String(api.me.id) : `clone_${botId}`,
+            chatId,
+            items,
+            richCard,
+            bufferCache
+          });
+        }
         sentCount++;
-        await sleep(35); // stay under Telegram 30 msgs/sec broadcast rate limit
+        await sleep(35);
       } catch {
         failedCount++;
       }
@@ -339,10 +420,10 @@ export class MultiBotManager {
     this.db.run(
       `INSERT INTO bot_broadcasts (bot_id, sender_tg_id, message_text, target_language, sent_count, failed_count)
        VALUES (?, ?, ?, ?, ?, ?)`,
-      botId, Number(senderTgId), text, targetLanguage, sentCount, failedCount
+      botId, Number(senderTgId), String(summaryText).slice(0, 500), targetLanguage, sentCount, failedCount
     );
 
-    return { sentCount, failedCount, total: users.length };
+    return { sentCount, failedCount, total: targetIds.length };
   }
 
   /**

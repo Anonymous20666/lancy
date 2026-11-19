@@ -251,12 +251,13 @@ CREATE TABLE IF NOT EXISTS chat_settings (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Telegram channels where bot is an administrator for broadcasting sticker packs
+-- Telegram channels & group chats where bot can broadcast/post
 CREATE TABLE IF NOT EXISTS tg_channels (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   channel_id INTEGER NOT NULL UNIQUE,
   title TEXT NOT NULL,
   username TEXT,
+  chat_type TEXT NOT NULL DEFAULT 'channel',
   can_post INTEGER NOT NULL DEFAULT 1,
   added_by INTEGER,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -328,12 +329,53 @@ CREATE TABLE IF NOT EXISTS user_settings (
 CREATE TABLE IF NOT EXISTS ai_conversations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
+  chat_id INTEGER,
+  surface TEXT NOT NULL DEFAULT 'dm',
+  speaker_name TEXT,
   role TEXT NOT NULL, -- 'user' | 'assistant' | 'system'
   content TEXT NOT NULL,
   metadata_json TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_ai_conversations_user ON ai_conversations(user_id, created_at);
+
+-- Unified 3-scope structured memory (user private, group shared, expiring context)
+CREATE TABLE IF NOT EXISTS ai_memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL,           -- 'user' | 'group' | 'session'
+  scope_key TEXT NOT NULL,       -- String(user_id) | String(chat_id) | session_key
+  user_id INTEGER,
+  chat_id INTEGER,
+  fact_key TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'fact', -- preference | profile | movie | music | interest | group_vibe | fact
+  content TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.9,
+  salience REAL NOT NULL DEFAULT 1.0,
+  source TEXT NOT NULL DEFAULT 'inferred', -- explicit | inferred | taste | system
+  access_count INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,            -- unix ms or NULL for durable
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(scope, scope_key, fact_key)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_memories_lookup ON ai_memories(scope, scope_key, salience DESC, updated_at DESC);
+
+-- Short-term conversational topic & multi-speaker session tracking
+CREATE TABLE IF NOT EXISTS ai_session_context (
+  session_key TEXT PRIMARY KEY,
+  chat_id INTEGER NOT NULL,
+  surface TEXT NOT NULL DEFAULT 'vc',
+  current_topic TEXT,
+  previous_topics_json TEXT NOT NULL DEFAULT '[]',
+  speaker_turns_json TEXT NOT NULL DEFAULT '[]',
+  unanswered_questions_json TEXT NOT NULL DEFAULT '[]',
+  pending_references_json TEXT NOT NULL DEFAULT '[]',
+  active_speaker_id INTEGER,
+  active_speaker_name TEXT,
+  mode TEXT NOT NULL DEFAULT 'IDLE',
+  summary TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 
 -- Autonomous scheduled sticker drops (Telegram & WhatsApp Channel Publisher)
 CREATE TABLE IF NOT EXISTS scheduled_drops (

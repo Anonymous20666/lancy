@@ -1,6 +1,6 @@
 import sharp from 'sharp';
-import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
-import { banner, kvTable, statusDot, ACCENT, SPARK } from '../ui.js';
+import { RichMessageBuilder, rt, block, richButton, encodeCallback } from '../rich.js';
+import { kvTable, statusDot } from '../ui.js';
 import { formatDateTime, timeAgo } from '../../utils/text.js';
 import { getLanguageName } from '../../core/i18n.js';
 
@@ -90,18 +90,16 @@ export function createDashboardScreen({ app }) {
     if (hasPfp) {
       b.photo('attach://pfp');
     }
-    b.paragraph(rt.concat(
-      rt.bold(banner([
-        `𓆩♡𓆪 ${botName.toUpperCase()} 𓆩♡𓆪`,
-        isGroup ? 'group media & music companion ♡' : 'your cute little control center ♡'
-      ]))
-    ));
-    b.spacer();
+    b.bannerHeader([
+      `𓆩♡𓆪 ${botName.toUpperCase()} 𓆩♡𓆪`,
+      isGroup ? 'group media & music companion' : 'your cute little control center'
+    ], { size: 1 });
     if (isGroup) {
-      b.paragraph(rt.concat(rt.italic(`hello everyone! I'm ${botName} ♡`), rt.text(`\n${formatDateTime(new Date(), tz)}`)));
+      b.paragraph(rt.concat(rt.italic(`hello everyone! I'm ${botName} ♡`), rt.text(` · ${formatDateTime(new Date(), tz)}`)));
     } else {
-      b.paragraph(rt.concat(rt.italic(`welcome back, ${firstName} ♡`), rt.text(`\n${formatDateTime(new Date(), tz)}`)));
+      b.paragraph(rt.concat(rt.italic(`welcome back, ${firstName} ♡`), rt.text(` · ${formatDateTime(new Date(), tz)}`)));
     }
+    b.paragraph(rt.concat(rt.bold('💡 Heads up: '), rt.text('Everything works via quick buttons or direct commands (/play, /movie, /grab, /search, /clone).')));
     b.divider();
 
     // Live status card
@@ -124,47 +122,17 @@ export function createDashboardScreen({ app }) {
     }
     b.divider();
 
-    // Heads up & Addictive Expandable Guide explaining all bot powers
+    // Collapsible Bot API 10.3 Feature Overview (toggle bullets — crisp & zero wall-of-text)
     const botTag = ctx.bot?.botUsername ? `@${ctx.bot.botUsername}` : '@bot';
-    b.paragraph(rt.bold('✨ Heads up! Tap the card below to see everything I can do for you ♡'));
-    const stickerSection = isGroup
-      ? `🎀 STICKER STUDIO\n• Turn any picture, Pinterest pin, or meme into Telegram sticker packs in one click.`
-      : `🎀 STICKER STUDIO & WHATSAPP SYNC\n• Turn any picture, Pinterest pin, or meme into Telegram sticker packs in one click.\n• Seamlessly publish sticker packs to your paired WhatsApp sessions and announcement channels.`;
-
-    const guideText =
-`✨ Welcome to your ultimate aesthetic all-in-one companion! Tap to uncover all superpowers:
-
-🎵 MUSIC · DOWNLOADS & LIVE CALLS
-• /play <title artist> searches for a permitted download. /addq queues call audio; /vplay queues video with audio.
-• Use /player for a destination-specific dashboard and queue controls.
-• Lyrics use reliable title, artist and duration matching; unmatched results are not substituted.
-• Heard a fire song in a video or voice note? Just reply or forward it to the bot — our Shazam recognizer identifies it instantly!
-
-📥 UNIVERSAL HD MEDIA DOWNLOADER (/grab or /download)
-• Paste ANY link or type /grab <link> from TikTok (no watermark!), Instagram Reels, YouTube Shorts, Twitter/X, Pinterest, or Facebook.
-• The bot grabs crystal-clear HD video or photo albums in seconds.
-• If the video has a soundtrack or background song, the MP3 audio track is automatically extracted and delivered right alongside it!
-
-🔍 PINTEREST HD AESTHETIC STUDIO (/search or /pint)
-• Search millions of aesthetic wallpapers, anime art, fashion, and video loops.
-• Choose your style: photos or video loops, depth, and pick your batch size (10 to 150+ picks!).
-• Browse through albums with smooth ← Prev / Next → pagination and download your favorites in original quality.
-
-${stickerSection}
-
-📱 LIVE INLINE SEARCH EVERYWHERE
-• Type ${botTag} <song name> in ANY chat or group!
-• Preview tracks with album art in real-time and drop music directly into any conversation without leaving the chat!
-• (Tip: Cloned bots must have /setinline enabled in @BotFather to activate live search in chats)
-
-🤖 BRING YOUR OWN BOT (/clone in 60s)
-• Want your own private bot? Send /clone in private DM to launch your branded clone with your own name, multi-language support (7 languages!), and audience broadcasting!
-
-👥 GROUP CHATS & MULTITASKING
-• Add the bot to your group chats for shared music drops, Custom Emojis, sticker tools, media downloads, and Pinterest searches.
-• Group AI conversation is disabled. Reply to this bot with "play <title artist>" for download search, or use music/emoji commands.`;
-
-    b.expandableBlockquote(guideText);
+    b.details('✨ What I Can Do (Tap to Expand A–Z)', [
+      block.list([
+        rt.concat(rt.bold('🎬 Cinema & VC AI — '), rt.text('Stream HD movies/series or listen cleanly with synced subs & voice AI.')),
+        rt.concat(rt.bold('🎵 Music & Recognition — '), rt.text('/play full tracks with cover + lyrics, radio mixes, or reply to ID any song.')),
+        rt.concat(rt.bold('📥 Downloader & Pinterest — '), rt.text('Save TikTok, Reels, YT & X media + browse HD Pinterest slides.')),
+        rt.concat(rt.bold('✨ Stickers, Emojis & Broadcasts — '), rt.text(isGroup ? 'Build sticker & custom emoji packs right in chat.' : 'Build packs, post 10-slide rich cards across channels/GCs, or /clone your own bot.')),
+        rt.concat(rt.bold('📱 Inline Search Anywhere — '), rt.text(`Type ${botTag} <query> in any chat to share songs, pins, or cards.`))
+      ])
+    ], false);
     b.divider();
 
     // Primary navigation — grouped rows.
@@ -217,6 +185,9 @@ ${stickerSection}
         richButton.callback('📢 Post to Channel', encodeCallback('channel_post', 'open'), { style: 'primary' }),
         richButton.callback('📅 Auto Post', encodeCallback('autopost', 'open'), { style: 'success' })
       ]);
+      b.buttons([
+        richButton.callback('📡 Broadcast Studio (Channels • GCs • Clones)', encodeCallback('broadcast', 'open'), { style: 'primary' })
+      ]);
       const isClone = Boolean(ctx.isClone || ctx.controller?.botContext?.isClone || app.telegram?.controller?.botContext?.isClone);
       const botContext = ctx.bot || ctx.controller?.botContext || app.telegram?.controller?.botContext || null;
       const cloneOwnerId = Number(botContext?.ownerId || botContext?.ownerTgId || 0);
@@ -256,11 +227,10 @@ ${stickerSection}
 
   function renderLanguagePicker(ctx) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 CHOOSE LANGUAGE 𓆩♡𓆪',
-      'customize your bot language ♡'
-    ])));
-    b.divider();
+      'customize your bot language'
+    ], { size: 1 });
     b.quote(rt.concat(
       rt.bold('🌍 Please select your preferred language:\n'),
       rt.text('All bot responses and notifications will be personalized for you ♡')

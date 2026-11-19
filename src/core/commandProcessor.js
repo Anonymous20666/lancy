@@ -58,6 +58,11 @@ export class CommandJobProcessor {
     this.recentCallbacks = new Map();  // sig -> at
     this.cardPipelines = new Map();    // cardKey -> { running: Promise, pendingJob: fn|null }
     this.noticeHistory = new Map();    // `${chatId}:${userId}` -> at
+    this.stressMonitor = null;
+  }
+
+  setStressMonitor(monitor) {
+    this.stressMonitor = monitor || null;
   }
 
   isFastCommand(command = '') {
@@ -257,7 +262,15 @@ export class CommandJobProcessor {
   }
 
   #canRunJob(job) {
-    if (this.activeGlobal >= this.maxConcurrentGlobal) return false;
+    const stress = this.stressMonitor?.sampleStress?.() || null;
+    const effectiveMaxGlobal = stress?.pressureLevel === 'critical'
+      ? Math.max(2, Math.floor(this.maxConcurrentGlobal * 0.25))
+      : stress?.pressureLevel === 'high'
+        ? Math.max(3, Math.floor(this.maxConcurrentGlobal * 0.45))
+        : stress?.pressureLevel === 'elevated'
+          ? Math.max(4, Math.floor(this.maxConcurrentGlobal * 0.7))
+          : this.maxConcurrentGlobal;
+    if (this.activeGlobal >= effectiveMaxGlobal) return false;
     const uActive = this.activeByUser.get(job.userKey) || 0;
     if (uActive >= this.maxConcurrentPerUser) return false;
     if (job.isGroup) {

@@ -17,6 +17,7 @@ import { SearchSessions } from '../src/music/search.js';
 import { normalizeTrack, MusicError } from '../src/music/model.js';
 import { MusicService } from '../src/music/service.js';
 import { createMusicScreen } from '../src/telegram/screens/music.js';
+import { richTextToString } from '../src/telegram/rich.js';
 import { TelegramAPI } from '../src/telegram/api.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { Database } from '../src/core/db.js';
@@ -747,7 +748,7 @@ test('InfiniteRadio & searchYouTubeFast deliver trending->old real music videos 
   const chSession = qm.getSession(-10099);
   chSession.isChannel = true;
   const playerCard = screen.renderPlayer(chSession);
-  const catBtn = playerCard.blocks.flatMap(b => b.buttons || []).find(b => b.text.includes('Infinite'));
+  const catBtn = playerCard.blocks.flatMap(b => b.buttons || []).find(b => richTextToString(b.text).includes('Infinite'));
   assert.ok(catBtn.callback_data.includes(':video:'), `Channel category button must open video mode by default (got ${catBtn.callback_data})`);
 
   app.music.radio.configure(chSession, ['Afrobeats']);
@@ -894,12 +895,12 @@ test('Spotify-on-TG: live charts, conversational AI DJ chat, group+channel HD vi
 
   // Group InfiniteRadio + catmenu also default to real video when YouTube is enabled
   const grpCard = screen.renderPlayer(grpSession);
-  const catBtn = grpCard.blocks.flatMap(b => b.buttons || []).find(b => b.text.includes('Infinite'));
-  const chatDjBtn = grpCard.blocks.flatMap(b => b.buttons || []).find(b => b.text.includes('Chat DJ'));
-  const bassBtn = grpCard.blocks.flatMap(b => b.buttons || []).find(b => b.text.includes('Bass'));
+  const catBtn = grpCard.blocks.flatMap(b => b.buttons || []).find(b => richTextToString(b.text).includes('Infinite'));
+  const chatDjBtn = grpCard.blocks.flatMap(b => b.buttons || []).find(b => richTextToString(b.text).includes('Chat DJ'));
+  const bassBtn = grpCard.blocks.flatMap(b => b.buttons || []).find(b => richTextToString(b.text).includes('Bass'));
   assert.ok(catBtn.callback_data.includes(':video:'), 'Group dashboard must open real video categories by default');
   assert.ok(chatDjBtn && Buffer.byteLength(chatDjBtn.callback_data) <= 64 && decodeCallback(chatDjBtn.callback_data));
-  assert.ok(bassBtn && bassBtn.text.includes('ON') && Buffer.byteLength(bassBtn.callback_data) <= 64);
+  assert.ok(bassBtn && richTextToString(bassBtn.text).includes('ON') && Buffer.byteLength(bassBtn.callback_data) <= 64);
 
   service.radio.configure(grpSession, ['Afrobeats']);
   assert.equal(grpSession.radio.video, true, 'Group InfiniteRadio must default to real music video when YouTube is enabled');

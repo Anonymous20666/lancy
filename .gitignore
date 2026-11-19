@@ -1,5 +1,6 @@
 node_modules/
 /data/
+/cache/
 !src/games/data/
 vendor/
 logs/

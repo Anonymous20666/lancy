@@ -17,6 +17,7 @@ import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionErr
 import { PinterestWebProvider } from '../../pinterest/web.js';
 import { fitResultForTelegram, describeOversized } from '../../media/telegramLimits.js';
 import { getStreamPublicUrl } from '../../media/streamingServer.js';
+import { didEditStripMedia, sendRichWithPhotoFallback } from '../../music/model.js';
 
 // Global cache for track metadata: lyricKey -> { title, artist }
 const lyricsCache = new Map();
@@ -941,8 +942,11 @@ export function createDownloaderScreen({ app }) {
     if (mediaItems.length === 1) {
       const item = mediaItems[0];
       const field = `${item.type}_0`;
+      const finalBuffer = (item.type === 'photo' && item.buffer)
+        ? await optimizePreviewImage(item.buffer, { maxDimension: 1280, quality: 88 })
+        : item.buffer;
       files[field] = {
-        buffer: item.buffer,
+        buffer: finalBuffer,
         filePath: item.filePath,
         filename: item.filename || `${field}.${item.type === 'video' ? 'mp4' : 'jpg'}`,
         contentType: item.mimeType || (item.type === 'video' ? 'video/mp4' : 'image/jpeg')
@@ -2341,7 +2345,10 @@ export function createDownloaderScreen({ app }) {
           const imgRes = await fetch(coverUrl, { signal: AbortSignal.timeout(5000) });
           if (imgRes.ok) {
             const ab = await imgRes.arrayBuffer();
-            coverBuf = Buffer.from(ab);
+            const rawCover = Buffer.from(ab);
+            if (rawCover.length > 0) {
+              coverBuf = await optimizePreviewImage(rawCover, { maxDimension: 1280, quality: 88 }).catch(() => rawCover);
+            }
           }
         } catch {}
       }
@@ -2527,13 +2534,15 @@ export function createDownloaderScreen({ app }) {
 
           if (targetMsgId) {
             try {
-              await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+              const edited = await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+              if (didEditStripMedia(rich, edited)) throw new Error('Telegram edit stripped slideshow media');
               return { message_id: targetMsgId };
             } catch (err) {
               const errMsg = String(err?.description ?? err?.message);
               if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
               try {
-                const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                const out = await sendRichWithPhotoFallback(ctx.api, chatId, rich, {}, files);
+                const sent = out?.sent;
                 if (sent?.message_id) {
                   if (targetMsgId && sent.message_id !== targetMsgId) {
                     await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
@@ -2550,7 +2559,8 @@ export function createDownloaderScreen({ app }) {
             }
           } else {
             try {
-              const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+              const out = await sendRichWithPhotoFallback(ctx.api, chatId, rich, {}, files);
+              const sent = out?.sent;
               if (sent?.message_id) {
                 ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
                 app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
@@ -3617,13 +3627,15 @@ export function createDownloaderScreen({ app }) {
               const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
               if (targetMsgId) {
                 try {
-                  await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+                  const edited = await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+                  if (didEditStripMedia(rich, edited)) throw new Error('Telegram edit stripped slideshow media');
                   return { message_id: targetMsgId };
                 } catch (err) {
                   const errMsg = String(err?.description ?? err?.message);
                   if (/not modified/i.test(errMsg)) return { message_id: targetMsgId };
                   try {
-                    const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                    const out = await sendRichWithPhotoFallback(ctx.api, chatId, rich, {}, files);
+                    const sent = out?.sent;
                     if (sent?.message_id) {
                       if (targetMsgId && sent.message_id !== targetMsgId) {
                         await ctx.api.deleteMessage(chatId, targetMsgId).catch(() => {});
@@ -3640,7 +3652,8 @@ export function createDownloaderScreen({ app }) {
                 }
               } else {
                 try {
-                  const sent = await ctx.api.sendRichMessage(chatId, rich, {}, files);
+                  const out = await sendRichWithPhotoFallback(ctx.api, chatId, rich, {}, files);
+                  const sent = out?.sent;
                   if (sent?.message_id) {
                     ctx.controller?.markMediaDeliveryMessage?.(sent.message_id);
                     app.telegram?.markMediaDeliveryMessage?.(sent.message_id);
@@ -3871,7 +3884,8 @@ export function createDownloaderScreen({ app }) {
           const targetMsgId = ctx.query?.message?.message_id || ctx.messageId || ctx.screenMessageId || ctx.sm?.context(ctx.tgId)?.screenMessageId;
           if (targetMsgId && ctx.api?.editMessageRich) {
             try {
-              await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+              const edited = await ctx.api.editMessageRich(chatId, targetMsgId, rich, {}, files);
+              if (didEditStripMedia(rich, edited)) throw new Error('Telegram edit stripped cover media');
               return { message_id: targetMsgId };
             } catch (err) {
               const errMsg = String(err?.description ?? err?.message);
@@ -3883,7 +3897,8 @@ export function createDownloaderScreen({ app }) {
                   attachCover: Boolean(col.coverBuf),
                   botName: ctx?.botName || 'Lancy Bot'
                 });
-                const sent = await ctx.api.sendRichMessage(chatId, freshRich, {}, freshFiles).catch(() => null);
+                const out = await sendRichWithPhotoFallback(ctx.api, chatId, freshRich, {}, freshFiles).catch(() => null);
+                const sent = out?.sent || null;
                 if (sent?.message_id) {
                   if (sent.message_id !== targetMsgId) {
                     await ctx.api.deleteMessage?.(chatId, targetMsgId).catch(() => {});

@@ -1,4 +1,5 @@
 import { logger } from '../core/logger.js';
+import { searchYouTubeFast } from './youtubeSearch.js';
 
 const DEFAULT_BASE_URL = 'https://pappy-hosting.duckdns.org/media/api/v1/movies';
 
@@ -205,6 +206,38 @@ function cleanWpMovieTitle(rawTitle = '') {
     .trim();
 }
 
+function extractYoutubeIdFromTrailerPayload(item = {}) {
+  if (!item || typeof item !== 'object') return null;
+  const direct = String(item.trailerYoutubeId || item.yt_trailer_code || item.trailer_youtube_id || '').trim();
+  if (/^[A-Za-z0-9_-]{11}$/.test(direct)) return direct;
+  const urlCand = String(item.trailerUrl || item.trailer_url || (typeof item.trailer === 'string' ? item.trailer : '') || '').trim();
+  const urlMatch = urlCand.match(/(?:youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/)|youtu\.be\/)([A-Za-z0-9_-]{11})/i);
+  if (urlMatch) return urlMatch[1];
+  const streams = Array.isArray(item.trailerStreams) ? item.trailerStreams : [];
+  for (const s of streams) {
+    const id = String(s?.ytId || s?.youtubeId || '').trim();
+    if (/^[A-Za-z0-9_-]{11}$/.test(id)) return id;
+  }
+  const trailers = Array.isArray(item.trailers) ? item.trailers : [];
+  for (const t of trailers) {
+    if (!t) continue;
+    if (String(t.type || '').toLowerCase() === 'trailer' && /^[A-Za-z0-9_-]{11}$/.test(String(t.source || '').trim())) {
+      return String(t.source).trim();
+    }
+  }
+  for (const t of trailers) {
+    const id = String(t?.source || t?.key || '').trim();
+    if (/^[A-Za-z0-9_-]{11}$/.test(id)) return id;
+  }
+  const tmdbResults = Array.isArray(item.videos?.results) ? item.videos.results : (Array.isArray(item.videos) ? item.videos : []);
+  const ytTmdb = tmdbResults.filter((v) => /youtube/i.test(String(v?.site || 'youtube')) && /^[A-Za-z0-9_-]{11}$/.test(String(v?.key || '').trim()));
+  const picked = ytTmdb.find((v) => /trailer/i.test(String(v?.type || '')) && v?.official !== false)
+    || ytTmdb.find((v) => /trailer|teaser/i.test(String(v?.type || '')))
+    || ytTmdb[0];
+  if (picked?.key) return String(picked.key).trim();
+  return null;
+}
+
 function normalizeListItem(item, fallbackType = null) {
   if (!item || typeof item !== 'object') return null;
   const id = String(item.provider_id ?? item.id ?? '').trim();
@@ -214,6 +247,9 @@ function normalizeListItem(item, fallbackType = null) {
   const type = typeRaw === 'tv' || typeRaw === 'series' || typeRaw === 'show' ? 'tv' : 'movie';
   const imdbRaw = item.imdb_id || item.imdbId || (/^tt\d+$/i.test(id) ? id : null);
   const tmdbRaw = item.tmdb_id || item.tmdbId || (/^\d+$/.test(id) ? id : null);
+  const trailerYoutubeId = extractYoutubeIdFromTrailerPayload(item);
+  const rawTrailerUrl = String(item.trailerUrl || item.trailer_url || (typeof item.trailer === 'string' && /^https?:\/\//i.test(item.trailer) ? item.trailer : '') || '').trim() || null;
+  const trailerUrl = rawTrailerUrl || (trailerYoutubeId ? `https://www.youtube.com/watch?v=${trailerYoutubeId}` : null);
   return {
     provider: item.provider || 'holaflix',
     sourceProvider: item.sourceProvider || item.source || item.provider || 'holaflix',
@@ -239,6 +275,8 @@ function normalizeListItem(item, fallbackType = null) {
     adult: Boolean(item.adult),
     detailUrl: item.detail_url || item.detailUrl || null,
     playUrl: item.play_url || item.playUrl || null,
+    trailerYoutubeId,
+    trailerUrl,
     downloadUrls: Array.isArray(item.downloadUrls) ? item.downloadUrls : [],
     cast: Array.isArray(item.cast) ? item.cast.slice(0, 8) : []
   };
@@ -466,6 +504,7 @@ export class MovieApiClient {
         runtime: m.runtime || null,
         language: m.language || null,
         detail_url: m.url || null,
+        yt_trailer_code: m.yt_trailer_code || null,
         provider: 'yts',
         sourceProvider: 'yts'
       });
@@ -715,10 +754,18 @@ export class MovieApiClient {
         continue;
       }
 
-      // Demote sparse far-future placeholder entries when an earlier released match exists.
-      if (r.year && Number(r.year) > currentYear + 1 && !r.overview && !r.rating && best && Number(best.item.year || 0) <= currentYear + 1) {
-        deferred.push(r);
-        continue;
+      // Demote sparse future/upcoming entries when an already-released match for the same title exists (even across movie/tv).
+      if (r.year && Number(r.year) > currentYear && !r.rating) {
+        const hasReleasedSameTitle = results.some((x) => (
+          x !== r
+          && normTitleMergeKey(expandCamelCaseTitle(x.title)) === normTitle
+          && (!x.year || Number(x.year) <= currentYear)
+          && (x.tmdbId || x.imdbId || x.rating || x.overview)
+        ));
+        if (hasReleasedSameTitle) {
+          deferred.push(r);
+          continue;
+        }
       }
 
       // Fold same-run episode-arc compilation TV-movies when the parent TV series is in results.
@@ -1005,11 +1052,27 @@ export class MovieApiClient {
 
     const normSearch = normTitleMergeKey(expandCamelCaseTitle(searchTitle));
     const targetY = searchYear ? Number(searchYear) : null;
+    const currentYear = new Date().getUTCFullYear();
+    const scoreSearchItem = (item) => {
+      const nt = normTitleMergeKey(expandCamelCaseTitle(item?.title || ''));
+      const isExact = nt === normSearch;
+      const isPrefix = nt.startsWith(normSearch) && nt.length > normSearch.length;
+      const hasTmdb = Boolean(item?.tmdbId && /^\d+$/.test(String(item.tmdbId)));
+      const hasImdb = Boolean(item?.imdbId && /^tt\d+$/i.test(String(item.imdbId)));
+      const hasRating = Number(item?.rating || 0) > 0;
+      const isFutureStub = Boolean(item?.year && Number(item.year) > currentYear && !hasRating);
+      let s = isExact ? 45 : (isPrefix ? 35 : 0);
+      if (isFutureStub) s -= 120;
+      if (hasTmdb) s += 30;
+      if (hasImdb) s += 20;
+      if (hasRating) s += 12;
+      if (item?.poster) s += 5;
+      if (item?.overview) s += 4;
+      if (item?.genres?.length) s += 2;
+      return s;
+    };
     if (results.length > 1) {
       results.sort((a, b) => {
-        const exactA = normTitleMergeKey(expandCamelCaseTitle(a.title)) === normSearch ? 0 : 1;
-        const exactB = normTitleMergeKey(expandCamelCaseTitle(b.title)) === normSearch ? 0 : 1;
-        if (exactA !== exactB) return exactA - exactB;
         if (targetY) {
           const dyA = a.year ? Math.abs(Number(a.year) - targetY) : 99;
           const dyB = b.year ? Math.abs(Number(b.year) - targetY) : 99;
@@ -1017,9 +1080,11 @@ export class MovieApiClient {
           const bucketB = dyB === 0 ? 0 : (dyB <= 1 ? 1 : 2);
           if (bucketA !== bucketB) return bucketA - bucketB;
         }
-        const holaA = a.tmdbId && /^\d+$/.test(String(a.tmdbId)) ? 0 : 1;
-        const holaB = b.tmdbId && /^\d+$/.test(String(b.tmdbId)) ? 0 : 1;
-        return holaA - holaB;
+        const diff = scoreSearchItem(b) - scoreSearchItem(a);
+        if (diff !== 0) return diff;
+        const exactA = normTitleMergeKey(expandCamelCaseTitle(a.title)) === normSearch ? 0 : 1;
+        const exactB = normTitleMergeKey(expandCamelCaseTitle(b.title)) === normSearch ? 0 : 1;
+        return exactA - exactB;
       });
     }
 
@@ -1294,6 +1359,10 @@ export class MovieApiClient {
           runtimeMinutes: rtMin,
           runtimeSeconds: rtMin ? rtMin * 60 : null,
           cast: Array.isArray(meta.cast) ? meta.cast : (cached?.cast || []),
+          trailers: Array.isArray(meta.trailers) ? meta.trailers : undefined,
+          trailerStreams: Array.isArray(meta.trailerStreams) ? meta.trailerStreams : undefined,
+          trailerYoutubeId: cached?.trailerYoutubeId || null,
+          trailerUrl: cached?.trailerUrl || null,
           provider: cached?.provider || 'cinemeta',
           sourceProvider: cached?.sourceProvider || 'cinemeta'
         }, 'movie');
@@ -1497,10 +1566,27 @@ export class MovieApiClient {
       }
     }
 
+    let resolvedImdb = effImdb;
+    if (!resolvedImdb && spacedTitle && typeof this.fetch === 'function') {
+      if (wantType !== 'movie') {
+        const fbTv = await this.#findFallbackTvMeta({ idStr, imdbId: null, title: spacedTitle, year: effYear }).catch(() => null);
+        if (fbTv?.imdbId && /^tt\d+$/i.test(String(fbTv.imdbId))) resolvedImdb = String(fbTv.imdbId);
+      } else {
+        const cmMvs = await this.#searchCinemeta(spacedTitle, { type: 'movie', limit: 5 }).catch(() => []);
+        const mvHit = cmMvs.find((h) => {
+          const nt = normTitleMergeKey(expandCamelCaseTitle(h.title));
+          const yOk = !effYear || !h.year || Math.abs(Number(h.year) - Number(effYear)) <= 2;
+          return yOk && (nt === normTarget || nt.includes(normTarget) || normTarget.includes(nt));
+        });
+        if (mvHit?.imdbId) resolvedImdb = mvHit.imdbId;
+      }
+      if (resolvedImdb && !empty.imdbId) empty.imdbId = resolvedImdb;
+    }
+
     // 2. Wikidata IMDb -> TMDB claim fallback, validated against HolaFlix so deleted TMDB IDs (e.g. 139440) are skipped
-    if (effImdb && typeof this.fetch === 'function') {
+    if (resolvedImdb && typeof this.fetch === 'function') {
       try {
-        const srUrl = `https://www.wikidata.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(`haswbstatement:P345=${effImdb}`)}&srlimit=3&format=json`;
+        const srUrl = `https://www.wikidata.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(`haswbstatement:P345=${resolvedImdb}`)}&srlimit=3&format=json`;
         const sr = await this.#fetchExternalJson(srUrl, {
           ttlMs: 900_000,
           headers: { 'user-agent': 'LancyBot/2.0 (movie metadata resolver)' },
@@ -1528,16 +1614,29 @@ export class MovieApiClient {
                 return null;
               });
               if (verified && (verified.id || verified.provider_id || verified.title || verified.name)) {
-                return saveAndReturn({ ...empty, tmdbId: String(candId) });
+                return saveAndReturn({ ...empty, imdbId: resolvedImdb, tmdbId: String(candId) });
               }
               // Skip deleted/4xx TMDB IDs (e.g. 404), but still accept Wikidata's P345->TMDB claim during API network outages.
               if (checkHttpStatus === 0) {
-                return saveAndReturn({ ...empty, tmdbId: String(candId) });
+                return saveAndReturn({ ...empty, imdbId: resolvedImdb, tmdbId: String(candId) });
               }
             }
           }
         }
       } catch {}
+    }
+
+    // 3. Direct Wikidata title lookup fallback when IMDb claim wasn't present
+    if (spacedTitle && typeof this.fetch === 'function') {
+      const wdHits = await this.#searchWikidataTitles(spacedTitle, { limit: 3, year: effYear, type: wantType }).catch(() => []);
+      const wdMatch = wdHits.find((h) => h?.tmdbId && /^\d+$/.test(String(h.tmdbId)));
+      if (wdMatch) {
+        return saveAndReturn({
+          ...empty,
+          imdbId: resolvedImdb || wdMatch.imdbId || null,
+          tmdbId: String(wdMatch.tmdbId)
+        });
+      }
     }
 
     return saveAndReturn(empty);
@@ -1562,9 +1661,10 @@ export class MovieApiClient {
         let runtimeMinutes = base.runtimeMinutes || cached?.runtimeMinutes || null;
         let tvmazeId = cached?.tvmazeId || null;
         let fbLang = null;
+        let fb = null;
 
         if (!seasons.length || !resolvedImdb || seasons.some((s) => s.episodeCount <= 0)) {
-          const fb = await this.#findFallbackTvMeta({
+          fb = await this.#findFallbackTvMeta({
             idStr,
             imdbId: resolvedImdb,
             title: base.title,
@@ -1632,6 +1732,8 @@ export class MovieApiClient {
           originalLanguage: data.original_language || data.originalLanguage || base.originalLanguage || fbLang || null,
           originalTitle: data.original_title || data.originalTitle || base.originalTitle || null,
           cast: Array.isArray(data.cast) ? data.cast.slice(0, 8) : [],
+          trailerYoutubeId: base.trailerYoutubeId || extractYoutubeIdFromTrailerPayload(fb?.cinemeta) || cached?.trailerYoutubeId || null,
+          trailerUrl: base.trailerUrl || cached?.trailerUrl || null,
           seasons
         };
         this.#rememberExternalItem(outShow);
@@ -1725,6 +1827,10 @@ export class MovieApiClient {
             runtimeMinutes: rtMin,
             runtimeSeconds: rtMin ? rtMin * 60 : null,
             cast: Array.isArray(meta.cast) ? meta.cast : (cached?.cast || []),
+            trailers: Array.isArray(meta.trailers) ? meta.trailers : undefined,
+            trailerStreams: Array.isArray(meta.trailerStreams) ? meta.trailerStreams : undefined,
+            trailerYoutubeId: cached?.trailerYoutubeId || null,
+            trailerUrl: cached?.trailerUrl || null,
             provider: cached?.provider || 'cinemeta'
           }, 'tv'),
           franchiseTmdbId: tmdbMap?.franchiseTmdbId || null,
@@ -1755,17 +1861,28 @@ export class MovieApiClient {
           episode_count: count,
           poster: show.image?.original || show.image?.medium || null
         })));
+        const showYear = show.premiered ? Number(String(show.premiered).slice(0, 4)) || null : null;
+        let showImdb = (show.externals?.imdb && /^tt\d+$/i.test(show.externals.imdb)) ? show.externals.imdb : (cached?.imdbId || null);
+        const tmdbMap = await this.resolveNumericTmdbInfo({
+          id: idStr,
+          imdbId: showImdb,
+          type: 'tv',
+          title: show.name,
+          year: showYear
+        }).catch(() => null);
+        if (!showImdb && tmdbMap?.imdbId) showImdb = tmdbMap.imdbId;
         const outShow = {
           ...normalizeListItem({
             ...cached,
-            id: show.externals?.imdb || idStr,
-            imdb_id: show.externals?.imdb || null,
+            id: showImdb || idStr,
+            imdb_id: showImdb || null,
+            tmdb_id: tmdbMap?.tmdbId || cached?.tmdbId || null,
             tvmazeId: show.id,
             type: 'tv',
             title: show.name,
             original_language: cached?.originalLanguage || firstLangValue(show.language) || null,
             language: cached?.language || firstLangValue(show.language) || null,
-            year: show.premiered ? Number(String(show.premiered).slice(0, 4)) || null : null,
+            year: showYear,
             poster: show.image?.original || show.image?.medium || cached?.poster || null,
             overview: stripHtml(show.summary || '') || cached?.overview || '',
             genres: Array.isArray(show.genres) ? show.genres : [],
@@ -2093,5 +2210,110 @@ export class MovieApiClient {
       rootStream: data?.root_stream || null,
       viewingUrl: data?.viewing_url || null
     };
+  }
+
+  async resolveTrailer(item = {}) {
+    if (!item || typeof item !== 'object' || item.adult || item.isAdultCatalogItem) return null;
+    const title = String(item.title || '').trim();
+    const type = String(item.type || 'movie').toLowerCase() === 'tv' ? 'tv' : 'movie';
+    const year = item.year ? Number(item.year) : null;
+    const cacheKey = `trailer:${type}:${item.tmdbId || item.imdbId || item.id || `${title}:${year || ''}`}`;
+    const cached = this.cache.get(cacheKey);
+    if (cached != null) return cached;
+
+    const existingId = extractYoutubeIdFromTrailerPayload(item);
+    if (existingId) {
+      const out = {
+        youtubeId: existingId,
+        url: `https://www.youtube.com/watch?v=${existingId}`,
+        title: title ? `${title} · Official Trailer` : 'Official Trailer',
+        source: 'metadata'
+      };
+      this.cache.set(cacheKey, out, 3_600_000);
+      return out;
+    }
+
+    const imdb = item.imdbId && /^tt\d+$/i.test(String(item.imdbId))
+      ? String(item.imdbId)
+      : (/^tt\d+$/i.test(String(item.id || '')) ? String(item.id) : null);
+    if (imdb) {
+      const cMeta = await this.#fetchCinemetaMeta(type === 'tv' ? 'series' : 'movie', imdb).catch(() => null);
+      const ytId = extractYoutubeIdFromTrailerPayload(cMeta);
+      if (ytId) {
+        const out = {
+          youtubeId: ytId,
+          url: `https://www.youtube.com/watch?v=${ytId}`,
+          title: title ? `${title} · Official Trailer` : 'Official Trailer',
+          source: 'cinemeta'
+        };
+        this.cache.set(cacheKey, out, 3_600_000);
+        return out;
+      }
+    }
+
+    if (item.tmdbId && /^\d+$/.test(String(item.tmdbId))) {
+      const vRes = await this.#getJson(`/${type}/${encodeURIComponent(item.tmdbId)}/videos`, null, { ttlMs: 3_600_000 }).catch(() => null);
+      const ytId = extractYoutubeIdFromTrailerPayload(vRes);
+      if (ytId) {
+        const out = {
+          youtubeId: ytId,
+          url: `https://www.youtube.com/watch?v=${ytId}`,
+          title: title ? `${title} · Official Trailer` : 'Official Trailer',
+          source: 'tmdb'
+        };
+        this.cache.set(cacheKey, out, 3_600_000);
+        return out;
+      }
+    }
+
+    if (!title) return null;
+    const query = [title, year || '', type === 'tv' ? 'official trailer season 1' : 'official trailer'].filter(Boolean).join(' ');
+    const ytResults = await searchYouTubeFast(query, 'US', { wide: false }).catch(() => []);
+    const titleWords = normTitleMergeKey(title).split(/\s+/).filter((w) => w.length >= 2);
+    const badTrailerRe = /\b(reaction|reacts|review|explained|breakdown|ending\s+explained|recap|full\s*movie|full\s*episode|parody|spoof|gameplay|theme\s*song|soundtrack|interview|behind\s*the\s*scenes|blooper|honest\s*trailers?|pitch\s*meeting|everything\s*wrong)\b/i;
+
+    const parseDurSec = (d) => {
+      if (!d || typeof d !== 'string' || !/^\d+:\d+/.test(d)) return 0;
+      const parts = d.split(':').map(Number);
+      if (parts.length === 2) return parts[0] * 60 + parts[1];
+      if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+      return 0;
+    };
+
+    let best = null;
+    let bestScore = -1e9;
+    for (const r of (Array.isArray(ytResults) ? ytResults : []).slice(0, 10)) {
+      const vid = String(r?.videoId || '').trim();
+      if (!/^[A-Za-z0-9_-]{11}$/.test(vid)) continue;
+      const rTitle = String(r.title || '');
+      if (badTrailerRe.test(rTitle)) continue;
+      const durSec = parseDurSec(r.duration);
+      if (durSec > 0 && (durSec < 18 || durSec > 320)) continue;
+      const normR = normTitleMergeKey(rTitle);
+      const matchedWords = titleWords.filter((w) => normR.includes(w)).length;
+      if (titleWords.length > 0 && matchedWords === 0) continue;
+      let score = matchedWords * 10;
+      if (/\bofficial\s*(?:final\s*|teaser\s*|main\s*)?trailer\b/i.test(rTitle)) score += 25;
+      else if (/\b(?:trailer|teaser|promo)\b/i.test(rTitle)) score += 14;
+      if (year && rTitle.includes(String(year))) score += 8;
+      if (/netflix|prime\s*video|hbo|marvel|disney|warner|universal|sony|paramount|apple\s*tv|a24|lionsgate|tvn|crunchyroll/i.test(String(r.author || '') + ' ' + rTitle)) score += 10;
+      if (durSec >= 40 && durSec <= 210) score += 6;
+      if (score > bestScore) {
+        bestScore = score;
+        best = {
+          youtubeId: vid,
+          url: `https://www.youtube.com/watch?v=${vid}`,
+          title: rTitle || `${title} Trailer`,
+          durationSeconds: durSec || null,
+          source: 'youtube'
+        };
+      }
+    }
+
+    if (best) {
+      this.cache.set(cacheKey, best, 3_600_000);
+      return best;
+    }
+    return null;
   }
 }

@@ -2,6 +2,30 @@ import { openAsBlob, existsSync, statSync } from 'node:fs';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 import { RichMessageBuilder } from './rich.js';
+import { enhanceHtmlWithCustomEmojis, extractCustomEmojiEntities, getCustomEmojiId } from './customEmoji.js';
+
+function applyCustomEmojisToOutgoingParams(params, { isCaption = false } = {}) {
+  if (!params || typeof params !== 'object') return params;
+  const skip = Boolean(params.skip_custom_emojis);
+  if ('skip_custom_emojis' in params) delete params.skip_custom_emojis;
+  if (skip) return params;
+
+  const field = isCaption ? 'caption' : 'text';
+  const entitiesField = isCaption ? 'caption_entities' : 'entities';
+  if (typeof params[field] !== 'string' || !params[field]) return params;
+  if (Array.isArray(params[entitiesField])) return params;
+
+  const parseMode = typeof params.parse_mode === 'string' ? params.parse_mode.trim().toUpperCase() : '';
+  if (parseMode === 'HTML') {
+    params[field] = enhanceHtmlWithCustomEmojis(params[field]);
+  } else if (!parseMode) {
+    const { entities } = extractCustomEmojiEntities(params[field]);
+    if (entities.length > 0) {
+      params[entitiesField] = entities;
+    }
+  }
+  return params;
+}
 
 /**
  * Minimal, precise Telegram Bot API client (Bot API 10.3).
@@ -224,7 +248,7 @@ export class TelegramAPI {
   }
 
   sendMessage(chatId, text, extra = {}) {
-    const params = { chat_id: chatId, text, ...extra };
+    const params = applyCustomEmojisToOutgoingParams({ chat_id: chatId, text, ...extra });
     if (/https?:\/\/[^\s]+/i.test(text) && !params.link_preview_options && params.disable_web_page_preview === undefined) {
       params.link_preview_options = { is_disabled: false, prefer_large_media: true };
     }
@@ -303,17 +327,18 @@ export class TelegramAPI {
     } else if (richMessage && typeof richMessage.html === 'string') {
       payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
     }
-    const dropOnFloodWait = Boolean(extra?.dropOnFloodWait);
+    const { dropOnFloodWait: rawDrop, ...restExtra } = (extra && typeof extra === 'object') ? extra : {};
+    const dropOnFloodWait = Boolean(rawDrop);
     return this.call('editMessageText', {
       chat_id: chatId,
       message_id: messageId,
       rich_message: payload,
-      ...extra
+      ...restExtra
     }, { files, dropOnFloodWait });
   }
 
   editMessageText(chatId, messageId, text, extra = {}) {
-    const params = { chat_id: chatId, message_id: messageId, text, ...extra };
+    const params = applyCustomEmojisToOutgoingParams({ chat_id: chatId, message_id: messageId, text, ...extra });
     if (/https?:\/\/[^\s]+/i.test(text) && !params.link_preview_options && params.disable_web_page_preview === undefined) {
       params.link_preview_options = { is_disabled: false, prefer_large_media: true };
     }
@@ -329,7 +354,109 @@ export class TelegramAPI {
   }
 
   editMessageCaption(params, extra = {}) {
-    return this.call('editMessageCaption', { ...params, ...extra });
+    return this.call('editMessageCaption', applyCustomEmojisToOutgoingParams({ ...params, ...extra }, { isCaption: true }));
+  }
+
+  async setMessageReaction(chatId, messageId, reactions = [], extra = {}) {
+    const list = Array.isArray(reactions) ? reactions : [reactions];
+    const resolved = [];
+    const standardFallback = [];
+    for (const item of list) {
+      if (!item) continue;
+      if (typeof item === 'object' && item.type) {
+        resolved.push(item);
+        if (item.type === 'emoji' && item.emoji) standardFallback.push(item);
+        continue;
+      }
+      const raw = String(item).trim();
+      if (!raw) continue;
+      if (/^\d+$/.test(raw)) {
+        resolved.push({ type: 'custom_emoji', custom_emoji_id: raw });
+        continue;
+      }
+      const customId = extra.preferCustom !== false ? getCustomEmojiId(raw) : null;
+      if (customId) {
+        resolved.push({ type: 'custom_emoji', custom_emoji_id: String(customId) });
+      } else {
+        resolved.push({ type: 'emoji', emoji: raw });
+      }
+      standardFallback.push({ type: 'emoji', emoji: raw });
+    }
+    const { preferCustom: _pc, ...restExtra } = extra && typeof extra === 'object' ? extra : {};
+    try {
+      return await this.call('setMessageReaction', {
+        chat_id: chatId,
+        message_id: messageId,
+        reaction: resolved,
+        ...restExtra
+      });
+    } catch (err) {
+      if (standardFallback.length > 0 && resolved.some((r) => r.type === 'custom_emoji') && /reaction|custom_emoji|emoji/i.test(String(err?.description || err?.message || ''))) {
+        return this.call('setMessageReaction', {
+          chat_id: chatId,
+          message_id: messageId,
+          reaction: standardFallback,
+          ...restExtra
+        });
+      }
+      throw err;
+    }
+  }
+
+  /** Bot API 9.5+/10.4: stream partial message drafts in private chat while AI generates a reply. */
+  sendMessageDraft(chatId, draftId, text, extra = {}) {
+    const params = applyCustomEmojisToOutgoingParams({
+      chat_id: chatId,
+      draft_id: Number(draftId) || 1,
+      text: String(text || '').slice(0, 4096),
+      ...extra
+    });
+    return this.call('sendMessageDraft', params, { dropOnFloodWait: true });
+  }
+
+  /** Bot API 10.4: send an interactive HTML Widget message (DM only in Telegram production). */
+  sendWidget(chatId, html, extra = {}) {
+    return this.call('sendWidget', {
+      chat_id: chatId,
+      html: String(html || ''),
+      ...extra
+    });
+  }
+
+  /** Bot API 10.4: resend a shared widget previously created by the bot. */
+  sendSharedWidget(chatId, widgetId, extra = {}) {
+    return this.call('sendSharedWidget', {
+      chat_id: chatId,
+      widget_id: String(widgetId),
+      ...extra
+    });
+  }
+
+  /** Bot API 10.4: answer an incoming WidgetQuery or SharedWidgetQuery. */
+  answerWidgetQuery(widgetQueryId, extra = {}) {
+    return this.call('answerWidgetQuery', {
+      widget_query_id: String(widgetQueryId),
+      ...extra
+    });
+  }
+
+  /** Bot API 10.4: update the data payload of an existing widget message. */
+  editMessageWidgetData(chatId, messageId, data, extra = {}) {
+    return this.call('editMessageWidgetData', {
+      chat_id: chatId,
+      message_id: messageId,
+      data: typeof data === 'string' ? data : JSON.stringify(data || {}),
+      ...extra
+    });
+  }
+
+  /** Bot API 10.4: update a shared widget's public data payload. */
+  editSharedWidgetData(widgetId, data, extra = {}) {
+    return this.call('editSharedWidgetData', {
+      widget_id: String(widgetId),
+      data: typeof data === 'string' ? data : JSON.stringify(data || {}),
+      ...extra
+    });
   }
 
   sendMediaGroup(chatId, media, extra = {}, files = null) {
@@ -337,14 +464,15 @@ export class TelegramAPI {
   }
 
   sendPhoto(chatId, photo, extra = {}, files = null) {
+    const cleanExtra = applyCustomEmojisToOutgoingParams({ ...extra }, { isCaption: true });
     if (Buffer.isBuffer(photo)) {
-      const filename = extra.filename ?? 'photo.jpg';
-      const contentType = extra.contentType ?? (filename.endsWith('.png') ? 'image/png' : 'image/jpeg');
-      return this.call('sendPhoto', { chat_id: chatId, photo: 'attach://photo', ...extra }, {
+      const filename = cleanExtra.filename ?? 'photo.jpg';
+      const contentType = cleanExtra.contentType ?? (filename.endsWith('.png') ? 'image/png' : 'image/jpeg');
+      return this.call('sendPhoto', { chat_id: chatId, photo: 'attach://photo', ...cleanExtra }, {
         files: { photo: { buffer: photo, filename, contentType } }
       });
     }
-    const params = { chat_id: chatId, ...extra };
+    const params = { chat_id: chatId, ...cleanExtra };
     if (files?.photo) {
       params.photo = 'attach://photo';
       return this.call('sendPhoto', params, { files });
@@ -354,17 +482,18 @@ export class TelegramAPI {
   }
 
   sendVideo(chatId, video, extra = {}, files = null) {
+    const cleanExtra = applyCustomEmojisToOutgoingParams({ ...extra }, { isCaption: true });
     if (Buffer.isBuffer(video)) {
-      return this.call('sendVideo', { chat_id: chatId, video: 'attach://video', ...extra }, {
-        files: { video: { buffer: video, filename: extra.filename ?? 'video.mp4', contentType: 'video/mp4' } }
+      return this.call('sendVideo', { chat_id: chatId, video: 'attach://video', ...cleanExtra }, {
+        files: { video: { buffer: video, filename: cleanExtra.filename ?? 'video.mp4', contentType: 'video/mp4' } }
       });
     }
     if (video && typeof video === 'object' && video.filePath) {
-      return this.call('sendVideo', { chat_id: chatId, video: 'attach://video', ...extra }, {
-        files: { video: { filePath: video.filePath, filename: video.filename ?? extra.filename ?? 'video.mp4', contentType: video.contentType ?? 'video/mp4' } }
+      return this.call('sendVideo', { chat_id: chatId, video: 'attach://video', ...cleanExtra }, {
+        files: { video: { filePath: video.filePath, filename: video.filename ?? cleanExtra.filename ?? 'video.mp4', contentType: video.contentType ?? 'video/mp4' } }
       });
     }
-    const params = { chat_id: chatId, ...extra };
+    const params = { chat_id: chatId, ...cleanExtra };
     if (files?.video) {
       params.video = 'attach://video';
       return this.call('sendVideo', params, { files });
@@ -374,12 +503,13 @@ export class TelegramAPI {
   }
 
   sendAnimation(chatId, animation, extra = {}, files = null) {
+    const cleanExtra = applyCustomEmojisToOutgoingParams({ ...extra }, { isCaption: true });
     if (Buffer.isBuffer(animation)) {
-      return this.call('sendAnimation', { chat_id: chatId, animation: 'attach://animation', ...extra }, {
-        files: { animation: { buffer: animation, filename: extra.filename ?? 'animation.mp4', contentType: 'video/mp4' } }
+      return this.call('sendAnimation', { chat_id: chatId, animation: 'attach://animation', ...cleanExtra }, {
+        files: { animation: { buffer: animation, filename: cleanExtra.filename ?? 'animation.mp4', contentType: 'video/mp4' } }
       });
     }
-    const params = { chat_id: chatId, ...extra };
+    const params = { chat_id: chatId, ...cleanExtra };
     if (files?.animation) {
       params.animation = 'attach://animation';
       return this.call('sendAnimation', params, { files });
@@ -389,7 +519,8 @@ export class TelegramAPI {
   }
 
   sendAudio(chatId, audio, extra = {}, files = null) {
-    const { filename = 'audio.mp3', thumbnail = null, ...restExtra } = extra;
+    const cleanExtra = applyCustomEmojisToOutgoingParams({ ...extra }, { isCaption: true });
+    const { filename = 'audio.mp3', thumbnail = null, ...restExtra } = cleanExtra;
     const allFiles = files ? { ...files } : {};
     const params = { chat_id: chatId, ...restExtra };
 
@@ -415,8 +546,28 @@ export class TelegramAPI {
     return this.call('sendAudio', params);
   }
 
+  sendVoice(chatId, voice, extra = {}, files = null) {
+    const cleanExtra = applyCustomEmojisToOutgoingParams({ ...extra }, { isCaption: true });
+    const { filename = 'voice.ogg', contentType = 'audio/ogg', ...restExtra } = cleanExtra;
+    const allFiles = files ? { ...files } : {};
+    const params = { chat_id: chatId, ...restExtra };
+    if (Buffer.isBuffer(voice)) {
+      params.voice = 'attach://voice';
+      allFiles.voice = { buffer: voice, filename, contentType };
+    } else if (allFiles.voice) {
+      params.voice = 'attach://voice';
+    } else {
+      params.voice = voice;
+    }
+    if (Object.keys(allFiles).length > 0) {
+      return this.call('sendVoice', params, { files: allFiles });
+    }
+    return this.call('sendVoice', params);
+  }
+
   sendDocument(chatId, document, extra = {}, files = null) {
-    const { filename = 'file.bin', contentType = 'application/octet-stream', ...restExtra } = extra;
+    const cleanExtra = applyCustomEmojisToOutgoingParams({ ...extra }, { isCaption: true });
+    const { filename = 'file.bin', contentType = 'application/octet-stream', ...restExtra } = cleanExtra;
     const allFiles = files ? { ...files } : {};
     const params = { chat_id: chatId, ...restExtra };
 

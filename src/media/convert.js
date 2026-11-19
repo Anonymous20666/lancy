@@ -416,18 +416,62 @@ export async function toThumbnail(buffer, { size = 100 } = {}) {
 }
 
 /**
- * Fast slideshow/preview image optimizer.
- * If image is > 250KB, downsizes to max 1080px JPEG (~80-150KB) in milliseconds.
- * This avoids uploading 20-40MB payloads to Telegram during pagination / slide browsing.
+ * Guaranteed Telegram-safe preview image optimizer.
+ * Converts any non-JPEG (WebP/PNG/AVIF/GIF/SVG/TIFF), CMYK, EXIF-rotated, extreme
+ * aspect-ratio, oversized-dimension, or >250KB image into a baseline RGB JPEG <= maxDimension.
  */
-export async function optimizePreviewImage(buffer, { maxDimension = 1080, quality = 82, thresholdBytes = 250 * 1024 } = {}) {
-  if (!buffer || buffer.length <= thresholdBytes) return buffer;
+export async function optimizePreviewImage(buffer, { maxDimension = null, maxWidth = null, quality = 84, thresholdBytes = 250 * 1024 } = {}) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return buffer;
+  const effMaxDim = Math.max(64, Number(maxDimension ?? maxWidth ?? 1080) || 1080);
   try {
-    return await sharp(buffer, { failOn: 'none', animated: false })
-      .rotate()
-      .resize(maxDimension, maxDimension, { fit: 'inside', withoutEnlargement: true })
+    const meta = await sharp(buffer, { failOn: 'none', animated: false }).metadata();
+    const width = Number(meta?.width || 0);
+    const height = Number(meta?.height || 0);
+    if (width < 8 || height < 8) return buffer;
+
+    const aspectRatio = width / height;
+    const extremeAspect = aspectRatio > 8 || aspectRatio < 1 / 8;
+    const isSafeBaselineJpeg = (
+      meta?.format === 'jpeg'
+      && meta?.space !== 'cmyk'
+      && (!meta?.orientation || meta.orientation === 1)
+      && !extremeAspect
+      && width <= effMaxDim
+      && height <= effMaxDim
+      && buffer.length <= thresholdBytes
+    );
+    if (isSafeBaselineJpeg) return buffer;
+
+    let pipeline = sharp(buffer, { failOn: 'none', animated: false }).rotate();
+    if (extremeAspect) {
+      // Clamp extreme thin banners/strips inside a <= 4:1 box so Telegram never throws PHOTO_INVALID_DIMENSIONS
+      const targetW = Math.min(effMaxDim, Math.max(320, width));
+      const targetH = Math.min(effMaxDim, Math.max(320, Math.round(targetW / Math.max(0.25, Math.min(4, aspectRatio)))));
+      pipeline = pipeline.resize(targetW, targetH, {
+        fit: 'contain',
+        background: '#0b1021'
+      });
+    } else {
+      pipeline = pipeline.resize(effMaxDim, effMaxDim, {
+        fit: 'inside',
+        withoutEnlargement: true
+      });
+    }
+
+    let out = await pipeline
+      .toColorspace('srgb')
+      .flatten({ background: '#0b1021' })
       .jpeg({ quality, mozjpeg: false })
       .toBuffer();
+
+    // Enforce Telegram 10MB photo cap with a comfortable safety margin
+    if (out.length > 4.5 * 1024 * 1024) {
+      out = await sharp(out, { failOn: 'none' })
+        .resize(Math.min(1280, effMaxDim), Math.min(1280, effMaxDim), { fit: 'inside', withoutEnlargement: true })
+        .jpeg({ quality: 70, mozjpeg: false })
+        .toBuffer();
+    }
+    return out.length > 0 ? out : buffer;
   } catch {
     return buffer;
   }

@@ -133,9 +133,9 @@ export const rt = {
   html: (s) => parseHtmlToRichText(s)
 };
 
-import { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText } from './customEmoji.js';
+import { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText, enhanceHtmlWithCustomEmojis, setGlobalCustomEmojiLookup } from './customEmoji.js';
 
-export { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText };
+export { applyCustomEmojisToBlocks, CUSTOM_EMOJI_MAP, getCustomEmojiId, toCustomEmojiHtml, enhanceRichText, enhanceHtmlWithCustomEmojis, setGlobalCustomEmojiLookup };
 
 /** Flatten RichText to plain string (for length checks / previews). */
 export function richTextToString(text) {
@@ -155,15 +155,15 @@ export function richTextToString(text) {
 // ── Block builders ────────────────────────────────────────────────────────
 
 export const block = {
-  paragraph: (text) => {
+  paragraph: (text, opts = null) => {
     let parsedText = text;
     if (typeof text === 'string' && text.includes('<') && /<\/?(b|strong|i|em|u|ins|s|strike|del|code|tg-spoiler|spoiler|a|tg-emoji)\b/i.test(text)) {
       parsedText = parseHtmlToRichText(text);
     }
-    return { type: 'paragraph', text: parsedText };
+    return { type: 'paragraph', text: parsedText, ...(opts?.rawEmoji ? { _rawEmoji: true } : {}) };
   },
-  heading: (text, size = 1) => ({ type: 'heading', text, size: clampSize(size) }),
-  header: (text, size = 1) => ({ type: 'heading', text, size: clampSize(size) }),
+  heading: (text, size = 1, opts = null) => ({ type: 'heading', text, size: clampSize(size), ...(opts?.rawEmoji ? { _rawEmoji: true } : {}) }),
+  header: (text, size = 1, opts = null) => ({ type: 'heading', text, size: clampSize(size), ...(opts?.rawEmoji ? { _rawEmoji: true } : {}) }),
   pre: (text, language) => ({ type: 'pre', text, ...(language ? { language } : {}) }),
   footer: (text) => ({ type: 'footer', text }),
   divider: () => ({ type: 'divider' }),
@@ -183,17 +183,26 @@ export const block = {
     is_compact: compact,
     ...(caption ? { caption } : {})
   }),
-  list: (items) => ({
-    type: 'list',
-    items: items.map((item) =>
-      typeof item === 'object' && item !== null && 'blocks' in item
-        ? item
-        : { blocks: [block.paragraph(item)] }
-    )
-  }),
+  list: (items, opts = {}) => {
+    const out = {
+      type: 'list',
+      items: items.map((item) =>
+        typeof item === 'object' && item !== null && 'blocks' in item
+          ? item
+          : { blocks: [block.paragraph(item)] }
+      )
+    };
+    if (opts && typeof opts === 'object') {
+      if (opts.ordered !== undefined || opts.is_ordered !== undefined) {
+        out.is_ordered = Boolean(opts.is_ordered ?? opts.ordered);
+      }
+      if (opts.style) out.style = String(opts.style);
+    }
+    return out;
+  },
   blockquote: (blocks, credit) => ({ type: 'blockquote', blocks, ...(credit ? { credit } : {}) }),
   expandableBlockquote: (text, credit) => ({ type: 'expandable_blockquote', text, ...(credit ? { credit } : {}) }),
-  pullquote: (text, credit) => ({ type: 'pullquote', text, ...(credit ? { credit } : {}) }),
+  pullquote: (text, credit, opts = null) => ({ type: 'pullquote', text, ...(credit ? { credit } : {}), ...(opts?.rawEmoji ? { _rawEmoji: true } : {}) }),
   details: (summary, blocks, isOpen = false) => ({ type: 'details', summary, blocks, is_open: isOpen }),
   photo: (media, caption) => ({ type: 'photo', photo: typeof media === 'object' && media !== null ? media : { type: 'photo', media }, ...(caption ? { caption: { text: caption } } : {}) }),
   video: (media, caption) => ({ type: 'video', video: typeof media === 'object' && media !== null ? media : { type: 'video', media }, ...(caption ? { caption: { text: caption } } : {}) }),
@@ -241,18 +250,25 @@ export function normalizeButtonStyle(style, { allowLink = true } = {}) {
   return 'primary';
 }
 
+function attachButtonOpts(base, { style = 'primary', iconCustomEmojiId, emojiId, rawEmoji = false } = {}) {
+  const out = { ...base, style: normalizeButtonStyle(style) };
+  const eid = iconCustomEmojiId || emojiId;
+  if (eid) out.icon_custom_emoji_id = String(eid);
+  if (rawEmoji) out._rawEmoji = true;
+  return out;
+}
+
 export const richButton = {
-  callback: (text, callbackData, { style = 'primary' } = {}) => ({
+  callback: (text, callbackData, opts = {}) => attachButtonOpts({
     text: rt.text(text),
-    callback_data: callbackData,
-    style: normalizeButtonStyle(style)
-  }),
-  url: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), url, style: normalizeButtonStyle(style) }),
-  webApp: (text, url, { style = 'primary' } = {}) => ({ text: rt.text(text), web_app: { url }, style: normalizeButtonStyle(style) }),
-  copy: (text, copyText, { style = 'primary' } = {}) => ({ text: rt.text(text), copy_text: { text: copyText }, style: normalizeButtonStyle(style) }),
-  switchInline: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query: query, style: normalizeButtonStyle(style) }),
-  switchInlineCurrent: (text, query = '', { style = 'primary' } = {}) => ({ text: rt.text(text), switch_inline_query_current_chat: query, style: normalizeButtonStyle(style) }),
-  disabled: (text) => ({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' }, style: 'primary' })
+    callback_data: callbackData
+  }, opts),
+  url: (text, url, opts = {}) => attachButtonOpts({ text: rt.text(text), url }, opts),
+  webApp: (text, url, opts = {}) => attachButtonOpts({ text: rt.text(text), web_app: { url } }, opts),
+  copy: (text, copyText, opts = {}) => attachButtonOpts({ text: rt.text(text), copy_text: { text: copyText } }, opts),
+  switchInline: (text, query = '', opts = {}) => attachButtonOpts({ text: rt.text(text), switch_inline_query: query }, opts),
+  switchInlineCurrent: (text, query = '', opts = {}) => attachButtonOpts({ text: rt.text(text), switch_inline_query_current_chat: query }, opts),
+  disabled: (text, opts = {}) => attachButtonOpts({ text: rt.text(text), callback_data: 'noop', disabled: { reason: 'disabled' } }, opts)
 };
 
 function isRichMessageBlock(item) {
@@ -280,16 +296,16 @@ export class RichMessageBuilder {
     return this;
   }
 
-  heading(text, size = 1) { this.blocks.push(block.heading(text, size)); return this; }
-  header(text, size = 1) { this.blocks.push(block.heading(text, size)); return this; }
-  paragraph(text) { this.blocks.push(block.paragraph(text)); return this; }
-  text(text) { return this.paragraph(text); }
+  heading(text, size = 1, opts = null) { this.blocks.push(block.heading(text, size, opts)); return this; }
+  header(text, size = 1, opts = null) { this.blocks.push(block.heading(text, size, opts)); return this; }
+  paragraph(text, opts = null) { this.blocks.push(block.paragraph(text, opts)); return this; }
+  text(text, opts = null) { return this.paragraph(text, opts); }
   pre(text, language) { this.blocks.push(block.pre(text, language)); return this; }
   footer(text) { this.blocks.push(block.footer(text)); return this; }
   divider() { this.blocks.push(block.divider()); return this; }
   buttons(buttons, align) { this.blocks.push(block.buttons(buttons, align)); return this; }
   table(rows, opts) { this.blocks.push(block.table(rows, opts)); return this; }
-  list(items) { this.blocks.push(block.list(items)); return this; }
+  list(items, opts) { this.blocks.push(block.list(items, opts)); return this; }
   blockquote(blocksOrText, credit) {
     let blocks;
     if (Array.isArray(blocksOrText)) {
@@ -313,8 +329,8 @@ export class RichMessageBuilder {
     this.blocks.push(block.expandableBlockquote(text, credit));
     return this;
   }
-  pullquote(text, credit) {
-    this.blocks.push(block.pullquote(text, credit));
+  pullquote(text, credit, opts = null) {
+    this.blocks.push(block.pullquote(text, credit, opts));
     return this;
   }
   details(summary, blocks, isOpen) { this.blocks.push(block.details(summary, blocks, isOpen)); return this; }
@@ -338,13 +354,13 @@ export class RichMessageBuilder {
   /**
    * Header banner using native Bot API 10.3 heading + italic subtitle.
    */
-  bannerHeader(lines, { size = 1 } = {}) {
+  bannerHeader(lines, { size = 1, rawSubtitle = false } = {}) {
     const list = Array.isArray(lines) ? lines : [lines];
     const title = list[0] || 'LANCY BOT';
     const sub = list.slice(1).join(' • ');
     this.heading(title, size);
     if (sub) {
-      this.paragraph(rt.italic(`₊˚⊹♡  ${sub}  ˙ᵕ˙`));
+      this.paragraph(rt.italic(`₊˚⊹♡  ${sub}  ˙ᵕ˙`), rawSubtitle ? { rawEmoji: true } : null);
     }
     this.divider();
     return this;
@@ -467,11 +483,16 @@ export class RichMessageBuilder {
       if (b && b.type === 'buttons' && Array.isArray(b.buttons)) {
         return {
           ...b,
-          buttons: b.buttons.map((btn) => ({
-            ...btn,
-            style: normalizeButtonStyle(btn.style)
-          }))
+          buttons: b.buttons.map((btn) => {
+            const cleaned = { ...btn, style: normalizeButtonStyle(btn.style) };
+            if (!useCustomEmojis && cleaned._rawEmoji !== undefined) delete cleaned._rawEmoji;
+            return cleaned;
+          })
         };
+      }
+      if (b && b._rawEmoji && !useCustomEmojis) {
+        const { _rawEmoji, ...cleaned } = b;
+        return cleaned;
       }
       return b;
     });

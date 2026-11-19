@@ -13,6 +13,8 @@ import { sleep, parseDurationToSeconds } from '../utils/time.js';
 import { truncate } from '../utils/text.js';
 import { recognizeAudio, extractMediaForMusicRecognition } from '../media/recognizer.js';
 import { getLyrics, getCachedLyrics, chunkLyrics, escapeHtml, formatBlockquoteLyrics, cleanSongMetadata } from '../media/lyrics.js';
+import { buildShowcaseHtmlFallback } from './showcaseCard.js';
+import { enhanceHtmlWithCustomEmojis } from './customEmoji.js';
 import { getStreamPublicUrl } from '../media/streamingServer.js';
 import { t } from '../core/i18n.js';
 import { PinterestWebProvider } from '../pinterest/web.js';
@@ -116,6 +118,7 @@ export class TelegramController extends EventEmitter {
     this.userScreenMessage = new Map(); // `${chatId}:${tgId}` or tgId -> { chatId, messageId }
     this.activeUserTasks = new Map(); // tgId -> count of active heavy downloads
     this.mediaDeliveryMessageIds = new Set(); // messageId -> boolean
+    this.aiMessageIds = new Map(); // `${chatId}:${messageId}` -> expiresAt
     this.pendingAudioCaches = new Set(); // query -> boolean
     this.pendingVideoCaches = new Set(); // videoId -> boolean
     this.audioMetadataMap = new Map(); // trackId -> { id, title, artist, album, cover, previewUrl }
@@ -198,6 +201,74 @@ export class TelegramController extends EventEmitter {
   getInlineAudioMetadata(trackId) {
     if (!trackId) return null;
     return this.audioMetadataMap.get(String(trackId));
+  }
+
+  markAiMessage(chatId, messageId) {
+    if (!chatId || !messageId) return;
+    const key = `${chatId}:${Number(messageId)}`;
+    this.aiMessageIds.set(key, Date.now() + 24 * 60 * 60 * 1000);
+    if (this.aiMessageIds.size > 1000) {
+      const oldest = this.aiMessageIds.keys().next().value;
+      if (oldest !== undefined) this.aiMessageIds.delete(oldest);
+    }
+  }
+
+  isAiMessage(chatId, messageId) {
+    if (!chatId || !messageId) return false;
+    const key = `${chatId}:${Number(messageId)}`;
+    const exp = this.aiMessageIds.get(key);
+    if (!exp) return false;
+    if (exp <= Date.now()) {
+      this.aiMessageIds.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  /** Detect whether a DM reply is targeting a non-AI message (user/forwarded message, prompt card, menu, media delivery, or player). */
+  isNonAiDmReply(chatId, tgId, message, { botUsername = '', isChannelCardReply = false, activeStateRecord = null } = {}) {
+    const reply = message?.reply_to_message;
+    if (!reply) return false;
+    const isForwarded = Boolean(
+      reply.forward_from || reply.forward_from_chat || reply.forward_origin || reply.forward_date
+    );
+    if (isForwarded) return true;
+
+    const replyFrom = reply.from;
+    const fromThisBot = Boolean(
+      isChannelCardReply ||
+      (this.api?.me?.id && replyFrom?.id != null && Number(replyFrom.id) === Number(this.api.me.id)) ||
+      (botUsername && replyFrom?.username && replyFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
+      (!this.api?.me?.id && (!replyFrom || replyFrom.is_bot))
+    );
+    if (!fromThisBot) return true;
+
+    const replyId = Number(reply.message_id || 0);
+    if (replyId && this.isAiMessage(chatId, replyId)) return false;
+
+    const trackedAiIds = Array.isArray(activeStateRecord?.context?.replyableMessageIds)
+      ? activeStateRecord.context.replyableMessageIds.map(Number)
+      : [];
+    const activeAiState = activeStateRecord && [States.AI_CHAT, States.AI_MEDIA_CHAT].includes(activeStateRecord.state);
+    if (activeAiState && replyId && (replyId === Number(activeStateRecord.context?.promptMessageId) || trackedAiIds.includes(replyId))) {
+      return false;
+    }
+
+    if (replyId && this.isMediaDeliveryMessageId(replyId)) return true;
+    if (reply.photo || reply.video || reply.audio || reply.voice || reply.document || reply.sticker || reply.animation) {
+      return true;
+    }
+
+    const replyText = String(reply.text || reply.caption || '');
+    const hasButtons = Boolean(Array.isArray(reply.reply_markup?.inline_keyboard) && reply.reply_markup.inline_keyboard.length > 0);
+    if (hasButtons && !/\b(?:lancy\s+ai|ai\s+movie\s*&\s*song\s*agent|chat\s+with\s+lancy|interactive\s+dj|ask\s+ai\s+again)\b/i.test(replyText)) {
+      return true;
+    }
+
+    if (/PLAY\s*&\s*DOWNLOAD|SEARCH\s+SONG\s+LYRICS|URL\s+DOWNLOADER|PINTEREST\s+(?:SEARCH|STUDIO)|STICKER\s+(?:STUDIO|PACK)|CUSTOM\s+EMOJI|NSFW\s+STUDIO|18\+\s+STUDIO|XVIDEOS|PORNHUB|CINEMA\s+VC|NOW\s+PLAYING|VOICE\s+CHAT|MOVIE\s+HUB|CHANNEL\s+(?:DASHBOARD|PANEL)|SETTINGS|DASHBOARD|MAIN\s+MENU|HELP\s+GUIDE|CLONE\s+BOT|FORCEJOIN|Send\s+a\s+movie\s+or\s+TV|18\+\s+movie\s+title|pornstar\s*\/\s*artist|18\+\s+studio\s+name|tell\s+me\s+what\s+to\s+search|valid\s+media\s+link|\/cancel\s+closes|song\s+title\s*(?:&|and)\s*artist|type\s+any\s+song|Send\s+me\s+any\s+link/i.test(replyText)) {
+      return true;
+    }
+    return false;
   }
 
   /** Mark a message as containing delivered media (video, album, audio, stickers). */
@@ -286,15 +357,21 @@ export class TelegramController extends EventEmitter {
   }
 
   #recordKnownChannel(chat, fromUser = null) {
-    if (!chat?.id || chat.type !== 'channel') return;
+    if (!chat?.id) return;
+    const chatType = chat.type;
+    if (chatType !== 'channel' && chatType !== 'group' && chatType !== 'supergroup') return;
     if (typeof this.db?.getTelegramChannel !== 'function' || typeof this.db?.recordTelegramChannel !== 'function') return;
     try {
-      if (this.db.getTelegramChannel(chat.id)) return;
+      const existing = this.db.getTelegramChannel(chat.id);
+      if (existing && (existing.chat_type || 'channel') === chatType && existing.title === (chat.title || existing.title)) {
+        return;
+      }
       this.db.recordTelegramChannel({
         channel_id: chat.id,
-        title: chat.title || 'Untitled Channel',
+        title: chat.title || (chatType === 'channel' ? 'Untitled Channel' : 'Telegram Group'),
         username: chat.username || null,
-        can_post: 1,
+        chat_type: chatType,
+        can_post: existing ? existing.can_post : 1,
         added_by: fromUser?.id || null
       });
     } catch {}
@@ -366,14 +443,18 @@ export class TelegramController extends EventEmitter {
     this.botUsername = me.username;
     this.supportsInline = Boolean(me.supports_inline_queries);
     if (!this.botContext?.isClone) {
-      this.settings.values.telegram.botUsername = me.username;
+      if (this.settings?.values?.telegram) this.settings.values.telegram.botUsername = me.username;
+      if (this.settings?.values?.general) this.settings.values.general.botUsername = me.username;
     }
-    this.log.info({ bot: `@${me.username}`, supportsInline: this.supportsInline }, 'telegram connected');
+    this.log.info({ bot: `@${me.username}`, id: me.id, supportsInline: this.supportsInline }, 'telegram connected');
     if (!this.supportsInline) {
       this.log.warn({ bot: `@${me.username}` }, 'Inline mode is disabled in @BotFather. Send /setinline to @BotFather to enable live @bot search in chats.');
     }
 
-    // Register slash commands so typing / displays suggestions
+    // Ensure long polling is clean after any bot token switch (clear any stale webhook)
+    await this.api.call('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
+
+    // Register slash commands & menu button so typing / and the suggestion box stay synced
     await this.registerCommands();
 
     this.abort = new AbortController();
@@ -433,6 +514,7 @@ export class TelegramController extends EventEmitter {
       { command: 'matching', description: '👥 Grab 2-piece & multi-slide matching avatars' },
       { command: 'hidetag', description: '📢 Invisibly mention all group members in one message (admins only)' },
       { command: 'tagall', description: '📢 Tag all group members in one clean message' },
+      { command: 'schedule', description: '📅 Schedule screening & media drops' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       { command: 'cancel', description: '✕ Cancel current active operation' }
     ];
@@ -470,13 +552,16 @@ export class TelegramController extends EventEmitter {
       { command: 'emojiid', description: '🆔 Extract custom emoji IDs & add to system catalog' },
       { command: 'emojisuggest', description: '🪄 Match normal emojis to custom emojis + Remix' },
       { command: 'postchannel', description: '📢 Post sticker/emoji pack to Telegram channel' },
+      { command: 'broadcast', description: '📡 Broadcast messages, media & albums to channels, groups & users' },
       { command: 'autopost', description: '📅 Schedule automated sticker drops' },
+      { command: 'schedule', description: '📅 Schedule screening & media drops' },
       { command: 'forcejoin', description: '🔒 Configure Force-Join channels & groups' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       ...(isClone ? [] : [
         { command: 'whatsapp', description: '📱 WhatsApp publishing & channels' },
         { command: 'ai', description: '🪄 Aesthetic AI assistant' },
-        { command: 'clone', description: '🤖 Bring your own bot / clone in 60s' }
+        { command: 'clone', description: '🤖 Bring your own bot / clone in 60s' },
+        { command: 'botcommands', description: '🔄 Sync command suggestion box' }
       ]),
       { command: 'rmbot', description: '🗑 Remove or delete a cloned bot' },
       { command: 'settings', description: '⚙ Studio configuration' },
@@ -485,10 +570,30 @@ export class TelegramController extends EventEmitter {
     ];
 
     try {
-      await this.api.call('setMyCommands', { commands: withMusicCommands(privateCommands,{privateChat:true}), scope: { type: 'default' } }).catch(() => {});
-      await this.api.call('setMyCommands', { commands: withMusicCommands(privateCommands,{privateChat:true}), scope: { type: 'all_private_chats' } }).catch(() => {});
-      await this.api.call('setMyCommands', { commands: withMusicCommands(groupCommands), scope: { type: 'all_group_chats' } }).catch(() => {});
-      await this.api.call('setMyCommands', { commands: withMusicCommands(groupCommands,{admin:true}), scope: { type: 'all_chat_administrators' } }).catch(() => {});
+      const privCmds = withMusicCommands(privateCommands, { privateChat: true }).slice(0, 100);
+      const grpCmds = withMusicCommands(groupCommands).slice(0, 100);
+      const grpAdminCmds = withMusicCommands(groupCommands, { admin: true }).slice(0, 100);
+      await this.api.call('setMyCommands', { commands: privCmds, scope: { type: 'default' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: privCmds, scope: { type: 'all_private_chats' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: grpCmds, scope: { type: 'all_group_chats' } }).catch(() => {});
+      await this.api.call('setMyCommands', { commands: grpAdminCmds, scope: { type: 'all_chat_administrators' } }).catch(() => {});
+      await this.api.call('setChatMenuButton', { menu_button: { type: 'commands' } }).catch(() => {});
+
+      if (!isClone && typeof this.db?.all === 'function') {
+        try {
+          const customChats = this.db.all("SELECT chat_id, prefix FROM chat_settings WHERE prefix IS NOT NULL AND prefix != '/' AND prefix != ''");
+          for (const row of (customChats || []).slice(0, 25)) {
+            if (row?.chat_id && row?.prefix) {
+              await this.updateCommandsForChat(row.chat_id, row.prefix).catch(() => {});
+            }
+          }
+        } catch {}
+      }
+
+      this.log.info(
+        { bot: `@${this.botUsername || 'bot'}`, privateCount: privCmds.length, groupCount: grpCmds.length, adminCount: grpAdminCmds.length },
+        'command suggestion box synced'
+      );
     } catch (err) {
       this.log.debug({ err: err?.message }, 'could not setMyCommands');
     }
@@ -533,7 +638,9 @@ export class TelegramController extends EventEmitter {
     this.log.info({
       updateId: update.update_id,
       from: update.message?.from?.id ?? update.callback_query?.from?.id ?? update.poll_answer?.user?.id ?? update.poll_answer?.voter_chat?.id,
+      chatType: update.message?.chat?.type ?? update.callback_query?.message?.chat?.type,
       hasText: Boolean(update.message?.text),
+      hasVoice: Boolean(update.message?.voice),
       hasCallback: Boolean(update.callback_query?.data),
       hasPoll: Boolean(update.poll),
       hasPollAnswer: Boolean(update.poll_answer)
@@ -548,6 +655,9 @@ export class TelegramController extends EventEmitter {
     if (update.chat_join_request) return this.#handleChatJoinRequest(update.chat_join_request);
     if (update.poll) return this.app?.music?.handlePollUpdate?.(update.poll, { api: this.api, botId: Number(this.botContext?.botId || 0) || 0 });
     if (update.poll_answer) return this.app?.music?.handlePollAnswer?.(update.poll_answer, { api: this.api, botId: Number(this.botContext?.botId || 0) || 0 });
+    if (update.widget_query) {
+      return this.api?.answerWidgetQuery?.(update.widget_query.id, { text: 'Updated!' }).catch(() => {});
+    }
     if (update.pre_checkout_query) return this.app?.starsBilling?.handlePreCheckout?.(update.pre_checkout_query, this.api);
     if (update.callback_query) return this.#handleCallback(update.callback_query);
     if (update.message) return this.#handleMessage(update.message);
@@ -597,28 +707,81 @@ export class TelegramController extends EventEmitter {
     }
   }
 
-  #handleMyChatMemberUpdated(myChatMember) {
+  async #handleMyChatMemberUpdated(myChatMember) {
     if (!myChatMember?.chat?.id) return;
     const chat = myChatMember.chat;
     const chatId = chat.id;
-    const newStatus = myChatMember.new_chat_member?.status;
+    const newMember = myChatMember.new_chat_member;
+    const newStatus = newMember?.status;
     const isChannel = chat.type === 'channel';
+    const isGroup = chat.type === 'group' || chat.type === 'supergroup';
 
-    if (isChannel) {
+    if (isChannel || isGroup) {
       invalidateChannelAdminCache(this.api, chatId);
-      if (['administrator', 'creator'].includes(newStatus)) {
-        const canPost = newStatus === 'creator' || myChatMember.new_chat_member?.can_post_messages !== false;
-        this.log.info?.({ channelId: chatId, title: chat.title, status: newStatus, canPost }, 'bot added or updated as admin in channel');
-        this.db.recordTelegramChannel({
-          channel_id: chatId,
-          title: chat.title || 'Untitled Channel',
-          username: chat.username || null,
-          can_post: canPost ? 1 : 0,
-          added_by: myChatMember.from?.id || null
-        });
-      } else if (['kicked', 'left', 'restricted', 'member'].includes(newStatus)) {
-        this.log.info?.({ channelId: chatId, status: newStatus }, 'bot removed or demoted in channel');
-        this.db.removeTelegramChannel(chatId);
+      const me = this.api?.me?.id ? this.api.me : (newMember?.user?.is_bot ? newMember.user : await this.api?.getMe?.().catch(() => null));
+      const botId = me?.id ? String(me.id) : (this.botContext?.isClone ? `clone_${this.botContext.botId}` : null);
+      const botUsername = me?.username || this.botContext?.botUsername || null;
+
+      if (isChannel) {
+        if (['administrator', 'creator'].includes(newStatus)) {
+          const canPost = newStatus === 'creator' || newMember?.can_post_messages !== false;
+          this.log.info?.({ channelId: chatId, title: chat.title, status: newStatus, canPost, botId }, 'bot added or updated as admin in channel');
+          this.db.recordTelegramChannel({
+            channel_id: chatId,
+            title: chat.title || 'Untitled Channel',
+            username: chat.username || null,
+            chat_type: 'channel',
+            can_post: canPost ? 1 : 0,
+            added_by: myChatMember.from?.id || null
+          });
+          if (botId) {
+            this.db.recordBotChannelVerification?.({
+              bot_id: botId,
+              channel_id: chatId,
+              bot_username: botUsername,
+              is_admin: 1,
+              can_post: canPost ? 1 : 0
+            });
+          }
+        } else if (['kicked', 'left', 'restricted', 'member'].includes(newStatus)) {
+          this.log.info?.({ channelId: chatId, status: newStatus, botId }, 'bot removed or demoted in channel');
+          if (typeof this.db.markBotChannelUnavailable === 'function' && botId) {
+            this.db.markBotChannelUnavailable(botId, chatId, { bot_username: botUsername });
+          } else {
+            this.db.removeTelegramChannel(chatId);
+          }
+        }
+      } else if (isGroup) {
+        const isRemoved = ['kicked', 'left'].includes(newStatus);
+        const canSend = !isRemoved && !(newStatus === 'restricted' && newMember?.can_send_messages === false);
+        const isAdmin = ['administrator', 'creator'].includes(newStatus);
+        if (!isRemoved && canSend) {
+          this.log.info?.({ groupId: chatId, title: chat.title, chatType: chat.type, status: newStatus, botId }, 'bot added or updated in group chat');
+          this.db.recordTelegramChannel({
+            channel_id: chatId,
+            title: chat.title || 'Telegram Group',
+            username: chat.username || null,
+            chat_type: chat.type,
+            can_post: 1,
+            added_by: myChatMember.from?.id || null
+          });
+          if (botId) {
+            this.db.recordBotChannelVerification?.({
+              bot_id: botId,
+              channel_id: chatId,
+              bot_username: botUsername,
+              is_admin: isAdmin ? 1 : 0,
+              can_post: 1
+            });
+          }
+        } else {
+          this.log.info?.({ groupId: chatId, status: newStatus, botId }, 'bot removed or muted in group chat');
+          if (typeof this.db.markBotChannelUnavailable === 'function' && botId) {
+            this.db.markBotChannelUnavailable(botId, chatId, { bot_username: botUsername });
+          } else {
+            this.db.removeTelegramChannel(chatId);
+          }
+        }
       }
     }
 
@@ -2945,6 +3108,11 @@ export class TelegramController extends EventEmitter {
     try {
       // 1. If query is empty: provide intuitive entrypoint cards (Shazam style)
       if (!rawText) {
+        const showcaseHandle = this.botUsername || 'pappy_agent';
+        const showcaseHtml = enhanceHtmlWithCustomEmojis(
+          buildShowcaseHtmlFallback({ botName, botUsername: showcaseHandle }),
+          { registry: this.app?.customEmojiRegistry }
+        );
         const defaultResults = [
           {
             type: 'article',
@@ -2965,6 +3133,26 @@ export class TelegramController extends EventEmitter {
                     switch_inline_query_current_chat: '',
                     style: 'primary'
                   }
+                ]
+              ]
+            }
+          },
+          {
+            type: 'article',
+            id: 'hint_showcase',
+            title: `✨ ${botName} · All-in-One Capabilities A–Z`,
+            description: 'Share the aesthetic showcase card of everything this bot can do ♡',
+            thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            input_message_content: {
+              message_text: showcaseHtml,
+              parse_mode: 'HTML'
+            },
+            reply_markup: {
+              inline_keyboard: [
+                [
+                  { text: `🚀 Open @${showcaseHandle}`, url: `https://t.me/${showcaseHandle}`, style: 'success' },
+                  { text: '💌 Share Showcase', switch_inline_query: 'showcase', style: 'primary' }
                 ]
               ]
             }
@@ -3117,6 +3305,71 @@ export class TelegramController extends EventEmitter {
           });
           return;
         }
+      }
+
+      // Explicit inline showcase / composed post sharing (`@bot showcase`, `@bot post`, `@bot promo`)
+      if (/^(?:showcase|features|about|post|promo)(?:\s|$)/i.test(rawText)) {
+        const showcaseHandle = this.botUsername || 'pappy_agent';
+        const results = [];
+        const userDraft = this.screens?.get?.('broadcast')?.getDraft?.(query.from?.id);
+        const textItem = userDraft?.items?.find?.((it) => it.kind === 'text');
+        if (textItem && (textItem.html || textItem.text)) {
+          const postHtml = enhanceHtmlWithCustomEmojis(
+            textItem.html || escapeHtml(textItem.text),
+            { registry: this.app?.customEmojiRegistry }
+          );
+          const customRows = (userDraft.buttonRows || []).map((row) =>
+            row.map((btn) => btn.kind === 'copy'
+              ? { text: btn.label, copy_text: { text: btn.value }, style: 'primary' }
+              : (btn.kind === 'inline'
+                ? { text: btn.label, switch_inline_query: btn.value, style: 'primary' }
+                : { text: btn.label, url: btn.value, style: 'success' }))
+          );
+          results.push({
+            type: 'article',
+            id: `draft_post_${Date.now()}`,
+            title: '📡 Share Your Broadcast Studio Draft',
+            description: String(textItem.text || 'Formatted post with custom emojis & buttons').slice(0, 90),
+            thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+            input_message_content: {
+              message_text: userDraft.richCard ? `<blockquote>${postHtml}</blockquote>` : postHtml,
+              parse_mode: 'HTML'
+            },
+            ...(customRows.length ? { reply_markup: { inline_keyboard: customRows } } : {})
+          });
+        }
+        const showcaseHtml = enhanceHtmlWithCustomEmojis(
+          buildShowcaseHtmlFallback({ botName, botUsername: showcaseHandle }),
+          { registry: this.app?.customEmojiRegistry }
+        );
+        results.push({
+          type: 'article',
+          id: `showcase_${showcaseHandle}`,
+          title: `✨ ${botName} · Complete Capabilities A–Z`,
+          description: 'Drop clean A–Z overview card with buttons ♡',
+          thumb_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+          thumbnail_url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=150',
+          input_message_content: {
+            message_text: showcaseHtml,
+            parse_mode: 'HTML'
+          },
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: `🚀 Open @${showcaseHandle}`, url: `https://t.me/${showcaseHandle}`, style: 'success' },
+                { text: '💌 Share Card', switch_inline_query: 'showcase', style: 'primary' }
+              ]
+            ]
+          }
+        });
+        await this.api.call('answerInlineQuery', {
+          inline_query_id: qId,
+          results,
+          cache_time: 5,
+          is_personal: true
+        });
+        return;
       }
 
       // 2. Check if user pasted a media URL (TikTok, Pinterest, direct media, etc.)
@@ -3655,7 +3908,7 @@ export class TelegramController extends EventEmitter {
         }
       }
       const decodedPre = decodeCallback(query.data ?? '');
-      if (decodedPre && (decodedPre.screen === 'channel_post' || decodedPre.screen === 'autopost')) {
+      if (decodedPre && (decodedPre.screen === 'channel_post' || decodedPre.screen === 'autopost' || decodedPre.screen === 'broadcast')) {
         if (await this.#isAnyChannelAdmin(query.from.id)) {
           guard = { ok: true, role: 'channel_admin' };
         }
@@ -3802,8 +4055,9 @@ export class TelegramController extends EventEmitter {
       this.#recordKnownChannel(message.chat, message.from);
     }
 
-    // In group chats, passively keep group roster up-to-date for /hidetag (throttled per user)
+    // In group chats, passively keep group roster + group chat directory up-to-date (throttled)
     if (isGroup && chatId) {
+      this.#recordKnownChannel(message.chat, message.from);
       if (message.from && !message.from.is_bot) {
         this.#recordGroupMemberThrottled(chatId, message.from);
       }
@@ -4021,6 +4275,31 @@ export class TelegramController extends EventEmitter {
         const channelPostScreen = this.screens.get('channel_post');
         if (channelPostScreen) {
           const sent = await channelPostScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
+          if (sent?.message_id) {
+            this.setScreenMsg(chatId, tgId, sent.message_id);
+            this.sm.update(tgId, { screenMessageId: sent.message_id });
+            if (!this.botContext?.isClone) {
+              this.db.run('UPDATE user_states SET screen_message_id = ? WHERE tg_id = ?', sent.message_id, Number(tgId));
+            }
+          }
+          return;
+        }
+      }
+
+      if (command === '/broadcast' || command === '/bcast' || command === '/cast') {
+        if (isGroup || isChannel) {
+          await this.#sendDmOnlyNotice(
+            chatId,
+            message,
+            `<blockquote>📡 Broadcast Studio is opened in private DM with the bot (<code>/broadcast</code>) ♡</blockquote>`,
+            isChannel
+          );
+          return;
+        }
+        await this.sm.reset(tgId, { reason: 'command' });
+        const broadcastScreen = this.screens.get('broadcast');
+        if (broadcastScreen) {
+          const sent = await broadcastScreen.open(this.#ctx(tgId, { message }, { forceNew: true }));
           if (sent?.message_id) {
             this.setScreenMsg(chatId, tgId, sent.message_id);
             this.sm.update(tgId, { screenMessageId: sent.message_id });
@@ -4633,13 +4912,17 @@ export class TelegramController extends EventEmitter {
         }
         return;
       }
-      if (command === '/settings' || command === '/ownersettings' || command === '/cinemasettings') {
+      if (command === '/settings' || command === '/ownersettings' || command === '/cinemasettings' || command === '/jobs' || command === '/stress' || command === '/queueplan') {
         await this.sm.reset(tgId, { reason: 'command' });
         const settingsScreen = this.screens.get('settings');
         const sctx = this.#ctx(tgId, { message }, { forceNew: true });
-        const sent = (command === '/ownersettings' || command === '/cinemasettings') && settingsScreen?.handle
-          ? await settingsScreen.handle(sctx, 'category', ['cinema'])
-          : await settingsScreen?.open(sctx);
+        const isPerfCmd = command === '/jobs' || command === '/stress' || command === '/queueplan';
+        const isCinemaCmd = command === '/ownersettings' || command === '/cinemasettings';
+        const sent = (isPerfCmd && settingsScreen?.handle)
+          ? await settingsScreen.handle(sctx, 'category', ['performance'])
+          : (isCinemaCmd && settingsScreen?.handle)
+            ? await settingsScreen.handle(sctx, 'category', ['cinema'])
+            : await settingsScreen?.open(sctx);
         updateScreenMsg(sent);
         return;
       }
@@ -4761,6 +5044,38 @@ export class TelegramController extends EventEmitter {
         await this.api.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
         return;
       }
+      if (command === '/memory') {
+        const sub = String(rest[0] || '').toLowerCase();
+        const memStore = this.app?.lancyAgent?.memory;
+        if (!memStore) {
+          await this.api.sendMessage(chatId, '🧠 Memory store is not active right now.').catch(() => {});
+          return;
+        }
+        if (['forget', 'clear', 'wipe', 'delete', 'reset'].includes(sub)) {
+          const cleared = memStore.forgetUserMemories(tgId);
+          this.app?.assistant?.clearHistory?.(Number(tgId));
+          await this.api.sendMessage(
+            chatId,
+            `🧹 Done! Cleared ${cleared} saved personal memor${cleared === 1 ? 'y' : 'ies'} and your DM chat history.`
+          ).catch(() => {});
+          return;
+        }
+        const items = memStore.getUserMemories(tgId, { limit: 12 });
+        if (!items.length) {
+          await this.api.sendMessage(
+            chatId,
+            '🧠 I don’t have any personal facts saved for you yet.\nTell me things like `"remember my favorite vibe is afrobeats"` or clear anytime with `/memory forget`.'
+          ).catch(() => {});
+          return;
+        }
+        const lines = items.map((m, idx) => `${idx + 1}. <b>[${escapeHtml(m.category || 'fact')}]</b> ${escapeHtml(m.content)}`);
+        await this.api.sendMessage(
+          chatId,
+          `🧠 <b>Your Personal Lancy Memory</b>\n<blockquote>${lines.join('\n')}</blockquote>\nClear anytime with <code>/memory forget</code>`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+        return;
+      }
       // Unknown command: silently ignore to keep chat clean
       return;
     }
@@ -4774,7 +5089,7 @@ export class TelegramController extends EventEmitter {
       const botName = this.botName || this.botContext?.botName || 'Lancy';
       const cleanBotName = String(botName).replace(/[^\p{L}\p{N}_]/gu, ' ').trim();
       const botNameParts = cleanBotName.split(/\s+/).filter(Boolean);
-      const nameTriggers = new Set(['lancy']);
+      const nameTriggers = new Set(['lancy', 'pappy', 'ava', 'maya', 'leo', 'nana', 'elder', 'zara', 'marcus', 'chloe']);
       if (botNameParts.length > 0) {
         const first = botNameParts[0].toLowerCase();
         if (first.length >= 2 && !['the', 'bot', 'easy', 'official'].includes(first)) {
@@ -4783,23 +5098,27 @@ export class TelegramController extends EventEmitter {
       }
 
       const botUsername = (this.botUsername || this.botContext?.botUsername || this.api.me?.username || 'Lancy_easy_bot').replace(/^@/, '');
-      const replyMsgFrom = message.reply_to_message?.from;
+      const replyMsg = message.reply_to_message;
+      const replyMsgFrom = replyMsg?.from;
+      const isForwardedReply = Boolean(
+        replyMsg?.forward_from || replyMsg?.forward_from_chat || replyMsg?.forward_origin || replyMsg?.forward_date
+      );
       const musicScreen = this.screens.get('music');
       const isChannelCardReply = Boolean(
         isChannelMsg &&
-        message.reply_to_message?.message_id &&
+        replyMsg?.message_id &&
         (
-          this.app?.musicQueueManager?.getSession?.(Number(chatId))?.screenMessageId === message.reply_to_message.message_id ||
-          musicScreen?.isBotMessageId?.(chatId, message.reply_to_message.message_id) ||
-          this.getScreenMsg(chatId, tgId)?.messageId === message.reply_to_message.message_id
+          this.app?.musicQueueManager?.getSession?.(Number(chatId))?.screenMessageId === replyMsg.message_id ||
+          musicScreen?.isBotMessageId?.(chatId, replyMsg.message_id) ||
+          this.getScreenMsg(chatId, tgId)?.messageId === replyMsg.message_id
         )
       );
       const isReplyToThisBot = Boolean(
-        message.reply_to_message && (
+        replyMsg && (
           isChannelCardReply ||
           (this.api.me?.id && replyMsgFrom?.id === this.api.me.id) ||
           (botUsername && replyMsgFrom?.username && replyMsgFrom.username.toLowerCase() === botUsername.toLowerCase()) ||
-          (isPrivate && (replyMsgFrom?.is_bot || !replyMsgFrom || (replyMsgFrom?.id && replyMsgFrom.id !== Number(tgId))))
+          (!this.api.me?.id && isPrivate && !isForwardedReply && (replyMsgFrom?.is_bot || !replyMsgFrom))
         )
       );
       const isReplyToBot = isReplyToThisBot;
@@ -4826,6 +5145,14 @@ export class TelegramController extends EventEmitter {
       const stateOwnerId = (isChannelMsg && this.sm.get?.(String(chatId)))
         ? String(chatId)
         : (this.sm.get?.(tgId) ? tgId : (isChannelMsg ? String(chatId) : tgId));
+      const activeStateRecord = this.sm?.get?.(stateOwnerId) || null;
+      const isNonAiDmReply = Boolean(
+        isPrivate && replyMsg && this.isNonAiDmReply(chatId, tgId, message, {
+          botUsername,
+          isChannelCardReply,
+          activeStateRecord
+        })
+      );
 
       // Check if user uploaded/sent a video, audio file, or voice note for music recognition:
       const recMedia = extractMediaForMusicRecognition(message);
@@ -4841,6 +5168,81 @@ export class TelegramController extends EventEmitter {
         }
       }
 
+      // Voice Note (VN) listener: transcribe Telegram voice messages and respond with spoken voice + tool execution
+      const voiceObj = message.voice || message.video_note;
+      if (
+        voiceObj?.file_id
+        && !isChannelMsg
+        && (voiceObj.file_size || 0) <= 20 * 1024 * 1024
+        && (voiceObj.duration || 0) <= 180
+        && typeof this.app?.voiceClient?.transcribeAudioBuffer === 'function'
+      ) {
+        const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
+        this.log?.info?.({ chatId, tgId, isGroup, isPrivate, enabled, duration: voiceObj.duration }, 'voice note received');
+        if (enabled) {
+          if (isPrivate || isReplyToThisBot) {
+            void this.api?.sendChatAction?.(chatId, 'record_voice')?.catch?.(() => {});
+          }
+          try {
+            const fInfo = await this.api.getFile(voiceObj.file_id);
+            const buf = fInfo?.file_path ? await this.api.downloadFile(fInfo.file_path) : null;
+            if (buf && buf.length > 0) {
+              const ext = extname(fInfo.file_path || '').replace(/^\./, '') || (message.video_note ? 'mp4' : 'ogg');
+              const tr = await this.app.voiceClient.transcribeAudioBuffer(buf, { extension: ext, activeSession: true }).catch((err) => {
+                this.log?.warn?.({ err: err?.message, chatId }, 'voice note transcription failed');
+                return null;
+              });
+              const vnText = String(tr?.text || '').trim();
+              const vnMentionsBot = Boolean(
+                vnText && (
+                  nameRegex.test(vnText)
+                  || tr?.is_wake
+                  || /\blancy\b/i.test(vnText)
+                  || (botUsername && new RegExp(`@?${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(vnText))
+                )
+              );
+              this.log?.info?.({ chatId, vnText: vnText.slice(0, 120), vnMentionsBot, isReplyToThisBot, confidence: tr?.confidence }, 'voice note transcribed');
+
+              if (isPrivate) {
+                if (!vnText || (tr?.low_confidence && Number(tr?.confidence ?? 0) < 0.35)) {
+                  await this.api.sendMessage(chatId, '🎙️ I couldn’t hear that voice note clearly — could you say it again?', {
+                    reply_to_message_id: message.message_id
+                  }).catch(() => {});
+                  return;
+                }
+                const vnCtx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate, isReplyToBot, isTag: vnMentionsBot, forceNew: true });
+                const stateHandled = await this.sm.handleMessage(stateOwnerId, { ...message, chatId, text: vnText }, vnCtx);
+                if (!stateHandled && this.app?.assistant) {
+                  await this.app.assistant.handleMessage({ ctx: vnCtx, message, text: vnText, voiceMode: true });
+                }
+                return;
+              }
+
+              if (isGroup) {
+                const groupAiOn = Boolean(this.app?.lancyAgent?.isGroupAiEnabled?.(chatId));
+                if (vnText && (vnMentionsBot || isReplyToThisBot)) {
+                  void this.api?.sendChatAction?.(chatId, 'record_voice')?.catch?.(() => {});
+                  const vnCtx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate: false, isReplyToBot: isReplyToThisBot, isTag: vnMentionsBot, forceNew: true });
+                  const stateHandled = await this.sm.handleMessage(stateOwnerId, { ...message, chatId, text: vnText }, vnCtx);
+                  if (!stateHandled && this.app?.assistant) {
+                    await this.app.assistant.handleMessage({ ctx: vnCtx, message, text: vnText, voiceMode: true });
+                  }
+                  return;
+                }
+                if (vnText && groupAiOn && typeof this.app?.lancyAgent?.observeGroupMessage === 'function') {
+                  const senderDisplay = [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ')
+                    || message.from?.username
+                    || `User ${tgId}`;
+                  this.app.lancyAgent.observeGroupMessage({ chatId, userId: Number(tgId), senderName: senderDisplay, text: vnText });
+                }
+              }
+            }
+          } catch (err) {
+            this.log?.warn?.({ err: err?.message }, 'voice note handling failed');
+          }
+        }
+      }
+
       // In DM (private chat): state inputs work directly without needing to quote or tag!
       // In Group Chat: interactive prompt input requires replying to the bot or tagging @bot
       // to avoid chat conflicts when group members talk with each other.
@@ -4850,7 +5252,7 @@ export class TelegramController extends EventEmitter {
       );
       const shouldHandleState = (stateChat == null || Number(stateChat) === Number(chatId))
         && (isPrivate || isReplyToBot || isTag || isAlbumContinuation || (isChannelMsg && stateChat != null && Number(stateChat) === Number(chatId)));
-      const ctx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate, isReplyToBot, isTag });
+      const ctx = this.#ctx(stateOwnerId, { message }, { isGroup, isPrivate, isReplyToBot, isTag, isNonAiReply: isNonAiDmReply });
       const handled = shouldHandleState ? await this.sm.handleMessage(stateOwnerId, { ...message, chatId }, ctx) : false;
       if (!handled) {
         if (text) {
@@ -4878,6 +5280,27 @@ export class TelegramController extends EventEmitter {
               if (downloaderScreen?.executeDownload) {
                 const dlCtx = this.#ctx(tgId, { message }, { forceNew: true });
                 await downloaderScreen.executeDownload(dlCtx, text);
+                return;
+              }
+            }
+            if (isReplyToBot && /movie or TV series title|18\+ movie title|pornstar \/ artist name|18\+ studio name|Post the movie or TV series title/i.test(promptText)) {
+              const movieUiHandler = this.screens.get('music')?.movieUi || this.screens.get('movie');
+              if (movieUiHandler?.openMovieSearch) {
+                const isXv = /18\+|pornstar|studio/i.test(promptText);
+                const mCtx = this.#ctx(tgId, { message }, { forceNew: true });
+                await movieUiHandler.openMovieSearch(mCtx, text, {
+                  sourceMode: isXv ? 'xvideos' : 'movie',
+                  originMessageId: message.message_id,
+                  forceNewCard: true
+                });
+                return;
+              }
+            }
+            if (isReplyToBot && /PINTEREST SEARCH|tell me what to search for.*♡/i.test(promptText)) {
+              const pinterestScreen = this.screens.get('pinterest');
+              if (pinterestScreen?.executeSearch) {
+                const pCtx = this.#ctx(tgId, { message }, { forceNew: true });
+                await pinterestScreen.executeSearch(pCtx, text);
                 return;
               }
             }
@@ -4910,14 +5333,50 @@ export class TelegramController extends EventEmitter {
             }
           }
 
-          // AI assistant: responds in private DM and in group chat when tagged, quoted, or called by name
+          // AI assistant: responds in DM, in group chat for literal play replies, and for group conversation when /vcai group on is enabled
           const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
           if (enabled && this.app?.assistant) {
+            const groupAiOn = Boolean(isGroup && this.app?.lancyAgent?.isGroupAiEnabled?.(chatId));
             const isGcPlayMusic = isGroup && isReplyToThisBot && /^\s*play\b/i.test(text);
-            const shouldReply = isGroup ? isGcPlayMusic : (isPrivate || isReplyToThisBot || isTag || isNameTriggered);
+            const hasExplicitAtMention = Boolean(
+              botUsername && new RegExp(`@${botUsername.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(text)
+            );
+            const dmAllowed = !replyMsg || !isNonAiDmReply || hasExplicitAtMention;
+            const shouldReply = isGroup
+              ? (isGcPlayMusic || (groupAiOn && (isReplyToThisBot || isTag || isNameTriggered)))
+              : (isPrivate ? dmAllowed : (isReplyToThisBot || isTag || isNameTriggered));
             if (shouldReply) {
-              const aiCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot: isReplyToThisBot, isTag, forceNew: true });
-              await this.app.assistant.handleMessage({ ctx: aiCtx, message, text });
+              const images = await this.#extractMessageImages(message);
+              const aiCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot: isReplyToThisBot, isTag, isNonAiReply: isNonAiDmReply, forceNew: true });
+              await this.app.assistant.handleMessage({ ctx: aiCtx, message, text, images });
+            } else if (groupAiOn && !isChannelMsg && typeof this.app?.lancyAgent?.observeGroupMessage === 'function') {
+              const senderDisplay = [message.from?.first_name, message.from?.last_name].filter(Boolean).join(' ')
+                || message.from?.username
+                || `User ${tgId}`;
+              const obs = await this.app.lancyAgent.observeGroupMessage({
+                chatId,
+                userId: Number(tgId),
+                senderName: senderDisplay,
+                text,
+                ctx: this.#ctx(tgId, { message }, { isGroup, isPrivate: false })
+              }).catch(() => null);
+              if (obs?.proactiveReply) {
+                await this.api.sendMessage(chatId, obs.proactiveReply, { reply_to_message_id: message.message_id }).catch(() => {});
+              }
+            }
+          }
+        } else if (message.photo?.length && !isChannelMsg) {
+          const enabled = this.settings.getForUser(Number(tgId), 'ai.assistantEnabled', true);
+          const groupAiOn = Boolean(isGroup && this.app?.lancyAgent?.isGroupAiEnabled?.(chatId));
+          const canAnalyzePhoto = enabled && this.app?.assistant && (
+            (isPrivate && (!replyMsg || !isNonAiDmReply))
+            || (groupAiOn && isReplyToThisBot)
+          );
+          if (canAnalyzePhoto) {
+            const images = await this.#extractMessageImages(message);
+            if (images.length) {
+              const aiCtx = this.#ctx(tgId, { message }, { isGroup, isPrivate, isReplyToBot: isReplyToThisBot, isTag, isNonAiReply: isNonAiDmReply, forceNew: true });
+              await this.app.assistant.handleMessage({ ctx: aiCtx, message, text: '', images });
             }
           }
         }
@@ -4925,6 +5384,25 @@ export class TelegramController extends EventEmitter {
     } catch (error) {
       this.log.error({ err: error, tgId }, 'message handling failed');
       await this.api.sendMessage(chatId, friendly(error)).catch(() => {});
+    }
+  }
+
+  async #extractMessageImages(message) {
+    const photos = Array.isArray(message?.photo) ? message.photo : [];
+    const target = photos.at(-1);
+    if (!target?.file_id || typeof this.api?.getFile !== 'function' || typeof this.api?.downloadFile !== 'function') {
+      return [];
+    }
+    try {
+      const info = await this.api.getFile(target.file_id);
+      if (!info?.file_path) return [];
+      const buf = await this.api.downloadFile(info.file_path);
+      if (!buf || !buf.length || buf.length > 4 * 1024 * 1024) return [];
+      const ext = extname(info.file_path).toLowerCase();
+      const mime = ext === '.png' ? 'image/png' : (ext === '.webp' ? 'image/webp' : 'image/jpeg');
+      return [`data:${mime};base64,${Buffer.from(buf).toString('base64')}`];
+    } catch {
+      return [];
     }
   }
 
@@ -5096,6 +5574,10 @@ export class TelegramController extends EventEmitter {
       chatType,
       isChannel,
       isGroup,
+      isPrivate: Boolean(opts.isPrivate ?? chatType === 'private'),
+      isReplyToBot: Boolean(opts.isReplyToBot),
+      isTag: Boolean(opts.isTag),
+      isNonAiReply: Boolean(opts.isNonAiReply),
       directMessageId: directMessage?.message_id ?? null,
       ephemeralMessageId: queryMessage?.ephemeral_message_id ?? directMessage?.ephemeral_message_id ?? null,
       receiverUserId: Number(tgId) || null,

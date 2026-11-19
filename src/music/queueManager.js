@@ -8,7 +8,7 @@ import { logger } from '../core/logger.js';
 import { getCueAt, mapMediaSecToSubMs } from '../media/subtitles.js';
 import { buildLrcSubtitleText } from './lyrics.js';
 import { resolveAppScreen } from './accounts.js';
-import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, sendRichWithPhotoFallback, extractRichPhotoUrl, replaceRichPhotoMedia, extractSentPhotoFileId } from './model.js';
+import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, didEditStripMedia, didEditStripCustomEmojis, sendRichWithPhotoFallback, extractRichPhotoUrl, replaceRichPhotoMedia, extractSentPhotoFileId } from './model.js';
 
 /** Sole owner of ephemeral destination queues. The bridge exclusively owns account leases. */
 export class QueueManager extends EventEmitter {
@@ -23,7 +23,7 @@ export class QueueManager extends EventEmitter {
   }
   async watchEvents(){
     while(!this.closed){
-      try{const result=await this.voice.waitEvent(this.eventAbort.signal);if(this.closed)return;for(const event of result.events||[]){if(this.eventJobs.size>=16)continue;if(event.status==='ended'){const job=this.handleStreamEnded(event.chat_id,event.playback_id).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.status==='call_ended'){const job=this.handleCallEnded(event.chat_id,event.playback_id,event.position_seconds).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_message'){const job=this.handleVcMessage(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}}}
+      try{const result=await this.voice.waitEvent(this.eventAbort.signal);if(this.closed)return;for(const event of result.events||[]){if(this.eventJobs.size>=16)continue;if(event.status==='ended'){const job=this.handleStreamEnded(event.chat_id,event.playback_id).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.status==='call_ended'){const job=this.handleCallEnded(event.chat_id,event.playback_id,event.position_seconds).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_message'){const job=this.handleVcMessage(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_voice_transcript'){const job=this.handleVcVoiceTranscript(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_voice_barge_in'){const job=this.handleVcVoiceBargeIn(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_live_tool_call'){const job=this.handleVcLiveToolCall(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_live_transcript'){const job=this.handleVcLiveTranscript(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}else if(event.type==='vc_live_state_change'){const job=this.handleVcLiveStateChange(event).catch(()=>{}).finally(()=>this.eventJobs.delete(job));this.eventJobs.add(job);}}}
       catch{if(this.closed)return;await new Promise(resolve=>{const timer=setTimeout(resolve,3000);timer.unref?.();});}
     }
   }
@@ -298,6 +298,7 @@ export class QueueManager extends EventEmitter {
     }
     const next=s.upcoming[0];
     if(!next||s.status!=='playing')return;
+    if(this.app?.jobPlanner?.shouldDeferBackground?.())return;
     for(const u of s.upcoming.slice(1,4))this.#warmTrack(s,u);
     if(next.filePath&&existsSync(next.filePath))return;
     if(!['youtube','audius','telegram','music'].includes(next.provider)||!this.app?.musicLibrary)return;
@@ -449,6 +450,7 @@ export class QueueManager extends EventEmitter {
             isDash,
             maxHeight:(isMovieTrack || streamMode==='rtmp') ? 1080 : 720,
             videoQuality,
+            preferH264: streamMode !== 'rtmp',
             preferredAudioLang: track.preferredAudioLang || null,
             contentType: isDash ? 'application/dash+xml' : isHls ? 'application/vnd.apple.mpegurl' : 'video/mp4'
           });
@@ -536,7 +538,8 @@ export class QueueManager extends EventEmitter {
         const startSeconds=Math.max(0, Number(entry.startOffsetSeconds ?? entry.resumePositionSeconds ?? 0) || 0);
         const vcTitle=String(track.title||'').trim().slice(0, 64) || undefined;
         const volume=Number.isFinite(Number(s.volume)) ? Number(s.volume) : 100;
-        const playOpts={isChannel:s.isChannel,video:isVideo,videoQuality,volume,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset,subtitleSameRoute,subtitleManualOverride,subtitleRenderScreen,subDriftSecPerSec:subDriftRate,subDriftAnchorSec:subDriftAnchor,streamMode,preferredAudioLang:track.preferredAudioLang||null,rejectDub:Boolean(track.preferredAudioLang),...(djDesk?{djDesk:true,djDeskImage,crossfadeSec}:{})};
+        const voiceAiFlag = this.app?.lancyAgent ? { voiceAiEnabled: this.app.lancyAgent.isVoiceAiEnabled(s.chatId) } : {};
+        const playOpts={isChannel:s.isChannel,isMusic:targetDeck !== 'movie',video:isVideo,videoQuality,volume,playbackId,accountAlias:s.preferredAccount,durationSeconds:track.durationSeconds,startSeconds,vcTitle,bass:s.bass||eq==='bass',eq,remoteProxy,subtitlePath,subtitleOffset,subtitleSameRoute,subtitleManualOverride,subtitleRenderScreen,subDriftSecPerSec:subDriftRate,subDriftAnchorSec:subDriftAnchor,streamMode,preferredAudioLang:track.preferredAudioLang||null,rejectDub:Boolean(track.preferredAudioLang),...voiceAiFlag,...(djDesk?{djDesk:true,djDeskImage,crossfadeSec}:{})};
         let r;
         try {
           r=this.#assert(await this.voice.play(s.chatId,source,playOpts));
@@ -1758,7 +1761,136 @@ export class QueueManager extends EventEmitter {
       if (res?.reply) return reply(res.reply);
     }
     if (cmd === '!help') {
-      return reply('Commands: !np (now playing), !queue (up next), !skip (vote skip), !chapter, !dj <request>');
+      return reply('Commands: !np (now playing), !queue (up next), !skip (vote skip), !chapter, !dj <request> · Or say "Lancy <anything>"');
+    }
+    if (this.app?.lancyAgent && !text.startsWith('!')) {
+      await this.app.lancyAgent.handleVcTurn({
+        chatId,
+        userId: event?.sender_id || null,
+        senderName: event?.sender_name || 'Member',
+        fromAdmin: Boolean(event?.from_admin),
+        text,
+        source: 'vc_message',
+        eventId: event?.event_id || (event?.message_id ? `vcmsg:${chatId}:${event.message_id}` : null)
+      }).catch(() => {});
+    }
+  }
+  async handleVcVoiceTranscript(event) {
+    const chatId = Number(event?.chat_id);
+    if (!Number.isFinite(chatId) || chatId >= 0 || !this.app?.lancyAgent) return;
+    const s = this.sessions.get(chatId);
+    if (!s || (!s.connected && !s.currentTrack)) return;
+    const conv = this.app.lancyAgent.getVcConversation?.(chatId);
+    if (conv?.mode !== 'IDLE' || event?.is_listen_command) {
+      this.emit('vc_voice_transcript', event);
+    }
+    await this.app.lancyAgent.handleVcTurn({
+      chatId,
+      userId: event?.sender_id ?? null,
+      senderName: event?.sender_name || (event?.sender_id ? String(event.sender_id) : 'Speaker'),
+      fromAdmin: Boolean(event?.from_admin),
+      text: String(event?.text || ''),
+      source: 'vc_voice',
+      confidence: Number(event?.confidence ?? 1.0),
+      lowConfidence: Boolean(event?.low_confidence),
+      isWake: Boolean(event?.is_wake),
+      isListenCommand: Boolean(event?.is_listen_command),
+      eventId: event?.event_id || null,
+      simultaneousSpeakers: Array.isArray(event?.simultaneous_speakers) ? event.simultaneous_speakers : [],
+      detectedAtMs: event?.detected_at_ms ?? null
+    }).catch(() => {});
+  }
+  async handleVcVoiceBargeIn(event) {
+    const chatId = Number(event?.chat_id);
+    if (!Number.isFinite(chatId) || chatId >= 0) return;
+    this.emit('vc_voice_barge_in', event);
+    await this.app?.lancyAgent?.handleBargeIn?.({
+      chatId,
+      userId: event?.sender_id ?? null,
+      senderName: event?.sender_name || null,
+      eventId: event?.event_id || null
+    }).catch(() => {});
+  }
+  async handleVcLiveToolCall(event) {
+    const chatId = Number(event?.chat_id);
+    if (!Number.isFinite(chatId) || chatId >= 0 || !this.app?.lancyAgent?.executeLiveToolCall) return;
+    const response = await this.app.lancyAgent.executeLiveToolCall({
+      chatId,
+      callId: event?.call_id || '',
+      name: event?.name || '',
+      args: event?.args || {},
+      userId: event?.sender_id ?? null,
+      senderName: event?.sender_name || null
+    });
+    if (typeof this.voice?.submitLiveToolResult === 'function') {
+      await this.voice.submitLiveToolResult(chatId, {
+        callId: event?.call_id || '',
+        name: event?.name || '',
+        response
+      }).catch(() => {});
+    }
+  }
+  async handleVcLiveTranscript(event) {
+    const chatId = Number(event?.chat_id);
+    if (!Number.isFinite(chatId) || chatId >= 0 || !this.app?.lancyAgent) return;
+    const inText = String(event?.input_text || '').trim();
+    const outText = String(event?.output_text || '').trim();
+    if (typeof this.app.lancyAgent.syncLiveBehavioralTurn === 'function') {
+      await this.app.lancyAgent.syncLiveBehavioralTurn({
+        chatId,
+        inputText: inText,
+        outputText: outText,
+        userId: event?.sender_id ?? null,
+        senderName: event?.sender_name || null
+      }).catch(() => {});
+      return;
+    }
+    if (!this.app.lancyAgent.memory) return;
+    const sessionKey = `vc:${chatId}`;
+    if (inText) {
+      const cleanName = await this.app.lancyAgent.resolveSpeakerName(chatId, event?.sender_id, event?.sender_name);
+      this.app.lancyAgent.memory.recordSpeakerTurn(sessionKey, {
+        chatId,
+        surface: 'vc_voice',
+        userId: event?.sender_id ?? null,
+        speakerName: cleanName,
+        role: 'user',
+        text: inText,
+        addressedToLancy: true
+      });
+    }
+    if (outText) {
+      this.app.lancyAgent.memory.recordSpeakerTurn(sessionKey, {
+        chatId,
+        surface: 'vc_voice',
+        role: 'assistant',
+        speakerName: 'Lancy',
+        text: outText
+      });
+    }
+  }
+  async handleVcLiveStateChange(event) {
+    const chatId = Number(event?.chat_id);
+    if (!Number.isFinite(chatId) || chatId >= 0) return;
+    const s = this.sessions.get(chatId);
+    const conv = this.app?.lancyAgent?.getVcConversation?.(chatId);
+    const action = String(event?.action || '');
+    if (action === 'paused_by_lancy') {
+      if (s && s.status === 'playing') s.status = 'paused';
+      if (conv) {
+        conv.mode = 'LISTENING';
+        conv.pausedByLancy = true;
+        conv.pausedTrackId = s?.currentTrack?.entryId || s?.currentTrack?.id || null;
+      }
+      void this.updatePlayerCard(chatId, { forceEdit: true }).catch(() => {});
+    } else if (action === 'resumed_by_lancy') {
+      if (s && s.status === 'paused') s.status = 'playing';
+      if (conv) {
+        conv.mode = 'IDLE';
+        conv.pausedByLancy = false;
+        conv.pausedTrackId = null;
+      }
+      void this.updatePlayerCard(chatId, { forceEdit: true }).catch(() => {});
     }
   }
   async setSubtitleOffset(id, deltaOrValue = 0, { absolute = false } = {}) {
@@ -1956,7 +2088,7 @@ export class QueueManager extends EventEmitter {
           s.avSync = r.info.av_sync || null;
           const nextSyncHealth = s.avSync?.sync_health || null;
           const nextResyncCount = Number(s.avSync?.resync_count || 0);
-          if (nextSyncHealth && nextSyncHealth !== prevSyncHealth) {
+          if (s.deck === 'movie' && nextSyncHealth && nextSyncHealth !== prevSyncHealth) {
             if (['drifted', 'stalled'].includes(nextSyncHealth)) {
               this.log.warn({ chatId: s.chatId, syncHealth: nextSyncHealth, skewMs: s.avSync?.skew_ms, hbAgeSec: s.avSync?.hb_age_sec }, 'VC A/V sync degraded');
             } else if (['drifted', 'stalled', 'syncing'].includes(prevSyncHealth) && nextSyncHealth === 'locked') {
@@ -1967,7 +2099,11 @@ export class QueueManager extends EventEmitter {
             this.log.warn({ chatId: s.chatId, resyncCount: nextResyncCount, reason: s.avSync?.last_resync_reason }, 'VC A/V auto-resync triggered');
           }
           if (Boolean(s.avSync?.syncing) !== prevSyncing || nextSyncHealth !== prevSyncHealth || nextResyncCount !== prevResyncCount) {
-            s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+            const nowAv = Date.now();
+            if (!s._lastAvSyncEditAt || (nowAv - s._lastAvSyncEditAt) >= 12000) {
+              s._lastAvSyncEditAt = nowAv;
+              s.nextCardEdit = Math.min(s.nextCardEdit || 0, nowAv);
+            }
           }
           if (r.info.audio_language && s.currentTrack) s.currentTrack.audioLanguage = r.info.audio_language;
           if (r.info.audio_is_dub !== undefined && s.currentTrack) {
@@ -1987,7 +2123,11 @@ export class QueueManager extends EventEmitter {
                 driftAnchor: Number(s.subtitleDriftAnchor || 0) || 0
               });
             }
-            s.nextCardEdit = Math.min(s.nextCardEdit || 0, Date.now());
+            const nowSub = Date.now();
+            if (!s._lastSubTelemetryEditAt || (nowSub - s._lastSubTelemetryEditAt) >= 12000) {
+              s._lastSubTelemetryEditAt = nowSub;
+              s.nextCardEdit = Math.min(s.nextCardEdit || 0, nowSub);
+            }
           }
           if (['live', 'vc'].includes(s.subtitleMode) && s.currentTrack?.subtitlePath && Number.isFinite(s.positionSeconds)) {
             this.#ensureLiveSubTimer(s);
@@ -2030,7 +2170,7 @@ export class QueueManager extends EventEmitter {
         }
         if(s.status==='playing'&&(!s.prefetched||((s.radio?.enabled||this.app?.music?.aiDj?.isEnabled?.(s))&&s.upcoming.length<3))){this.prefetch(s);}
       } catch { s.failures = (s.failures || 0) + 1; s.positionSeconds = null; s.lastError = 'Playback status unavailable; reconnecting to the engine.'; }
-      if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+25000;if(!s.overlayView&&(s.view==='player'||s.view==='cinema'))await this.updatePlayerCard(s.chatId);}
+      if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+45000;if(!s.overlayView&&(s.view==='player'||s.view==='cinema')&&!(s._editStripsCustomEmoji&&s._editStripsCustomEmojiMsgId===s.screenMessageId))await this.updatePlayerCard(s.chatId);}
     })));
   }
   setPlayerMessage(id, messageId, targetChatId = null, api = null) { const s = this.getSession(id); s.screenMessageId = messageId; s.playerChatId = targetChatId || id; if (api) s.api = api; if (s.currentTrack && ['playing', 'paused', 'buffering'].includes(s.status)) this.#savePlaybackSnapshot(s); }
@@ -2242,6 +2382,66 @@ export class QueueManager extends EventEmitter {
     }
     return restored;
   }
+  #playerReplyExtra(s, fallbackMsgId = null) {
+    const targetChatId = Number(s?.playerChatId || s?.chatId);
+    if (!(targetChatId < 0) || s?.isChannel) return {};
+    const anchor = Number(s?.replyAnchorMessageId || fallbackMsgId || s?.screenMessageId || 0) || null;
+    return anchor ? { reply_parameters: { message_id: anchor, allow_sending_without_reply: true } } : {};
+  }
+  async #replacePlayerCardWithSend(s, api, effectiveRich, files, content, { oldMsgId = null, wasPinned = false, markReanchored = false, markStripped = false, trackKey = null, rawPhotoUrl = null } = {}) {
+    if (!api || typeof api.sendRichMessage !== 'function') return null;
+    const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich, this.#playerReplyExtra(s, oldMsgId), files);
+    const replacement = out?.sent || null;
+    if (rawPhotoUrl) {
+      if (!out?.hasPhoto) {
+        s._photoBlockedUrl = rawPhotoUrl;
+      } else {
+        const fid = extractSentPhotoFileId(replacement);
+        if (fid) {
+          if (!s._photoFileIdByUrl) s._photoFileIdByUrl = new Map();
+          s._photoFileIdByUrl.set(rawPhotoUrl, fid);
+        }
+      }
+    }
+    if (!replacement?.message_id) return null;
+    if (oldMsgId && oldMsgId !== replacement.message_id && typeof api.deleteMessage === 'function') {
+      await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
+    }
+    if (oldMsgId !== replacement.message_id) {
+      s.pinned = false;
+      s.pinnedMessageId = null;
+    }
+    if (s.panelToken && this.app?.music?.channelPanels?.registerMessage) {
+      this.app.music.channelPanels.registerMessage(s.panelToken, replacement.message_id);
+    } else {
+      s.screenMessageId = replacement.message_id;
+    }
+    s.lastRender = content;
+    s.lastRenderHasPhoto = Boolean(out?.hasPhoto);
+    s.editAfter = 0;
+    if (markReanchored) {
+      s._customEmojiReanchoredMsgId = replacement.message_id;
+      s._editStripsCustomEmoji = false;
+      s._editStripsCustomEmojiMsgId = null;
+      s._editStripsCustomEmojiTrackId = null;
+    } else if (markStripped) {
+      s._editStripsCustomEmoji = true;
+      s._editStripsCustomEmojiMsgId = replacement.message_id;
+      s._editStripsCustomEmojiTrackId = trackKey;
+    }
+    if (wasPinned && Number(s.playerChatId || s.chatId) < 0 && typeof api.pinChatMessage === 'function') {
+      try {
+        await api.pinChatMessage(s.playerChatId, replacement.message_id, { disable_notification: true });
+        s.pinned = true;
+        s.pinnedMessageId = replacement.message_id;
+      } catch {
+        await this.autoPinPlayerCard(s.chatId, replacement.message_id, s.playerChatId, api);
+      }
+    } else {
+      await this.autoPinPlayerCard(s.chatId, replacement.message_id, s.playerChatId, api);
+    }
+    return replacement;
+  }
   async #ensureRestoredCard(s, api) {
     if (s.screenMessageId) {
       const updated = await this.updatePlayerCard(s.chatId, { forceEdit: true });
@@ -2255,10 +2455,12 @@ export class QueueManager extends EventEmitter {
     const isCinema = s.activeDeck === 'movie' || s.currentTrack?.provider === 'movie';
     const rich = isCinema && screen.renderCinemaPlayer ? screen.renderCinemaPlayer(s) : screen.renderPlayer(s);
     if (!rich) return false;
-    let sent = await useApi.sendRichMessage(targetChatId, rich).catch(() => null);
+    const replyExtra = this.#playerReplyExtra(s);
+    const out = await sendRichWithPhotoFallback(useApi, targetChatId, rich, replyExtra).catch(() => null);
+    let sent = out?.sent || null;
     if (!sent) {
       const noPhoto = stripRemotePhotoBlocks(rich);
-      if (noPhoto) sent = await useApi.sendRichMessage(targetChatId, noPhoto).catch(() => null);
+      if (noPhoto) sent = await useApi.sendRichMessage(targetChatId, noPhoto, replyExtra).catch(() => null);
     }
     if (!sent?.message_id) return false;
     this.setPlayerMessage(s.chatId, sent.message_id, targetChatId, useApi);
@@ -2266,11 +2468,25 @@ export class QueueManager extends EventEmitter {
     s.pinnedMessageId = null;
     s.lastRender = JSON.stringify(rich);
     s.editAfter = 0;
+    s._editStripsCustomEmoji = false;
+    s._editStripsCustomEmojiMsgId = null;
+    s._editStripsCustomEmojiTrackId = null;
+    s._customEmojiReanchoredMsgId = replyExtra.reply_parameters ? sent.message_id : null;
     await this.autoPinPlayerCard(s.chatId, sent.message_id, targetChatId, useApi);
     return true;
   }
   async updatePlayerCard(id, options = {}) {
     const s=this.getSession(id);
+    if (s.connected && Number(id) < 0 && typeof this.voice?.pushLiveContext === 'function') {
+      const tTitle = s.currentTrack?.title ? `${s.currentTrack.title}${s.currentTrack.artist ? ` - ${s.currentTrack.artist}` : ''}` : 'None';
+      const qCount = s.activeDeck === 'movie' ? (s.movieUpcoming?.length || 0) : (s.upcoming?.length || 0);
+      const ctxKey = `${s.status}|${s.activeDeck}|${s.currentTrack?.id || ''}|${s.volume}|${s.muted}|${qCount}`;
+      if (ctxKey !== s._lastLiveCtxKey) {
+        s._lastLiveCtxKey = ctxKey;
+        const summary = `deck=${s.activeDeck || 'music'}, status=${s.status || 'idle'}, playing="${tTitle}", volume=${s.volume ?? 100}%, muted=${Boolean(s.muted)}, queue=${qCount}`;
+        void this.voice.pushLiveContext(id, summary).catch(() => {});
+      }
+    }
     let updated = false;
     if(s.screenMessageId) {
       updated = (await this.updatePlayerView(s, options)) || updated;
@@ -2316,9 +2532,18 @@ export class QueueManager extends EventEmitter {
         : screen.renderPlayer(display);
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
+      const curRenderStateKey = `${s.currentTrack?.entryId || s.currentTrack?.id || 'idle'}:${s.status}:${effectiveView}:${s.volume}:${s.loopMode}:${s.upcoming?.length || 0}:${s.movieUpcoming?.length || 0}:${s.subtitleMode || ''}:${s.vcQuality || ''}:${s.streamMode || ''}:${s.pinned ? 1 : 0}`;
+      const editStripsHere = Boolean(
+        !preview
+        && s._editStripsCustomEmoji
+        && s._editStripsCustomEmojiMsgId === s.screenMessageId
+      );
+      if (editStripsHere && !forceEdit && s._editStripsCustomEmojiTrackId === curRenderStateKey) {
+        return true;
+      }
       const rawPhotoUrl = extractRichPhotoUrl(rich);
       let effectiveRich = rich;
-      if (!preview && rawPhotoUrl) {
+      if (rawPhotoUrl) {
         const cachedFileId = s._photoFileIdByUrl?.get?.(rawPhotoUrl);
         if (cachedFileId) {
           effectiveRich = replaceRichPhotoMedia(rich, cachedFileId);
@@ -2340,12 +2565,32 @@ export class QueueManager extends EventEmitter {
         const files = preview ? await audioUpload(preview.media) : null;
         // A track/control can change while reading the file. Never upload stale audio.
         if (preview && (!previews.current(s, preview.request) || s.view !== 'player')) return false;
+        if (editStripsHere && typeof api.sendRichMessage === 'function') {
+          const replaced = await this.#replacePlayerCardWithSend(
+            s,
+            api,
+            effectiveRich,
+            files,
+            content,
+            {
+              oldMsgId: s.screenMessageId,
+              wasPinned: Boolean(s.pinned),
+              markStripped: true,
+              trackKey: curRenderStateKey,
+              rawPhotoUrl
+            }
+          );
+          if (replaced?.message_id) return true;
+        }
         let sent;
         let renderedHasPhoto = nextHasPhoto;
+        let usedEdit = false;
+        let editedPayload = effectiveRich;
         if (canAttemptUpgrade) {
           s._photoUpgradeAttemptedUrl = rawPhotoUrl;
           const oldMsgId = s.screenMessageId;
-          const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich);
+          const replyExtra = this.#playerReplyExtra(s, oldMsgId);
+          const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich, replyExtra);
           sent = out.sent;
           renderedHasPhoto = out.hasPhoto;
           if (!out.hasPhoto && rawPhotoUrl) {
@@ -2366,12 +2611,29 @@ export class QueueManager extends EventEmitter {
               s.pinnedMessageId = null;
             }
             s.screenMessageId = sent.message_id;
+            s._editStripsCustomEmoji = false;
+            s._editStripsCustomEmojiMsgId = null;
+            s._editStripsCustomEmojiTrackId = null;
+            s._customEmojiReanchoredMsgId = replyExtra.reply_parameters ? sent.message_id : null;
           }
         } else {
           try {
+            usedEdit = true;
             sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, effectiveRich, { dropOnFloodWait: !forceEdit }, files);
+            if (renderedHasPhoto && didEditStripMedia(effectiveRich, sent)) {
+              const stripErr = new Error('wrong type of the web page content: edit stripped photo');
+              stripErr.description = stripErr.message;
+              throw stripErr;
+            }
+            if (renderedHasPhoto && rawPhotoUrl) {
+              const fid = extractSentPhotoFileId(sent);
+              if (fid) {
+                if (!s._photoFileIdByUrl) s._photoFileIdByUrl = new Map();
+                s._photoFileIdByUrl.set(rawPhotoUrl, fid);
+              }
+            }
           } catch (editErr) {
-            if (!preview && isRemotePhotoError(editErr)) {
+            if (isRemotePhotoError(editErr)) {
               const firstUpgradeAttempt = Boolean(
                 nextHasPhoto
                 && rawPhotoUrl
@@ -2380,9 +2642,11 @@ export class QueueManager extends EventEmitter {
                 && typeof api.sendRichMessage === 'function'
               );
               if (firstUpgradeAttempt) {
+                usedEdit = false;
                 s._photoUpgradeAttemptedUrl = rawPhotoUrl;
                 const oldMsgId = s.screenMessageId;
-                const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich);
+                const replyExtra = this.#playerReplyExtra(s, oldMsgId);
+                const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich, replyExtra, files);
                 sent = out.sent;
                 renderedHasPhoto = out.hasPhoto;
                 if (!out.hasPhoto && rawPhotoUrl) {
@@ -2403,11 +2667,16 @@ export class QueueManager extends EventEmitter {
                     s.pinnedMessageId = null;
                   }
                   s.screenMessageId = sent.message_id;
+                  s._editStripsCustomEmoji = false;
+                  s._editStripsCustomEmojiMsgId = null;
+                  s._editStripsCustomEmojiTrackId = null;
+                  s._customEmojiReanchoredMsgId = replyExtra.reply_parameters ? sent.message_id : null;
                 }
               } else {
                 if (rawPhotoUrl) s._photoBlockedUrl = rawPhotoUrl;
                 const noPhoto = stripRemotePhotoBlocks(effectiveRich);
                 if (noPhoto) {
+                  editedPayload = noPhoto;
                   sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, noPhoto, { dropOnFloodWait: !forceEdit }, files);
                   renderedHasPhoto = false;
                 } else {
@@ -2416,6 +2685,36 @@ export class QueueManager extends EventEmitter {
               }
             } else {
               throw editErr;
+            }
+          }
+          if (usedEdit && !preview && sent) {
+            if (didEditStripCustomEmojis(editedPayload, sent) && typeof api.sendRichMessage === 'function') {
+              const targetChatId = Number(s.playerChatId || s.chatId);
+              const canTryReanchor = Boolean(
+                targetChatId < 0
+                && !s.isChannel
+                && s._customEmojiReanchoredMsgId !== s.screenMessageId
+              );
+              const replaced = await this.#replacePlayerCardWithSend(
+                s,
+                api,
+                editedPayload,
+                files,
+                content,
+                {
+                  oldMsgId: s.screenMessageId,
+                  wasPinned: Boolean(s.pinned),
+                  markReanchored: canTryReanchor,
+                  markStripped: !canTryReanchor,
+                  trackKey: curRenderStateKey,
+                  rawPhotoUrl
+                }
+              );
+              if (replaced?.message_id) return true;
+            } else if (Array.isArray(sent.rich_message?.blocks) && !didEditStripCustomEmojis(editedPayload, sent)) {
+              s._editStripsCustomEmoji = false;
+              s._editStripsCustomEmojiMsgId = null;
+              s._editStripsCustomEmojiTrackId = null;
             }
           }
         }
@@ -2443,32 +2742,25 @@ export class QueueManager extends EventEmitter {
         }
         if (/message to edit not found|message_id_invalid|message can't be edited|message edit time expired|message_edit_time_expired|edit_time_expired|edit time expired|there is no text in the message to edit/i.test(desc)) {
           const oldMsgId = s.screenMessageId;
+          const wasPinned = Boolean(s.pinned);
           const now = Date.now();
           if (oldMsgId && (forceEdit || now - (s._lastCardReplaceAt || 0) >= 8000) && typeof api.sendRichMessage === 'function') {
             s._lastCardReplaceAt = now;
             try {
-              const out = await sendRichWithPhotoFallback(api, s.playerChatId, rich);
-              const replacement = out.sent;
-              const replacementHasPhoto = out.hasPhoto;
-              if (replacement?.message_id) {
-                if (oldMsgId !== replacement.message_id && typeof api.deleteMessage === 'function') {
-                  await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
+              const replacement = await this.#replacePlayerCardWithSend(
+                s,
+                api,
+                rich,
+                null,
+                content,
+                {
+                  oldMsgId,
+                  wasPinned,
+                  markReanchored: Boolean(Number(s.playerChatId || s.chatId) < 0 && !s.isChannel && this.#playerReplyExtra(s, oldMsgId).reply_parameters),
+                  trackKey: curRenderStateKey
                 }
-                if (oldMsgId !== replacement.message_id) {
-                  s.pinned = false;
-                  s.pinnedMessageId = null;
-                }
-                if (s.panelToken && this.app?.music?.channelPanels?.registerMessage) {
-                  this.app.music.channelPanels.registerMessage(s.panelToken, replacement.message_id);
-                } else {
-                  s.screenMessageId = replacement.message_id;
-                }
-                s.lastRender = content;
-                s.lastRenderHasPhoto = replacementHasPhoto;
-                s.editAfter = 0;
-                await this.autoPinPlayerCard(s.chatId, replacement.message_id, s.playerChatId, api);
-                return true;
-              }
+              );
+              if (replacement?.message_id) return true;
             } catch {}
           }
           s.screenMessageId = null;

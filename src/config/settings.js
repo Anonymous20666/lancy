@@ -55,6 +55,26 @@ export class SettingsManager extends EventEmitter {
     if (this.env.AI_ENDPOINT) this.values.ai.endpoint = this.env.AI_ENDPOINT;
     if (this.env.AI_MODEL) this.values.ai.model = this.env.AI_MODEL;
     if (this.env.AI_API_KEY) this.values.ai.apiKey = this.env.AI_API_KEY;
+    if (this.env.EXPLABS_API_KEY) {
+      if (!this.env.AI_PROVIDER && (!this.values.ai.provider || this.values.ai.provider === 'ollama')) {
+        this.values.ai.provider = 'openai-compatible';
+        this.values.ai.endpoint = this.env.AI_ENDPOINT || 'https://api.experientiallabs.ai/v1';
+        this.values.ai.model = this.env.AI_MODEL || 'gpt-6.2-astra:free';
+      }
+      if (!this.env.AI_API_KEY || String(this.values.ai.endpoint || '').includes('experientiallabs.ai')) {
+        this.values.ai.apiKey = this.env.EXPLABS_API_KEY;
+      }
+      if (!this.values.ai.backupModel) {
+        this.values.ai.backupProvider = this.env.AI_BACKUP_PROVIDER || 'openai-compatible';
+        this.values.ai.backupEndpoint = this.env.AI_BACKUP_ENDPOINT || 'https://api.experientiallabs.ai/v1';
+        this.values.ai.backupModel = this.env.AI_BACKUP_MODEL || 'gemini-4-neon:free';
+        this.values.ai.backupApiKey = this.env.AI_BACKUP_API_KEY || this.env.EXPLABS_API_KEY;
+      }
+    }
+    if (this.env.AI_BACKUP_PROVIDER) this.values.ai.backupProvider = this.env.AI_BACKUP_PROVIDER;
+    if (this.env.AI_BACKUP_ENDPOINT) this.values.ai.backupEndpoint = this.env.AI_BACKUP_ENDPOINT;
+    if (this.env.AI_BACKUP_MODEL) this.values.ai.backupModel = this.env.AI_BACKUP_MODEL;
+    if (this.env.AI_BACKUP_API_KEY) this.values.ai.backupApiKey = this.env.AI_BACKUP_API_KEY;
     if (this.env.PINTEREST_PROVIDER) this.values.pinterest.provider = this.env.PINTEREST_PROVIDER;
     if (this.env.FFMPEG_PATH) this.values.media.ffmpegPath = this.env.FFMPEG_PATH;
     if (this.env.PUBLIC_ACCESS !== undefined || process.env.PUBLIC_ACCESS !== undefined) {

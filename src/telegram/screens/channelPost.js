@@ -1205,11 +1205,10 @@ export function createChannelPostScreen({ app }) {
     const botUser = ctx?.bot?.botUsername || api?.me?.username || app.telegram?.botUsername || 'Lancy_easy_bot';
 
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 SELECT TELEGRAM CHANNELS 𓆩♡𓆪',
-      'step 2 of 3 — tap to multi-select targets ♡'
-    ])));
-    b.divider();
+      'step 2 of 3 — tap to multi-select verified targets'
+    ], { size: 1 });
 
     if (sel.pack) {
       const np = normalizePack(sel.pack);
@@ -1276,6 +1275,9 @@ export function createChannelPostScreen({ app }) {
       ]);
     }
 
+    b.buttons([
+      richButton.callback('📡 Broadcast Any Content (Media / Album / GCs)', encodeCallback('broadcast', 'open'), { style: 'primary' })
+    ]);
     b.buttons([
       richButton.callback('« Change Pack', encodeCallback(id, 'to_packs')),
       richButton.callback('🏠 Home', encodeCallback('dashboard', 'open'))
@@ -1666,6 +1668,28 @@ Respond with valid JSON ONLY:
           error: null
         };
         try {
+          if (api?.getChat && api?.getChatMember) {
+            const preCheck = await verifyBotCanPostInChannel(api, ch.channel_id);
+            if (preCheck?.botId) {
+              app.db?.recordBotChannelVerification?.({
+                bot_id: preCheck.botId,
+                channel_id: ch.channel_id,
+                bot_username: preCheck.botUsername,
+                is_admin: preCheck.isAdmin ? 1 : 0,
+                can_post: preCheck.canPost ? 1 : 0
+              });
+            }
+            if (!preCheck?.ok) {
+              if (preCheck?.botId) {
+                app.db?.markBotChannelUnavailable?.(preCheck.botId, ch.channel_id, { bot_username: preCheck.botUsername });
+              }
+              throw new Error(
+                preCheck?.reason === 'missing_post_permission'
+                  ? 'Bot lacks "Post Messages" admin permission in this channel'
+                  : 'Bot is not an Administrator in this channel'
+              );
+            }
+          }
           const dropRes = await publishChannelPackDrop({
             api,
             channelId: ch.channel_id,

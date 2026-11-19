@@ -7,6 +7,48 @@ const EXTENDED_PICTO_RE = /\p{Extended_Pictographic}/u;
 const REGIONAL_FLAG_RE = /^[\u{1F1E6}-\u{1F1FF}]{2}$/u;
 const KEYCAP_RE = /^[0-9#*]\uFE0F?\u20E3$/u;
 
+// Dark monochrome or cartoonish meme packs that turn invisible or look broken on Telegram dark cards/buttons.
+export const NOISY_OR_DARK_UI_SET_NAMES = new Set([
+  'StatusPackNew',
+  'Emoji_fan37_by_TgEmodziBot',
+  'BlackEmojiGray',
+  'DarkEmoji3_by_emsetbot',
+  'Earning_ON_World_by_TgEmojis_bot',
+  'AlphabetEmoji',
+  'darkemtgs1',
+  'russian_osint',
+  'finnik_donut_day_emoji'
+]);
+
+export const PREFERRED_ANIMATED_UI_SET_NAMES = new Set([
+  'RestrictedEmoji',
+  'NewsEmoji',
+  'PremiumIcons',
+  'TopicIcons',
+  'EmojiStatus',
+  'GameEmoji',
+  'FlagsEmoji',
+  'MovieIcons',
+  'AdaptiveIcons',
+  'AdaptiveUi',
+  'NeonEmoji'
+]);
+
+export const PREFERRED_STATIC_UI_SET_NAMES = new Set([
+  'InterfaceElements',
+  'MusicadaptiveEmojiFTS',
+  'ArrowsEmoji',
+  'ControlsEmoji',
+  'ShapesEmoji',
+  'CirclesEmoji',
+  'UiSymbols'
+]);
+
+export const PREFERRED_UI_SET_NAMES = new Set([
+  ...PREFERRED_ANIMATED_UI_SET_NAMES,
+  ...PREFERRED_STATIC_UI_SET_NAMES
+]);
+
 /** Normalize a Unicode emoji grapheme into a canonical lookup key (strips VS15/VS16 selectors while preserving ZWJ sequences). */
 export function normalizeEmojiKey(emoji) {
   if (!emoji) return '';
@@ -258,6 +300,15 @@ export class CustomEmojiRegistry {
     }
 
     const inserted = this.upsertCatalogEntries(entries);
+    try {
+      const validIds = new Set(Object.values(CUSTOM_EMOJI_MAP).filter(Boolean).map(String));
+      const builtinRows = this.db.all("SELECT custom_emoji_id FROM custom_emoji_catalog WHERE source = 'builtin'");
+      for (const row of builtinRows || []) {
+        if (!validIds.has(String(row.custom_emoji_id))) {
+          this.db.run("DELETE FROM custom_emoji_catalog WHERE custom_emoji_id = ? AND source = 'builtin'", String(row.custom_emoji_id));
+        }
+      }
+    } catch {}
     this.seeded = true;
     return inserted;
   }
@@ -333,9 +384,10 @@ export class CustomEmojiRegistry {
 
   /**
    * Look up all available custom emoji candidates for a Unicode emoji.
-   * Ensures exact + VS16-normalized matches return in deterministic preference order.
+   * Ensures exact + VS16-normalized matches return in deterministic preference order,
+   * prioritizing clean animated UI packs and deprioritizing/excluding dark-monochrome or meme packs.
    */
-  lookupCandidates(rawEmoji, { limit = 40 } = {}) {
+  lookupCandidates(rawEmoji, { limit = 40, excludeDarkUiSets = false, preferAnimated = false } = {}) {
     if (!this.db || !rawEmoji) return [];
     if (!this.seeded) this.seedBuiltinCatalog();
 
@@ -343,8 +395,9 @@ export class CustomEmojiRegistry {
     const key = normalizeEmojiKey(exact);
     if (!key) return [];
 
+    const maxRows = Math.max(Number(limit) * 3, 60);
     const rows = this.db.all(`
-      SELECT custom_emoji_id, unicode_emoji, unicode_key, set_name, file_id, is_video, is_animated, source, usage_count
+      SELECT custom_emoji_id, unicode_emoji, unicode_key, set_name, file_id, is_video, is_animated, source, usage_count, updated_at
       FROM custom_emoji_catalog
       WHERE unicode_key = ? OR unicode_emoji = ?
       ORDER BY
@@ -353,18 +406,58 @@ export class CustomEmojiRegistry {
         usage_count DESC,
         custom_emoji_id ASC
       LIMIT ?
-    `, key, exact, Number(limit));
+    `, key, exact, maxRows);
 
-    return rows.map((r) => ({
-      customEmojiId: String(r.custom_emoji_id),
-      unicodeEmoji: r.unicode_emoji,
-      unicodeKey: r.unicode_key,
-      setName: r.set_name,
-      fileId: r.file_id,
-      isVideo: Boolean(r.is_video),
-      isAnimated: Boolean(r.is_animated),
-      source: r.source
-    }));
+    const deterministicUi = Boolean(excludeDarkUiSets || preferAnimated);
+    const mapped = rows
+      .filter((r) => !(excludeDarkUiSets && r.set_name && NOISY_OR_DARK_UI_SET_NAMES.has(r.set_name)))
+      .map((r) => {
+        const sourceRank = r.source === 'user' ? 0 : r.source === 'extracted' ? 1 : r.source === 'pack' ? 2 : 3;
+        const setPenalty = !r.set_name
+          ? (r.source === 'builtin' ? 2 : 3)
+          : NOISY_OR_DARK_UI_SET_NAMES.has(r.set_name)
+            ? 99
+            : PREFERRED_ANIMATED_UI_SET_NAMES.has(r.set_name)
+              ? 0
+              : PREFERRED_STATIC_UI_SET_NAMES.has(r.set_name)
+                ? 1
+                : 2;
+        const animRank = r.is_animated ? 0 : r.is_video ? 1 : 2;
+        return {
+          _sourceRank: sourceRank,
+          _setPenalty: setPenalty,
+          _animRank: animRank,
+          _usage: Number(r.usage_count || 0),
+          _updatedAt: String(r.updated_at || ''),
+          customEmojiId: String(r.custom_emoji_id),
+          unicodeEmoji: r.unicode_emoji,
+          unicodeKey: r.unicode_key,
+          setName: r.set_name,
+          fileId: r.file_id,
+          isVideo: Boolean(r.is_video),
+          isAnimated: Boolean(r.is_animated),
+          source: r.source
+        };
+      });
+
+    mapped.sort((a, b) => {
+      // Dark/broken UI packs must always sink below clean packs/builtins unless user explicitly saved them
+      const aNoisy = a.source !== 'user' && a._setPenalty >= 99 ? 1 : 0;
+      const bNoisy = b.source !== 'user' && b._setPenalty >= 99 ? 1 : 0;
+      if (aNoisy !== bNoisy) return aNoisy - bNoisy;
+      if (a._sourceRank !== b._sourceRank) return a._sourceRank - b._sourceRank;
+      if (deterministicUi) {
+        if (preferAnimated && a._animRank !== b._animRank) return a._animRank - b._animRank;
+        if (a._setPenalty !== b._setPenalty) return a._setPenalty - b._setPenalty;
+        return a.customEmojiId.localeCompare(b.customEmojiId);
+      }
+      if (a._setPenalty !== b._setPenalty) return a._setPenalty - b._setPenalty;
+      if (a._updatedAt !== b._updatedAt) return b._updatedAt.localeCompare(a._updatedAt);
+      if (a._usage !== b._usage) return b._usage - a._usage;
+      return a.customEmojiId.localeCompare(b.customEmojiId);
+    });
+
+    return mapped.slice(0, Number(limit)).map(({ _sourceRank, _setPenalty, _animRank, _usage, _updatedAt, ...clean }) => clean);
   }
 
   /** Increment popularity counter when a suggestion is rendered or selected. */
@@ -389,5 +482,71 @@ export class CustomEmojiRegistry {
       totalIds: Number(row?.total_ids || 0),
       distinctEmojis: Number(row?.distinct_emojis || 0)
     };
+  }
+
+  /**
+   * Synchronize builtin & pack custom emojis against the active bot's Telegram session:
+   * seeds builtin catalog, refreshes custom_emoji sticker packs via getStickerSet,
+   * and hydrates live metadata (file_id, set_name, format) via getCustomEmojiStickers.
+   */
+  async syncPremiumEmojis(api, { limitPacks = 40 } = {}) {
+    if (!this.db) return { syncedPacks: 0, hydratedIds: 0, totalIds: 0 };
+    this.seedBuiltinCatalog();
+    let syncedPacks = 0;
+    let hydratedIds = 0;
+
+    if (typeof api?.getStickerSet === 'function') {
+      try {
+        const packs = this.db.all(
+          "SELECT DISTINCT tg_short_name, user_id FROM sticker_packs WHERE sticker_kind = 'custom_emoji' AND tg_short_name IS NOT NULL AND tg_short_name != '' ORDER BY modified_at DESC LIMIT ?",
+          Number(limitPacks)
+        );
+        for (const row of packs || []) {
+          try {
+            const set = await api.getStickerSet(row.tg_short_name);
+            if (set?.stickers?.length) {
+              this.registerPackSet(set, { userId: row.user_id || null, source: 'pack' });
+              syncedPacks += 1;
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+
+    if (typeof api?.getCustomEmojiStickers === 'function') {
+      try {
+        const rows = this.db.all(
+          "SELECT custom_emoji_id, unicode_emoji, set_name, file_id FROM custom_emoji_catalog WHERE file_id IS NULL OR set_name IS NULL LIMIT 400"
+        );
+        const allIds = [...new Set([
+          ...Object.values(CUSTOM_EMOJI_MAP).filter(Boolean).map(String),
+          ...(rows || []).map((r) => String(r.custom_emoji_id))
+        ])];
+        if (allIds.length) {
+          const metaMap = await resolveEmojiMetadataChunked(api, allIds);
+          if (metaMap.size > 0) {
+            const updates = [];
+            for (const [id, st] of metaMap.entries()) {
+              const em = String(st.emoji || '✨').trim() || '✨';
+              updates.push({
+                customEmojiId: id,
+                unicodeEmoji: em,
+                unicodeKey: normalizeEmojiKey(em) || em,
+                setName: st.set_name || null,
+                fileId: st.file_id || null,
+                isVideo: Boolean(st.is_video),
+                isAnimated: Boolean(st.is_animated),
+                source: st.set_name ? 'pack' : 'builtin'
+              });
+            }
+            hydratedIds = this.upsertCatalogEntries(updates);
+          }
+        }
+      } catch {}
+    }
+
+    const stats = this.getStats();
+    this.log.info({ syncedPacks, hydratedIds, totalIds: stats.totalIds, distinctEmojis: stats.distinctEmojis }, 'premium custom emoji catalog synced');
+    return { syncedPacks, hydratedIds, totalIds: stats.totalIds, distinctEmojis: stats.distinctEmojis };
   }
 }

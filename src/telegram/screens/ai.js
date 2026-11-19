@@ -1,5 +1,5 @@
-import { RichMessageBuilder, rt, richButton, encodeCallback } from '../rich.js';
-import { navButtons, kvTable, banner, ACCENT, SPARK } from '../ui.js';
+import { RichMessageBuilder, rt, block, richButton, encodeCallback } from '../rich.js';
+import { navButtons, kvTable, ACCENT, SPARK } from '../ui.js';
 import { States } from '../../core/stateMachine.js';
 import { truncate } from '../../utils/text.js';
 
@@ -27,11 +27,10 @@ export function createAIScreen({ app }) {
     const activeSchedules = schedules.filter((s) => s.status === 'active');
 
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 LANCY AI ASSISTANT 𓆩♡𓆪',
-      'aesthetic creative bestie & studio operator ♡'
-    ])));
-    b.divider();
+      'aesthetic creative bestie & studio operator'
+    ], { size: 1 });
 
     b.table(kvTable([
       ['ʕ•ᴥ•ʔ Assistant', enabled ? '🟢 Active (Listening)' : '🔴 Inactive (Off)'],
@@ -41,11 +40,13 @@ export function createAIScreen({ app }) {
     ]), { compact: true });
     b.divider();
 
-    b.paragraph(rt.bold('💬 HOW TO TALK TO ME:'));
-    b.paragraph(rt.italic('> • Quote / reply to any bot or AI message in chat!'));
-    b.paragraph(rt.italic('> • Or mention "lancy" in any message (e.g. "hey lancy...")'));
-    b.paragraph(rt.italic('> • I can chat, search Pinterest, drop sticker packs,'));
-    b.paragraph(rt.italic('>   paginate drops ("next"), and schedule daily autoposts! ♡'));
+    b.details('💬 How to Talk to Lancy AI', [
+      block.list([
+        rt.text('Reply / quote any bot message in private DM, or mention "lancy".'),
+        rt.text('In Voice Chat (Owner/Sudo): say "Lancy listen" to control music, movies & search videos.'),
+        rt.text('Ask me to search Pinterest, drop sticker packs, paginate ("next"), or schedule daily drops.')
+      ])
+    ], false);
     b.divider();
 
     // Toggle button
@@ -80,11 +81,10 @@ export function createAIScreen({ app }) {
     const schedules = app.scheduler ? app.scheduler.getUserSchedules(userId) : [];
 
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 SCHEDULED AUTOPOSTS 𓆩♡𓆪',
-      'autonomous drops from Pinterest to WhatsApp ♡'
-    ])));
-    b.divider();
+      'autonomous drops from Pinterest to WhatsApp'
+    ], { size: 1 });
 
     if (!schedules.length) {
       b.paragraph(rt.italic('No scheduled drops yet!'));
@@ -125,11 +125,10 @@ export function createAIScreen({ app }) {
 
   async function openStyleMenu(ctx) {
     const b = new RichMessageBuilder();
-    b.paragraph(rt.bold(banner([
+    b.bannerHeader([
       '𓆩♡𓆪 PERSONA STYLE 𓆩♡𓆪',
-      'pick Lancy’s aesthetic vibe ♡'
-    ])));
-    b.divider();
+      'pick Lancy’s aesthetic vibe'
+    ], { size: 1 });
     b.paragraph(rt.italic('Select an aesthetic personality style:'));
     for (let i = 0; i < AI_STYLES.length; i += 4) {
       b.buttons(AI_STYLES.slice(i, i + 4).map((s) =>
@@ -152,6 +151,7 @@ export function createAIScreen({ app }) {
       onMessage: async (sctx, message) => {
         const text = (message.text ?? '').trim();
         if (!text) return false;
+        if (sctx.isNonAiReply && !sctx.isTag) return false;
         if (app.assistant) {
           const ctx = (typeof app.telegram?.controller?.createContext === 'function')
             ? app.telegram.controller.createContext(sctx.tgId, { message, chatId: sctx.chatId })
@@ -194,7 +194,11 @@ export function createAIScreen({ app }) {
             chatId: ctx.chatId,
             screenMessageId: ctx.messageId
           });
-          return ctx.reply('heyyy bestie ♡ tell me what’s on your mind or what you want to create today! ✨');
+          const sentPrompt = await ctx.reply('heyyy bestie ♡ tell me what’s on your mind or what you want to create today! ✨');
+          if (sentPrompt?.message_id) {
+            app.telegram?.markAiMessage?.(ctx.chatId, sentPrompt.message_id);
+          }
+          return sentPrompt;
         }
         case 'schedules':
           return openSchedules(ctx);

@@ -6,6 +6,7 @@ import { SEARCH_MODES } from '../../pinterest/search.js';
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isPermissionError } from '../permissions.js';
 import { optimizePreviewImage } from '../../media/convert.js';
+import { editOrSendRichWithFallback } from '../../music/model.js';
 
 /**
  * Pinterest screen + deep search flow.
@@ -54,15 +55,8 @@ export function createPinterestScreen({ app }) {
     const sm = ctx.sm ?? ctx.machine;
     const targetMsgId = ctx.messageId ?? ctx.screenMessageId ?? sm?.for(tgId)?.screenMessageId ?? sm?.context?.(tgId)?.screenMessageId;
     const api = ctx.api || app.telegram.api;
-    if (targetMsgId) {
-      const res = await api.editMessageRich(chatId, targetMsgId, rich, {}, files).catch(() => null);
-      if (res) return res;
-    }
-    const sent = await api.sendRichMessage(chatId, rich, {}, files);
-    if (targetMsgId && sent?.message_id && sent.message_id !== targetMsgId) {
-      await api.deleteMessage(chatId, targetMsgId).catch(() => {});
-    }
-    return sent;
+    const out = await editOrSendRichWithFallback(api, chatId, targetMsgId, rich, {}, files, { deleteReplaced: true });
+    return out?.sent || null;
   }
 
   async function openMenu(ctx) {
@@ -411,14 +405,15 @@ export function createPinterestScreen({ app }) {
     const files = {};
     let i = 0;
     for (const p of previews) {
-      const buffer = app.media.cache.read(p.sha256);
-      if (buffer) {
+      const rawBuffer = app.media.cache.read(p.sha256);
+      if (rawBuffer) {
         const name = `preview_${i++}`;
         if (p.type === 'video') {
-          files[name] = { buffer, filename: `${name}.mp4`, contentType: p.mime ?? 'video/mp4' };
+          files[name] = { buffer: rawBuffer, filename: `${name}.mp4`, contentType: p.mime ?? 'video/mp4' };
           b.video(`attach://${name}`);
         } else {
-          files[name] = { buffer, filename: `${name}.jpg`, contentType: p.mime ?? 'image/jpeg' };
+          const optBuf = await optimizePreviewImage(rawBuffer);
+          files[name] = { buffer: optBuf, filename: `${name}.jpg`, contentType: 'image/jpeg' };
           b.photo(`attach://${name}`);
         }
       }
@@ -444,14 +439,11 @@ export function createPinterestScreen({ app }) {
     const rich = b.toJSON();
     const chatId = ctx.chatId;
     if (screenMessageId) {
-      await ctx.api.editMessageRich(chatId, screenMessageId, rich, {}, files).catch(async (error) => {
-        if (/not modified|not found/i.test(String(error?.description ?? error?.message))) return;
-        await ctx.api.sendRichMessage(chatId, rich, {}, files);
-      });
+      await editOrSendRichWithFallback(ctx.api, chatId, screenMessageId, rich, {}, files, { deleteReplaced: true });
     } else if (ctx.messageId && ctx.message) {
       await ctx.editScreen(rich, files);
     } else {
-      await ctx.api.sendRichMessage(chatId, rich, {}, files);
+      await editOrSendRichWithFallback(ctx.api, chatId, null, rich, {}, files);
     }
   }
 

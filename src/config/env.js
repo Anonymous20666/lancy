@@ -39,6 +39,13 @@ export function getEnv() {
     AI_ENDPOINT: process.env.AI_ENDPOINT || '',
     AI_MODEL: process.env.AI_MODEL || '',
     AI_API_KEY: process.env.AI_API_KEY || '',
+    EXPLABS_API_KEY: process.env.EXPLABS_API_KEY || '',
+    GEMINI_API_KEY: process.env.GEMINI_API_KEY || '',
+    GEMINI_LIVE_MODEL: process.env.GEMINI_LIVE_MODEL || 'gemini-3.8-live',
+    AI_BACKUP_PROVIDER: process.env.AI_BACKUP_PROVIDER || '',
+    AI_BACKUP_ENDPOINT: process.env.AI_BACKUP_ENDPOINT || '',
+    AI_BACKUP_MODEL: process.env.AI_BACKUP_MODEL || '',
+    AI_BACKUP_API_KEY: process.env.AI_BACKUP_API_KEY || '',
     PINTEREST_PROVIDER: process.env.PINTEREST_PROVIDER || '',
     LOG_LEVEL: process.env.LOG_LEVEL || 'info'
   };

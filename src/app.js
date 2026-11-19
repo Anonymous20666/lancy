@@ -27,11 +27,13 @@ import { CaptionEngine } from './captions/engine.js';
 import { TemplateStore } from './captions/templates.js';
 import { AIService } from './ai/service.js';
 import { LancyAssistant } from './ai/assistant.js';
+import { LancyAgent } from './ai/lancyAgent.js';
 import { AutonomousScheduler } from './ai/scheduler.js';
 
 import { MediaDownloader } from './media/downloader.js';
 import { getSharedMediaWorkerPool } from './core/mediaWorkerPool.js';
 import { VideoStreamingServer } from './media/streamingServer.js';
+import { setGlobalCustomEmojiLookup } from './telegram/customEmoji.js';
 import { createDashboardScreen } from './telegram/screens/dashboard.js';
 import { createPinterestScreen } from './telegram/screens/pinterest.js';
 import { createStickersScreen } from './telegram/screens/stickers.js';
@@ -41,6 +43,7 @@ import { createSettingsScreen } from './telegram/screens/settings.js';
 import { createHelpScreen } from './telegram/screens/help.js';
 import { createDownloaderScreen } from './telegram/screens/downloader.js';
 import { createCloneScreen } from './telegram/screens/clone.js';
+import { createBroadcastScreen } from './telegram/screens/broadcast.js';
 import { createChannelPostScreen } from './telegram/screens/channelPost.js';
 import { createAutoPostScreen } from './telegram/screens/autoPost.js';
 import { createNsfwScreen } from './telegram/screens/nsfw.js';
@@ -64,6 +67,7 @@ import { MovieSessions } from './media/movieSessions.js';
 import { MovieDownloader } from './media/movieDownloader.js';
 import { defaultAdultCatalog } from './media/adultCatalog.js';
 import { CommandJobProcessor } from './core/commandProcessor.js';
+import { JobPlanner } from './core/jobPlanner.js';
 import { MediaAiAgent } from './ai/mediaAgent.js';
 
 /**
@@ -162,11 +166,13 @@ export class LancyApp {
     this.inboundHandler = new InboundHandler({ app: this, log: this.log });
 
     // ── AI ──
-    if (!this.env.AI_MODEL && this.settings.get('ai.model') === 'qwen2.5:0.5b') {
-      this.db?.setSetting?.('ai.model', 'qwen2.5:3b');
+    const configuredAiModel = this.settings.get('ai.model');
+    if (!this.env.AI_MODEL && (!configuredAiModel || configuredAiModel === 'qwen2.5:0.5b' || configuredAiModel === 'qwen2.5:3b')) {
+      this.db?.setSetting?.('ai.model', 'qwen2.5:7b');
       this.settings.load?.();
     }
     this.ai = new AIService({ settings: this.settings });
+    this.lancyAgent = new LancyAgent({ app: this });
     this.assistant = new LancyAssistant({ app: this });
     this.mediaAgent = new MediaAiAgent({ app: this, log: this.log });
     this.scheduler = new AutonomousScheduler({ app: this });
@@ -194,10 +200,20 @@ export class LancyApp {
       movieApi: this.movieApi,
       subtitles: this.subtitles,
       adultCatalog: this.adultCatalog,
+      voiceClient: this.voiceClient,
       log: this.log
     });
     this.movieSessions = new MovieSessions({ db: this.db });
     this.commandProcessor = new CommandJobProcessor({ log: this.log });
+    this.jobPlanner = new JobPlanner({
+      db: this.db,
+      queues: this.queues,
+      settings: this.settings,
+      log: this.log,
+      maxConcurrency: this.settings.get('performance.workerConcurrency') ?? 8,
+      getStressSignals: () => ({ activeVcCount: this.musicQueueManager?.sessions?.size || 0 })
+    });
+    this.commandProcessor.setStressMonitor(this.jobPlanner);
     this.movieDownloader = new MovieDownloader({ app: this, log: this.log });
     this.musicAccounts = new AccountStore({ db: this.db, root: this.root, voice: this.voiceClient, allowExistingMemberGroups: this.settings.get('music.allowExistingGroupMembers') });
     this.music = new MusicService({ app: this, search: new SearchSessions({ providers: this.musicProviders }), lyrics: new MatchedLyrics(), accounts: this.musicAccounts });
@@ -234,6 +250,19 @@ export class LancyApp {
       log: this.log
     });
     this.customEmojiRegistry.seedBuiltinCatalog();
+    this.catalogEmojiCache = new Map();
+    setGlobalCustomEmojiLookup((emoji) => {
+      const key = String(emoji || '').trim().replace(/[\uFE0E\uFE0F]/g, '');
+      if (!key) return null;
+      if (this.catalogEmojiCache.has(key)) return this.catalogEmojiCache.get(key);
+      const id = this.customEmojiRegistry?.lookupCandidates?.(emoji, {
+        limit: 1,
+        excludeDarkUiSets: false,
+        preferAnimated: true
+      })?.[0]?.customEmojiId || null;
+      if (id) this.catalogEmojiCache.set(key, id);
+      return id;
+    });
 
     this.stickerService = new TelegramStickerService({
       api: this.telegram.api,
@@ -269,7 +298,7 @@ export class LancyApp {
     const factories = [
       createDashboardScreen, createPinterestScreen, createStickersScreen,
       createCustomEmojiStudioScreen, createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
-      createDownloaderScreen, createCloneScreen, createChannelPostScreen,
+      createDownloaderScreen, createCloneScreen, createBroadcastScreen, createChannelPostScreen,
       createAutoPostScreen, createNsfwScreen, createMusicScreen
     ];
     for (const factory of factories) {
@@ -323,8 +352,9 @@ export class LancyApp {
     const restored = await this.whatsapp.restore();
     if (restored) this.log.info({ count: restored }, 'whatsapp sessions restored');
 
-    // Start the AI worker & autonomous schedulers.
+    // Start the AI worker, job planner & autonomous schedulers.
     this.ai.start();
+    this.jobPlanner.start();
     this.scheduler.start();
     this.movieScheduler.start();
 
@@ -343,6 +373,9 @@ export class LancyApp {
 
     // Telegram polling.
     await this.telegram.controller.start();
+    void this.customEmojiRegistry?.syncPremiumEmojis?.(this.telegram?.api).then(() => {
+      this.catalogEmojiCache?.clear?.();
+    }).catch(() => {});
     await this.multiBotManager.startAll();
     this.#setupTestTriggerWatcher();
     this.log.info('✦ Lancy Bot is ready ♡');
@@ -430,6 +463,7 @@ export class LancyApp {
     await this.videoServer?.stop().catch(() => {});
     await this.whatsapp.stopAll();
     await this.ai.stop();
+    await this.jobPlanner?.shutdown?.().catch(() => {});
     await this.queues.shutdown();
     await this.mediaWorkerPool?.shutdown?.().catch(() => {});
     this.db.close();

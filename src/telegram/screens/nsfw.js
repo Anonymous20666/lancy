@@ -19,6 +19,7 @@ import {
 import { truncate } from '../../utils/text.js';
 import { checkChatMediaPermissions, formatMediaRestrictedNotice, isBotSuperAdmin, isAnonymousGroupAdmin } from '../permissions.js';
 import { optimizePreviewImage } from '../../media/convert.js';
+import { editOrSendRichWithFallback } from '../../music/model.js';
 import { logger } from '../../core/logger.js';
 
 const log = logger().child({ module: 'nsfw-screen' });
@@ -272,7 +273,7 @@ export function createNsfwScreen({ app }) {
           let buf = Buffer.from(await res.arrayBuffer());
           if (!buf.length || buf.length < 400) return null;
           try {
-            buf = await optimizePreviewImage(buf, { maxWidth: 960, quality: 75 });
+            buf = await optimizePreviewImage(buf, { maxDimension: 960, quality: 75 });
           } catch {}
           return { i, buf };
         } catch {
@@ -1606,46 +1607,23 @@ export function createNsfwScreen({ app }) {
     const api = ctx.api || app.telegram.api;
     const chatId = ctx.chatId ?? Number(ctx.tgId);
     const targetMsgId = ctx.query?.message?.message_id || session?.msgId || ctx.messageId || ctx.screenMessageId || ctx.sm?.context?.(ctx.tgId)?.screenMessageId || null;
-    if (targetMsgId && !files && typeof api.editMessageRich === 'function') {
-      try {
-        await api.editMessageRich(chatId, targetMsgId, rich);
+    try {
+      const out = await editOrSendRichWithFallback(api, chatId, targetMsgId, rich, {}, files, { deleteReplaced: true });
+      const finalMsgId = out?.sent?.message_id || targetMsgId;
+      if (finalMsgId) {
+        if (session) session.msgId = finalMsgId;
+        app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: finalMsgId });
+        ctx.sm?.update?.(ctx.tgId, { screenMessageId: finalMsgId });
+      }
+      return out?.sent || (finalMsgId ? { message_id: finalMsgId } : null);
+    } catch (err) {
+      const desc = String(err?.description ?? err?.message ?? '');
+      if (targetMsgId && (/not modified|too many requests|flood/i.test(desc) || err?.errorCode === 429 || err?.code === 'FLOOD_WAIT')) {
         if (session) session.msgId = targetMsgId;
-        app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: targetMsgId });
-        ctx.sm?.update?.(ctx.tgId, { screenMessageId: targetMsgId });
         return { message_id: targetMsgId };
-      } catch (err) {
-        const desc = String(err?.description ?? err?.message ?? '');
-        if (/not modified|too many requests|flood/i.test(desc) || err?.errorCode === 429 || err?.code === 'FLOOD_WAIT') {
-          if (session) session.msgId = targetMsgId;
-          return { message_id: targetMsgId };
-        }
       }
+      throw err;
     }
-    if (targetMsgId && files && typeof api.editMessageRich === 'function') {
-      try {
-        await api.editMessageRich(chatId, targetMsgId, rich, {}, files);
-        if (session) session.msgId = targetMsgId;
-        app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: targetMsgId });
-        ctx.sm?.update?.(ctx.tgId, { screenMessageId: targetMsgId });
-        return { message_id: targetMsgId };
-      } catch (err) {
-        const desc = String(err?.description ?? err?.message ?? '');
-        if (/not modified|too many requests|flood/i.test(desc) || err?.errorCode === 429 || err?.code === 'FLOOD_WAIT') {
-          if (session) session.msgId = targetMsgId;
-          return { message_id: targetMsgId };
-        }
-      }
-    }
-    const sent = await api.sendRichMessage(chatId, rich, {}, files);
-    if (sent?.message_id) {
-      if (targetMsgId && sent.message_id !== targetMsgId) {
-        await api.deleteMessage(chatId, targetMsgId).catch(() => {});
-      }
-      if (session) session.msgId = sent.message_id;
-      app.telegram?.userScreenMessage?.set(ctx.tgId, { chatId, messageId: sent.message_id });
-      ctx.sm?.update?.(ctx.tgId, { screenMessageId: sent.message_id });
-    }
-    return sent;
   }
 
   async function fetchMoreForSession(session, targetUiPage = 0) {

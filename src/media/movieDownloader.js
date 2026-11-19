@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createWriteStream, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -12,10 +12,12 @@ import { ProgressTracker } from '../telegram/progress.js';
 import { durationText } from '../music/model.js';
 import { logger } from '../core/logger.js';
 import { normalizeLangCode, isDubAudioLabel } from './streamingServer.js';
+import { parseAnySubtitleText, serializeSrt } from './subtitles.js';
 
 const execFileAsync = promisify(execFile);
 const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36';
 const DEFAULT_AUDIO_KBPS = 96;
+const MP4_UNIVERSAL_AUDIO_CODECS = new Set(['aac', 'mp3']);
 
 function sanitizeFilename(raw, fallback = 'lancy_movie') {
   const clean = String(raw || fallback)
@@ -66,6 +68,186 @@ async function probeVideoHeight(filePath, runner = execFileAsync) {
   }
 }
 
+function escapeFfmpegFilterPath(filePath) {
+  return String(filePath || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]');
+}
+
+/** Collapse noisy internal tier-scanning resolver messages into clean user milestones. */
+export function sanitizeDownloadProgress(line) {
+  const txt = String(line || '').trim();
+  if (!txt) return '';
+  if (/^[\u{1F4AC}\u{1F501}\u{1F50E}\u{1F3AC}\u{1F51E}\u{23F3}\u{2705}\u{26A0}\u{2139}\u{FE0F}\s]*\[(?:\d+(?:\.\d+)?\/\d+|Subs|5\.5)\]/u.test(txt)) {
+    if (/\[Subs\]/i.test(txt)) return '💬 Checking subtitles…';
+    return '🔎 Finding best HD mirror with audio…';
+  }
+  return txt;
+}
+
+/**
+ * Single-pass ffprobe inspection returning stream topology (video, audio, subtitles, duration, height).
+ * Only sets `known: true` when ffprobe yields valid JSON with a non-empty streams array.
+ */
+export async function probeMediaFile(inputTarget, runner = execFileAsync, { headers = null, timeoutMs = 20000 } = {}) {
+  const empty = {
+    known: false,
+    durationSeconds: null,
+    height: null,
+    width: null,
+    videoCodec: null,
+    hasVideo: true,
+    hasAudio: true,
+    audioStreams: [],
+    subtitleStreams: []
+  };
+  try {
+    const args = ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams'];
+    if (headers && /^https?:\/\//i.test(String(inputTarget || ''))) {
+      args.push('-headers', buildFfmpegHeaders(headers));
+    }
+    args.push(String(inputTarget || ''));
+    const { stdout } = await runner('ffprobe', args, { timeout: timeoutMs, maxBuffer: 2 * 1024 * 1024 });
+    const raw = String(stdout || '').trim();
+    if (!raw.startsWith('{')) return empty;
+    const parsed = JSON.parse(raw);
+    const streams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+    if (!streams.length) return empty;
+    const videoStreams = streams.filter((s) => s?.codec_type === 'video' && !s?.disposition?.attached_pic);
+    const rawAudioStreams = streams.filter((s) => s?.codec_type === 'audio');
+    const rawSubStreams = streams.filter((s) => s?.codec_type === 'subtitle');
+    const firstV = videoStreams[0] || streams.find((s) => s?.codec_type === 'video') || null;
+    const fmtDur = parseFloat(parsed?.format?.duration);
+    const streamDur = parseFloat(firstV?.duration);
+    const durationSeconds = (Number.isFinite(fmtDur) && fmtDur > 0)
+      ? fmtDur
+      : ((Number.isFinite(streamDur) && streamDur > 0) ? streamDur : null);
+    const h = parseInt(firstV?.height, 10);
+    const w = parseInt(firstV?.width, 10);
+    const audioStreams = rawAudioStreams.map((s, idx) => {
+      const lang = normalizeLangCode(s?.tags?.language || s?.tags?.lang || '');
+      const titleTag = [s?.tags?.title, s?.tags?.handler_name].filter(Boolean).join(' ');
+      const disp = s?.disposition || {};
+      return {
+        streamPos: idx,
+        codec: String(s?.codec_name || '').toLowerCase(),
+        channels: Number(s?.channels || 0) || 0,
+        language: lang,
+        title: titleTag,
+        isDub: Boolean(disp.dub || isDubAudioLabel(titleTag)),
+        isCommentary: Boolean(disp.commentary || /\b(?:commentary|description|descriptive)\b/i.test(titleTag)),
+        isOriginal: Boolean(disp.original || /\b(?:main|original|orig|raw|native)\b/i.test(titleTag)),
+        isDefault: Boolean(disp.default)
+      };
+    });
+    const subtitleStreams = rawSubStreams.map((s, idx) => ({
+      streamPos: idx,
+      codec: String(s?.codec_name || '').toLowerCase(),
+      language: normalizeLangCode(s?.tags?.language || s?.tags?.lang || ''),
+      title: [s?.tags?.title, s?.tags?.handler_name].filter(Boolean).join(' ')
+    }));
+    return {
+      known: true,
+      durationSeconds,
+      height: Number.isFinite(h) && h > 0 ? h : null,
+      width: Number.isFinite(w) && w > 0 ? w : null,
+      videoCodec: firstV?.codec_name ? String(firstV.codec_name).toLowerCase() : null,
+      hasVideo: Boolean(videoStreams.length > 0 || firstV),
+      hasAudio: audioStreams.length > 0,
+      audioStreams,
+      subtitleStreams
+    };
+  } catch {
+    return empty;
+  }
+}
+
+/** Pick best non-dub audio stream index matching preferred original language. */
+export function pickBestAudioStream(audioStreams = [], preferredAudioLang = '') {
+  if (!Array.isArray(audioStreams) || !audioStreams.length) {
+    return { bestIndex: 0, stream: null, isDub: false };
+  }
+  const prefLang = normalizeLangCode(preferredAudioLang);
+  let bestIndex = 0;
+  let bestScore = -Infinity;
+  for (let i = 0; i < audioStreams.length; i += 1) {
+    const s = audioStreams[i];
+    let score = 0;
+    if (prefLang && s.language) score += (s.language === prefLang) ? 100 : -80;
+    if (s.isDub) score -= 120;
+    else {
+      score += 30;
+      if (s.isOriginal) score += 40;
+    }
+    if (s.isCommentary) score -= 100;
+    if (s.isDefault) score += 4;
+    if (MP4_UNIVERSAL_AUDIO_CODECS.has(s.codec)) score += 3;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+  return {
+    bestIndex,
+    stream: audioStreams[bestIndex] || audioStreams[0],
+    isDub: Boolean(audioStreams[bestIndex]?.isDub || (prefLang && audioStreams[bestIndex]?.language && audioStreams[bestIndex].language !== prefLang))
+  };
+}
+
+/** Order candidate mirrors so non-dubbed original-language sources are tried first. */
+export function sortDownloadCandidates(candidates = [], preferredOriginalLang = '') {
+  const pref = normalizeLangCode(preferredOriginalLang);
+  return candidates
+    .map((c, idx) => {
+      const cLang = normalizeLangCode(c?.audioLanguage || c?.preferredAudioLang || '');
+      const isDub = Boolean(c?.audioIsDub || (pref && cLang && cLang !== pref));
+      let score = 0;
+      if (!isDub) score += 100;
+      if (pref && cLang === pref) score += 50;
+      const fmt = String(c?.format || '').toLowerCase();
+      if (fmt === 'mp4') score += 10;
+      if (c?.audioUrl || c?.separateAudioUrl) score += 5;
+      return { c, idx, score };
+    })
+    .sort((a, b) => (b.score - a.score) || (a.idx - b.idx))
+    .map((x) => x.c);
+}
+
+/** Validate subtitle timing/length & language sanity, converting to clean UTF-8 .srt when valid. */
+export function validateAndPrepareSrt(subPath, workDir, { durationSeconds = null, expectEnglish = true } = {}) {
+  if (!subPath || !existsSync(subPath)) return { ok: false, reason: 'missing' };
+  try {
+    const raw = readFileSync(subPath, 'utf8');
+    if (!raw || raw.trim().length < 80) return { ok: false, reason: 'empty' };
+    const ext = String(subPath).split('.').pop()?.toLowerCase() || '';
+    const cues = parseAnySubtitleText(raw, ext);
+    if (!Array.isArray(cues) || cues.length < 12) return { ok: false, reason: 'too_few_cues' };
+    const lastEndSec = Math.max(...cues.map((c) => Number(c.endMs || 0))) / 1000;
+    const dur = Number(durationSeconds || 0);
+    if (dur >= 300) {
+      if (lastEndSec < Math.max(90, dur * 0.22)) return { ok: false, reason: 'trailer_or_truncated_subs' };
+      if (lastEndSec > (dur * 1.4) + 120) return { ok: false, reason: 'mismatched_duration_subs' };
+    }
+    if (expectEnglish) {
+      const sampleText = cues.slice(0, 60).map((c) => String(c.text || '')).join(' ');
+      const latinChars = (sampleText.match(/[A-Za-z]/g) || []).length;
+      const nonAsciiLetters = (sampleText.match(/[\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/g) || []).length;
+      if (nonAsciiLetters > latinChars && nonAsciiLetters > 40) {
+        return { ok: false, reason: 'non_english_sub_track' };
+      }
+    }
+    const cleanSrt = serializeSrt(cues);
+    const outSrt = join(workDir, `verified_subs_${randomBytes(2).toString('hex')}.srt`);
+    writeFileSync(outSrt, cleanSrt, 'utf8');
+    return { ok: true, srtPath: outSrt, cueCount: cues.length };
+  } catch {
+    return { ok: false, reason: 'parse_error' };
+  }
+}
+
 export async function selectOriginalAudioMapArgs(inputTarget, runner = execFileAsync, { headers = null, preferredAudioLang = '' } = {}) {
   try {
     const args = ['-v', 'quiet', '-print_format', 'json', '-select_streams', 'a', '-show_streams'];
@@ -75,32 +257,25 @@ export async function selectOriginalAudioMapArgs(inputTarget, runner = execFileA
     args.push(String(inputTarget || ''));
     const { stdout } = await runner('ffprobe', args, { timeout: 15000, maxBuffer: 1024 * 1024 });
     const parsed = JSON.parse(stdout || '{}');
-    const audioStreams = Array.isArray(parsed?.streams) ? parsed.streams : [];
-    if (audioStreams.length <= 1) return [];
-    const prefLang = normalizeLangCode(preferredAudioLang);
-    let bestAudioIdx = 0;
-    let bestScore = -Infinity;
-    for (let i = 0; i < audioStreams.length; i += 1) {
-      const s = audioStreams[i];
+    const rawStreams = Array.isArray(parsed?.streams) ? parsed.streams : [];
+    if (rawStreams.length <= 1) return [];
+    const normalized = rawStreams.map((s, idx) => {
       const lang = normalizeLangCode(s?.tags?.language || s?.tags?.lang || '');
       const titleTag = [s?.tags?.title, s?.tags?.handler_name].filter(Boolean).join(' ');
       const disp = s?.disposition || {};
-      const isDub = Boolean(disp.dub || isDubAudioLabel(titleTag));
-      let score = 0;
-      if (prefLang && lang) score += (lang === prefLang) ? 100 : -80;
-      if (isDub) score -= 120;
-      else {
-        score += 30;
-        if (disp.original || /\b(?:main|original|orig|raw|native)\b/i.test(titleTag)) score += 40;
-      }
-      if (disp.commentary || /\b(?:commentary|description|descriptive)\b/i.test(titleTag)) score -= 100;
-      if (disp.default) score += 4;
-      if (score > bestScore) {
-        bestScore = score;
-        bestAudioIdx = i;
-      }
-    }
-    return ['-map', '0:v:0', '-map', `0:a:${bestAudioIdx}`];
+      return {
+        streamPos: idx,
+        codec: String(s?.codec_name || '').toLowerCase(),
+        language: lang,
+        title: titleTag,
+        isDub: Boolean(disp.dub || isDubAudioLabel(titleTag)),
+        isCommentary: Boolean(disp.commentary || /\b(?:commentary|description|descriptive)\b/i.test(titleTag)),
+        isOriginal: Boolean(disp.original || /\b(?:main|original|orig|raw|native)\b/i.test(titleTag)),
+        isDefault: Boolean(disp.default)
+      };
+    });
+    const { bestIndex } = pickBestAudioStream(normalized, preferredAudioLang);
+    return ['-map', '0:v:0', '-map', `0:a:${bestIndex}`];
   } catch {
     return [];
   }
@@ -203,8 +378,21 @@ export class MovieDownloader {
    * Resolve and materialize a single movie, TV episode, or already-playing track into an .mp4 on disk.
    * Caller must invoke `cleanup()` when upload finishes.
    */
-  async prepareVideoFile(item, { onProgress = null, skipCache = false, quality = '480p', allowAdultFeatures = false } = {}) {
-    const emit = (msg) => { if (typeof onProgress === 'function') void onProgress(msg); };
+  async prepareVideoFile(item, { onProgress = null, skipCache = false, quality = '480p', allowAdultFeatures = false, subtitles = null } = {}) {
+    let lastEmitAt = 0;
+    let lastEmitLine = '';
+    const emit = (msg, { sanitize = false, force = false } = {}) => {
+      if (typeof onProgress !== 'function') return;
+      const line = sanitize ? sanitizeDownloadProgress(msg) : String(msg || '').trim();
+      if (!line) return;
+      const now = Date.now();
+      if (!force && line === lastEmitLine) return;
+      if (!force && (now - lastEmitAt) < 1200) return;
+      lastEmitAt = now;
+      lastEmitLine = line;
+      void onProgress(line);
+    };
+    const emitCleanResolver = (msg) => emit(msg, { sanitize: true });
     const limitBytes = this.getLimitBytes();
     const targetQuality = normalizeDownloadQuality(quality);
     const profile = DOWNLOAD_QUALITY_PROFILES[targetQuality] || DOWNLOAD_QUALITY_PROFILES['480p'];
@@ -213,7 +401,7 @@ export class MovieDownloader {
       const cached = this.#lookupCachedFileId(cacheKey);
       if (cached?.file_id) {
         const displayTitle = item?.title || cached.title || 'Movie';
-        emit(`⚡ Instant ${profile.short} cache hit for ${displayTitle}!`);
+        emit(`⚡ Instant ${profile.short} cache hit for ${displayTitle}!`, { force: true });
         return {
           ok: true,
           cachedFileId: cached.file_id,
@@ -237,9 +425,16 @@ export class MovieDownloader {
     };
 
     try {
+      const expectedOrigLang = normalizeLangCode(item?.originalLanguage || item?.language || '');
+      const initialNeedSubs = Boolean(
+        subtitles === true
+        || item?.includeSubtitles
+        || (expectedOrigLang && expectedOrigLang !== 'en' && expectedOrigLang !== 'und')
+      );
       let track = item?.streamUrl || item?.videoUrl || item?.filePath ? item : null;
+      let resolvedSubInfo = null;
       if (!track && item?.isAdult && item?.pageUrl && typeof this.app?.adultCatalog?.resolveStream === 'function') {
-        emit(`🔎 Resolving ${profile.short} 18+ stream for ${item?.title || 'video'}…`);
+        emit(`🔎 Finding ${profile.short} 18+ stream for ${item?.title || 'video'}…`, { force: true });
         const resolvedAdult = await this.app.adultCatalog.resolveStream(item, {
           preferredHeight: profile.height
         }).catch(() => null);
@@ -256,18 +451,19 @@ export class MovieDownloader {
         }
       }
       if (!track && this.app?.movieResolver) {
-        emit(`🔎 Resolving ${profile.short} stream for ${item?.title || 'title'}…`);
+        emit(`🔎 Finding verified ${profile.short} stream for ${item?.title || 'title'}…`, { force: true });
         const res = await this.app.movieResolver.resolve(item, {
-          fetchSubtitles: false,
+          fetchSubtitles: initialNeedSubs,
           preferredHeight: profile.height,
-          originalLanguage: item?.originalLanguage || item?.language || null,
+          originalLanguage: expectedOrigLang || null,
           allowAdultFeatures: Boolean(allowAdultFeatures),
-          onProgress: emit
+          onProgress: emitCleanResolver
         });
         if (!res?.ok || !res.track) {
           return { ok: false, reason: res?.reason || 'No downloadable stream found for this title.', cleanup };
         }
         track = res.track;
+        resolvedSubInfo = res.subtitles || null;
       }
       if (!track) {
         return { ok: false, reason: 'No stream metadata available to download.', cleanup };
@@ -275,10 +471,14 @@ export class MovieDownloader {
 
       const displayTitle = track.title || item?.title || 'Movie';
       const safeName = sanitizeFilename(displayTitle, 'movie');
+      const effectiveOrigLang = expectedOrigLang || normalizeLangCode(track.originalLanguage || track.preferredAudioLang || '');
       let outPath = join(workDir, `${safeName}.mp4`);
+      let dlProbe = null;
+      let activeCand = track;
 
       if (track.filePath && existsSync(track.filePath)) {
         outPath = track.filePath;
+        dlProbe = await probeMediaFile(outPath, this.runner);
       } else {
         const failedUrls = [];
         const pickCandidateStreamUrl = (candObj) => {
@@ -307,13 +507,33 @@ export class MovieDownloader {
           const fmt = String(candObj?.format || track.format || '').toLowerCase();
           const isDash = Boolean(candObj?.isDash || fmt === 'dash' || /\.mpd(\?|$)/i.test(streamUrl));
           const isHls = !isDash && Boolean(candObj?.isHls || fmt === 'hls' || /\.m3u8(\?|$)/i.test(streamUrl));
-          const needsRemux = isHls || isDash || /\.(mkv|webm|ts)(\?|$)/i.test(streamUrl) || ['mkv', 'dash', 'hls'].includes(fmt);
-          const prefAudioLang = candObj?.preferredAudioLang || track.preferredAudioLang || item?.originalLanguage || item?.language || candObj?.audioLanguage || track.audioLanguage || '';
+          const audioUrl = candObj?.audioUrl || candObj?.separateAudioUrl || track?.audioUrl || '';
+          const hasSeparateAudio = Boolean(audioUrl && audioUrl !== streamUrl);
+          const needsRemux = hasSeparateAudio || isHls || isDash || /\.(mkv|webm|ts)(\?|$)/i.test(streamUrl) || ['mkv', 'dash', 'hls'].includes(fmt);
+          const prefAudioLang = candObj?.preferredAudioLang || track.preferredAudioLang || effectiveOrigLang || candObj?.audioLanguage || track.audioLanguage || '';
 
-          if (needsRemux) {
+          if (hasSeparateAudio) {
+            emit(`⬇️ Muxing HD video + audio for ${safeName}…`);
+            const hdrStr = buildFfmpegHeaders(headers);
+            await this.runner('ffmpeg', [
+              '-nostdin', '-y',
+              '-headers', hdrStr,
+              ...(isHls ? ['-allowed_extensions', 'ALL'] : []),
+              '-i', streamUrl,
+              '-headers', hdrStr,
+              '-i', audioUrl,
+              '-map', '0:v:0', '-map', '1:a:0', '-sn',
+              '-c:v', 'copy',
+              '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
+              '-shortest',
+              '-movflags', '+faststart',
+              outPath
+            ], { timeout: 600_000, maxBuffer: 4 * 1024 * 1024 });
+          } else if (needsRemux) {
             emit(`⬇️ Remuxing HD stream to MP4 for ${safeName}…`);
             const hdrStr = buildFfmpegHeaders(headers);
             const audioMapArgs = await selectOriginalAudioMapArgs(streamUrl, this.runner, { headers, preferredAudioLang: prefAudioLang });
+            const effectiveMap = audioMapArgs.length ? audioMapArgs : ['-map', '0:v:0', '-map', '0:a:0?'];
             const inputFlags = [
               '-nostdin', '-y',
               '-headers', hdrStr,
@@ -323,7 +543,8 @@ export class MovieDownloader {
             try {
               await this.runner('ffmpeg', [
                 ...inputFlags,
-                ...audioMapArgs,
+                ...effectiveMap,
+                '-sn',
                 '-c', 'copy',
                 '-bsf:a', 'aac_adtstoasc',
                 '-movflags', '+faststart',
@@ -336,7 +557,8 @@ export class MovieDownloader {
               // Re-encode audio to AAC if source had non-MP4 audio codec (AC3/DTS/Opus)
               await this.runner('ffmpeg', [
                 ...inputFlags,
-                ...audioMapArgs,
+                ...effectiveMap,
+                '-sn',
                 '-c:v', 'copy',
                 '-c:a', 'aac', '-b:a', '128k', '-ac', '2',
                 '-movflags', '+faststart',
@@ -363,13 +585,19 @@ export class MovieDownloader {
           if (!existsSync(outPath) || statSync(outPath).size < 1024) {
             throw new Error('Downloaded file is missing or empty.');
           }
-          return streamUrl;
+          const probe = await probeMediaFile(outPath, this.runner);
+          if (probe.known && (!probe.hasVideo || !probe.hasAudio)) {
+            try { rmSync(outPath, { force: true }); } catch {}
+            throw new Error(!probe.hasVideo ? 'Downloaded stream has no video track.' : 'Downloaded mirror has no audio track (video-only).');
+          }
+          return { streamUrl, probe, cand: candObj };
         };
 
-        const initialCandidates = [
+        const rawCandidates = [
           track,
           ...(Array.isArray(track.fallbackStreams) ? track.fallbackStreams : [])
         ].filter((c) => Boolean(c?.streamUrl || c?.videoUrl || c?.mediaUrl || c?.url));
+        const initialCandidates = sortDownloadCandidates(rawCandidates, effectiveOrigLang);
         if (!initialCandidates.length) {
           cleanup();
           return { ok: false, reason: 'Playable video URL was unavailable.', cleanup: () => {} };
@@ -381,7 +609,9 @@ export class MovieDownloader {
           const candUrl = pickCandidateStreamUrl(cand);
           if (!candUrl || failedUrls.includes(candUrl)) continue;
           try {
-            await downloadCandidate(cand);
+            const dlRes = await downloadCandidate(cand);
+            dlProbe = dlRes.probe;
+            activeCand = dlRes.cand;
             succeeded = true;
             break;
           } catch (err) {
@@ -391,18 +621,21 @@ export class MovieDownloader {
         }
 
         if (!succeeded && !item?.filePath && typeof this.app?.movieResolver?.resolve === 'function' && failedUrls.length > 0) {
-          emit(`🔁 Primary download mirror failed — switching source for ${safeName}…`);
+          emit(`🔁 Switching mirror for verified audio on ${safeName}…`, { force: true });
           const freshRes = await this.app.movieResolver.resolve(item, {
-            fetchSubtitles: false,
+            fetchSubtitles: initialNeedSubs,
             preferredHeight: profile.height,
-            originalLanguage: item?.originalLanguage || item?.language || null,
+            originalLanguage: effectiveOrigLang || null,
             allowAdultFeatures: Boolean(allowAdultFeatures),
             excludeUrls: failedUrls,
-            onProgress: emit
+            onProgress: emitCleanResolver
           }).catch(() => null);
           if (freshRes?.ok && freshRes.track?.streamUrl && !failedUrls.includes(freshRes.track.streamUrl)) {
             track = freshRes.track;
-            await downloadCandidate(track);
+            if (freshRes.subtitles) resolvedSubInfo = freshRes.subtitles;
+            const dlRes = await downloadCandidate(track);
+            dlProbe = dlRes.probe;
+            activeCand = dlRes.cand;
             succeeded = true;
           }
         }
@@ -415,10 +648,63 @@ export class MovieDownloader {
       if (!existsSync(outPath)) {
         throw new Error('Downloaded file is missing.');
       }
+      if (!dlProbe) dlProbe = await probeMediaFile(outPath, this.runner);
+      if (dlProbe.known && (!dlProbe.hasVideo || !dlProbe.hasAudio)) {
+        throw new Error(!dlProbe.hasVideo ? 'Video stream missing.' : 'Source file has no audio track.');
+      }
 
       let sizeBytes = statSync(outPath).size;
-      let durationSeconds = Number(track.durationSeconds || item?.durationSeconds || 0) || await probeDurationSeconds(outPath, this.runner);
-      const sourceHeight = await probeVideoHeight(outPath, this.runner);
+      let durationSeconds = Number(track.durationSeconds || item?.durationSeconds || 0)
+        || (dlProbe.known ? dlProbe.durationSeconds : null)
+        || await probeDurationSeconds(outPath, this.runner);
+      const sourceHeight = (dlProbe.known && dlProbe.height)
+        ? dlProbe.height
+        : await probeVideoHeight(outPath, this.runner);
+
+      const prefAudioLang = normalizeLangCode(
+        activeCand?.preferredAudioLang || track.preferredAudioLang || effectiveOrigLang || activeCand?.audioLanguage || track.audioLanguage || ''
+      );
+      const bestAudio = pickBestAudioStream(dlProbe.audioStreams || [], prefAudioLang);
+      const resolvedAudioLang = normalizeLangCode(
+        bestAudio.stream?.language || activeCand?.audioLanguage || track.audioLanguage || ''
+      );
+      const audioIsDub = Boolean(
+        bestAudio.isDub
+        || activeCand?.audioIsDub
+        || (activeCand === track && track.audioIsDub)
+        || (effectiveOrigLang && resolvedAudioLang && resolvedAudioLang !== effectiveOrigLang)
+      );
+
+      // Fetch subtitles lazily ONLY if resolved movie is foreign-language original (non-English & not English-dubbed)
+      const shouldUseSubtitles = Boolean(
+        subtitles === true
+        || item?.includeSubtitles
+        || (effectiveOrigLang && effectiveOrigLang !== 'en' && effectiveOrigLang !== 'und' && resolvedAudioLang !== 'en' && !audioIsDub)
+      );
+      const hasEmbeddedEnglishSub = Boolean(
+        dlProbe.known && (dlProbe.subtitleStreams || []).some((s) => ['en', 'eng'].includes(normalizeLangCode(s.language)))
+      );
+      if (shouldUseSubtitles && !hasEmbeddedEnglishSub && !track.subtitlePath && typeof this.app?.movieResolver?.subtitles?.resolveForMedia === 'function') {
+        emit(`💬 Matching clean English subtitles for ${safeName}…`);
+        const lateSub = await this.app.movieResolver.subtitles.resolveForMedia({
+          type: track.mediaKind || item?.type || 'movie',
+          id: item?.id || track.id,
+          tmdbId: track.tmdbId || item?.tmdbId || null,
+          imdbId: track.imdbId || item?.imdbId || null,
+          title: item?.title || track.title,
+          year: track.year || item?.year || null,
+          season: track.season ?? item?.season ?? null,
+          episode: track.episode ?? item?.episode ?? null,
+          durationSeconds: durationSeconds || null
+        }).catch(() => null);
+        if (lateSub?.filePath) resolvedSubInfo = lateSub;
+      }
+
+      const candidateSubPath = resolvedSubInfo?.filePath || track.subtitlePath || null;
+      const validSub = (shouldUseSubtitles && !hasEmbeddedEnglishSub && candidateSubPath)
+        ? validateAndPrepareSrt(candidateSubPath, workDir, { durationSeconds, expectEnglish: true })
+        : { ok: false };
+
       const fitPlan = sizeBytes > limitBytes ? planVideoFit({ sizeBytes, durationSeconds, limitBytes }) : null;
       const needsHeightScale = Boolean(
         !item?.filePath && (
@@ -426,8 +712,15 @@ export class MovieDownloader {
           (targetQuality === '360p' && !sourceHeight && sizeBytes > 32 * 1024 * 1024)
         )
       );
+      const needsSubBurn = Boolean(!item?.filePath && validSub.ok && validSub.srtPath);
+      const audioCodecLower = String(bestAudio.stream?.codec || '').toLowerCase();
+      const needsAudioTranscode = Boolean(dlProbe.known && bestAudio.stream && !MP4_UNIVERSAL_AUDIO_CODECS.has(audioCodecLower));
+      const needsAudioTrackReselect = Boolean(dlProbe.known && (dlProbe.audioStreams?.length || 0) > 1 && bestAudio.bestIndex > 0);
+      const hasUnwantedForeignSoftSubs = Boolean(
+        dlProbe.known && !needsSubBurn && (dlProbe.subtitleStreams || []).some((s) => s.language && !['en', 'eng', 'und', ''].includes(s.language))
+      );
 
-      if (sizeBytes > limitBytes || needsHeightScale) {
+      if (sizeBytes > limitBytes || needsHeightScale || needsSubBurn) {
         if (fitPlan && fitPlan.action === 'reject') {
           cleanup();
           return {
@@ -438,7 +731,7 @@ export class MovieDownloader {
         }
         const fitHeight = fitPlan?.action === 'transcode'
           ? Math.min(profile.height, fitPlan.height)
-          : profile.height;
+          : (sourceHeight ? Math.min(profile.height, sourceHeight) : profile.height);
         const targetVideoKbps = fitPlan?.action === 'transcode'
           ? Math.min(profile.videoKbps, fitPlan.videoKbps)
           : profile.videoKbps;
@@ -448,15 +741,26 @@ export class MovieDownloader {
         const targetAudioKbps = fitPlan?.action === 'transcode'
           ? Math.min(profile.audioKbps, DEFAULT_AUDIO_KBPS)
           : profile.audioKbps;
-        emit(`🗜 Optimizing ${Math.round(sizeBytes / (1024 * 1024))} MB video to ${profile.short} (${fitHeight}p)…`);
+        emit(
+          needsSubBurn && !needsHeightScale && sizeBytes <= limitBytes
+            ? `💬 Embedding verified English subtitles (${safeName})…`
+            : `🗜 Optimizing ${Math.round(sizeBytes / (1024 * 1024))} MB video to ${profile.short} (${fitHeight}p)…`,
+          { force: true }
+        );
         const fitPath = join(workDir, `${safeName}_${profile.short}.mp4`);
-        const fitPrefLang = track.preferredAudioLang || item?.originalLanguage || item?.language || track.audioLanguage || '';
-        const fitAudioMapArgs = await selectOriginalAudioMapArgs(outPath, this.runner, { preferredAudioLang: fitPrefLang });
+        const fitAudioMapArgs = (dlProbe.known && dlProbe.audioStreams?.length)
+          ? ['-map', '0:v:0', '-map', `0:a:${bestAudio.bestIndex}`]
+          : await selectOriginalAudioMapArgs(outPath, this.runner, { preferredAudioLang: prefAudioLang });
+        const vfParts = [`scale=-2:'min(${fitHeight},ih)'`];
+        if (needsSubBurn) {
+          vfParts.push(`subtitles='${escapeFfmpegFilterPath(validSub.srtPath)}:charenc=UTF-8'`);
+        }
         await this.runner('ffmpeg', [
           '-nostdin', '-y',
           '-i', outPath,
           ...fitAudioMapArgs,
-          '-vf', `scale=-2:'min(${fitHeight},ih)'`,
+          '-sn',
+          '-vf', vfParts.join(','),
           '-c:v', 'libx264', '-preset', 'veryfast',
           '-crf', String(profile.crf),
           '-maxrate', `${targetMaxrateKbps}k`,
@@ -467,6 +771,11 @@ export class MovieDownloader {
           fitPath
         ], { timeout: 900_000, maxBuffer: 4 * 1024 * 1024 });
         if (existsSync(fitPath)) {
+          const postProbe = await probeMediaFile(fitPath, this.runner);
+          if (postProbe.known && (!postProbe.hasVideo || !postProbe.hasAudio)) {
+            cleanup();
+            return { ok: false, reason: 'Encoded output lost audio track.', cleanup: () => {} };
+          }
           if (outPath !== track.filePath) {
             try { rmSync(outPath, { force: true }); } catch {}
           }
@@ -481,6 +790,35 @@ export class MovieDownloader {
             cleanup: () => {}
           };
         }
+      } else if (!item?.filePath && (needsAudioTranscode || needsAudioTrackReselect || hasUnwantedForeignSoftSubs)) {
+        // Fast 1-3s stream-copy remux: fixes incompatible audio codec (AC3/DTS/Opus -> AAC), removes wrong dubs/foreign soft-subs
+        emit(`🔧 Normalizing clean AAC audio for ${safeName}…`);
+        const fixedPath = join(workDir, `${safeName}_clean.mp4`);
+        const fastArgs = [
+          '-nostdin', '-y',
+          '-i', outPath,
+          '-map', '0:v:0', '-map', `0:a:${bestAudio.bestIndex}`,
+          '-sn',
+          '-c:v', 'copy',
+          ...(needsAudioTranscode ? ['-c:a', 'aac', '-b:a', '128k', '-ac', '2'] : ['-c:a', 'copy']),
+          '-movflags', '+faststart',
+          fixedPath
+        ];
+        try {
+          await this.runner('ffmpeg', fastArgs, { timeout: 300_000, maxBuffer: 4 * 1024 * 1024 });
+          if (existsSync(fixedPath) && statSync(fixedPath).size > 1024) {
+            const fixProbe = await probeMediaFile(fixedPath, this.runner);
+            if (!fixProbe.known || (fixProbe.hasVideo && fixProbe.hasAudio)) {
+              if (outPath !== track.filePath) {
+                try { rmSync(outPath, { force: true }); } catch {}
+              }
+              outPath = fixedPath;
+              sizeBytes = statSync(outPath).size;
+            }
+          }
+        } catch {
+          try { rmSync(fixedPath, { force: true }); } catch {}
+        }
       }
 
       return {
@@ -493,6 +831,10 @@ export class MovieDownloader {
         sizeBytes,
         durationSeconds: durationSeconds ? Math.round(durationSeconds) : null,
         title: displayTitle,
+        audioLanguage: resolvedAudioLang || null,
+        audioIsDub,
+        subtitleApplied: needsSubBurn,
+        hasEmbeddedEnglishSub,
         track,
         cleanup: outPath === track.filePath ? () => {} : cleanup
       };
@@ -516,23 +858,31 @@ export class MovieDownloader {
     const effectiveAllowAdult = allowAdultFeatures !== null
       ? Boolean(allowAdultFeatures)
       : Number(ctx?.chatId || ctx?.chat?.id || 0) > 0;
-    const prepared = await this.prepareVideoFile(itemOrTrack, {
+    const runPrepare = () => this.prepareVideoFile(itemOrTrack, {
       onProgress,
       quality: targetQuality,
       allowAdultFeatures: effectiveAllowAdult
     });
+    const dedupeId = `${itemOrTrack?.id || itemOrTrack?.title || 'single'}_s${itemOrTrack?.season ?? 0}_e${itemOrTrack?.episode ?? 0}_${targetQuality}`;
+    const prepared = typeof this.app?.jobPlanner?.schedule === 'function'
+      ? await this.app.jobPlanner.schedule('media', { dedupeKey: `mvdl_${dedupeId}` }, runPrepare)
+      : await runPrepare();
     if (!prepared.ok) return prepared;
 
     const api = ctx.api || this.app?.telegram?.api;
     const botUsername = api?.botUsername || api?.me?.username || this.app?.telegram?.botUsername || 'Lancy_easy_bot';
     const qTag = prepared.quality || targetQuality;
     const durTag = prepared.durationSeconds ? ` · ⏱ ${durationText(prepared.durationSeconds)}` : '';
+    const langTag = prepared.audioIsDub
+      ? ` · ⚠️ Dub (${String(prepared.audioLanguage || 'ALT').toUpperCase()})`
+      : (prepared.audioLanguage ? ` · 🔊 ${String(prepared.audioLanguage).toUpperCase()}` : '');
+    const subTag = prepared.subtitleApplied ? ' · 💬 EN Subs' : (prepared.hasEmbeddedEnglishSub ? ' · 💬 EN' : '');
     const sizeLabel = prepared.sizeBytes > 0
       ? `📦 ${Math.max(1, Math.round(prepared.sizeBytes / (1024 * 1024)))} MB · ${qTag} MP4`
       : `⚡ Instant Telegram ${qTag} MP4`;
     const caption =
       `🎬 <b>${escapeHtml(prepared.title)}</b>\n` +
-      `<blockquote>${sizeLabel}${escapeHtml(durTag)} · 🤖 @${escapeHtml(botUsername)}</blockquote>`;
+      `<blockquote>${sizeLabel}${escapeHtml(durTag)}${escapeHtml(langTag)}${escapeHtml(subTag)} · 🤖 @${escapeHtml(botUsername)}</blockquote>`;
 
     const extra = {
       caption,
@@ -624,10 +974,14 @@ export class MovieDownloader {
     const allInstant = slice.every((d) => Boolean(d?.filePath || this.hasCachedVideo(d, targetQuality)));
     let tracker = null;
     if (!allInstant && typeof api?.sendRichMessage === 'function') {
+      const trackerReplyId = (Number(ctx.chatId) < 0 && !reusableCardId)
+        ? (ctx.message?.message_id || ctx.query?.message?.message_id || ms.messageId || null)
+        : null;
       tracker = new ProgressTracker({
         api,
         chatId: ctx.chatId,
         messageId: reusableCardId,
+        replyToMessageId: trackerReplyId,
         heartbeatMs: 2000,
         action: 'upload_video'
       });
@@ -660,18 +1014,19 @@ export class MovieDownloader {
       const results = new Array(slice.length);
       let cursor = 0;
       let completed = 0;
-      const concurrency = Math.min(2, slice.length);
+      const stressLevel = this.app?.jobPlanner?.sampleStress?.()?.pressureLevel || 'nominal';
+      const concurrency = (stressLevel === 'high' || stressLevel === 'critical') ? 1 : Math.min(3, slice.length);
       const worker = async () => {
         while (cursor < slice.length) {
           const idx = cursor++;
           const desc = slice[idx];
+          await this.app?.jobPlanner?.yieldIfStressed?.('media');
           const label = desc.episode
             ? `S${String(desc.season).padStart(2, '0')}E${String(desc.episode).padStart(2, '0')}`
             : String(desc.title || `Item ${start + idx + 1}`).slice(0, 36);
-          emitProgress(`📦 Preparing ${targetQuality} [${completed + 1}/${slice.length}] ${label}…`, { completed, total: slice.length });
+          emitProgress(`📦 Preparing ${targetQuality} · ${completed}/${slice.length} ready (${label})…`, { completed, total: slice.length });
           const p = await this.prepareVideoFile(desc, {
-            quality: targetQuality,
-            onProgress: (line) => emitProgress(line, { completed, total: slice.length })
+            quality: targetQuality
           });
           completed++;
           results[idx] = { desc, label, p };

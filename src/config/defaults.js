@@ -116,13 +116,17 @@ export const DEFAULT_SETTINGS = {
     assistantEnabled: true,      // toggleable AI assistant
     provider: 'ollama',         // builtin | ollama | openai-compatible
     endpoint: 'http://127.0.0.1:11434',
-    model: 'qwen2.5:3b',
+    model: 'qwen2.5:7b',
     apiKey: '',                  // env-overridable, never shown in UI
+    backupProvider: '',
+    backupEndpoint: '',
+    backupModel: '',
+    backupApiKey: '',
     personality: 'lancy',
     style: 'girly',
     creativity: 0.7,
     maxTokens: 400,
-    timeoutSeconds: 20,
+    timeoutSeconds: 42,
     fallbackProvider: 'builtin',
     autoCaption: true,
     chatMode: true

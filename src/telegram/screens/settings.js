@@ -189,11 +189,10 @@ export function createSettingsScreen({ app }) {
     if (isClone) {
       if (!isCloneOwner && !isMain) {
         const b = new RichMessageBuilder();
-        b.paragraph(rt.bold(banner([
+        b.bannerHeader([
           `𓆩♡𓆪 @${botUsername.toUpperCase()} 𓆩♡𓆪`,
           'bot settings'
-        ])));
-        b.divider();
+        ], { size: 1 });
         b.blockquote(`🌸 Settings and force-join configuration for @${botUsername} are reserved for the bot owner ♡`);
         b.divider();
         b.buttons([
@@ -213,11 +212,10 @@ export function createSettingsScreen({ app }) {
       const globalFj = getGlobalForceJoinChannels(app.db);
 
       const b = new RichMessageBuilder();
-      b.paragraph(rt.bold(banner([
+      b.bannerHeader([
         `𓆩♡𓆪 @${botUsername.toUpperCase()} SETTINGS 𓆩♡𓆪`,
-        'force-join channels & bot control ♡'
-      ])));
-      b.divider();
+        'force-join channels & bot control'
+      ], { size: 1 });
       b.blockquote(
         `🤖 CLONED BOT CONTROLS:\n` +
         `• Set up Force-Join so members must join your channel or group before chatting with @${botUsername}!\n` +
@@ -356,6 +354,18 @@ export function createSettingsScreen({ app }) {
     b.heading(category === 'cinema' ? '🎬 CINEMA & STARS OWNER PANEL' : `⚙ ${category.toUpperCase()}`, 2);
     if (['performance', 'storage', 'security', 'logging', 'advanced'].includes(category)) {
       b.blockquote('⚠️ Engine & system settings are automatically tuned by Lancy core.');
+    }
+    if (category === 'performance' && app.jobPlanner?.getStats) {
+      const jp = app.jobPlanner.getStats();
+      const stressIcon = jp.pressureLevel === 'nominal' ? '🟢' : jp.pressureLevel === 'elevated' ? '🟡' : jp.pressureLevel === 'high' ? '🟠' : '🔴';
+      b.heading('⚡ Live Job Planner & Stress Relief', 3);
+      b.table([
+        ['Stress Level', `${stressIcon} ${String(jp.pressureLevel).toUpperCase()} (${jp.eventLoopLagMs}ms lag)`],
+        ['CPU & RAM', `load ${jp.load1m} (${jp.cpuCount}c) · ${jp.rssMb} MB (${jp.memPct}%)`],
+        ['Worker Cap', `${jp.activeJobs}/${jp.concurrencyLimit} active · ${jp.pendingJobs} queued`],
+        ['Active VCs', `${jp.activeVcCount} streaming · ${jp.deferredForStress} deferred · ${jp.coalescedTotal} coalesced`],
+        ...(jp.persistent ? [['SQLite Jobs', `${jp.persistent.pending || 0} pending · ${jp.persistent.done || 0} done · ${jp.persistent.failed || 0} failed`]] : [])
+      ], { compact: true, striped: true });
     }
     if (category === 'cinema') {
       const starsOn = ctx.settings.get('cinema.starsEnabled') !== false;

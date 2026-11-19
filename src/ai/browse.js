@@ -25,60 +25,102 @@ export class WebBrowser {
   }
 
   /**
-   * Search DuckDuckGo HTML for web results.
+   * Search Wikipedia + DuckDuckGo HTML concurrently for reliable real-time web knowledge.
    */
   async search(query, { maxResults = 5 } = {}) {
-    const results = [];
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), this.timeoutMs);
-      const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
-        headers: {
-          'User-Agent': this.userAgent,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-        },
-        signal: controller.signal
-      }).finally(() => clearTimeout(timer));
+    const cleanQuery = String(query || '').trim();
+    if (!cleanQuery) return [];
 
-      if (res.ok) {
-        const text = await res.text();
-        // Extract results from DDG HTML: class="result__snippet" and class="result__url"
-        const resultBlocks = text.split(/class="result\s+results_links/g).slice(1);
-        for (const block of resultBlocks) {
-          if (results.length >= maxResults) break;
-          const titleMatch = block.match(/<a[^>]+class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i)
-            || block.match(/<a[^>]+class="result__url"[^>]*>([\s\S]*?)<\/a>/i);
-          const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/a>/i);
-          const linkMatch = block.match(/<a[^>]+class="result__url"[^>]+href="([^"]+)"/i);
+    const ddgPromise = (async () => {
+      const out = [];
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+        const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(cleanQuery)}`, {
+          headers: {
+            'User-Agent': this.userAgent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          },
+          signal: controller.signal
+        }).finally(() => clearTimeout(timer));
 
-          const snippet = snippetMatch ? cleanHtml(snippetMatch[1]) : '';
-          const title = titleMatch ? cleanHtml(titleMatch[1]) : '';
-          const url = linkMatch ? linkMatch[1] : '';
+        if (res.ok) {
+          const text = await res.text();
+          const resultBlocks = text.split(/class="result\s+results_links/g).slice(1);
+          for (const block of resultBlocks) {
+            if (out.length >= maxResults) break;
+            const titleMatch = block.match(/<a[^>]+class="result__a"[^>]*>([\s\S]*?)<\/a>/i)
+              || block.match(/<a[^>]+class="result__url"[^>]*>([\s\S]*?)<\/a>/i);
+            const snippetMatch = block.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div|span)>/i);
+            const linkMatch = block.match(/<a[^>]+class="result__a"[^>]+href="([^"]+)"/i)
+              || block.match(/<a[^>]+class="result__url"[^>]+href="([^"]+)"/i);
 
-          if (snippet || title) {
-            results.push({
-              title: title.slice(0, 100),
-              snippet: snippet.slice(0, 300),
-              url
-            });
+            const snippet = snippetMatch ? cleanHtml(snippetMatch[1]) : '';
+            const title = titleMatch ? cleanHtml(titleMatch[1]) : '';
+            const url = linkMatch ? linkMatch[1] : '';
+            if (snippet || title) {
+              out.push({ title: title.slice(0, 120), snippet: snippet.slice(0, 360), url });
+            }
           }
         }
-      }
-    } catch {
-      // Fallback below
-    }
-
-    // Also check Wikipedia summary for rich character / anime lore if few results
-    if (results.length < 2) {
-      try {
-        const wikiRes = await this.getWikipediaSummary(query);
-        if (wikiRes) {
-          results.unshift(wikiRes);
-        }
       } catch {}
-    }
+      return out;
+    })();
 
-    return results.slice(0, maxResults);
+    const wikiPromise = this.searchWikipedia(cleanQuery, { maxResults: 3 }).catch(() => []);
+    const [ddgHits, wikiHits] = await Promise.all([ddgPromise, wikiPromise]);
+
+    const merged = [...ddgHits];
+    for (const w of wikiHits) {
+      if (!merged.some((m) => m.title?.toLowerCase() === w.title?.toLowerCase())) {
+        merged.push(w);
+      }
+    }
+    if (!merged.length) {
+      const exact = await this.getWikipediaSummary(cleanQuery).catch(() => null);
+      if (exact) merged.push(exact);
+    }
+    return merged.slice(0, maxResults);
+  }
+
+  /**
+   * Search Wikipedia via MediaWiki search + extracts API (fast, rich plot & fact coverage).
+   */
+  async searchWikipedia(query, { maxResults = 3, extractChars = 600 } = {}) {
+    const cleanTopic = String(query || '').replace(/\b(?:plot\s+summary|story\s+summary|summary|what\s+is|tell\s+me\s+about)\b/gi, '').replace(/\s+/g, ' ').trim();
+    if (!cleanTopic) return [];
+    try {
+      const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(cleanTopic)}&format=json&srlimit=${maxResults}&origin=*`;
+      const sRes = await fetch(searchUrl, {
+        headers: { 'User-Agent': 'LancyBot/2.0 (contact@lancy.studio)' },
+        signal: AbortSignal.timeout(4000)
+      });
+      if (!sRes.ok) return [];
+      const sData = await sRes.json();
+      const hits = sData?.query?.search || [];
+      if (!hits.length) return [];
+
+      const titles = hits.slice(0, maxResults).map((h) => h.title).join('|');
+      const extUrl = `https://en.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=false&explaintext=true&exchars=${extractChars}&titles=${encodeURIComponent(titles)}&format=json&origin=*`;
+      const eRes = await fetch(extUrl, {
+        headers: { 'User-Agent': 'LancyBot/2.0 (contact@lancy.studio)' },
+        signal: AbortSignal.timeout(4000)
+      }).catch(() => null);
+      const eData = eRes?.ok ? await eRes.json().catch(() => null) : null;
+      const pages = Object.values(eData?.query?.pages || {});
+
+      return hits.slice(0, maxResults).map((h) => {
+        const page = pages.find((p) => p.title === h.title);
+        const snippet = page?.extract ? cleanHtml(page.extract).slice(0, extractChars) : cleanHtml(h.snippet || '');
+        return {
+          title: h.title,
+          snippet,
+          url: `https://en.wikipedia.org/wiki/${encodeURIComponent(h.title.replace(/\s+/g, '_'))}`
+        };
+      });
+    } catch {
+      return [];
+    }
   }
 
   /**
@@ -124,6 +166,18 @@ export class WebBrowser {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * Structured research payload for tool execution (results + top excerpt).
+   */
+  async researchStructured(query, { maxResults = 4 } = {}) {
+    const hits = await this.search(query, { maxResults });
+    if (!hits.length) return { results: [], topExcerpt: null };
+    return {
+      results: hits,
+      topExcerpt: hits[0]?.snippet || null
+    };
   }
 
   /**

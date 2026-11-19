@@ -310,17 +310,15 @@ test('Dashboard and Help: include heads-up banner and expandable superpowers gui
   const dashHasHeadsUp = dashRich.blocks.some((b) => b.type === 'paragraph' && JSON.stringify(b).includes('Heads up'));
   assert.ok(dashHasHeadsUp, 'Dashboard must contain heads up notice');
 
-  const dashExpandable = dashRich.blocks.find((b) => b.type === 'expandable_blockquote');
-  assert.ok(dashExpandable, 'Dashboard must contain expandable blockquote');
-  const dashStr = richTextToString(dashExpandable.text);
-  assert.match(dashStr, /MUSIC · DOWNLOADS & LIVE CALLS/);
-  assert.match(dashStr, /UNIVERSAL HD MEDIA DOWNLOADER/);
-  assert.match(dashStr, /PINTEREST HD AESTHETIC STUDIO/);
-  assert.match(dashStr, /BRING YOUR OWN BOT/);
+  const dashDetails = dashRich.blocks.find((b) => b.type === 'details');
+  assert.ok(dashDetails, 'Dashboard must contain Bot API 10.3 details toggle block');
+  const dashStr = JSON.stringify(dashDetails);
+  assert.match(dashStr, /Music|MUSIC/i);
+  assert.match(dashStr, /Downloader|UNIVERSAL/i);
+  assert.match(dashStr, /Pinterest|PINTEREST/i);
+  assert.match(dashStr, /clone/i);
 
   // 2. Help
-  const helpRich = help.open ? null : null; // render method
-  // Let's test help render through ctx
   let sentHelp = null;
   const helpCtx = {
     tgId: '1001',
@@ -330,10 +328,9 @@ test('Dashboard and Help: include heads-up banner and expandable superpowers gui
   await help.open(helpCtx);
   assert.ok(sentHelp, 'Help screen opens');
 
-  const helpExpandable = sentHelp.blocks.find((b) => b.type === 'expandable_blockquote');
-  assert.ok(helpExpandable, 'Help screen must contain expandable blockquote');
-  const helpStr = richTextToString(helpExpandable.text);
-  assert.match(helpStr, /MUSIC · DOWNLOADS & LIVE CALLS/);
+  const helpDetails = sentHelp.blocks.filter((b) => b.type === 'details');
+  assert.ok(helpDetails.length >= 4, 'Help screen must contain Bot API 10.3 collapsible details toggles');
+  assert.match(JSON.stringify(helpDetails), /Music Studio/i);
 
   db.close();
 });
@@ -440,6 +437,177 @@ test('Group Chat sticker completion & help: omit WhatsApp Studio and WhatsApp De
   assert.ok(groupHelpRich);
   const helpWaButton = groupHelpRich.blocks.flatMap(b => b.buttons || []).flat().find(btn => /whatsapp/i.test(btn.text || btn.url || btn.callback_data));
   assert.equal(helpWaButton, undefined, 'WhatsApp Detailed Guide button must be omitted in group chat');
+
+  db.close();
+});
+
+test('DM AI conflict prevention: AI ignores replies to user/forwarded messages and non-AI cards, routes prompt replies cleanly, and answers actual AI replies', async () => {
+  const db = new Database(':memory:');
+  const settings = new SettingsManager(db);
+  settings.values.general.ownerIds = [1001];
+  const sm = new StateMachine();
+
+  const assistantCalls = [];
+  const movieSearches = [];
+  const pinterestSearches = [];
+
+  const mockAssistant = {
+    handleMessage: async ({ text }) => {
+      assistantCalls.push(text);
+    }
+  };
+
+  const fakeApi = {
+    me: { id: 900, username: 'pappy_agent' },
+    getMe: async () => ({ id: 900, username: 'pappy_agent' }),
+    sendMessage: async () => ({ message_id: 999 })
+  };
+
+  const screens = new Map([
+    ['movie', {
+      openMovieSearch: async (_ctx, query) => {
+        movieSearches.push(query);
+      }
+    }],
+    ['pinterest', {
+      executeSearch: async (_ctx, query) => {
+        pinterestSearches.push(query);
+      }
+    }]
+  ]);
+
+  const controller = new TelegramController({
+    api: fakeApi,
+    db,
+    settings,
+    stateMachine: sm,
+    app: { assistant: mockAssistant },
+    screens,
+    botContext: { botName: 'Lancy', botUsername: 'pappy_agent' }
+  });
+  controller.botUsername = 'pappy_agent';
+
+  // Even when AI_CHAT state is active, replying to non-AI messages/cards must NOT trigger AI
+  let aiStateCalls = 0;
+  sm.register(States.AI_CHAT, {
+    onMessage: async (sctx, message) => {
+      if (sctx.isNonAiReply && !sctx.isTag) return false;
+      aiStateCalls++;
+      await mockAssistant.handleMessage({ text: message.text });
+      return true;
+    }
+  });
+  await sm.transition('1001', States.AI_CHAT, { chatId: 1001, context: {} });
+
+  // 1. Replying to user's own message in DM -> must NOT call AI
+  await controller.handleUpdate({
+    update_id: 101,
+    message: {
+      message_id: 401,
+      from: { id: 1001, first_name: 'Pappy' },
+      chat: { id: 1001, type: 'private' },
+      reply_to_message: {
+        message_id: 390,
+        from: { id: 1001, first_name: 'Pappy' },
+        text: 'my saved note'
+      },
+      text: 'remind me later'
+    }
+  });
+  assert.equal(assistantCalls.length, 0, 'DM reply to user own message must not trigger AI');
+
+  // 2. Replying to a forwarded message in DM -> must NOT call AI
+  await controller.handleUpdate({
+    update_id: 102,
+    message: {
+      message_id: 402,
+      from: { id: 1001, first_name: 'Pappy' },
+      chat: { id: 1001, type: 'private' },
+      reply_to_message: {
+        message_id: 391,
+        forward_date: 1700000000,
+        forward_origin: { type: 'user', date: 1700000000 },
+        text: 'forwarded song clip'
+      },
+      text: 'save this'
+    }
+  });
+  assert.equal(assistantCalls.length, 0, 'DM reply to forwarded message must not trigger AI');
+
+  // 3. Replying to a bot non-AI card (photo/button card or media delivery) -> must NOT call AI
+  controller.markMediaDeliveryMessage(392);
+  await controller.handleUpdate({
+    update_id: 103,
+    message: {
+      message_id: 403,
+      from: { id: 1001, first_name: 'Pappy' },
+      chat: { id: 1001, type: 'private' },
+      reply_to_message: {
+        message_id: 392,
+        from: { id: 900, is_bot: true, username: 'pappy_agent' },
+        photo: [{ file_id: 'abc' }],
+        caption: '🎬 Inception (2010)',
+        reply_markup: { inline_keyboard: [[{ text: '⬇ Download', callback_data: 'x' }]] }
+      },
+      text: 'nice quality'
+    }
+  });
+  assert.equal(assistantCalls.length, 0, 'DM reply to bot media/preview card must not trigger AI');
+
+  // 4. Replying to a Movie Search prompt card while AI_CHAT is active -> routes cleanly to movie search, zero AI hijack
+  await controller.handleUpdate({
+    update_id: 104,
+    message: {
+      message_id: 404,
+      from: { id: 1001, first_name: 'Pappy' },
+      chat: { id: 1001, type: 'private' },
+      reply_to_message: {
+        message_id: 393,
+        from: { id: 900, is_bot: true, username: 'pappy_agent' },
+        text: 'Send a movie or TV series title (e.g. "Breaking Bad", "Inception"). /cancel closes search.'
+      },
+      text: 'Alchemy of Souls'
+    }
+  });
+  assert.deepEqual(movieSearches, ['Alchemy of Souls'], 'Reply to Movie Search prompt must route cleanly without AI hijack');
+  assert.equal(assistantCalls.length, 0);
+
+  // 5. Replying to a Pinterest Search prompt card -> routes cleanly to Pinterest search, zero AI hijack
+  await controller.handleUpdate({
+    update_id: 105,
+    message: {
+      message_id: 405,
+      from: { id: 1001, first_name: 'Pappy' },
+      chat: { id: 1001, type: 'private' },
+      reply_to_message: {
+        message_id: 394,
+        from: { id: 900, is_bot: true, username: 'pappy_agent' },
+        text: '𓆩♡𓆪 PINTEREST SEARCH 𓆩♡𓆪\ntell me what to search for ♡'
+      },
+      text: 'gojo satoru'
+    }
+  });
+  assert.deepEqual(pinterestSearches, ['gojo satoru']);
+  assert.equal(assistantCalls.length, 0);
+
+  // 6. Replying to an actual AI reply message (marked with markAiMessage) -> DOES invoke AI
+  controller.markAiMessage(1001, 395);
+  await controller.handleUpdate({
+    update_id: 106,
+    message: {
+      message_id: 406,
+      from: { id: 1001, first_name: 'Pappy' },
+      chat: { id: 1001, type: 'private' },
+      reply_to_message: {
+        message_id: 395,
+        from: { id: 900, is_bot: true, username: 'pappy_agent' },
+        text: 'heyyy bestie, what vibe are you looking for?'
+      },
+      text: 'something chill today'
+    }
+  });
+  assert.deepEqual(assistantCalls, ['something chill today']);
+  assert.equal(aiStateCalls, 1);
 
   db.close();
 });

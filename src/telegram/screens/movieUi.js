@@ -1,12 +1,13 @@
 import { block, rt, richButton, encodeCallback } from '../rich.js';
 import { ProgressTracker } from '../progress.js';
 import { States } from '../../core/stateMachine.js';
-import { durationText, MusicError, stripRemotePhotoBlocks, sendRichWithPhotoFallback } from '../../music/model.js';
+import { durationText, MusicError, stripRemotePhotoBlocks, sendRichWithPhotoFallback, editOrSendRichWithFallback, hasRichVideoPayload, extractSentPhotoFileId, extractSentVideoFileId, extractRichPhotoUrl } from '../../music/model.js';
 import { PANEL_ACTIONS } from '../../music/channelPanels.js';
 import { DOWNLOAD_QUALITY_PROFILES, estimateDownloadSizeMb, normalizeDownloadQuality, uploadLimitBytes } from '../../media/telegramLimits.js';
 import { isBotSuperAdmin, isAnonymousGroupAdmin } from '../permissions.js';
 import { defaultAdultCatalog, FEATURED_STUDIOS, isBlockedAdultText, formatDurationLabel } from '../../media/adultCatalog.js';
-import { parseMovieSearchIntent } from '../../media/movieQueryParser.js';
+import { parseMovieSearchIntent, extractSeasonEpisodeHint } from '../../media/movieQueryParser.js';
+import { prepareMovieTrailerPreview, getCachedTrailerFileId, saveCachedTrailerFileId, buildTrailerItemKey } from '../../media/movieTrailer.js';
 
 const cut = (s, n = 60) => [...String(s || '')].slice(0, n).join('');
 
@@ -36,6 +37,78 @@ function appendNoticeIfDistinct(b, ms) {
   const lastLog = Array.isArray(ms.logLines) && ms.logLines.length ? ms.logLines[ms.logLines.length - 1] : '';
   if (lastLog && lastLog === ms.notice) return;
   b.paragraph(rt.italic(cut(ms.notice, 260)));
+}
+
+function uniqueSafeUrls(urls = []) {
+  const out = [];
+  for (const u of urls) {
+    if (isSafeHttpsUrl(u) && !out.includes(u)) out.push(u);
+  }
+  return out;
+}
+
+function appendPreviewVisuals(b, ms, item = {}, { artworkUrls = [], photoCaption = '', allowPhoto = true, allowTrailer = true } = {}) {
+  if (!ms) return;
+  ms._pendingTrailerFile = null;
+  const safeUrls = uniqueSafeUrls(artworkUrls);
+  ms._fallbackArtworkUrls = safeUrls.slice(1);
+  if (allowPhoto && safeUrls.length) {
+    const primaryUrl = safeUrls[0];
+    const cachedFid = ms._photoFileIdByUrl?.get?.(primaryUrl) || null;
+    if (cachedFid) {
+      b.photo(cachedFid, photoCaption || undefined);
+    } else if (!ms._blockedArtworkUrls?.has?.(primaryUrl)) {
+      b.photo(primaryUrl, photoCaption || undefined);
+    } else if (safeUrls.length > 1) {
+      const nextAlt = safeUrls.find((u) => !ms._blockedArtworkUrls?.has?.(u));
+      if (nextAlt) b.photo(nextAlt, photoCaption || undefined);
+    }
+  }
+
+  const itemKey = item && (item.id || item.title) ? buildTrailerItemKey(item) : null;
+  const tm = ms.trailerMedia;
+  if (allowTrailer && tm && itemKey && tm.itemKey === itemKey && !item?.adult && !item?.isAdultCatalogItem) {
+    const cap = `🎞 ${cut(tm.title || `${item.title || 'Movie'} Official Trailer`, 75)}`;
+    const vidOpts = {
+      type: 'video',
+      supports_streaming: true,
+      ...(tm.durationSeconds ? { duration: Number(tm.durationSeconds) } : {}),
+      ...(tm.width ? { width: Number(tm.width) } : {}),
+      ...(tm.height ? { height: Number(tm.height) } : {})
+    };
+    if (tm.fileId) {
+      b.video({ ...vidOpts, media: tm.fileId }, cap);
+    } else if (tm.filePath || tm.buffer) {
+      b.video({ ...vidOpts, media: 'attach://trailer_video' }, cap);
+      ms._pendingTrailerFile = {
+        ...(tm.filePath ? { filePath: tm.filePath } : {}),
+        ...(tm.buffer ? { buffer: tm.buffer } : {}),
+        filename: tm.filename || 'trailer.mp4',
+        contentType: tm.contentType || 'video/mp4'
+      };
+    }
+  }
+}
+
+function appendTrailerButtons(b, ms, item = {}, mvBtnFn = null) {
+  if (!item || item.adult || item.isAdultCatalogItem) return;
+  const itemKey = buildTrailerItemKey(item);
+  const tm = (ms?.trailerMedia && ms.trailerMedia.itemKey === itemKey) ? ms.trailerMedia : null;
+  if (tm?.fileId || tm?.attached) {
+    if (isSafeHttpsUrl(tm.url)) {
+      b.buttons([richButton.url('🌐 Watch Full Trailer on YouTube', tm.url, { style: 'link' })]);
+    }
+    return;
+  }
+  const row = [];
+  if (typeof mvBtnFn === 'function') {
+    row.push(mvBtnFn(ms, '🎞 Attach Trailer', 'tl', '', { style: 'primary' }));
+  }
+  const fallbackYtUrl = tm?.url || item?.trailerUrl || (item?.trailerYoutubeId ? `https://www.youtube.com/watch?v=${item.trailerYoutubeId}` : null);
+  if (isSafeHttpsUrl(fallbackYtUrl)) {
+    row.push(richButton.url('▶ YouTube', fallbackYtUrl, { style: 'link' }));
+  }
+  if (row.length) b.buttons(row);
 }
 
 /**
@@ -778,11 +851,14 @@ export function createMovieUi({
           || 0
         );
         const epCount = Number(item.totalEpisodes || 0);
+        const seasonDetail = item.seasonsBreakdown
+          ? `Series · ${item.seasonsBreakdown}`
+          : (seasonCount > 0
+            ? `Series · ${seasonCount} ${seasonCount === 1 ? 'Season' : 'Seasons'}${epCount > 0 ? ` (${epCount} Eps)` : ''}`
+            : (epCount > 0 ? `Series · ${epCount} Eps` : 'TV Series'));
         const typeBadge = isAdult
           ? '18+ Feature'
-          : (isTv
-            ? (seasonCount > 0 ? `Series · ${seasonCount} ${seasonCount === 1 ? 'Season' : 'Seasons'}` : (epCount > 0 ? `Series · ${epCount} Eps` : 'TV Series'))
-            : 'Movie');
+          : (isTv ? seasonDetail : 'Movie');
         const metaParts = [typeBadge];
         if (item.year) metaParts.push(String(item.year));
         if (item.duration) metaParts.push(String(item.duration));
@@ -861,10 +937,10 @@ export function createMovieUi({
     const dmOnly = isDmDownloadMode(ctx, ms);
     const runtime = item.runtimeMinutes || item.runtime || null;
     const b = card(`🎬 ${cut(item.title || 'Movie', 52)}`, `${item.year || ''} ${item.rating ? `· ⭐ ${item.rating}` : ''} ${runtime ? `· ${runtime} min` : ''}`.trim());
-    const detailArt = item.poster || item.backdrop || item.artwork;
-    if (isSafeHttpsUrl(detailArt)) {
-      b.photo(detailArt, cut(item.title, 90));
-    }
+    appendPreviewVisuals(b, ms, item, {
+      artworkUrls: [item.poster, item.backdrop, item.artwork],
+      photoCaption: cut(item.title, 90)
+    });
     const dlQuality = getUserDownloadQuality(ctx, ms);
     const estDur = Number(item.runtimeSeconds || (runtime ? Number(runtime) * 60 : 5400));
     const variants = ms.playback?.variants || item.variants || null;
@@ -904,6 +980,7 @@ export function createMovieUi({
     if (ms.results?.length) row2.push(mvBtn(ms, '◀ Results', 'rs', ''));
     row2.push(mvBtn(ms, '🏠 Hub', 'hb', ''));
     b.buttons(row2);
+    appendTrailerButtons(b, ms, item, mvBtn);
     return finish(b);
   }
 
@@ -927,9 +1004,12 @@ export function createMovieUi({
       `📺 ${cut(item.title || 'Series', 48)}`,
       `${seasonLabel} of ${totalSeasons} · Page ${ms.epPage + 1}/${totalPages} · ${episodes.length} episodes`
     );
-    if (isSafeHttpsUrl(item.poster) && ms.epPage === 0) {
-      b.photo(item.poster, `${cut(item.title, 70)} · ${seasonLabel}`);
-    }
+    appendPreviewVisuals(b, ms, item, {
+      artworkUrls: [item.poster, item.backdrop, item.artwork],
+      photoCaption: `${cut(item.title, 70)} · ${seasonLabel}`,
+      allowPhoto: ms.epPage === 0,
+      allowTrailer: ms.epPage === 0
+    });
     if (item.overview) {
       b.expandableBlockquote(`${cut(item.title, 48)} · ${item.year || ''} ${item.rating ? `⭐ ${item.rating}` : ''}\n\n${cut(item.overview, 500)}`);
     }
@@ -946,31 +1026,45 @@ export function createMovieUi({
           return {
             is_checked: checked,
             blocks: [
-              block.paragraph(
+              block.paragraph(rt.concat(
                 rt.bold(`E${String(epNum).padStart(2, '0')}`),
                 rt.text(` · ${cut(ep.title || `Episode ${epNum}`, 42)}${runtime}`)
-              )
+              ))
             ]
           };
         })
       );
 
+      const epCodesSample = slice
+        .slice(0, 2)
+        .map((ep) => `E${Number(ep.episodeNumber || 0)}`)
+        .join(', ');
+      b.footer(rt.concat(
+        rt.bold('Episode'),
+        rt.text(
+          dmOnly
+            ? ` (${epCodesSample}${slice.length > 2 ? '…' : ''})  ·  ☐ Pick  ·  🎬 Details  ·  ⬇ MP4`
+            : ` (${epCodesSample}${slice.length > 2 ? '…' : ''})  ·  ☐ Pick  ·  🎬 Info  ·  ▶ Play  ·  ➕ Queue  ·  ⬇ DL`
+        )
+      ));
+
       if (dmOnly) {
-        for (let i = 0; i < slice.length; i += 3) {
-          b.buttons(
-            slice.slice(i, i + 3).map(ep => {
-              const epNum = Number(ep.episodeNumber || 0);
-              const checked = selectedSet.has(epNum);
-              return mvBtn(ms, `${checked ? '☑' : '☐'} E${epNum}`, 'tg', `${seasonNum}-${epNum}`, checked ? { style: 'success' } : null);
-            })
-          );
+        for (const ep of slice) {
+          const epNum = Number(ep.episodeNumber || 0);
+          const checked = selectedSet.has(epNum);
+          b.buttons([
+            mvBtn(ms, `${checked ? '☑' : '☐'} E${epNum}`, 'tg', `${seasonNum}-${epNum}`, { rawEmoji: true, ...(checked ? { style: 'success' } : {}) }),
+            mvBtn(ms, `🎬 E${epNum} Details`, 'ed', `${seasonNum}-${epNum}`, { style: 'primary' }),
+            mvBtn(ms, `⬇ MP4 E${epNum}`, 'de', `${seasonNum}-${epNum}`, { style: 'success' })
+          ]);
         }
       } else {
         for (const ep of slice) {
           const epNum = Number(ep.episodeNumber || 0);
           const checked = selectedSet.has(epNum);
           b.buttons([
-            mvBtn(ms, `${checked ? '☑' : '☐'} E${epNum}`, 'tg', `${seasonNum}-${epNum}`, checked ? { style: 'success' } : null),
+            mvBtn(ms, `${checked ? '☑' : '☐'} E${epNum}`, 'tg', `${seasonNum}-${epNum}`, { rawEmoji: true, ...(checked ? { style: 'success' } : {}) }),
+            mvBtn(ms, `🎬 E${epNum}`, 'ed', `${seasonNum}-${epNum}`),
             mvBtn(ms, '▶', 'pe', `${seasonNum}-${epNum}`, { style: 'primary' }),
             mvBtn(ms, '➕', 'qe', `${seasonNum}-${epNum}`),
             mvBtn(ms, '⬇', 'de', `${seasonNum}-${epNum}`, { style: 'success' })
@@ -980,6 +1074,14 @@ export function createMovieUi({
     }
 
     if (seasons.length > 1) {
+      const seasonCodesSample = seasons
+        .slice(0, 3)
+        .map((se) => (Number(se.seasonNumber) === 0 ? 'Specials' : `S${Number(se.seasonNumber)}`))
+        .join(', ');
+      b.footer(rt.concat(
+        rt.bold('Season'),
+        rt.text(` (${seasonCodesSample}${seasons.length > 3 ? '…' : ''})  ·  ${seasonLabel} of ${totalSeasons}`)
+      ));
       const pillWindow = seasons.length <= 8
         ? seasons
         : (() => {
@@ -995,23 +1097,27 @@ export function createMovieUi({
             const sLbl = sN === 0 ? 'Specials' : `S${sN}`;
             const selCnt = ms.selectedBySeason.get(sN)?.size || 0;
             const btnText = `${active ? '• ' : ''}${sLbl}${selCnt ? `✓${selCnt}` : ''}`;
-            return mvBtn(ms, btnText, 'so', String(sN), active ? { style: 'success' } : null);
+            return mvBtn(ms, btnText, 'so', String(sN), { rawEmoji: true, ...(active ? { style: 'success' } : {}) });
           })
         );
       }
     }
 
+    b.footer(rt.concat(
+      rt.bold('Select All / Block Select'),
+      rt.text(totalSelected > 0 ? `  ·  ${totalSelected} picked` : '  ·  Page · Season · All · Clear')
+    ));
     b.buttons([
-      mvBtn(ms, '☑ Page', 'sp', String(ms.epPage)),
+      mvBtn(ms, '☑ Page', 'sp', String(ms.epPage), { rawEmoji: true }),
       mvBtn(ms, `✅ All ${shortSeasonTag}`, 'sa', String(seasonNum)),
-      mvBtn(ms, '☑ All Seasons', 'sas', '', { style: 'primary' }),
-      mvBtn(ms, '✕ Clear', 'cl', '')
+      mvBtn(ms, '☑ All Seasons', 'sas', '', { style: 'primary', rawEmoji: true }),
+      mvBtn(ms, '✕ Clear', 'cl', '', { rawEmoji: true })
     ]);
 
     const nav = [];
-    if (ms.epPage > 0) nav.push(mvBtn(ms, '◀ Prev', 'ep', String(ms.epPage - 1)));
+    if (ms.epPage > 0) nav.push(mvBtn(ms, '◀ Prev', 'ep', String(ms.epPage - 1), { rawEmoji: true }));
     nav.push(mvBtn(ms, `📚 Seasons (${seasons.length || totalSeasons})`, 'ss', '0', { style: 'primary' }));
-    if (ms.epPage < totalPages - 1) nav.push(mvBtn(ms, 'Next ▶', 'ep', String(ms.epPage + 1)));
+    if (ms.epPage < totalPages - 1) nav.push(mvBtn(ms, 'Next ▶', 'ep', String(ms.epPage + 1), { rawEmoji: true }));
     b.buttons(nav);
 
     if (!dmOnly) {
@@ -1023,11 +1129,15 @@ export function createMovieUi({
     const dlQuality = getUserDownloadQuality(ctx, ms);
     const epDur = Number(episodes[0]?.runtimeSeconds || (episodes[0]?.runtimeMinutes ? Number(episodes[0].runtimeMinutes) * 60 : 2700));
     const dlCount = totalSelected > 0 ? totalSelected : Math.max(1, episodes.length);
+    const singleSel = totalSelected === 1 ? app.movieSessions.getSelectedEpisodes(ms, ms.episodeCache)?.[0] : null;
+    b.footer(rt.concat(rt.bold('Download'), rt.text(`  ·  Quality (${dlQuality})`)));
     b.buttons(buildQualitySelectorRow(ms, dlQuality, { durationSeconds: epDur, itemCount: dlCount }));
     b.buttons([
       mvBtn(
         ms,
-        totalSelected > 0 ? `⬇ Download Slides (${totalSelected} · ${dlQuality})` : `⬇ Download ${seasonLabel} Slides (${dlQuality})`,
+        singleSel
+          ? `⬇ Download S${singleSel.seasonNumber}E${singleSel.episodeNumber} (${dlQuality})`
+          : (totalSelected > 0 ? `⬇ Download Slides (${totalSelected} · ${dlQuality})` : `⬇ Download ${seasonLabel} Slides (${dlQuality})`),
         totalSelected > 0 ? 'dx' : 'dsx',
         totalSelected > 0 ? '' : String(seasonNum),
         { style: 'success' }
@@ -1041,6 +1151,7 @@ export function createMovieUi({
     if (ms.results?.length) tail.push(mvBtn(ms, '◀ Results', 'rs', ''));
     tail.push(mvBtn(ms, '🏠 Hub', 'hb', ''));
     b.buttons(tail);
+    if (ms.epPage === 0) appendTrailerButtons(b, ms, item, mvBtn);
     return finish(b);
   }
 
@@ -1069,6 +1180,7 @@ export function createMovieUi({
       { striped: true, bordered: true, compact: true }
     );
 
+    b.footer(rt.concat(rt.bold('Season'), rt.text('  ·  Tap S1, S2… to open episodes')));
     for (let i = 0; i < slice.length; i += 3) {
       b.buttons(
         slice.slice(i, i + 3).map(se => {
@@ -1085,8 +1197,9 @@ export function createMovieUi({
     const curSe = seasons.find((se) => Number(se.seasonNumber) === activeSeasonNum);
     const estCount = totalSelected > 0 ? totalSelected : Math.max(1, Number(curSe?.episodeCount || ms.episodes?.length || 6));
     b.buttons([
-      mvBtn(ms, '☑ Select All Seasons & All Episodes', 'sas', '', { style: 'success' })
+      mvBtn(ms, '☑ Select All Seasons & All Episodes', 'sas', '', { style: 'success', rawEmoji: true })
     ]);
+    b.footer(rt.concat(rt.bold('Download'), rt.text(`  ·  Quality (${dlQuality})`)));
     b.buttons(buildQualitySelectorRow(ms, dlQuality, { durationSeconds: 2700, itemCount: estCount }));
     const activeSeasonTitle = activeSeasonNum === 0 ? 'Specials' : `Season ${activeSeasonNum}`;
     const activeSeasonShort = activeSeasonNum === 0 ? 'Specials' : `S${activeSeasonNum}`;
@@ -1108,6 +1221,61 @@ export function createMovieUi({
     nav.push(mvBtn(ms, `◀ Back to ${activeSeasonShort}`, 'sv', ''));
     if (ms.seasonPage < totalPages - 1) nav.push(mvBtn(ms, 'Next Seasons ▶', 'ss', String(ms.seasonPage + 1)));
     b.buttons(nav);
+    return finish(b);
+  }
+
+  function renderEpisodeDetail(ctx, ms) {
+    const item = ms.mediaItem || {};
+    const dmOnly = isDmDownloadMode(ctx, ms);
+    const sNum = Number(ms.activeEpisode?.seasonNumber ?? ms.seasonNumber ?? 1);
+    const eNum = Number(ms.activeEpisode?.episodeNumber ?? 1);
+    const epList = ms.episodeCache.get(sNum) || ms.episodes || [];
+    const ep = epList.find((x) => Number(x.episodeNumber) === eNum) || ms.activeEpisode || { seasonNumber: sNum, episodeNumber: eNum, title: `Episode ${eNum}` };
+    const epTag = `S${String(sNum).padStart(2, '0')}E${String(eNum).padStart(2, '0')}`;
+    const runtime = ep.runtimeMinutes || (ep.runtimeSeconds ? Math.round(Number(ep.runtimeSeconds) / 60) : null);
+    const dlQuality = getUserDownloadQuality(ctx, ms);
+    const epDur = Number(ep.runtimeSeconds || (runtime ? Number(runtime) * 60 : 2700));
+    const estInfo = estimateQualityInfo(dlQuality, { durationSeconds: epDur, itemCount: 1 });
+    const checked = Boolean(ms.selectedBySeason.get(sNum)?.has(eNum));
+
+    const b = card(
+      `🎬 ${cut(item.title || 'Series', 40)} · ${epTag}`,
+      `${cut(ep.title || `Episode ${eNum}`, 48)}${runtime ? ` · ${runtime}m` : ''}`
+    );
+    appendPreviewVisuals(b, ms, item, {
+      artworkUrls: [ep.still, item.poster, item.backdrop, item.artwork],
+      photoCaption: `${cut(item.title || 'Series', 50)} · ${epTag}`,
+      allowTrailer: false
+    });
+    b.table([
+      ['📺 Series', cut(item.title || 'Series', 42)],
+      ['🎞 Episode', `${epTag} — ${cut(ep.title || `Episode ${eNum}`, 36)}`],
+      ...(ep.airDate ? [['📅 Aired', String(ep.airDate)]] : []),
+      ...(runtime ? [['⏱ Runtime', `${runtime} min`]] : []),
+      ['📦 Standalone MP4', `${estInfo.label} (${estInfo.text})`]
+    ], { striped: true, bordered: true, compact: true });
+    if (ep.overview || item.overview) {
+      b.expandableBlockquote(`Episode Synopsis · ${epTag}\n\n${cut(ep.overview || item.overview, 550)}`);
+    }
+    appendLiveLog(b, ms);
+    appendNoticeIfDistinct(b, ms);
+
+    if (!dmOnly) {
+      b.buttons([
+        mvBtn(ms, `⚡ Play ${epTag} Only`, 'pe', `${sNum}-${eNum}`, { style: 'success' }),
+        mvBtn(ms, `➕ Queue ${epTag}`, 'qe', `${sNum}-${eNum}`, { style: 'primary' })
+      ]);
+    }
+    b.buttons(buildQualitySelectorRow(ms, dlQuality, { durationSeconds: epDur, itemCount: 1 }));
+    b.buttons([
+      mvBtn(ms, `⬇ Download ${epTag} (${dlQuality} · ${estInfo.text})`, 'de', `${sNum}-${eNum}`, { style: 'success' }),
+      mvBtn(ms, checked ? `☑ Selected for Slides` : `☐ Multi-Select`, 'tg', `${sNum}-${eNum}`, { rawEmoji: true, ...(checked ? { style: 'primary' } : {}) })
+    ]);
+    b.buttons([
+      mvBtn(ms, `◀ Season ${sNum} Episodes`, 'sv', ''),
+      mvBtn(ms, `📚 Seasons`, 'ss', '0'),
+      mvBtn(ms, '🏠 Hub', 'hb', '')
+    ]);
     return finish(b);
   }
 
@@ -1142,6 +1310,7 @@ export function createMovieUi({
     if (ms.view === 'results') return renderResults(ctx, ms);
     if (ms.view === 'movie') return renderMovieDetail(ctx, ms);
     if (ms.view === 'season') return renderTvSeason(ctx, ms);
+    if (ms.view === 'episode') return renderEpisodeDetail(ctx, ms);
     if (ms.view === 'seasons') return renderSeasonPicker(ctx, ms);
     if (ms.view === 'categories') return renderCategories(ctx, ms);
     return renderHub(ctx, ms);
@@ -1214,64 +1383,75 @@ export function createMovieUi({
       ms.messageId = null;
     }
 
-    const nextHasPhoto = hasRichPhoto(rich);
-    const sameMediaKind = ms.messageHasPhoto == null || ms.messageHasPhoto === nextHasPhoto;
+    const pendingTrailerFile = ms._pendingTrailerFile || null;
+    ms._pendingTrailerFile = null;
+    const uploadFiles = pendingTrailerFile ? { trailer_video: pendingTrailerFile } : null;
+    const fallbackArtworkUrls = Array.isArray(ms._fallbackArtworkUrls) ? ms._fallbackArtworkUrls : [];
+    ms._fallbackArtworkUrls = null;
 
-    if (editId && ctx.api?.editMessageRich && sameMediaKind) {
-      try {
-        const edited = await ctx.api.editMessageRich(ctx.chatId, editId, rich);
-        ms.messageId = edited?.message_id || editId;
-        ms.messageHasPhoto = nextHasPhoto;
-        ms._pendingReplyToId = null;
-        app.movieSessions.registerMessage?.(ms, ms.messageId, 'card');
-        if (ms.panelToken) app.music.channelPanels?.registerMessage?.(ms.panelToken, ms.messageId);
-        if (isChan) {
-          menuMsgByChat.set(key, { messageId: ms.messageId, token: ms.temporaryToken || null, api: ctx.api });
+    const rawPhotoUrl = extractRichPhotoUrl(rich);
+    const nextHasPhoto = hasRichPhoto(rich);
+    const nextHasVideo = hasRichVideoPayload(rich);
+    const sameMediaKind = (ms.messageHasPhoto == null || ms.messageHasPhoto === nextHasPhoto)
+      && (ms.messageHasVideo == null || ms.messageHasVideo === nextHasVideo)
+      && !uploadFiles;
+
+    const isGroupTarget = Number(ctx.chatId) < 0 && !isChan;
+    const replyTarget = pendingReplyId
+      || ms.replyToMessageId
+      || (isGroupTarget ? (ctx.message?.message_id || ctx.query?.message?.message_id || ms.messageId || null) : null);
+    const sendExtra = replyTarget
+      ? { reply_parameters: { message_id: Number(replyTarget), allow_sending_without_reply: true } }
+      : {};
+
+    const targetEditId = (editId && sameMediaKind) ? editId : null;
+    const out = await editOrSendRichWithFallback(
+      ctx.api,
+      ctx.chatId,
+      targetEditId,
+      rich,
+      sendExtra,
+      uploadFiles,
+      { deleteReplaced: false, fallbackArtworkUrls }
+    );
+    const sent = out?.sent || null;
+    const finalMsgId = sent?.message_id || targetEditId;
+
+    if (rawPhotoUrl) {
+      if (out?.hasPhoto) {
+        const photoFid = extractSentPhotoFileId(sent);
+        if (photoFid) {
+          if (!ms._photoFileIdByUrl) ms._photoFileIdByUrl = new Map();
+          ms._photoFileIdByUrl.set(rawPhotoUrl, photoFid);
         }
-        return ms.messageId;
-      } catch (e) {
-        if (/message is not modified/i.test(String(e?.description || e?.message || ''))) return editId;
-        const msgStr = String(e?.description || e?.message || '');
-        if (hasRichPhoto(rich) && /wrong type of the web page content|failed to get http url content|wrong file identifier|media_empty|webpage_media_empty|photo_invalid_dimensions|wrong_file_id/i.test(msgStr)) {
-          try {
-            const stripped = stripRemotePhotoBlocks(rich);
-            const editedNoPhoto = await ctx.api.editMessageRich(ctx.chatId, editId, stripped);
-            ms.messageId = editedNoPhoto?.message_id || editId;
-            ms.messageHasPhoto = hasRichPhoto(stripped);
-            ms._pendingReplyToId = null;
-            app.movieSessions.registerMessage?.(ms, ms.messageId, 'card');
-            if (ms.panelToken) app.music.channelPanels?.registerMessage?.(ms.panelToken, ms.messageId);
-            if (isChan) {
-              menuMsgByChat.set(key, { messageId: ms.messageId, token: ms.temporaryToken || null, api: ctx.api });
-            }
-            return ms.messageId;
-          } catch {}
-        }
+      } else {
+        if (!ms._blockedArtworkUrls) ms._blockedArtworkUrls = new Set();
+        ms._blockedArtworkUrls.add(rawPhotoUrl);
       }
     }
 
-    const replyTarget = pendingReplyId || ms.replyToMessageId || null;
-    const sendExtra = replyTarget && (!editId || forceNewCard)
-      ? { reply_parameters: { message_id: Number(replyTarget), allow_sending_without_reply: true } }
-      : {};
-    let sent;
-    let sentRich = rich;
-    try {
-      const out = await sendRichWithPhotoFallback(ctx.api, ctx.chatId, rich, sendExtra);
-      sent = out.sent;
-      if (!out.hasPhoto) sentRich = stripRemotePhotoBlocks(rich) || rich;
-    } catch (e) {
-      throw e;
+    if (out?.hasVideo && ms.trailerMedia && !ms.trailerMedia.fileId) {
+      const videoFid = extractSentVideoFileId(sent);
+      if (videoFid) {
+        ms.trailerMedia = { ...ms.trailerMedia, fileId: videoFid, attached: true };
+        saveCachedTrailerFileId(app.db, ms.mediaItem, ms.botKey, ms.trailerMedia);
+      }
     }
-    if (sent?.message_id) {
-      ms.messageId = sent.message_id;
-      ms.messageHasPhoto = hasRichPhoto(sentRich);
+
+    if (finalMsgId) {
+      ms.messageId = finalMsgId;
+      ms.messageHasPhoto = Boolean(out?.hasPhoto);
+      ms.messageHasVideo = Boolean(out?.hasVideo);
       ms._pendingReplyToId = null;
-      app.movieSessions.registerMessage?.(ms, sent.message_id, 'card');
-      await cleanupSupersededCards(ctx, ms, sent.message_id);
-      if (ms.panelToken) app.music.channelPanels?.registerMessage?.(ms.panelToken, sent.message_id);
+      app.movieSessions.registerMessage?.(ms, finalMsgId, 'card');
+      if (!out?.edited) {
+        await cleanupSupersededCards(ctx, ms, finalMsgId);
+      } else if (editId && Number(editId) !== Number(finalMsgId)) {
+        await cleanupSupersededCards(ctx, ms, finalMsgId);
+      }
+      if (ms.panelToken) app.music.channelPanels?.registerMessage?.(ms.panelToken, finalMsgId);
       if (isChan) {
-        menuMsgByChat.set(key, { messageId: sent.message_id, token: ms.temporaryToken || null, api: ctx.api });
+        menuMsgByChat.set(key, { messageId: finalMsgId, token: ms.temporaryToken || null, api: ctx.api });
       }
     }
     return ms.messageId;
@@ -1307,6 +1487,8 @@ export function createMovieUi({
     ms.dlPage = 0;
     ms.notice = null;
     ms.logLines = null;
+    ms.trailerMedia = null;
+    ms._pendingTrailerFile = null;
     if (item.type === 'tv') {
       const [detail, seasonsRes] = await Promise.all([
         app.movieApi.getTvShow(item.id).catch(() => null),
@@ -1326,15 +1508,19 @@ export function createMovieUi({
         ? seasonsRes.seasons
         : (detail?.seasons?.length ? detail.seasons : [{ seasonNumber: 1, name: 'Season 1', episodeCount: detail?.totalEpisodes || 0 }]);
       ms.seasons = list;
-      // Default to Season 1 (first non-zero season when available), preserving Season 0 when only Specials exist
-      const firstSeason = list.find(s => Number(s.seasonNumber) > 0) || list[0];
+      const reqSeason = ms.targetSeason != null ? Number(ms.targetSeason) : null;
+      const matchedSeason = reqSeason != null
+        ? (list.find((s) => Number(s.seasonNumber) === reqSeason) || null)
+        : null;
+      const firstSeason = matchedSeason || list.find(s => Number(s.seasonNumber) > 0) || list[0];
       const sNum = firstSeason?.seasonNumber == null ? 1 : Number(firstSeason.seasonNumber);
       ms.seasonNumber = sNum;
       ms.seasonName = firstSeason?.name || (sNum === 0 ? 'Specials' : `Season ${sNum}`);
       ms.epPage = 0;
+      const targetEpNum = ms.targetEpisode != null ? Number(ms.targetEpisode) : 1;
       const [epsRes, pb] = await Promise.all([
         app.movieApi.getTvSeasonEpisodes(item.id, sNum).catch(() => null),
-        app.movieApi.getPlaybackInfo('tv', item.id, { season: sNum, episode: 1 }).catch(() => null)
+        app.movieApi.getPlaybackInfo('tv', item.id, { season: sNum, episode: targetEpNum }).catch(() => null)
       ]);
       ms.episodes = epsRes?.episodes || [];
       ms.playback = pb;
@@ -1345,7 +1531,17 @@ export function createMovieUi({
         };
       }
       ms.episodeCache.set(sNum, ms.episodes);
-      ms.view = 'season';
+      if (ms.targetEpisode != null) {
+        const epIdx = ms.episodes.findIndex((x) => Number(x.episodeNumber) === targetEpNum);
+        if (epIdx >= 0) ms.epPage = Math.floor(epIdx / 6);
+        ms.activeEpisode = { seasonNumber: sNum, episodeNumber: targetEpNum };
+        ms.view = 'episode';
+        ms.targetSeason = null;
+        ms.targetEpisode = null;
+      } else {
+        ms.activeEpisode = null;
+        ms.view = 'season';
+      }
     } else {
       const [detail, pb] = await Promise.all([
         app.movieApi.getMovie(item.id).catch(() => null),
@@ -1370,6 +1566,88 @@ export function createMovieUi({
       }
       ms.view = 'movie';
     }
+
+    const effItem = ms.mediaItem || item;
+    const cachedTrailer = effItem ? getCachedTrailerFileId(app.db, effItem, ms.botKey) : null;
+    if (cachedTrailer?.fileId) {
+      ms.trailerMedia = {
+        ...cachedTrailer,
+        itemKey: buildTrailerItemKey(effItem),
+        attached: true
+      };
+    }
+  }
+
+  async function scheduleOrAttachTrailerPreview(ctx, ms, { explicit = false } = {}) {
+    const item = ms?.mediaItem;
+    if (!item || item.adult || item.isAdultCatalogItem) return false;
+    if (!['movie', 'season', 'episode'].includes(ms.view)) return false;
+    if (typeof app.movieApi?.resolveTrailer !== 'function') return false;
+    if (!explicit && app.settings?.get?.('movies.autoAttachTrailerPreview', true) !== true) return false;
+
+    const itemKey = buildTrailerItemKey(item);
+    if (ms.trailerMedia?.itemKey === itemKey && (ms.trailerMedia.fileId || ms.trailerMedia.attached)) {
+      return true;
+    }
+    if (ms._trailerJobKey === itemKey) {
+      return Boolean(await ms._trailerJobPromise?.catch(() => false));
+    }
+
+    const job = (async () => {
+      try {
+        const res = await prepareMovieTrailerPreview({
+          movieApi: app.movieApi,
+          db: app.db,
+          item,
+          botKey: ms.botKey || 'default'
+        });
+        if (!ms.mediaItem || buildTrailerItemKey(ms.mediaItem) !== itemKey) return false;
+        if (!['movie', 'season', 'episode'].includes(ms.view)) return false;
+
+        if (res?.ok && (res.fileId || res.filePath || res.buffer)) {
+          ms.trailerMedia = {
+            ...res,
+            itemKey,
+            attached: Boolean(res.fileId)
+          };
+          if (explicit) ms.notice = `🎞 Official trailer attached for "${cut(item.title, 34)}".`;
+          await upsertCard(ctx, ms, renderCurrentView(ctx, ms));
+          return true;
+        }
+        if (res?.url) {
+          ms.trailerMedia = {
+            itemKey,
+            youtubeId: res.youtubeId || null,
+            url: res.url,
+            title: res.title || `${item.title || 'Movie'} Trailer`,
+            attached: false
+          };
+          if (explicit) {
+            ms.notice = '▶ Direct video clip unavailable — tap YouTube below to watch the official trailer.';
+            await upsertCard(ctx, ms, renderCurrentView(ctx, ms));
+          }
+          return true;
+        }
+        if (explicit) {
+          ms.notice = `ℹ️ No official trailer found for "${cut(item.title, 34)}".`;
+          await upsertCard(ctx, ms, renderCurrentView(ctx, ms));
+        }
+        return false;
+      } catch {
+        return false;
+      } finally {
+        if (ms._trailerJobKey === itemKey) {
+          ms._trailerJobKey = null;
+          ms._trailerJobPromise = null;
+        }
+      }
+    })();
+
+    ms._trailerJobKey = itemKey;
+    ms._trailerJobPromise = job;
+    if (explicit) return await job;
+    void job.catch(() => {});
+    return true;
   }
 
   async function createSessionForCtx(ctx, extra = {}) {
@@ -1553,7 +1831,7 @@ export function createMovieUi({
     return true;
   }
 
-  async function openMovieSearch(ctx, query, { random = false, category = null, genreId = null, categoryLabel = null, categoryType = 'movie', movieSid = null, sourceMode = null, xvSource = null, xvDur = null, promptKind = null, originMessageId = null, forceNewCard = false } = {}) {
+  async function openMovieSearch(ctx, query, { random = false, category = null, genreId = null, categoryLabel = null, categoryType = 'movie', movieSid = null, sourceMode = null, xvSource = null, xvDur = null, promptKind = null, originMessageId = null, forceNewCard = false, preloadedResults = null } = {}) {
     await ensureMovieAuth(ctx, null, null);
     const prev = app.movieSessions.getLatestForChat(ctx.chatId);
     const existing = movieSid ? app.movieSessions.get(movieSid) : null;
@@ -1697,15 +1975,19 @@ export function createMovieUi({
     const adultAllowed = isGroupAdultAllowed(ctx, ms);
     const catalog = getCatalog();
     const canSearchAdult = Boolean(adultAllowed && !isAgeGateRequired(ctx) && catalog && typeof catalog.search === 'function');
-    const [res, xvUnifiedRes] = await Promise.all([
-      app.movieApi.search(q, {
-        limit: 18,
-        includeAdultFallback: adultAllowed
-      }).catch(() => ({ results: [] })),
-      canSearchAdult
-        ? catalog.search({ source: 'all', query: q, page: 0, limit: 8, durationFilter: 'movie', minMinutes: 15, lazy: true }).catch(() => ({ results: [] }))
-        : Promise.resolve({ results: [] })
-    ]);
+    let mergedResults = Array.isArray(preloadedResults) && preloadedResults.length ? preloadedResults : null;
+    if (!mergedResults) {
+      const [res, xvUnifiedRes] = await Promise.all([
+        app.movieApi.search(q, {
+          limit: 18,
+          includeAdultFallback: adultAllowed
+        }).catch(() => ({ results: [] })),
+        canSearchAdult
+          ? catalog.search({ source: 'all', query: q, page: 0, limit: 8, durationFilter: 'movie', minMinutes: 15, lazy: true }).catch(() => ({ results: [] }))
+          : Promise.resolve({ results: [] })
+      ]);
+      mergedResults = mergeUnifiedSearchResults(q, res?.results || [], xvUnifiedRes?.results || [], { limit: 20 });
+    }
     ms.query = q;
     ms.sourceMode = 'movie';
     ms.mediaItem = null;
@@ -1720,15 +2002,28 @@ export function createMovieUi({
     ms.selectedBySeason?.clear?.();
     ms.dlManifest = null;
     ms.dlPage = 0;
-    ms.results = mergeUnifiedSearchResults(q, res?.results || [], xvUnifiedRes?.results || [], { limit: 20 });
+    ms.results = mergedResults;
     ms.resultPage = 0;
-    ms.view = 'results';
+    ms.targetSeason = parsedIntent?.season ?? null;
+    ms.targetEpisode = parsedIntent?.episode ?? null;
+    ms.activeEpisode = null;
+    const directTvHit = (ms.targetSeason != null || ms.targetEpisode != null)
+      ? (ms.results.find((r) => r?.type === 'tv') || null)
+      : null;
+    if (directTvHit) {
+      await loadItemIntoSession(ms, directTvHit);
+    } else {
+      ms.view = 'results';
+    }
     ms.notice = null;
     ms.logLines = null;
-    await upsertCard(ctx, ms, renderResults(ctx, ms), {
+    await upsertCard(ctx, ms, renderCurrentView(ctx, ms), {
       forceNewCard: Boolean((forceNewCard || resolvedOriginMsgId) && !ctx?.reuseMessageId),
       replyToMessageId: resolvedOriginMsgId
     });
+    if (directTvHit && ms.view === 'season') {
+      void scheduleOrAttachTrailerPreview(ctx, ms, { explicit: false });
+    }
     if (!reuseExisting && prev && prev.id !== ms.id && prev.messageId !== ms.messageId) {
       await cleanupSupersededCards(ctx, prev, ms.messageId);
     }
@@ -1750,19 +2045,35 @@ export function createMovieUi({
       return await handleAiTurn(ctx, String(initialText).trim(), { defaultDomain, panelToken, dest });
     }
 
-    const intro = '🤖 AI Movie & Song Agent ready!\nAsk for any song mood, trending chart, movie recommendation, or TV series (e.g. "recommend a thriller movie", "play Breaking Bad", "trending Afrobeats", "surprise me"). Say "done" or tap Finish anytime.';
-    const rich = finish(
-      card('🤖 Lancy AI Agent', 'Movies · TV Series · Music · VC')
-        .blockquote(rt.text(intro))
-        .buttons([
-          richButton.callback('🎬 Movie Hub', encodeCallback('music', 'mv', 'new', 'hb')),
-          richButton.callback('🚪 Finish AI Chat', encodeCallback('music', 'aiclose', ''), { style: 'danger' })
-        ])
-    );
+    const gInfo = app.lancyAgent?.generatePersonalizedGreeting
+      ? await app.lancyAgent.generatePersonalizedGreeting(ctx, { chatId: dest, mode: 'movie' }).catch(() => null)
+      : null;
+    const intro = gInfo?.greetingText || '🤖 AI Movie & Song Agent ready!\nAsk for any song mood, trending chart, movie recommendation, or TV series (e.g. "recommend a thriller movie", "play Breaking Bad", "trending Afrobeats", "surprise me"). Say "done" or tap Finish anytime.';
+    const rich = (app.lancyAgent?.buildConversationRichCard && !isChan)
+      ? app.lancyAgent.buildConversationRichCard({
+          title: '🤖 Lancy AI · Movies & Music',
+          subtitle: `${gInfo?.timeCtx?.greeting || 'Live'} · Continuous Conversation`,
+          bodyText: intro,
+          mention: gInfo?.mention || null,
+          mode: 'movie',
+          includeQuickStarters: false
+        })
+      : finish(
+          card('🤖 Lancy AI Agent', 'Movies · TV Series · Music · VC')
+            .blockquote(rt.text(intro))
+            .buttons([
+              richButton.callback('🎬 Movie Hub', encodeCallback('music', 'mv', 'new', 'hb')),
+              richButton.callback('🚪 Finish AI Chat', encodeCallback('music', 'aiclose', ''), { style: 'danger' })
+            ])
+        );
 
     let sent;
     if (isChan) {
       sent = await sendOrEditMenu(ctx, rich, { ttlMs: 300000 });
+    } else if (ctx.api?.sendRichMessage) {
+      sent = await ctx.api.sendRichMessage(ctx.chatId, rich, {
+        ...(ctx.message?.message_id ? { reply_to_message_id: ctx.message.message_id } : {})
+      });
     } else if (group) {
       sent = await ctx.api.sendMessage(ctx.chatId, `${intro}\n\n(Reply to this message to chat)`, {
         reply_markup: { force_reply: true, selective: true },
@@ -1772,6 +2083,9 @@ export function createMovieUi({
       sent = await ctx.api.sendRichMessage(ctx.chatId, rich);
     }
 
+    if (sent?.message_id) {
+      app.telegram?.markAiMessage?.(ctx.chatId, sent.message_id);
+    }
     const temporaryToken = temporary.remember(ctx, sent, { ttlMs: 300000 });
     await app.sm.transition(stateKey, States.AI_MEDIA_CHAT, {
       chatId: ctx.chatId,
@@ -1780,6 +2094,7 @@ export function createMovieUi({
         stateKey,
         botKey: app.music.botKey(ctx),
         promptMessageId: sent?.message_id || null,
+        replyableMessageIds: sent?.message_id ? [sent.message_id] : [],
         temporaryToken,
         panelToken,
         destination: dest,
@@ -1814,6 +2129,17 @@ export function createMovieUi({
             richButton.callback('🗑️ Close', encodeCallback('music', 'cancelprompt'), { style: 'danger' })
           ]]);
         return await sendOrEditMenu(resolvedCtx, finish(aiCard), { ttlMs: 120000 }).catch(() => null);
+      }
+      if (app.lancyAgent?.buildConversationRichCard && ctx.api?.sendRichMessage && !res.concluded) {
+        const richCard = app.lancyAgent.buildConversationRichCard({
+          title: '🤖 Lancy AI · Movies & Music',
+          subtitle: `${app.lancyAgent.getTimeContext(targetDest || ctx.chatId).greeting} · Live Chat`,
+          bodyText: textToSend,
+          executed: res.toolExecuted || [],
+          mode: 'movie',
+          includeQuickStarters: false
+        });
+        return await ctx.api.sendRichMessage(ctx.chatId, richCard, extra).catch(() => null);
       }
       return await ctx.api.sendMessage(ctx.chatId, textToSend, extra).catch(() => null);
     };
@@ -1860,9 +2186,13 @@ export function createMovieUi({
       return res;
     }
     if (res.reply) {
-      await sendAiNotice(res.reply, {
+      const sentNotice = await sendAiNotice(res.reply, {
         ...(!chanMode && ctx.message?.message_id ? { reply_to_message_id: ctx.message.message_id } : {})
       });
+      if (sentNotice?.message_id) {
+        res.sentMessageId = sentNotice.message_id;
+        app.telegram?.markAiMessage?.(ctx.chatId, sentNotice.message_id);
+      }
     }
     return res;
   }
@@ -1921,12 +2251,18 @@ export function createMovieUi({
       const stamp = new Date().toISOString().slice(11, 19);
       const entry = `[${stamp}] ${clean}`;
       const prevBody = String(ms.logLines[ms.logLines.length - 1] || '').replace(/^\[\d{2}:\d{2}:\d{2}\]\s*/, '');
+      const isTransientScan = /^(?:🔎|⏳|💬)\s*(?:\[|Starting|Scanning|Searching|Checking|Matching)/i.test(clean);
+      const prevTransientScan = /^(?:🔎|⏳|💬)\s*(?:\[|Starting|Scanning|Searching|Checking|Matching)/i.test(prevBody);
       if (prevBody !== clean) {
-        ms.logLines.push(entry);
-        if (ms.logLines.length > 10) ms.logLines.shift();
+        if (isTransientScan && prevTransientScan && ms.logLines.length) {
+          ms.logLines[ms.logLines.length - 1] = entry;
+        } else {
+          ms.logLines.push(entry);
+          if (ms.logLines.length > 3) ms.logLines.shift();
+        }
       }
       const elapsed = Date.now() - lastLogFlush;
-      if (force || elapsed >= 950) {
+      if (force || elapsed >= 2000) {
         if (pendingLogTimer) { clearTimeout(pendingLogTimer); pendingLogTimer = null; }
         return flushLog();
       }
@@ -1934,7 +2270,7 @@ export function createMovieUi({
         pendingLogTimer = setTimeout(() => {
           pendingLogTimer = null;
           void flushLog();
-        }, Math.max(150, 950 - elapsed));
+        }, Math.max(200, 2000 - elapsed));
         pendingLogTimer.unref?.();
       }
       return Promise.resolve();
@@ -2040,6 +2376,7 @@ export function createMovieUi({
           { force: true }
         );
       }
+      ms.logLines = [];
 
       if (remaining.length) {
         void (async () => {
@@ -2273,6 +2610,7 @@ export function createMovieUi({
       if (!ms.results?.length) ms.results = [pick];
       await loadItemIntoSession(ms, pick);
       await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
+      void scheduleOrAttachTrailerPreview(resolvedCtx, ms, { explicit: false });
       return true;
     }
 
@@ -2343,6 +2681,34 @@ export function createMovieUi({
       }
       await loadItemIntoSession(ms, picked);
       await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
+      void scheduleOrAttachTrailerPreview(resolvedCtx, ms, { explicit: false });
+      return true;
+    }
+
+    if (op === 'tl') {
+      if (!ms.mediaItem) throw new MusicError('STALE_PLAYER', 'Open a movie or series first.');
+      if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+        await ctx.api.answerCallbackQuery(ctx.query.id, { text: `🎞 Attaching official trailer for ${cut(ms.mediaItem.title, 28)}…` }).catch(() => {});
+      }
+      await scheduleOrAttachTrailerPreview(resolvedCtx, ms, { explicit: true });
+      return true;
+    }
+
+    if (op === 'ed') {
+      const [sStr, eStr] = String(arg).split('-');
+      const sNum = Number(sStr || ms.seasonNumber || 1);
+      const eNum = Number(eStr || 1);
+      if (sNum !== Number(ms.seasonNumber) || !ms.episodeCache.has(sNum)) {
+        ms.seasonNumber = sNum;
+        const epsRes = await app.movieApi.getTvSeasonEpisodes(ms.mediaItem?.id, sNum).catch(() => null);
+        if (epsRes?.episodes?.length) {
+          ms.episodes = epsRes.episodes;
+          ms.episodeCache.set(sNum, ms.episodes);
+        }
+      }
+      ms.activeEpisode = { seasonNumber: sNum, episodeNumber: eNum };
+      ms.view = 'episode';
+      await upsertCard(resolvedCtx, ms, renderEpisodeDetail(resolvedCtx, ms));
       return true;
     }
 
@@ -2352,7 +2718,7 @@ export function createMovieUi({
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
         await ctx.api.answerCallbackQuery(ctx.query.id, { text: `${checked ? '☑ Selected' : '☐ Deselected'} S${sStr}E${eStr} (${app.movieSessions.totalSelectedCount(ms)} total)` }).catch(() => {});
       }
-      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, ms.view === 'episode' ? renderEpisodeDetail(resolvedCtx, ms) : renderTvSeason(resolvedCtx, ms));
       return true;
     }
 
@@ -2549,9 +2915,13 @@ export function createMovieUi({
 
     const runSingleDownloadWithProgress = async (desc, { heading, subtitle, initialLine, renderOnDone, spoiler = false }) => {
       const dlQuality = getUserDownloadQuality(resolvedCtx, ms);
+      ms.logLines = [];
       const useTracker = !app.movieDownloader.hasCachedVideo?.(desc, dlQuality) && typeof resolvedCtx.api?.sendRichMessage === 'function';
+      const trackerReplyId = Number(resolvedCtx.chatId) < 0 && !isChannelCtx(resolvedCtx)
+        ? (resolvedCtx.message?.message_id || resolvedCtx.query?.message?.message_id || ms.messageId || null)
+        : null;
       const tracker = useTracker
-        ? new ProgressTracker({ api: resolvedCtx.api, chatId: resolvedCtx.chatId, heartbeatMs: 2000, action: 'upload_video' })
+        ? new ProgressTracker({ api: resolvedCtx.api, chatId: resolvedCtx.chatId, replyToMessageId: trackerReplyId, heartbeatMs: 2500, action: 'upload_video' })
         : null;
       if (tracker) {
         await tracker.live(
@@ -2565,7 +2935,6 @@ export function createMovieUi({
           spoiler: Boolean(spoiler),
           allowAdultFeatures: isGroupAdultAllowed(resolvedCtx, ms),
           onProgress: (line) => {
-            ms.logLines = [...(ms.logLines || []).slice(-7), line];
             ms.notice = line;
             tracker?.set({ statusLine: line });
           }
@@ -2597,10 +2966,8 @@ export function createMovieUi({
         downloadUrls: Array.isArray(item.downloadUrls) ? item.downloadUrls : []
       };
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
-        await ctx.api.answerCallbackQuery(ctx.query.id, { text: `⬇️ Preparing download: ${cut(item.title, 36)}…` }).catch(() => {});
+        await ctx.api.answerCallbackQuery(ctx.query.id, { text: `⬇️ Preparing ${cut(item.title, 36)}…` }).catch(() => {});
       }
-      ms.logLines = [`⬇️ Starting download for ${cut(item.title, 40)}…`];
-      await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
       const res = await runSingleDownloadWithProgress(desc, {
         heading: `⬇️ ${cut(item.title, 44)}`,
         subtitle: `${item.year || ''} · Direct HD MP4 Download`,
@@ -2628,8 +2995,6 @@ export function createMovieUi({
         const q = getXvQuality(ms);
         const spoiler = effectiveAdultChatId(resolvedCtx, ms) < 0;
         if (ctx.query?.id) await ctx.api?.answerCallbackQuery?.(ctx.query.id, { text: `⬇️ Preparing ${q} MP4: ${cut(item.title, 30)}…` }).catch(() => {});
-        ms.logLines = [`⬇️ Preparing 18+ MP4 for ${cut(item.title, 38)}…`];
-        await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
         const resolved = await getCatalog().resolveStream(item.xvItem, { preferredHeight: xvQualityHeight(q), probeSize: false }).catch(() => null);
         const track = buildXvTrack(item.xvItem, resolved, q);
         if (!track.streamUrl) throw new MusicError('NO_SOURCE', 'Could not resolve downloadable MP4 stream.');
@@ -2664,10 +3029,8 @@ export function createMovieUi({
         downloadUrls: Array.isArray(item.downloadUrls) ? item.downloadUrls : []
       };
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
-        await ctx.api.answerCallbackQuery(ctx.query.id, { text: `⬇️ Preparing download: ${cut(item.title, 36)}…` }).catch(() => {});
+        await ctx.api.answerCallbackQuery(ctx.query.id, { text: `⬇️ Preparing ${cut(item.title, 36)}…` }).catch(() => {});
       }
-      ms.logLines = [`⬇️ Starting download for ${cut(item.title, 40)}…`];
-      await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
       const res = await runSingleDownloadWithProgress(desc, {
         heading: `⬇️ ${cut(item.title, 44)}`,
         subtitle: `${item.year || ''} · ${isTv ? 'S01E01 MP4 Download' : 'Direct HD MP4 Download'}`,
@@ -2715,8 +3078,6 @@ export function createMovieUi({
         if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
           await ctx.api.answerCallbackQuery(ctx.query.id, { text: `⬇️ Downloading ${epTag}…` }).catch(() => {});
         }
-        ms.notice = `⬇️ Preparing ${epTag} for Telegram…`;
-        await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms));
         const res = await runSingleDownloadWithProgress(desc, {
           heading: `⬇️ ${cut(item.title || 'Series', 36)} · ${epTag}`,
           subtitle: cut(ep.title || epTag, 48),
@@ -2830,6 +3191,21 @@ export function createMovieUi({
           isAdultHint: Boolean(item.isAdultHint || item.adult),
           downloadUrls: Array.isArray(ep.downloadUrls) && ep.downloadUrls.length ? ep.downloadUrls : (Array.isArray(item.downloadUrls) ? item.downloadUrls : [])
         }));
+        if (op === 'dx' && descriptors.length === 1) {
+          const singleDesc = descriptors[0];
+          const epTag = `S${String(singleDesc.season).padStart(2, '0')}E${String(singleDesc.episode).padStart(2, '0')}`;
+          if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
+            await ctx.api.answerCallbackQuery(ctx.query.id, { text: `⬇️ Downloading ${epTag}…` }).catch(() => {});
+          }
+          const res = await runSingleDownloadWithProgress(singleDesc, {
+            heading: `⬇️ ${cut(item.title || 'Series', 36)} · ${epTag}`,
+            subtitle: cut(singleDesc.episodeTitle || epTag, 48),
+            initialLine: `⬇️ Preparing ${epTag} for Telegram…`
+          });
+          ms.notice = res?.ok ? `✅ Sent ${epTag} to chat!` : `⚠️ ${res?.reason || 'Episode download failed'}`;
+          await upsertCard(resolvedCtx, ms, renderCurrentView(resolvedCtx, ms));
+          return true;
+        }
         app.movieSessions.setDownloadManifest(ms, descriptors, {
           pageSize: 4,
           title: manifestTitle,
@@ -3351,8 +3727,11 @@ export function createMovieUi({
         const track = buildXvTrack(item, resolved || ms.xvResolved, q);
         if (!track.streamUrl) throw new MusicError('NO_SOURCE', 'Could not resolve downloadable MP4 stream.');
         const useTracker = !app.movieDownloader.hasCachedVideo?.(track, q) && typeof resolvedCtx.api?.sendRichMessage === 'function';
+        const xvReplyId = Number(resolvedCtx.chatId) < 0 && !isChannelCtx(resolvedCtx)
+          ? (resolvedCtx.message?.message_id || resolvedCtx.query?.message?.message_id || ms.messageId || null)
+          : null;
         const tracker = useTracker
-          ? new ProgressTracker({ api: resolvedCtx.api, chatId: resolvedCtx.chatId, heartbeatMs: 2000, action: 'upload_video' })
+          ? new ProgressTracker({ api: resolvedCtx.api, chatId: resolvedCtx.chatId, replyToMessageId: xvReplyId, heartbeatMs: 2000, action: 'upload_video' })
           : null;
         if (tracker) {
           await tracker.live(

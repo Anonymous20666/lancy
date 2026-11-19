@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, writeFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { logger } from '../core/logger.js';
@@ -82,7 +83,7 @@ export class VoiceClient {
   async play(chatId, streamUrl, opts = {}) {
     await this.ensureDaemon();
     const maxVid = opts.maxVideoCallsPerAccount ?? this.app?.settings?.get?.('cinema.maxVideoCallsPerAccount');
-    return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, remote_proxy:Boolean(opts.remoteProxy), subtitle_path:opts.subtitlePath || null, subtitle_offset:Number.isFinite(Number(opts.subtitleOffset)) ? Number(opts.subtitleOffset) : 0, subtitle_same_route:Boolean(opts.subtitleSameRoute), ...(opts.subtitleRenderScreen !== undefined ? { subtitle_render_screen: Boolean(opts.subtitleRenderScreen) } : {}), ...(Number.isFinite(Number(opts.subDriftSecPerSec)) && Number(opts.subDriftSecPerSec) !== 0 ? { sub_drift_sec_per_sec: Number(opts.subDriftSecPerSec) } : {}), ...(Number.isFinite(Number(opts.subDriftAnchorSec)) && Number(opts.subDriftAnchorSec) > 0 ? { sub_drift_anchor_sec: Number(opts.subDriftAnchorSec) } : {}), ...(opts.subtitleManualOverride !== undefined ? { subtitle_manual_override: Boolean(opts.subtitleManualOverride) } : {}), ...(opts.djDesk ? { dj_desk: true, ...(opts.djDeskImage ? { dj_desk_image: String(opts.djDeskImage) } : {}), ...(Number.isFinite(Number(opts.crossfadeSec)) ? { crossfade_sec: Number(opts.crossfadeSec) } : {}) } : {}), is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), video_quality:String(opts.videoQuality || process.env.VOICE_VIDEO_QUALITY || 'HD_720p'), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, start_seconds:Number.isFinite(Number(opts.startSeconds)) && Number(opts.startSeconds) > 0 ? Number(opts.startSeconds) : 0, vc_title:opts.vcTitle ? String(opts.vcTitle).slice(0, 64) : undefined, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')), volume:Number.isFinite(Number(opts.volume)) ? Number(opts.volume) : 100, ...(Number.isFinite(Number(maxVid)) && Number(maxVid) > 0 ? { max_video_calls_per_account: Number(maxVid) } : {}), ...(opts.streamMode ? { stream_mode: String(opts.streamMode) } : {}), ...(opts.preferredAudioLang ? { preferred_audio_lang: String(opts.preferredAudioLang) } : {}), ...(opts.rejectDub !== undefined ? { reject_dub: Boolean(opts.rejectDub) } : {}), ...(opts.messages_enabled !== undefined ? { messages_enabled: Boolean(opts.messages_enabled) } : (opts.messagesEnabled !== undefined ? { messages_enabled: Boolean(opts.messagesEnabled) } : {})) }, timeoutMs:110000 });
+    return this.request('/call/play', { method:'POST', body: { chat_id:Number(chatId), stream_url:streamUrl, remote_proxy:Boolean(opts.remoteProxy), subtitle_path:opts.subtitlePath || null, subtitle_offset:Number.isFinite(Number(opts.subtitleOffset)) ? Number(opts.subtitleOffset) : 0, subtitle_same_route:Boolean(opts.subtitleSameRoute), ...(opts.subtitleRenderScreen !== undefined ? { subtitle_render_screen: Boolean(opts.subtitleRenderScreen) } : {}), ...(Number.isFinite(Number(opts.subDriftSecPerSec)) && Number(opts.subDriftSecPerSec) !== 0 ? { sub_drift_sec_per_sec: Number(opts.subDriftSecPerSec) } : {}), ...(Number.isFinite(Number(opts.subDriftAnchorSec)) && Number(opts.subDriftAnchorSec) > 0 ? { sub_drift_anchor_sec: Number(opts.subDriftAnchorSec) } : {}), ...(opts.subtitleManualOverride !== undefined ? { subtitle_manual_override: Boolean(opts.subtitleManualOverride) } : {}), ...(opts.djDesk ? { dj_desk: true, ...(opts.djDeskImage ? { dj_desk_image: String(opts.djDeskImage) } : {}), ...(Number.isFinite(Number(opts.crossfadeSec)) ? { crossfade_sec: Number(opts.crossfadeSec) } : {}) } : {}), ...(opts.isMusic !== undefined ? { is_music: Boolean(opts.isMusic) } : {}), ...(opts.voiceAiEnabled !== undefined ? { voice_ai_enabled: Boolean(opts.voiceAiEnabled) } : {}), ...(Array.isArray(opts.voiceAuthorizedIds) ? { voice_authorized_ids: opts.voiceAuthorizedIds } : {}), is_channel:Boolean(opts.isChannel), video:Boolean(opts.video), video_quality:String(opts.videoQuality || process.env.VOICE_VIDEO_QUALITY || 'HD_720p'), playback_id:opts.playbackId, account_alias:opts.accountAlias, duration_seconds:opts.durationSeconds, start_seconds:Number.isFinite(Number(opts.startSeconds)) && Number(opts.startSeconds) > 0 ? Number(opts.startSeconds) : 0, vc_title:opts.vcTitle ? String(opts.vcTitle).slice(0, 64) : undefined, bass:Boolean(opts.bass), eq:String(opts.eq || (opts.bass ? 'bass' : 'off')), volume:Number.isFinite(Number(opts.volume)) ? Number(opts.volume) : 100, ...(Number.isFinite(Number(maxVid)) && Number(maxVid) > 0 ? { max_video_calls_per_account: Number(maxVid) } : {}), ...(opts.streamMode ? { stream_mode: String(opts.streamMode) } : {}), ...(opts.preferredAudioLang ? { preferred_audio_lang: String(opts.preferredAudioLang) } : {}), ...(opts.rejectDub !== undefined ? { reject_dub: Boolean(opts.rejectDub) } : {}), ...(opts.messages_enabled !== undefined ? { messages_enabled: Boolean(opts.messages_enabled) } : (opts.messagesEnabled !== undefined ? { messages_enabled: Boolean(opts.messagesEnabled) } : {})) }, timeoutMs:110000 });
   }
   startSecondaryTile(id, opts = {}) {
     return this.request('/call/secondary-tile/start', {
@@ -102,6 +103,53 @@ export class VoiceClient {
   stopSecondaryTile(id) { return this.request('/call/secondary-tile/stop', { method: 'POST', body: { chat_id: Number(id) }, timeoutMs: 15000 }); }
   control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 65000 : op === 'resume' ? 35000 : op === 'subcheck' ? 30000 : 20000 }); }
   sendCallMessage(id, text, more = {}) { return this.request('/call/message', { method:'POST', body:{ chat_id:Number(id), text:String(text || ''), ...more }, timeoutMs:12000 }); }
+  speak(id, text, opts = {}) { return this.request('/call/speak', { method:'POST', body:{ chat_id:Number(id), text:String(text || ''), ...(opts.voice ? { voice: String(opts.voice) } : {}), ...(opts.rate ? { rate: String(opts.rate) } : {}), ...(opts.append_mode !== undefined ? { append_mode: Boolean(opts.append_mode) } : {}), ...(opts.barge_in_clear !== undefined ? { barge_in_clear: Boolean(opts.barge_in_clear) } : {}), ...(opts.speaker_name ? { speaker_name: String(opts.speaker_name) } : {}), ...(opts.user_text ? { user_text: String(opts.user_text) } : {}), ...(opts.lancy_text ? { lancy_text: String(opts.lancy_text) } : {}), ...(opts.hud_theme ? { hud_theme: String(opts.hud_theme) } : {}) }, timeoutMs:18000 }); }
+  setListenState(id, opts = {}) { return this.request('/call/listen', { method:'POST', body:{ chat_id:Number(id), ...opts }, timeoutMs:12000 }); }
+  getParticipants(id) { return this.request(`/call/participants?chat_id=${Number(id)}`, { timeoutMs:8000 }); }
+  bargeIn(id, opts = {}) { return this.request('/call/barge_in', { method:'POST', body:{ chat_id:Number(id), ...opts }, timeoutMs:6000 }); }
+  submitLiveToolResult(id, { callId, name, response } = {}) { return this.request('/call/live-tool-result', { method:'POST', body:{ chat_id:Number(id), call_id:String(callId || ''), name:String(name || ''), response }, timeoutMs:8000 }); }
+  pushLiveContext(id, summary) { return this.request('/call/live-context', { method:'POST', body:{ chat_id:Number(id), summary:String(summary || '') }, timeoutMs:4000 }); }
+  async transcribeAudioBuffer(audioBuffer, { extension = 'ogg', activeSession = true, contextHint = '' } = {}) {
+    if (!audioBuffer || !audioBuffer.length) return { ok: false, text: '' };
+    await this.ensureDaemon();
+    const ext = String(extension || 'ogg').replace(/[^a-z0-9]/gi, '').slice(0, 8) || 'ogg';
+    const tmpPath = join(tmpdir(), `lancy-vn-${Date.now()}-${randomBytes(4).toString('hex')}.${ext}`);
+    writeFileSync(tmpPath, audioBuffer);
+    try {
+      return await this.request('/stt/transcribe', {
+        method: 'POST',
+        body: { file_path: tmpPath, active_session: Boolean(activeSession), context_hint: String(contextHint || '') },
+        timeoutMs: 25000
+      });
+    } finally {
+      try { unlinkSync(tmpPath); } catch {}
+    }
+  }
+  async synthesizeVoiceNote(text, { voice = null, rate = null } = {}) {
+    const clean = String(text || '').trim();
+    if (!clean) return null;
+    await this.ensureDaemon();
+    const res = await this.request('/tts/synthesize', {
+      method: 'POST',
+      body: { text: clean, ...(voice ? { voice: String(voice) } : {}), ...(rate ? { rate: String(rate) } : {}) },
+      timeoutMs: 20000
+    });
+    if (!res?.ok || !res.ogg_base64) return null;
+    return Buffer.from(res.ogg_base64, 'base64');
+  }
+  async verifyAudioLang(url, { headers = {}, offsetSec = 75, timeoutMs = 18000 } = {}) {
+    if (!url || !/^https?:\/\//i.test(String(url))) return null;
+    try {
+      await this.ensureDaemon();
+      return await this.request('/verify-audio-lang', {
+        method: 'POST',
+        body: { url: String(url), headers: headers || {}, offset_sec: Number(offsetSec) || 75 },
+        timeoutMs
+      });
+    } catch {
+      return null;
+    }
+  }
   updateCallSettings(id, settings = {}) { return this.request('/call/settings', { method:'POST', body:{ chat_id:Number(id), ...settings }, timeoutMs:12000 }); }
   deleteCallMessages(id, messageIds = []) { return this.request('/call/messages/delete', { method:'POST', body:{ chat_id:Number(id), message_ids:Array.isArray(messageIds) ? messageIds : [] }, timeoutMs:12000 }); }
   pause(id) { return this.control('pause', id); }

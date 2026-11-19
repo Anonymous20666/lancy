@@ -770,6 +770,8 @@ export class MovieStreamResolver {
     realDebridKey = process.env.REALDEBRID_API_KEY || '',
     allDebridKey = process.env.ALLDEBRID_API_KEY || '',
     premiumizeKey = process.env.PREMIUMIZE_API_KEY || '',
+    voiceClient = null,
+    audioLanguageVerifier = null,
     log
   } = {}) {
     this.movieApi = movieApi;
@@ -787,8 +789,41 @@ export class MovieStreamResolver {
     this.realDebridKey = String(realDebridKey || '').trim();
     this.allDebridKey = String(allDebridKey || '').trim();
     this.premiumizeKey = String(premiumizeKey || '').trim();
+    this.voiceClient = voiceClient || null;
+    this.audioLanguageVerifier = typeof audioLanguageVerifier === 'function' ? audioLanguageVerifier : null;
     this.hostCooldowns = new Map();
     this.log = log || logger().child({ module: 'movie-resolver' });
+  }
+
+  async #verifyCandidateSpokenAudio({ url, audioUri = null, headers = {}, preferredAudioLang = '', containerLang = '', explicitDub = false } = {}) {
+    const pref = normalizeLangCode(preferredAudioLang);
+    const tagged = normalizeLangCode(containerLang);
+    if (!pref || pref === 'en' || explicitDub || tagged) return null;
+    const hasVerifier = Boolean(this.audioLanguageVerifier || (this.fetchImpl === fetch && typeof this.voiceClient?.verifyAudioLang === 'function'));
+    if (!hasVerifier) return null;
+    const targetUrl = audioUri || url;
+    if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) return null;
+    try {
+      const res = this.audioLanguageVerifier
+        ? await this.audioLanguageVerifier(targetUrl, headers, { preferredAudioLang: pref })
+        : await this.voiceClient.verifyAudioLang(targetUrl, { headers, offsetSec: 75, timeoutMs: 18000 });
+      if (!res?.speech_detected) return null;
+      const det = normalizeLangCode(res.language || '');
+      const prob = Number(res.probability || 0);
+      if (!det) return null;
+      if (det === pref && prob >= 0.55) {
+        return { audioLanguage: pref, audioIsDub: false, audioVerified: true };
+      }
+      if (det === 'en' && prob >= 0.68) {
+        return { audioLanguage: 'en', audioIsDub: true, audioVerified: true };
+      }
+      if (det !== pref && prob >= 0.72) {
+        return { audioLanguage: det, audioIsDub: true, audioVerified: true };
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
 
   #computeVodMinDuration(minDuration = 0, { isTv = false } = {}) {
@@ -807,6 +842,16 @@ export class MovieStreamResolver {
       return isTv ? 900 : 3600;
     }
     return 0;
+  }
+
+  #computeVodMaxDuration(minDuration = 0, { isTv = false, verifiedEpisode = false } = {}) {
+    const dur = Number(minDuration || 0);
+    if (dur < 600) return 0;
+    if (!isTv) return Math.round(dur * 1.35);
+    // Double-length TV/anime premieres & finales (e.g. 48m or 85m on a 23m nominal runtime) are valid when episode-verified.
+    return verifiedEpisode
+      ? Math.max(Math.round(dur * 2.8), 5600)
+      : Math.max(Math.round(dur * 2.1), 4500);
   }
 
   async #probeContainerFormatWithFfprobe(url, headers = {}, { preferredAudioLang = '' } = {}) {
@@ -924,7 +969,7 @@ export class MovieStreamResolver {
     }
   }
 
-  async #probeHlsPlaylistAndSegment(playlistUrl, headers = {}, depth = 0, { minDuration = 0, preferredHeight = null, preferredAudioLang = '', isTv = false } = {}) {
+  async #probeHlsPlaylistAndSegment(playlistUrl, headers = {}, depth = 0, { minDuration = 0, preferredHeight = null, preferredAudioLang = '', isTv = false, verifiedEpisode = false } = {}) {
     if (!playlistUrl || !/^https?:\/\//i.test(playlistUrl) || depth > 2) return null;
     const prefLang = normalizeLangCode(preferredAudioLang);
     try {
@@ -950,6 +995,7 @@ export class MovieStreamResolver {
           const groupId = line.match(/\bGROUP-ID="([^"]+)"/i)?.[1] || '';
           const langRaw = line.match(/\bLANGUAGE="([^"]+)"/i)?.[1] || '';
           const name = line.match(/\bNAME="([^"]+)"/i)?.[1] || '';
+          const uriAttr = line.match(/\bURI="([^"]+)"/i)?.[1] || '';
           const isDefault = /\bDEFAULT=YES\b/i.test(line);
           const isAuto = /\bAUTOSELECT=YES\b/i.test(line);
           const lang = normalizeLangCode(langRaw) || normalizeLangCode(name);
@@ -964,7 +1010,7 @@ export class MovieStreamResolver {
           if (/\b(?:commentary|description|descriptive)\b/i.test(name)) score -= 100;
           if (isDefault) score += 4;
           if (isAuto) score += 2;
-          audioTracks.push({ groupId, lang, name, isDub, score });
+          audioTracks.push({ groupId, lang, name, uri: uriAttr ? new URL(uriAttr, masterUrl).toString() : null, isDub, score });
         }
         const hasMediaAudio = audioTracks.length > 0;
         const groupBestAudioScore = new Map();
@@ -1000,6 +1046,7 @@ export class MovieStreamResolver {
           const resMatch = lines[i].match(/RESOLUTION=\d+x(\d+)/i);
           const avgBwMatch = lines[i].match(/AVERAGE-BANDWIDTH=(\d+)/i);
           const bwMatch = lines[i].match(/\bBANDWIDTH=(\d+)/i);
+          const codecsStr = lines[i].match(/\bCODECS="([^"]+)"/i)?.[1] || '';
           const audioGroup = lines[i].match(/\bAUDIO="([^"]+)"/i)?.[1] || '';
           const height = resMatch ? Number(resMatch[1]) : 720;
           const bwBps = Number(avgBwMatch?.[1] || bwMatch?.[1] || 0);
@@ -1007,6 +1054,7 @@ export class MovieStreamResolver {
             uri: new URL(nextUri, masterUrl).toString(),
             height,
             bandwidthKbps: bwBps > 0 ? Math.round(bwBps / 1000) : null,
+            isHevc: /\b(?:hvc1|hev1|h265|hevc)\b/i.test(codecsStr) || /(?:_h265|hevc|x265)/i.test(nextUri),
             audioGroup,
             audioScore: audioGroup && groupBestAudioScore.has(audioGroup) ? groupBestAudioScore.get(audioGroup) : 0
           });
@@ -1025,12 +1073,15 @@ export class MovieStreamResolver {
             const fitA = a.height <= targetH ? 1000 + a.height : (500 - a.height);
             const fitB = b.height <= targetH ? 1000 + b.height : (500 - b.height);
             if (fitB !== fitA) return fitB - fitA;
+            if (targetH <= 720 && Boolean(a.isHevc) !== Boolean(b.isHevc)) {
+              return a.isHevc ? 1 : -1;
+            }
           }
           const scoreH = (h) => (h === 1080 ? 35 : h === 720 ? 30 : h <= 1080 ? 20 : 10);
           return scoreH(b.height) - scoreH(a.height);
         });
         for (const v of variants.slice(0, 2)) {
-          const nested = await this.#probeHlsPlaylistAndSegment(v.uri, headers, depth + 1, { minDuration, preferredHeight, preferredAudioLang, isTv });
+          const nested = await this.#probeHlsPlaylistAndSegment(v.uri, headers, depth + 1, { minDuration, preferredHeight, preferredAudioLang, isTv, verifiedEpisode });
           if (nested) {
             const estDur = nested.durationSeconds || minDuration || 0;
             const estSizeBytes = (v.bandwidthKbps && estDur > 0) ? Math.round((v.bandwidthKbps * 1000 / 8) * estDur) : null;
@@ -1058,6 +1109,8 @@ export class MovieStreamResolver {
               variants: variants.map(({ uri, height, bandwidthKbps }) => ({ url: uri, height, bandwidthKbps })),
               audioLanguage: resolvedLang,
               audioIsDub: resolvedIsDub,
+              winningAudioUri: winningAudio?.uri || null,
+              hasExplicitAudioTag: Boolean(winningAudio?.lang || nested.audioLanguage),
               audioLanguages: [...new Set([
                 ...audioTracks.map((a) => a.lang),
                 nested.audioLanguage || ''
@@ -1083,8 +1136,8 @@ export class MovieStreamResolver {
       if (!hasEndlist && segLines.length <= 3 && totalVodSec > 0 && totalVodSec <= 45) {
         return null;
       }
-      const maxHlsMult = isTv ? 1.45 : 1.30;
-      if (minDuration >= 1200 && totalVodSec > Math.round(minDuration * maxHlsMult)) {
+      const maxHlsSec = this.#computeVodMaxDuration(minDuration, { isTv, verifiedEpisode });
+      if (maxHlsSec > 0 && totalVodSec > maxHlsSec) {
         return null;
       }
 
@@ -1131,7 +1184,7 @@ export class MovieStreamResolver {
     }
   }
 
-  async #probeDashManifest(mpdUrl, headers = {}, { minDuration = 0, durationSeconds = null, expectedEpisodeTitle = null, preferredAudioLang = '', isTv = false } = {}) {
+  async #probeDashManifest(mpdUrl, headers = {}, { minDuration = 0, durationSeconds = null, expectedEpisodeTitle = null, preferredAudioLang = '', isTv = false, verifiedEpisode = false } = {}) {
     if (!mpdUrl || !/^https?:\/\//i.test(mpdUrl)) return null;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
@@ -1175,8 +1228,8 @@ export class MovieStreamResolver {
       if (effectiveFloor > 0 && mpdSeconds > 0 && mpdSeconds < effectiveFloor) {
         return null;
       }
-      const maxDashMult = isTv ? 1.45 : 1.30;
-      if (minDuration >= 1200 && mpdSeconds > Math.round(minDuration * maxDashMult)) {
+      const maxDashSec = this.#computeVodMaxDuration(minDuration, { isTv, verifiedEpisode });
+      if (maxDashSec > 0 && mpdSeconds > maxDashSec) {
         return null;
       }
 
@@ -1617,6 +1670,8 @@ export class MovieStreamResolver {
                   const origIsNonLatin = Boolean(originalTitle && /[^\u0000-\u024F]/.test(String(originalTitle)));
                   if (hasRouteMetaProof && (sharesDistinctiveWord || origIsNonLatin || (isTv && (cleanEpTitle || slugEpMatches)))) {
                     hasSlugProof = false;
+                  } else if (slugEpMatches && sharesDistinctiveWord) {
+                    hasSlugProof = true;
                   } else if (slugEpMatches && cleanEpTitle && isMpdCandidate) {
                     hasSlugProof = false;
                     requireEpisodeTitle = cleanEpTitle;
@@ -1666,6 +1721,9 @@ export class MovieStreamResolver {
         else if (qLabel === '1080p') rank += 7;
         else if (qLabel === '4K') rank += 4;
         else if (qLabel === '480p') rank += 2;
+        if ((!preferredHeight || preferredHeight <= 720) && /(?:_h265_|[._-]h265\b|hevc|x265)/i.test(`${qualityHint} ${decoded}`)) {
+          rank -= 10;
+        }
         batch.push({
           url,
           headers: candHeaders || CINEMA_PLAYER_HEADERS,
@@ -1677,6 +1735,7 @@ export class MovieStreamResolver {
           routeSubs,
           durationHint,
           requireEpisodeTitle,
+          verifiedEpisode: Boolean(hasSlugProof || hasRouteMetaProof || isVidbolt),
           audioLanguage: audioMeta.audioLanguage,
           explicitDub: audioMeta.explicitDub,
           isLikelyDub: audioMeta.isLikelyDub
@@ -1791,13 +1850,20 @@ export class MovieStreamResolver {
         if (!streamObj?.url || excludeSet.has(streamObj.url)) return { immediate: null };
         const probedLang = normalizeLangCode(streamObj.audioLanguage || '');
         const explicitSourceDub = Boolean(streamObj.candExplicitDub);
-        const hasExplicitOriginal = !explicitSourceDub && Boolean(prefLang && probedLang === prefLang && streamObj.audioIsDub === false);
-        const resolvedIsDub = explicitSourceDub || (!hasExplicitOriginal && Boolean(
-          streamObj.audioIsDub
-          || (prefLang && probedLang && probedLang !== prefLang)
-          || (!probedLang && streamObj.candIsLikelyDub)
-        ));
-        const finalLang = probedLang || streamObj.candAudioLang || '';
+        const verifiedSpokenOverride = Boolean(streamObj.audioVerified);
+        const hasExplicitOriginal = verifiedSpokenOverride
+          ? (!streamObj.audioIsDub && Boolean(prefLang && probedLang === prefLang))
+          : (!explicitSourceDub && Boolean(prefLang && probedLang === prefLang && streamObj.audioIsDub === false));
+        const resolvedIsDub = explicitSourceDub
+          || (verifiedSpokenOverride && Boolean(streamObj.audioIsDub))
+          || (!hasExplicitOriginal && Boolean(
+            streamObj.audioIsDub
+            || (prefLang && probedLang && probedLang !== prefLang)
+            || (!probedLang && streamObj.candIsLikelyDub)
+          ));
+        const finalLang = verifiedSpokenOverride
+          ? (probedLang || '')
+          : (probedLang || (resolvedIsDub ? '' : (streamObj.candAudioLang || '')));
         const { candExplicitDub, candIsLikelyDub, candAudioLang, ...cleanStream } = streamObj;
         const enriched = {
           ...cleanStream,
@@ -1827,13 +1893,23 @@ export class MovieStreamResolver {
             durationSeconds: cand.durationHint || durationSeconds,
             expectedEpisodeTitle: cand.requireEpisodeTitle || null,
             preferredAudioLang: prefLang,
-            isTv
+            isTv,
+            verifiedEpisode: Boolean(cand.verifiedEpisode)
           });
           if (probedDash) {
             const allDashSubs = [
               ...(Array.isArray(probedDash.subtitleHints) ? probedDash.subtitleHints : []),
               ...mergedRouteSubs
             ];
+            const spokenDash = (!probedDash.audioLanguage && !cand.explicitDub)
+              ? await this.#verifyCandidateSpokenAudio({
+                  url: probedDash.url,
+                  headers: probedDash.headers || candHeaders,
+                  preferredAudioLang: prefLang,
+                  containerLang: probedDash.audioLanguage,
+                  explicitDub: Boolean(cand.explicitDub || probedDash.audioIsDub)
+                })
+              : null;
             const res = evaluateHit({
               url: probedDash.url,
               headers: probedDash.headers,
@@ -1844,8 +1920,9 @@ export class MovieStreamResolver {
               qualityLabel: probedDash.qualityLabel !== 'HD' ? probedDash.qualityLabel : cand.qualityLabel,
               source: cand.routeName === 'vidbolt' ? 'movie_vidbolt' : 'movie_tmdb_stream',
               subtitleHints: allDashSubs,
-              audioLanguage: probedDash.audioLanguage,
-              audioIsDub: probedDash.audioIsDub,
+              audioLanguage: spokenDash?.audioLanguage || probedDash.audioLanguage,
+              audioIsDub: spokenDash ? spokenDash.audioIsDub : probedDash.audioIsDub,
+              audioVerified: Boolean(spokenDash?.audioVerified),
               candAudioLang: cand.audioLanguage,
               candExplicitDub: cand.explicitDub,
               candIsLikelyDub: cand.isLikelyDub
@@ -1858,14 +1935,25 @@ export class MovieStreamResolver {
             minDuration: effMin,
             preferredHeight,
             preferredAudioLang: prefLang,
-            isTv
+            isTv,
+            verifiedEpisode: Boolean(cand.verifiedEpisode)
           });
           if (probedHls) {
-            const maxHlsMult = isTv ? 1.45 : 1.30;
-            if (effMin >= 1200 && probedHls.durationSeconds > 0 && probedHls.durationSeconds > Math.round(effMin * maxHlsMult)) {
+            const maxHlsSec = this.#computeVodMaxDuration(effMin, { isTv, verifiedEpisode: Boolean(cand.verifiedEpisode) });
+            if (maxHlsSec > 0 && probedHls.durationSeconds > 0 && probedHls.durationSeconds > maxHlsSec) {
               continue;
             }
             const allHlsSubs = [...(probedHls.subtitleHints || []), ...mergedRouteSubs];
+            const spokenCheck = (!probedHls.hasExplicitAudioTag && !cand.explicitDub)
+              ? await this.#verifyCandidateSpokenAudio({
+                  url: probedHls.url,
+                  audioUri: probedHls.winningAudioUri || null,
+                  headers: probedHls.headers || candHeaders,
+                  preferredAudioLang: prefLang,
+                  containerLang: probedHls.audioLanguage,
+                  explicitDub: Boolean(cand.explicitDub || probedHls.audioIsDub)
+                })
+              : null;
             const res = evaluateHit({
               url: probedHls.url,
               headers: probedHls.headers,
@@ -1878,8 +1966,9 @@ export class MovieStreamResolver {
               variants: probedHls.variants || null,
               source: cand.routeName === 'vidbolt' ? 'movie_vidbolt' : 'movie_tmdb_stream',
               subtitleHints: allHlsSubs,
-              audioLanguage: probedHls.audioLanguage,
-              audioIsDub: probedHls.audioIsDub,
+              audioLanguage: spokenCheck?.audioLanguage || probedHls.audioLanguage,
+              audioIsDub: spokenCheck ? spokenCheck.audioIsDub : probedHls.audioIsDub,
+              audioVerified: Boolean(spokenCheck?.audioVerified),
               candAudioLang: cand.audioLanguage,
               candExplicitDub: cand.explicitDub,
               candIsLikelyDub: cand.isLikelyDub
@@ -1894,14 +1983,25 @@ export class MovieStreamResolver {
                 minDuration,
                 preferredHeight,
                 preferredAudioLang: prefLang,
-                isTv
+                isTv,
+                verifiedEpisode: Boolean(cand.verifiedEpisode)
               });
               if (!hlsCheck) continue;
-              const maxDirectHlsMult = isTv ? 1.45 : 1.30;
-              if (minDuration >= 1200 && hlsCheck.durationSeconds > 0 && hlsCheck.durationSeconds > Math.round(minDuration * maxDirectHlsMult)) {
+              const maxDirectHlsSec = this.#computeVodMaxDuration(minDuration, { isTv, verifiedEpisode: Boolean(cand.verifiedEpisode) });
+              if (maxDirectHlsSec > 0 && hlsCheck.durationSeconds > 0 && hlsCheck.durationSeconds > maxDirectHlsSec) {
                 continue;
               }
               const allHlsSubs = [...(hlsCheck.subtitleHints || []), ...mergedRouteSubs];
+              const spokenCheck = (!hlsCheck.hasExplicitAudioTag && !cand.explicitDub)
+                ? await this.#verifyCandidateSpokenAudio({
+                    url: hlsCheck.url,
+                    audioUri: hlsCheck.winningAudioUri || null,
+                    headers: hlsCheck.headers || candHeaders,
+                    preferredAudioLang: prefLang,
+                    containerLang: hlsCheck.audioLanguage,
+                    explicitDub: Boolean(cand.explicitDub || hlsCheck.audioIsDub)
+                  })
+                : null;
               const res = evaluateHit({
                 url: hlsCheck.url,
                 headers: hlsCheck.headers,
@@ -1913,8 +2013,9 @@ export class MovieStreamResolver {
                 variants: hlsCheck.variants || null,
                 source: cand.routeName === 'vidbolt' ? 'movie_vidbolt' : 'movie_tmdb_stream',
                 subtitleHints: allHlsSubs,
-                audioLanguage: hlsCheck.audioLanguage,
-                audioIsDub: hlsCheck.audioIsDub,
+                audioLanguage: spokenCheck?.audioLanguage || hlsCheck.audioLanguage,
+                audioIsDub: spokenCheck ? spokenCheck.audioIsDub : hlsCheck.audioIsDub,
+                audioVerified: Boolean(spokenCheck?.audioVerified),
                 candAudioLang: cand.audioLanguage,
                 candExplicitDub: cand.explicitDub,
                 candIsLikelyDub: cand.isLikelyDub
@@ -1922,6 +2023,15 @@ export class MovieStreamResolver {
               if (res.immediate && recordOriginal(res.immediate)) break;
               continue;
             }
+            const spokenDirect = (!probedDirect.audioLanguage && !cand.explicitDub)
+              ? await this.#verifyCandidateSpokenAudio({
+                  url: probedDirect.url,
+                  headers: probedDirect.headers || candHeaders,
+                  preferredAudioLang: prefLang,
+                  containerLang: probedDirect.audioLanguage,
+                  explicitDub: Boolean(cand.explicitDub || probedDirect.audioIsDub)
+                })
+              : null;
             const res = evaluateHit({
               url: probedDirect.url,
               headers: probedDirect.headers,
@@ -1932,8 +2042,9 @@ export class MovieStreamResolver {
               sizeBytes: probedDirect.sizeBytes || null,
               source: cand.routeName === 'vidbolt' ? 'movie_vidbolt' : 'movie_tmdb_stream',
               subtitleHints: mergedRouteSubs,
-              audioLanguage: probedDirect.audioLanguage || '',
-              audioIsDub: Boolean(probedDirect.audioIsDub),
+              audioLanguage: spokenDirect?.audioLanguage || probedDirect.audioLanguage || '',
+              audioIsDub: spokenDirect ? spokenDirect.audioIsDub : Boolean(probedDirect.audioIsDub),
+              audioVerified: Boolean(spokenDirect?.audioVerified),
               candAudioLang: cand.audioLanguage,
               candExplicitDub: cand.explicitDub,
               candIsLikelyDub: cand.isLikelyDub
@@ -3353,6 +3464,7 @@ export class MovieStreamResolver {
     let detailMeta = null;
     let epMeta = null;
     let resolvedTmdbId = opts.tmdbId || (/^\d+$/.test(String(id || '')) ? String(id) : null);
+    let resolvedImdbId = opts.imdbId || null;
     let franchiseTmdbId = opts.franchiseTmdbId || null;
     let franchiseTitle = opts.franchiseTitle || null;
     let franchiseSeasonNumber = opts.franchiseSeasonNumber ?? null;
@@ -3373,14 +3485,16 @@ export class MovieStreamResolver {
       ]);
       if (pbRes.status === 'fulfilled') playback = pbRes.value || null;
       else this.log?.debug?.({ err: pbRes.reason?.message, id }, 'movie playback info unavailable');
-      if (dtRes.status === 'fulfilled' && dtRes.value && (!dtRes.value.id || String(dtRes.value.id) === String(id))) {
+      if (dtRes.status === 'fulfilled' && dtRes.value && (!dtRes.value.id || String(dtRes.value.id) === String(id) || (dtRes.value.tvmazeId && `tvmaze:${dtRes.value.tvmazeId}` === String(id)))) {
         detailMeta = dtRes.value;
       }
       if (epRes.status === 'fulfilled' && Array.isArray(epRes.value?.episodes)) {
         epMeta = epRes.value.episodes.find((ep) => Number(ep?.episodeNumber) === Number(episode)) || null;
       }
+      if (detailMeta?.imdbId && !resolvedImdbId) resolvedImdbId = String(detailMeta.imdbId);
       if (mapRes.status === 'fulfilled' && mapRes.value) {
         if (!resolvedTmdbId && mapRes.value.tmdbId) resolvedTmdbId = String(mapRes.value.tmdbId);
+        if (!resolvedImdbId && mapRes.value.imdbId) resolvedImdbId = String(mapRes.value.imdbId);
         if (!franchiseTmdbId && mapRes.value.franchiseTmdbId) {
           franchiseTmdbId = mapRes.value.franchiseTmdbId;
           franchiseTitle = mapRes.value.franchiseTitle || franchiseTitle;
@@ -3389,6 +3503,7 @@ export class MovieStreamResolver {
         }
       }
       if (!resolvedTmdbId && detailMeta?.tmdbId) resolvedTmdbId = String(detailMeta.tmdbId);
+      if (!resolvedImdbId && detailMeta?.imdbId) resolvedImdbId = String(detailMeta.imdbId);
       if (!franchiseTmdbId && detailMeta?.franchiseTmdbId) {
         franchiseTmdbId = detailMeta.franchiseTmdbId;
         franchiseTitle = detailMeta.franchiseTitle || franchiseTitle;
@@ -3405,7 +3520,7 @@ export class MovieStreamResolver {
     const effectiveOriginalTitle = opts.originalTitle || extra?.originalTitle || detailMeta?.originalTitle || detailMeta?.original_title || null;
     const effectiveYear = year ?? detailMeta?.year ?? null;
     const effectiveReleaseDate = rawReleaseDate ?? detailMeta?.releaseDate ?? playback?.releaseDate ?? null;
-    const effectiveImdbId = imdbId ?? detailMeta?.imdbId ?? null;
+    const effectiveImdbId = imdbId ?? detailMeta?.imdbId ?? resolvedImdbId ?? null;
     const effectiveArtwork = inputArtwork || epMeta?.still || detailMeta?.poster || detailMeta?.backdrop || null;
     const effectiveDurationSeconds = durationSeconds ?? epMeta?.runtimeSeconds ?? detailMeta?.runtimeSeconds ?? detailMeta?.durationSeconds ?? null;
     const effectiveRating = rating ?? detailMeta?.rating ?? null;
@@ -3488,12 +3603,24 @@ export class MovieStreamResolver {
             });
             if (!hlsVerified || excludeSet.has(hlsVerified.url)) continue;
             const rootQ = extractQualityLabel(root.quality?.resolution || root.quality?.video_codec);
-            const hlsLang = hlsVerified.audioLanguage || rootLang;
-            const isDub = Boolean(
-              hlsVerified.audioIsDub
-              || rootExplicitDub
-              || (effectiveOriginalLanguage && hlsLang && hlsLang !== effectiveOriginalLanguage)
-            );
+            const spokenRootHls = (!hlsVerified.hasExplicitAudioTag && !rootExplicitDub)
+              ? await this.#verifyCandidateSpokenAudio({
+                  url: hlsVerified.url,
+                  audioUri: hlsVerified.winningAudioUri || null,
+                  headers: hlsVerified.headers,
+                  preferredAudioLang: effectiveOriginalLanguage,
+                  containerLang: hlsVerified.audioLanguage,
+                  explicitDub: Boolean(rootExplicitDub || hlsVerified.audioIsDub)
+                })
+              : null;
+            const hlsLang = spokenRootHls?.audioLanguage || hlsVerified.audioLanguage || rootLang;
+            const isDub = spokenRootHls
+              ? spokenRootHls.audioIsDub
+              : Boolean(
+                  hlsVerified.audioIsDub
+                  || rootExplicitDub
+                  || (effectiveOriginalLanguage && hlsLang && hlsLang !== effectiveOriginalLanguage)
+                );
             const candStream = {
               url: hlsVerified.url,
               headers: hlsVerified.headers,
@@ -3505,8 +3632,9 @@ export class MovieStreamResolver {
               sizeBytes: root.size_bytes || hlsVerified.sizeBytes || null,
               variants: hlsVerified.variants || null,
               subtitleHints: hlsVerified.subtitleHints || [],
-              audioLanguage: hlsLang || effectiveOriginalLanguage || '',
+              audioLanguage: hlsLang || (isDub ? '' : (effectiveOriginalLanguage || '')),
               audioIsDub: isDub,
+              audioVerified: Boolean(spokenRootHls?.audioVerified),
               source: 'movie_api_root'
             };
             acceptCandidate(candStream, `✅ [1/5] Primary HD stream ready (${candStream.qualityLabel})`);
@@ -3960,7 +4088,7 @@ export class MovieStreamResolver {
       subtitleSameRoute: Boolean(subtitleInfo?.sameRoute),
       subtitleTracks: Array.isArray(subtitleInfo?.tracks) ? subtitleInfo.tracks : [],
       preferredAudioLang: effectiveOriginalLanguage || null,
-      audioLanguage: resolvedStream.audioLanguage || effectiveOriginalLanguage || null,
+      audioLanguage: resolvedStream.audioLanguage || (resolvedStream.audioIsDub ? null : (effectiveOriginalLanguage || null)),
       audioIsDub: Boolean(resolvedStream.audioIsDub),
       audioVariants: audioVariants.length > 1 ? audioVariants : (audioVariants.length ? audioVariants : null),
       dubOnly: Boolean(resolvedStream.dubOnly || resolvedStream.audioIsDub),

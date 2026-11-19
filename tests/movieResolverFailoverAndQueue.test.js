@@ -532,3 +532,135 @@ test('MovieStreamResolver handles CamelCase TV titles, broadcast 30m->21m episod
     assert.doesNotMatch(l, /cinemeta|tvmaze|holaflix|flikhub|vidbolt|thenkiri|archive\.org/i, `Progress log leaked raw source name: ${l}`);
   }
 });
+
+test('MovieApiClient recovers TMDB/IMDb for ID-less TVMaze shows when HolaFlix is down, demotes future/unrated stubs, and allows double-length episode premieres', async () => {
+  const { MovieApiClient } = await import('../src/media/movieApi.js');
+
+  const futureYear = new Date().getUTCFullYear() + 1;
+  const mockApiFetch = async (url) => {
+    const u = String(url);
+    const okJson = (body) => ({ ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) });
+
+    if (u.startsWith('https://holaflix.down.test/')) {
+      throw new Error('fetch failed');
+    }
+    if (u.includes('api.tvmaze.com/search/shows')) {
+      return okJson([{ show: { id: 63721, name: 'Dragon Raja', premiered: '2022-08-19', language: 'Chinese', externals: {} } }]);
+    }
+    if (u.includes('api.tvmaze.com/shows/63721')) {
+      return okJson({
+        id: 63721,
+        name: 'Dragon Raja',
+        premiered: '2022-08-19',
+        language: 'Chinese',
+        runtime: 24,
+        externals: {},
+        _embedded: { episodes: [{ id: 1, season: 1, number: 1, name: 'Travels', runtime: 24 }] }
+      });
+    }
+    if (u.includes('v3-cinemeta.strem.io/catalog/series')) {
+      return okJson({
+        metas: [{
+          id: 'tt27442011',
+          imdb_id: 'tt27442011',
+          type: 'series',
+          name: 'Dragon Raja -The Blazing Dawn-',
+          releaseInfo: '2022',
+          imdbRating: '7.8',
+          poster: 'https://img.example/dr.jpg',
+          description: 'Fantasy donghua'
+        }]
+      });
+    }
+    if (u.includes('v3-cinemeta.strem.io/catalog/movie')) {
+      return okJson({
+        metas: [{
+          id: 'tt9990001',
+          imdb_id: 'tt9990001',
+          type: 'movie',
+          name: 'Dragon Raja',
+          releaseInfo: String(futureYear),
+          poster: null
+        }]
+      });
+    }
+    if (u.includes('v3-cinemeta.strem.io/meta/series/tt27442011')) {
+      return okJson({
+        meta: {
+          id: 'tt27442011',
+          name: 'Dragon Raja -The Blazing Dawn-',
+          releaseInfo: '2022',
+          runtime: '23 min',
+          videos: [{ id: 'tt27442011:1:1', season: 1, episode: 1, title: 'Travels' }]
+        }
+      });
+    }
+    if (u.includes('wikidata.org/w/api.php') && u.includes('P345%3Dtt27442011')) {
+      return okJson({ query: { search: [{ title: 'Q1200001' }] } });
+    }
+    if (u.includes('wikidata.org/w/api.php') && u.includes('Q1200001')) {
+      return okJson({
+        entities: {
+          Q1200001: {
+            claims: {
+              P4983: [{ mainsnak: { datavalue: { value: '107255' } } }]
+            }
+          }
+        }
+      });
+    }
+    return { ok: false, status: 404, json: async () => ({}), text: async () => '' };
+  };
+
+  const movieApi = new MovieApiClient({ baseUrl: 'https://holaflix.down.test/api', fetchImpl: mockApiFetch });
+  const srch = await movieApi.search('Dragon Raja', { type: 'multi', limit: 5 });
+  assert.equal(srch.results[0].imdbId, 'tt27442011', 'Released IMDb-backed series should beat unrated future stub & ID-less TVMaze');
+
+  const mapped = await movieApi.resolveNumericTmdbInfo({
+    id: 'tvmaze:63721',
+    type: 'tv',
+    title: 'Dragon Raja',
+    year: 2022
+  });
+  assert.equal(mapped.imdbId, 'tt27442011');
+  assert.equal(mapped.tmdbId, '107255');
+
+  // Verify double-length verified episode (48m15s = 2895s on a 23m nominal runtime) resolves cleanly
+  const tokenPayload = Buffer.from(JSON.stringify({ r: { se: 1, ep: 1, slug: 'dragon-raja-the-blazing-dawn-Y4BPIL9B7u6' } })).toString('base64');
+  const mpdUrl = `https://proxy.yenime.net/manifest.mpd?url=x&t=${encodeURIComponent(tokenPayload)}`;
+  const resolverFetch = async (url, opts) => {
+    const u = String(url);
+    if (u.includes('proxy.yenime.net/tv?id=107255')) {
+      return new Response(JSON.stringify({ source: { source: 'zendaya', url: mpdUrl, type: 'dash' } }), { status: 200 });
+    }
+    if (u === mpdUrl) {
+      const mpdXml = `<?xml version="1.0"?><MPD mediaPresentationDuration="PT48M15.2S"><Period><AdaptationSet contentType="video"><Representation id="0" height="1080"><SegmentTemplate initialization="init-0.m4s"/></Representation></AdaptationSet><AdaptationSet contentType="audio" lang="chi"><Representation id="1"/></AdaptationSet></Period></MPD>`;
+      return new Response(mpdXml, { status: 200, headers: { 'content-type': 'application/dash+xml' } });
+    }
+    if (u.includes('proxy') || u.includes('punkflix') || u.includes('vidbolt') || u.includes('archive') || u.includes('thenkiri') || u.includes('sepiasearch') || u.includes('dailymotion') || u.includes('ok.ru')) {
+      return new Response('', { status: 404 });
+    }
+    return mockApiFetch(url, opts);
+  };
+
+  const resolver = new MovieStreamResolver({
+    movieApi,
+    fetchImpl: resolverFetch,
+    enableYtDlp: false
+  });
+  const res = await resolver.resolve({
+    id: 'tvmaze:63721',
+    type: 'tv',
+    title: 'Dragon Raja',
+    originalLanguage: 'Chinese',
+    year: 2022,
+    season: 1,
+    episode: 1,
+    durationSeconds: 1380
+  }, { fetchSubtitles: false });
+
+  assert.equal(res.ok, true, res.reason);
+  assert.equal(res.track.audioLanguage, 'zh');
+  assert.equal(res.track.audioIsDub, false);
+  assert.equal(res.track.durationSeconds, 2895);
+});

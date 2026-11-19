@@ -27,7 +27,10 @@ if str(_VOICE_DIR) not in sys.path:
 import av_hub
 import av_sync
 import rtmp_streamer
+import stt_engine
 import sub_align
+import tts_engine
+import voice_listener
 
 _INITIAL_PPID = os.getppid()
 _ENV_PARENT_PID = os.environ.get('VOICE_BRIDGE_PARENT_PID')
@@ -243,6 +246,48 @@ def _set_sync_paused(sync_id, paused):
     def _upd(st):
         st.paused = 1 if paused else 0
     return _mutate_sync_state(sync_id, _upd)
+
+
+def _set_sync_tts_hold(sync_id, hold):
+    def _upd(st):
+        st.tts_hold = 1 if hold else 0
+    return _mutate_sync_state(sync_id, _upd)
+
+
+def _write_vchud_state(
+    sync_id,
+    *,
+    active=True,
+    mode='listening',
+    speaker_name='',
+    user_text='',
+    lancy_text='',
+    theme='neon_rose',
+    ttl_sec=35.0,
+):
+    if not sync_id:
+        return None
+    p = av_sync.vchud_config_path_for(sync_id)
+    if not active:
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    payload = {
+        'active': True,
+        'mode': str(mode or 'listening'),
+        'speaker_name': str(speaker_name or '')[:40],
+        'user_text': str(user_text or '')[:180],
+        'lancy_text': str(lancy_text or '')[:260],
+        'theme': str(theme or 'neon_rose'),
+        'updated_at': time.time(),
+        'expires_at': time.time() + max(2.5, float(ttl_sec or 35.0)),
+    }
+    tmp = p.with_suffix('.tmp')
+    tmp.write_text(json.dumps(payload), encoding='utf-8')
+    os.replace(tmp, p)
+    return p
 
 
 def _read_sync_metrics(sync_id):
@@ -540,6 +585,7 @@ def wrap_av_sync_pair(
     height=0,
     sub_config_path=None,
     dj_config_path=None,
+    music_freerun=False,
 ):
     """Wrap matched microphone/camera FFmpeg commands in a synchronized startup barrier and drift monitor."""
     if not audio_cmd or not video_cmd or int(frame_bytes or 0) <= 0:
@@ -567,9 +613,10 @@ def wrap_av_sync_pair(
         pass
     audio_sub_flag = f' --sub-config {shlex.quote(str(sub_config_path))}' if sub_config_path else ''
     audio_dj_flag = f' --dj-config {shlex.quote(str(dj_config_path))}' if dj_config_path else ''
+    freerun_flag = ' --music-freerun' if music_freerun else ''
     wrapped_a = (
         f'{py} {script} --role audio --sync-id {shlex.quote(sid)} '
-        f'--sample-rate {int(sample_rate)} --channels {int(channels)} --fps {eff_fps:.3f}{audio_sub_flag}{audio_dj_flag} -- {audio_cmd}'
+        f'--sample-rate {int(sample_rate)} --channels {int(channels)} --fps {eff_fps:.3f}{audio_sub_flag}{audio_dj_flag}{freerun_flag} -- {audio_cmd}'
     )
     sub_flags = ''
     has_geom = int(width or 0) > 0 and int(height or 0) > 0
@@ -581,7 +628,7 @@ def wrap_av_sync_pair(
             sub_flags += f' --dj-config {shlex.quote(str(dj_config_path))}'
     wrapped_v = (
         f'{py} {script} --role video --sync-id {shlex.quote(sid)} '
-        f'--frame-bytes {int(frame_bytes)} --fps {eff_fps:.3f}{sub_flags} -- {video_cmd}'
+        f'--frame-bytes {int(frame_bytes)} --fps {eff_fps:.3f}{sub_flags}{freerun_flag} -- {video_cmd}'
     )
     return wrapped_a, wrapped_v
 
@@ -1070,6 +1117,11 @@ class Bridge:
         self._sync_monitor_task = None
         self.sync_monitor_interval_sec = 2.5
         self.allow_auto_resync_in_tests = False
+        self.tts = tts_engine.TtsEngine(cache_dir=self.root)
+        self.stt = stt_engine.SttEngine(cache_dir=self.root)
+        self.enable_gemini_live = (factory is None) and bool(os.environ.get('GEMINI_API_KEY'))
+        self.voice_listener = voice_listener.VoiceListenerManager(bridge=self, stt_engine=self.stt)
+        self._audio_lang_cache = {}
 
     def chat_lock(self, chat): return self.chat_locks.setdefault(chat, asyncio.Lock())
 
@@ -1094,6 +1146,10 @@ class Bridge:
                 from pyrogram import Client
                 from pytgcalls import PyTgCalls
                 from pytgcalls.types import StreamEnded, Device, ChatUpdate
+                try:
+                    from pytgcalls.types import StreamFrames
+                except Exception:
+                    StreamFrames = None
                 client = Client(f'lancy_{alias}', api_id=int(os.environ['TELEGRAM_API_ID']), api_hash=os.environ['TELEGRAM_API_HASH'], session_string=data['session'], in_memory=True)
                 await asyncio.wait_for(client.start(), 30)
                 me = getattr(client, 'me', None) or await asyncio.wait_for(client.get_me(), 10)
@@ -1104,6 +1160,9 @@ class Bridge:
                 engine = PyTgCalls(client)
                 @engine.on_update()
                 async def update(_, event):
+                    if StreamFrames is not None and isinstance(event, StreamFrames):
+                        self.voice_listener.handle_incoming_frames(alias, event.chat_id, event.frames)
+                        return
                     if isinstance(event, ChatUpdate) and bool(event.status & ChatUpdate.Status.LEFT_CALL):
                         await self.handle_chat_update(event.chat_id, str(event.status), expected_alias=alias)
                         return
@@ -2056,7 +2115,7 @@ class Bridge:
                     pass
             sid = call.get('av_sync_id')
             if sid:
-                for p in (av_sync.shm_path_for(sid), av_sync.substatus_path_for(sid)):
+                for p in (av_sync.shm_path_for(sid), av_sync.substatus_path_for(sid), av_sync.vchud_config_path_for(sid)):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:
@@ -2330,6 +2389,16 @@ class Bridge:
                 mon['stall_streak'] = int(mon.get('stall_streak') or 0) + 1
                 return metrics, 'hub_exited'
             return None, None
+
+        if call.get('music_freerun') or call.get('dj_desk') or call.get('is_music'):
+            mon['health'] = 'locked'
+            mon['skew_streak'] = 0
+            mon['stall_streak'] = 0
+            mon['last_log_health'] = 'locked'
+            if isinstance(metrics, dict):
+                metrics['sync_health'] = 'locked'
+                metrics['skew_ms'] = 0
+            return metrics, None
 
         health = str(metrics.get('sync_health') or 'locked')
         skew_ms = int(metrics.get('skew_ms') or 0)
@@ -3213,7 +3282,7 @@ class Bridge:
                     dur_pad = min(14400.0, max(30.0, float(call.get('duration') or (info.get('duration') if info else 0) or 300.0) + 12.0))
                     stream.camera.path = (
                         f'ffmpeg -nostdin -hide_banner -loglevel error '
-                        f'-loop 1 -framerate {int(target_fps)} -i {shlex.quote(dj_desk_img)} '
+                        f'-re -loop 1 -framerate {int(target_fps)} -i {shlex.quote(dj_desk_img)} '
                         f'-t {dur_pad:.2f} -an -sn -dn '
                         f'-vf scale={int(final_w)}:{int(final_h)}:flags=lanczos,setsar=1,format=yuv420p '
                         f'-f rawvideo -pix_fmt yuv420p pipe:1'
@@ -3273,8 +3342,10 @@ class Bridge:
 
                     wrap_a_in = stream.microphone.path
                     wrap_v_in = stream.camera.path
+                    music_freerun = bool(dj_desk_on or dj_desk_override or call.get('is_music') or call.get('music_freerun'))
+                    call['music_freerun'] = music_freerun
                     is_real_engine = (not self.factory) and type(a.get('engine')).__module__.startswith('pytgcalls')
-                    if (is_real_engine or getattr(self, 'use_av_hub_in_tests', False)) and not is_img and not dj_desk_override and os.path.isfile(AV_HUB_SCRIPT):
+                    if (is_real_engine or getattr(self, 'use_av_hub_in_tests', False)) and not is_img and not music_freerun and not dj_desk_override and os.path.isfile(AV_HUB_SCRIPT):
                         unified_cmd = build_unified_av_ffmpeg_command(wrap_a_in, wrap_v_in, output_format='nut')
                         if unified_cmd:
                             self._cleanup_hub(call)
@@ -3300,7 +3371,23 @@ class Bridge:
                         height=final_h if (sub_cfg_path or dj_cfg_path) else 0,
                         sub_config_path=sub_cfg_path,
                         dj_config_path=dj_cfg_path,
+                        music_freerun=music_freerun,
                     )
+            elif (
+                getattr(stream, 'microphone', None) is not None
+                and getattr(stream.microphone, 'path', None)
+                and not call.get('av_sync_id')
+                and os.path.isfile(AV_SYNC_SCRIPT)
+            ):
+                pair_id = f"{call.get('playback_id') or abs(int(chat))}-{uuid.uuid4().hex[:8]}"
+                sid = re.sub(r'[^a-zA-Z0-9_-]', '_', pair_id)[:64]
+                call['av_sync_id'] = sid
+                call['music_freerun'] = True
+                stream.microphone.path = (
+                    f"{shlex.quote(sys.executable)} {shlex.quote(AV_SYNC_SCRIPT)} "
+                    f"--role audio --audio-only --music-freerun --sync-id {shlex.quote(sid)} "
+                    f"-- {stream.microphone.path}"
+                )
             play_stream = Stream(
                 microphone=getattr(stream, 'microphone', None),
                 speaker=getattr(stream, 'speaker', None),
@@ -3448,6 +3535,7 @@ class Bridge:
             sub_drift_anchor = float(data.get('sub_drift_anchor_sec') or 0.0)
             pref_audio_lang = _norm_lang(data.get('preferred_audio_lang') or data.get('original_language'))
             dj_desk_on = bool(data.get('dj_desk'))
+            is_music = bool(data.get('is_music')) or dj_desk_on
             dj_desk_img = self.source_dj_image(data.get('dj_desk_image')) if dj_desk_on else None
             crossfade_sec = max(0.0, min(12.0, float(data.get('crossfade_sec') or 0.0)))
             created_with_title = False
@@ -3455,7 +3543,7 @@ class Bridge:
                 if previous.get('stream_mode') == 'rtmp':
                     await self._stop_rtmp_proc(previous, wait_settle=(stream_mode != 'rtmp'))
                 self._cleanup_sub_overlay(previous)
-            call = {'alias': a['alias'], 'path': path, 'stream_mode': stream_mode, 'preferred_audio_lang': pref_audio_lang, 'reject_dub': bool(data.get('reject_dub')), 'subtitle_path': sub_path, 'subtitle_offset': sub_offset, 'subtitle_same_route': sub_same_route, 'subtitle_render_screen': sub_render_screen, 'sub_drift_sec_per_sec': sub_drift_rate, 'sub_drift_anchor_sec': sub_drift_anchor, 'manual_sub_override': bool(data.get('subtitle_manual_override', False)), 'auto_subtitle_offset': None, 'dj_desk': dj_desk_on, 'dj_desk_image': dj_desk_img, 'crossfade_sec': crossfade_sec, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'remote_proxy': bool(data.get('remote_proxy')), 'duration': call_duration, 'offset': start_sec, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': start_sec if start_sec > 0 else None, 'last_known_position': start_sec, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic(), 'vc_title': vc_title}
+            call = {'alias': a['alias'], 'path': path, 'stream_mode': stream_mode, 'preferred_audio_lang': pref_audio_lang, 'reject_dub': bool(data.get('reject_dub')), 'subtitle_path': sub_path, 'subtitle_offset': sub_offset, 'subtitle_same_route': sub_same_route, 'subtitle_render_screen': sub_render_screen, 'sub_drift_sec_per_sec': sub_drift_rate, 'sub_drift_anchor_sec': sub_drift_anchor, 'manual_sub_override': bool(data.get('subtitle_manual_override', False)), 'auto_subtitle_offset': None, 'dj_desk': dj_desk_on, 'is_music': is_music, 'music_freerun': is_music, 'dj_desk_image': dj_desk_img, 'crossfade_sec': crossfade_sec, 'video': bool(data.get('video')), 'video_quality': str(data.get('video_quality') or os.environ.get('VOICE_VIDEO_QUALITY') or 'HD_720p'), 'bass': bool(data.get('bass')), 'eq': str(data.get('eq') or ('bass' if data.get('bass') else 'off')), 'is_channel': bool(data.get('is_channel')), 'remote_proxy': bool(data.get('remote_proxy')), 'duration': call_duration, 'offset': start_sec, 'playback_id': str(data['playback_id']), 'status': 'buffering', 'clock_errors': 0, 'position_seconds': start_sec if start_sec > 0 else None, 'last_known_position': start_sec, 'retries': 0, 'retry_after': 0.0, 'last_progress': time.monotonic(), 'vc_title': vc_title}
             if previous and previous.get('stream_mode') == 'rtmp' and stream_mode == 'rtmp' and previous.get('_rtmp_target'):
                 call['_rtmp_target'] = previous['_rtmp_target']
             if data.get('volume') is not None:
@@ -3574,6 +3662,17 @@ class Bridge:
                 call['status'] = 'playing'; self.calls[chat] = call; self.last_failures.pop(chat, None); self.last_ended_positions.pop(chat, None)
                 self._maybe_schedule_sub_align(a, chat, call)
                 self.ensure_sync_monitor()
+                if stream_mode == 'interactive' and bool(data.get('voice_ai_enabled', True)):
+                    auth_ids = data.get('voice_authorized_ids')
+                    await self.voice_listener.start_chat(
+                        chat,
+                        a['alias'],
+                        enabled=True,
+                        authorized_user_ids=auth_ids if isinstance(auth_ids, list) else None,
+                        enforce_auth=bool(data.get('voice_enforce_auth', False)),
+                    )
+                else:
+                    await self.voice_listener.stop_chat(chat)
                 probe_meta = call.get('_probe_info') or {}
                 return {
                     'ok': True,
@@ -3620,6 +3719,7 @@ class Bridge:
             hot_resumed = False
             if op == 'stop':
                 await self._stop_secondary_tile_unlocked(chat)
+                await self.voice_listener.stop_chat(chat)
                 if is_rtmp:
                     await self._stop_rtmp_proc(call, wait_settle=False)
                 self._cleanup_sub_overlay(call)
@@ -3689,6 +3789,7 @@ class Bridge:
                             await self._stream_rtmp(a, chat, call)
                 else:
                     if call.get('av_sync_id'):
+                        _set_sync_tts_hold(call.get('av_sync_id'), False)
                         if op == 'pause':
                             _mutate_sync_state(call.get('av_sync_id'), lambda st: setattr(st, 'sync_flags', int(st.sync_flags) | 4))
                             if not self.factory:
@@ -4084,6 +4185,7 @@ class Bridge:
             if expected_alias and call.get('alias') != expected_alias:
                 return None
             a = self.accounts.get(call['alias'])
+            await self.voice_listener.stop_chat(chat)
             return await self._close_dropped_call(a, chat, call, reason=reason, probe_time=True, emit_event=True, ignore_leave_error=True)
 
     async def status(self, chat):
@@ -4351,8 +4453,575 @@ class Bridge:
             stopped = await self._stop_secondary_tile_unlocked(chat)
             return {'ok': True, 'stopped': stopped}
 
+    async def speak_in_call(self, data):
+        chat = int(data['chat_id'])
+        text = str(data.get('text') or '').strip()
+        if chat >= 0 or not text or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        t_start = time.monotonic()
+        voice = data.get('voice')
+        rate = data.get('rate')
+        append_mode = bool(data.get('append_mode'))
+        barge_in_clear = bool(data.get('barge_in_clear'))
+        use_streaming_tts = (
+            type(getattr(self.tts, 'synthesize_pcm', None)).__name__ == 'method'
+            and hasattr(self.tts, 'synthesize_stream_pcm')
+        )
+
+        # Peek call sync context quickly before acquiring write path for streaming vs single-shot
+        call_snap = self.calls.get(chat)
+        if not call_snap:
+            raise VoiceFailure('NO_ACTIVE_CALL')
+        sync_id = call_snap.get('av_sync_id')
+        st_listen = self.voice_listener.states.get(chat)
+        init_barge_seq = int(getattr(st_listen, 'barge_in_seq', 0)) if st_listen else 0
+
+        if use_streaming_tts and sync_id and call_snap.get('stream_mode') != 'rtmp':
+            q_dir = av_sync.tts_queue_dir_for(sync_id)
+            q_dir.mkdir(parents=True, exist_ok=True)
+            total_bytes = 0
+            chunks_written = 0
+            first_chunk_ms = None
+            aborted_by_barge_in = False
+            async for chunk in self.tts.synthesize_stream_pcm(text, voice=voice, rate=rate, chunk_ms=60):
+                if not chunk:
+                    continue
+                if st_listen and int(getattr(st_listen, 'barge_in_seq', 0)) != init_barge_seq:
+                    aborted_by_barge_in = True
+                    break
+                if chunks_written == 0:
+                    first_chunk_ms = round((time.monotonic() - t_start) * 1000.0, 1)
+                    if barge_in_clear:
+                        av_sync.clear_tts_queue(sync_id)
+                    is_paused_hold = (call_snap.get('status') == 'paused')
+                    _write_vchud_state(
+                        sync_id,
+                        active=True,
+                        mode='speaking',
+                        speaker_name=data.get('speaker_name') or call_snap.get('_hud_speaker') or '',
+                        user_text=data.get('user_text') or call_snap.get('_hud_user_text') or '',
+                        lancy_text=data.get('lancy_text') or text,
+                        theme=data.get('hud_theme') or call_snap.get('_hud_theme') or 'neon_rose',
+                        ttl_sec=(35.0 if is_paused_hold else 8.0),
+                    )
+                    a = self.accounts.get(call_snap['alias'])
+                    if is_paused_hold and a and a.get('engine') and not self.factory:
+                        def _chk_stream(st):
+                            if int(st.tts_hold) == 0:
+                                st.tts_hold = 1
+                                st.paused = 1
+                        _mutate_sync_state(sync_id, _chk_stream)
+                        try:
+                            await asyncio.wait_for(a['engine'].resume(chat), 5.0)
+                        except Exception:
+                            pass
+                fname = f'{time.monotonic_ns():020d}_{chunks_written:04d}_{secrets.token_hex(2)}.pcm'
+                tmp_f = q_dir / f'.{fname}.tmp'
+                final_f = q_dir / fname
+                tmp_f.write_bytes(chunk)
+                os.replace(tmp_f, final_f)
+                chunks_written += 1
+                total_bytes += len(chunk)
+                chunk_dur = len(chunk) / float(av_sync.PCM_BYTES_PER_SEC)
+                self.voice_listener.set_echo_guard(chat, chunk_dur, extend=(append_mode or chunks_written > 1))
+            if not total_bytes and not aborted_by_barge_in:
+                return {'ok': False, 'error': 'TTS_EMPTY'}
+            dur_sec = round(total_bytes / float(av_sync.PCM_BYTES_PER_SEC), 3)
+            return {
+                'ok': True,
+                'mode': 'av_sync_mix_stream',
+                'duration_sec': dur_sec,
+                'chunks': chunks_written,
+                'first_audio_latency_ms': first_chunk_ms,
+                'aborted_by_barge_in': aborted_by_barge_in,
+            }
+
+        pcm = await self.tts.synthesize_pcm(text, voice=voice, rate=rate)
+        if not pcm:
+            return {'ok': False, 'error': 'TTS_EMPTY'}
+        first_chunk_ms = round((time.monotonic() - t_start) * 1000.0, 1)
+        dur_sec = round(len(pcm) / float(av_sync.PCM_BYTES_PER_SEC), 3)
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call:
+                raise VoiceFailure('NO_ACTIVE_CALL')
+            sync_id = call.get('av_sync_id')
+            if barge_in_clear and sync_id:
+                av_sync.clear_tts_queue(sync_id)
+            self.voice_listener.set_echo_guard(chat, dur_sec, extend=append_mode)
+            if sync_id and call.get('stream_mode') != 'rtmp':
+                q_dir = av_sync.tts_queue_dir_for(sync_id)
+                q_dir.mkdir(parents=True, exist_ok=True)
+                fname = f'{time.monotonic_ns():020d}_{secrets.token_hex(3)}.pcm'
+                tmp_f = q_dir / f'.{fname}.tmp'
+                final_f = q_dir / fname
+                tmp_f.write_bytes(pcm)
+                os.replace(tmp_f, final_f)
+                # Update live VC screen dialogue HUD as she speaks!
+                is_paused_hold = (call.get('status') == 'paused')
+                _write_vchud_state(
+                    sync_id,
+                    active=True,
+                    mode='speaking',
+                    speaker_name=data.get('speaker_name') or call.get('_hud_speaker') or '',
+                    user_text=data.get('user_text') or call.get('_hud_user_text') or '',
+                    lancy_text=data.get('lancy_text') or text,
+                    theme=data.get('hud_theme') or call.get('_hud_theme') or 'neon_rose',
+                    ttl_sec=(35.0 if is_paused_hold else max(3.5, dur_sec + 1.8)),
+                )
+                # Ensure pipe is flowing if previously hard-paused via engine.pause
+                a = self.accounts.get(call['alias'])
+                if call.get('status') == 'paused' and a and a.get('engine') and not self.factory:
+                    def _chk(st):
+                        if int(st.tts_hold) == 0:
+                            st.tts_hold = 1
+                            st.paused = 1
+                    _mutate_sync_state(sync_id, _chk)
+                    try:
+                        await asyncio.wait_for(a['engine'].resume(chat), 5.0)
+                    except Exception:
+                        pass
+                return {'ok': True, 'mode': 'av_sync_mix', 'duration_sec': dur_sec, 'first_audio_latency_ms': first_chunk_ms}
+
+            # Fallback for idle / audio-only call without av_sync
+            if call.get('status') == 'idle' and not self.factory and call.get('stream_mode') != 'rtmp':
+                a = self.accounts.get(call['alias'])
+                engine = a.get('engine') if a else None
+                if engine is not None:
+                    wav_path = await self.tts.synthesize_wav(text, voice=voice, rate=rate)
+                    if wav_path and wav_path.is_file():
+                        from pytgcalls.types import MediaStream, AudioQuality, GroupCallConfig
+                        ms = MediaStream(str(wav_path), audio_parameters=AudioQuality.HIGH, video_flags=MediaStream.Flags.IGNORE)
+                        await asyncio.wait_for(engine.play(chat, ms, config=GroupCallConfig(auto_start=False)), 12.0)
+                        return {'ok': True, 'mode': 'direct_stream', 'duration_sec': dur_sec, 'first_audio_latency_ms': first_chunk_ms}
+            return {'ok': True, 'mode': 'queued_noop', 'duration_sec': dur_sec, 'first_audio_latency_ms': first_chunk_ms}
+
+    async def barge_in_call(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0 or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        user_id = int(data['user_id']) if data.get('user_id') is not None else None
+        cleared = self.voice_listener.trigger_barge_in(chat, user_id=user_id)
+        return {'ok': True, 'cleared': bool(cleared)}
+
+    async def set_listen_state(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0 or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        mode = str(data.get('mode') or 'config').strip().lower()
+        active = bool(data.get('active', mode == 'start'))
+        duration_sec = float(data.get('duration_sec') or 28.0)
+        active_uid = int(data['active_user_id']) if data.get('active_user_id') is not None else None
+        pause_media = data.get('pause_media')
+        resume_media = data.get('resume_media')
+        enabled = data.get('enabled')
+        auth_ids = data.get('authorized_user_ids')
+        enforce_auth = data.get('enforce_auth')
+
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call:
+                raise VoiceFailure('NO_ACTIVE_CALL')
+            if enabled is False:
+                await self.voice_listener.stop_chat(chat)
+                call['voice_ai_enabled'] = False
+                return {'ok': True, 'enabled': False, 'active': False}
+            if enabled is True or chat not in self.voice_listener.states:
+                call['voice_ai_enabled'] = True
+                await self.voice_listener.start_chat(
+                    chat,
+                    call['alias'],
+                    enabled=True,
+                    authorized_user_ids=auth_ids if isinstance(auth_ids, list) else None,
+                    enforce_auth=bool(enforce_auth) if enforce_auth is not None else False,
+                )
+            st = self.voice_listener.states.get(chat)
+            if st:
+                if isinstance(auth_ids, list):
+                    st.authorized_user_ids = {int(x) for x in auth_ids if int(x or 0) > 0}
+                if enforce_auth is not None:
+                    st.enforce_auth = bool(enforce_auth)
+                if data.get('voice'):
+                    new_v = str(data.get('voice')).strip()
+                    if new_v and new_v != st.voice_name:
+                        st.voice_name = new_v
+                        if st.live_session is not None and bool(getattr(self, 'enable_gemini_live', False)):
+                            asyncio.create_task(self.voice_listener._start_live_session(chat, st))
+            self.voice_listener.set_listening_window(chat, active=active, duration_sec=duration_sec, active_user_id=active_uid)
+
+            sync_id = call.get('av_sync_id')
+            if data.get('speaker_name'):
+                call['_hud_speaker'] = str(data.get('speaker_name'))[:40]
+            if data.get('user_text'):
+                call['_hud_user_text'] = str(data.get('user_text'))[:180]
+            if data.get('hud_theme'):
+                call['_hud_theme'] = str(data.get('hud_theme'))[:32]
+            a = self.accounts.get(call['alias'])
+            engine = a.get('engine') if a else None
+            if pause_media is True and call.get('status') == 'playing':
+                try:
+                    elapsed = await self._call_elapsed_seconds(engine, chat, call, timeout=2.0)
+                    pos = max(0.0, float(call.get('offset') or 0.0) + elapsed)
+                    call['last_known_position'] = max(float(call.get('last_known_position') or 0.0), pos)
+                    call['position_seconds'] = call['last_known_position']
+                except Exception:
+                    pass
+                if sync_id and call.get('stream_mode') != 'rtmp':
+                    _set_sync_tts_hold(sync_id, True)
+                    _set_sync_paused(sync_id, True)
+                    _write_vchud_state(
+                        sync_id,
+                        active=True,
+                        mode='listening',
+                        speaker_name=call.get('_hud_speaker') or '',
+                        user_text=call.get('_hud_user_text') or '',
+                        lancy_text=data.get('lancy_text') or '',
+                        theme=call.get('_hud_theme') or 'neon_rose',
+                        ttl_sec=max(32.0, duration_sec),
+                    )
+                    call['status'] = 'paused'
+                elif engine is not None and call.get('stream_mode') != 'rtmp':
+                    try:
+                        await asyncio.wait_for(engine.pause(chat), 6.0)
+                        call['status'] = 'paused'
+                    except Exception:
+                        pass
+            elif active and sync_id and call.get('status') == 'paused' and (data.get('user_text') or data.get('lancy_text')):
+                _write_vchud_state(
+                    sync_id,
+                    active=True,
+                    mode='speaking' if data.get('lancy_text') else 'listening',
+                    speaker_name=call.get('_hud_speaker') or '',
+                    user_text=call.get('_hud_user_text') or '',
+                    lancy_text=data.get('lancy_text') or '',
+                    theme=call.get('_hud_theme') or 'neon_rose',
+                    ttl_sec=max(28.0, duration_sec),
+                )
+            elif resume_media is True and call.get('status') == 'paused':
+                if sync_id and call.get('stream_mode') != 'rtmp':
+                    _set_sync_tts_hold(sync_id, False)
+                    _set_sync_paused(sync_id, False)
+                    _write_vchud_state(sync_id, active=False)
+                    call['status'] = 'playing'
+                    call['last_progress'] = time.monotonic()
+                elif engine is not None and call.get('stream_mode') != 'rtmp':
+                    try:
+                        await asyncio.wait_for(engine.resume(chat), 6.0)
+                        call['status'] = 'playing'
+                        call['last_progress'] = time.monotonic()
+                    except Exception:
+                        pass
+
+            return {
+                'ok': True,
+                'enabled': bool(call.get('voice_ai_enabled', True)),
+                'active': bool(active),
+                'status': call.get('status'),
+            }
+
+    async def get_call_participants(self, chat):
+        cid = int(chat)
+        st = self.voice_listener.states.get(cid)
+        if not st:
+            return {'ok': True, 'participants': {}, 'participant_list': []}
+        mapping = await self.voice_listener.refresh_participants(cid, force=True)
+        plist = [
+            {
+                'ssrc': int(src),
+                'user_id': int(uid),
+                'display_name': st.uid_to_name.get(int(uid)) or f'User {uid}',
+            }
+            for src, uid in mapping.items()
+        ]
+        return {'ok': True, 'participants': {str(k): int(v) for k, v in mapping.items()}, 'participant_list': plist}
+
+    async def stt_transcribe(self, data):
+        import tempfile
+        file_path = str(data.get('file_path') or '').strip()
+        if not file_path:
+            raise VoiceFailure('INVALID_REQUEST')
+        src_path = Path(file_path).resolve()
+        cache_attr = getattr(self, 'cache_root', None) or getattr(self, 'cache_dir', None) or getattr(getattr(self, 'tts', None), 'cache_dir', None)
+        allowed_roots = [Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()]
+        if cache_attr:
+            allowed_roots.append(Path(cache_attr).resolve())
+        if not any(src_path == root or root in src_path.parents for root in allowed_roots) or not src_path.is_file():
+            raise VoiceFailure('INVALID_REQUEST')
+        proc = await asyncio.create_subprocess_exec(
+            'ffmpeg', '-nostdin', '-hide_banner', '-loglevel', 'error',
+            '-i', str(src_path),
+            '-vn', '-sn', '-dn',
+            '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+            'pipe:1',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        pcm, stderr = await asyncio.wait_for(proc.communicate(), timeout=20.0)
+        if proc.returncode != 0 or not pcm:
+            log.debug('Voice note ffmpeg decode empty/err: %s', (stderr or b'').decode('utf-8', 'replace')[:120])
+            return {'ok': True, 'text': '', 'raw_text': '', 'confidence': 0.0, 'low_confidence': True, 'empty': True}
+        res = await self.stt.transcribe(
+            pcm,
+            sample_rate=16000,
+            channels=1,
+            context_hint=str(data.get('context_hint') or ''),
+            active_session=bool(data.get('active_session', True)),
+        )
+        if res is None:
+            return {'ok': True, 'text': '', 'raw_text': '', 'confidence': 0.0, 'low_confidence': True, 'empty': True}
+        return {
+            'ok': True,
+            'text': res.text,
+            'raw_text': res.raw_text,
+            'confidence': res.confidence,
+            'low_confidence': res.low_confidence,
+            'is_wake': res.is_wake,
+            'is_listen_command': res.is_listen_command,
+            'duration_sec': res.duration_sec,
+            'empty': False,
+        }
+
+    async def tts_synthesize_ogg(self, data):
+        import base64
+        text = str(data.get('text') or '').strip()
+        if not text:
+            raise VoiceFailure('INVALID_REQUEST')
+        ogg = await self.tts.synthesize_ogg_opus(
+            text,
+            voice=data.get('voice') or None,
+            rate=data.get('rate') or None,
+        )
+        if not ogg:
+            return {'ok': False, 'error': 'TTS_EMPTY'}
+        return {'ok': True, 'ogg_base64': base64.b64encode(ogg).decode('ascii'), 'bytes': len(ogg)}
+
+    async def submit_live_tool_result(self, data):
+        chat = int(data['chat_id'])
+        call_id = str(data.get('call_id') or '').strip()
+        name = str(data.get('name') or '').strip()
+        response = data.get('response')
+        if not name or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        sent = await self.voice_listener.submit_live_tool_result(chat, call_id, name, response)
+        return {'ok': True, 'sent': bool(sent)}
+
+    async def push_live_context(self, data):
+        chat = int(data['chat_id'])
+        summary = str(data.get('summary') or '').strip()
+        if chat >= 0 or not summary or self.closing:
+            return {'ok': False}
+        sent = await self.voice_listener.push_context_update(chat, summary)
+        return {'ok': True, 'sent': bool(sent)}
+
+    async def _fetch_bytes_with_fallback(self, target_url, headers=None, timeout_sec=6.0):
+        import urllib.request
+        import urllib.parse
+        hdr_variants = []
+        if isinstance(headers, dict) and headers:
+            hdr_variants.append(dict(headers))
+        hdr_variants.extend([
+            {'Referer': 'https://p.10010.top/', 'Origin': 'https://p.10010.top'},
+            {'Referer': 'https://player.cinezo.live/', 'Origin': 'https://player.cinezo.live'},
+            {},
+        ])
+        urls_to_try = [str(target_url)]
+        if 'sacdn.hakunaymatata.com' in str(target_url) and 'dash-hls-bridge' not in str(target_url):
+            urls_to_try.append(
+                'https://dash-hls-bridge.johndoesdmc.workers.dev/?url='
+                + urllib.parse.quote(str(target_url), safe='')
+            )
+
+        def _sync_get():
+            for cand_u in urls_to_try:
+                for hdr in hdr_variants:
+                    req_hdrs = {
+                        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+                        **{str(k): str(v) for k, v in hdr.items() if k and v is not None},
+                    }
+                    try:
+                        req = urllib.request.Request(cand_u, headers=req_hdrs)
+                        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+                            if 200 <= getattr(resp, 'status', 200) < 300:
+                                return resp.read(), getattr(resp, 'url', cand_u)
+                    except Exception:
+                        continue
+            return None, str(target_url)
+
+        return await asyncio.to_thread(_sync_get)
+
+    async def _extract_hls_audio_sample_bytes(self, playlist_url, headers=None, offset_sec=75):
+        import urllib.parse
+        raw, final_url = await self._fetch_bytes_with_fallback(playlist_url, headers=headers, timeout_sec=6.0)
+        if not raw:
+            return None
+        text = raw.decode('utf-8', errors='replace')
+        if '#EXTM3U' not in text:
+            return None
+
+        # Follow master -> primary/audio media playlist
+        if '#EXT-X-STREAM-INF' in text:
+            audio_uri = None
+            first_var = None
+            lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            for i, ln in enumerate(lines):
+                if ln.startswith('#EXT-X-MEDIA:') and 'TYPE=AUDIO' in ln.upper():
+                    m = re.search(r'URI="([^"]+)"', ln, re.I)
+                    if m:
+                        audio_uri = urllib.parse.urljoin(final_url, m.group(1))
+                        if 'DEFAULT=YES' in ln.upper():
+                            break
+                elif ln.startswith('#EXT-X-STREAM-INF:') and not first_var:
+                    for j in range(i + 1, len(lines)):
+                        if not lines[j].startswith('#'):
+                            first_var = urllib.parse.urljoin(final_url, lines[j])
+                            break
+            target_pl = audio_uri or first_var
+            if not target_pl:
+                return None
+            raw, final_url = await self._fetch_bytes_with_fallback(target_pl, headers=headers, timeout_sec=6.0)
+            if not raw:
+                return None
+            text = raw.decode('utf-8', errors='replace')
+
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        init_uri = None
+        segments = []
+        pending_dur = 5.0
+        for ln in lines:
+            if ln.startswith('#EXT-X-MAP:'):
+                m = re.search(r'URI="([^"]+)"', ln, re.I)
+                if m:
+                    init_uri = urllib.parse.urljoin(final_url, m.group(1))
+            elif ln.startswith('#EXTINF:'):
+                m = re.match(r'#EXTINF:([0-9.]+)', ln, re.I)
+                if m:
+                    try:
+                        pending_dur = max(0.5, float(m.group(1)))
+                    except Exception:
+                        pending_dur = 5.0
+            elif not ln.startswith('#'):
+                segments.append((pending_dur, urllib.parse.urljoin(final_url, ln)))
+                pending_dur = 5.0
+
+        if not segments:
+            return None
+
+        # Jump past intro/opening credits to offset_sec and collect ~20-25s of contiguous segments
+        elapsed = 0.0
+        start_idx = 0
+        for idx, (dur, _) in enumerate(segments):
+            if elapsed >= float(offset_sec):
+                start_idx = idx
+                break
+            elapsed += dur
+        if start_idx >= len(segments):
+            start_idx = max(0, len(segments) // 3)
+        chosen = segments[start_idx:start_idx + 5]
+        if not chosen:
+            chosen = segments[:4]
+
+        chunks = []
+        if init_uri:
+            init_bytes, _ = await self._fetch_bytes_with_fallback(init_uri, headers=headers, timeout_sec=5.0)
+            if init_bytes:
+                chunks.append(init_bytes)
+        seg_results = await asyncio.gather(
+            *[self._fetch_bytes_with_fallback(u, headers=headers, timeout_sec=5.0) for _, u in chosen],
+            return_exceptions=True,
+        )
+        for item in seg_results:
+            if isinstance(item, tuple) and item[0]:
+                chunks.append(item[0])
+        if not chunks:
+            return None
+        return b''.join(chunks)
+
+    async def verify_audio_language(self, data):
+        url = str(data.get('url') or '').strip()
+        if not url or not re.match(r'^https?://', url, re.I):
+            raise VoiceFailure('INVALID_REQUEST')
+        headers = data.get('headers') if isinstance(data.get('headers'), dict) else {}
+        offset_sec = max(0, min(600, int(data.get('offset_sec') if data.get('offset_sec') is not None else 75)))
+        now = time.monotonic()
+        cached = self._audio_lang_cache.get(url)
+        if cached and (now - cached[0]) < 600.0:
+            return dict(cached[1])
+        hdr_lines = ''.join(
+            f'{k}: {str(v).strip()}\r\n'
+            for k, v in headers.items()
+            if k and v is not None and str(v).strip()
+        )
+        # Try offset window first, then a deeper dialogue window (165s) and near-start fallback so quiet intros/credits never hide spoken audio.
+        offsets_to_try = [offset_sec]
+        if offset_sec < 140:
+            offsets_to_try.append(165)
+        if offset_sec > 20:
+            offsets_to_try.append(15)
+
+        best_res = {'ok': True, 'language': None, 'probability': 0.0, 'speech_detected': False, 'sample_text': ''}
+        looks_hls = bool('.m3u8' in url.lower() or '/m/' in url.lower())
+        for off in offsets_to_try:
+            raw_sample = None
+            if looks_hls:
+                raw_sample = await self._extract_hls_audio_sample_bytes(url, headers=headers, offset_sec=off)
+
+            if raw_sample:
+                cmd = [
+                    'ffmpeg', '-nostdin', '-v', 'error',
+                    '-i', 'pipe:0',
+                    '-vn', '-sn', '-dn',
+                    '-t', '22',
+                    '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                    'pipe:1',
+                ]
+            else:
+                cmd = ['ffmpeg', '-nostdin', '-v', 'error']
+                if hdr_lines:
+                    cmd.extend(['-headers', hdr_lines])
+                cmd.extend([
+                    '-user_agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+                    '-ss', str(off),
+                    '-i', url,
+                    '-vn', '-sn', '-dn',
+                    '-t', '18',
+                    '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                    'pipe:1',
+                ])
+
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE if raw_sample else asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(input=raw_sample if raw_sample else None),
+                    timeout=9.0,
+                )
+                if len(stdout) >= 32000:
+                    res = await self.stt.detect_spoken_language(stdout, sample_rate=16000, channels=1)
+                    if res.get('speech_detected'):
+                        best_res = res
+                        break
+                    if (res.get('probability') or 0.0) > (best_res.get('probability') or 0.0):
+                        best_res = res
+            except Exception:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+        if len(self._audio_lang_cache) > 256:
+            self._audio_lang_cache.clear()
+        self._audio_lang_cache[url] = (now, dict(best_res))
+        return best_res
+
     async def shutdown(self):
         self.closing = True
+        await self.voice_listener.stop_all()
         mon_task = getattr(self, '_sync_monitor_task', None)
         if mon_task is not None and not mon_task.done():
             mon_task.cancel()
@@ -4410,6 +5079,15 @@ def make_app(bridge, token):
     async def call_messages_delete(request): return web.json_response(await bridge.delete_call_messages(await request.json()))
     async def secondary_tile_start(request): return web.json_response(await bridge.start_secondary_tile(await request.json()))
     async def secondary_tile_stop(request): return web.json_response(await bridge.stop_secondary_tile(await request.json()))
+    async def call_speak(request): return web.json_response(await bridge.speak_in_call(await request.json()))
+    async def call_barge_in(request): return web.json_response(await bridge.barge_in_call(await request.json()))
+    async def call_live_tool_result(request): return web.json_response(await bridge.submit_live_tool_result(await request.json()))
+    async def call_live_context(request): return web.json_response(await bridge.push_live_context(await request.json()))
+    async def call_listen(request): return web.json_response(await bridge.set_listen_state(await request.json()))
+    async def call_participants(request): return web.json_response(await bridge.get_call_participants(int(request.query['chat_id'])))
+    async def stt_transcribe(request): return web.json_response(await bridge.stt_transcribe(await request.json()))
+    async def tts_synthesize(request): return web.json_response(await bridge.tts_synthesize_ogg(await request.json()))
+    async def verify_audio_lang(request): return web.json_response(await bridge.verify_audio_language(await request.json()))
     app.router.add_get('/events', events)
     app.router.add_get('/health', health); app.router.add_get('/accounts', accounts)
     app.router.add_post('/accounts/register', register); app.router.add_post('/accounts/configure', configure)
@@ -4417,6 +5095,9 @@ def make_app(bridge, token):
     app.router.add_post('/call/play', play); app.router.add_get('/call/status', status); app.router.add_get('/call/invite-link', call_invite)
     app.router.add_post('/call/settings', call_settings); app.router.add_post('/call/message', call_message); app.router.add_post('/call/messages/delete', call_messages_delete)
     app.router.add_post('/call/secondary-tile/start', secondary_tile_start); app.router.add_post('/call/secondary-tile/stop', secondary_tile_stop)
+    app.router.add_post('/call/speak', call_speak); app.router.add_post('/call/barge_in', call_barge_in); app.router.add_post('/call/live-tool-result', call_live_tool_result); app.router.add_post('/call/live-context', call_live_context); app.router.add_post('/call/listen', call_listen); app.router.add_get('/call/participants', call_participants)
+    app.router.add_post('/stt/transcribe', stt_transcribe); app.router.add_post('/tts/synthesize', tts_synthesize)
+    app.router.add_post('/verify-audio-lang', verify_audio_lang)
     app.router.add_post('/call/{op:pause|resume|stop|idle|volume|seek|subtitle|subcheck}', control)
     async def cleanup(_): await bridge.shutdown()
     app.on_cleanup.append(cleanup)
