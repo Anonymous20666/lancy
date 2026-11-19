@@ -211,7 +211,7 @@ class VoiceListenerManager:
         def _engage_live_pause():
             cur_call = self.bridge.calls.get(cid) or {}
             sync_id = cur_call.get('av_sync_id')
-            if cur_call.get('status') != 'playing' or not sync_id or cur_call.get('stream_mode') == 'rtmp':
+            if cur_call.get('browser_live') or cur_call.get('status') != 'playing' or not sync_id or cur_call.get('stream_mode') == 'rtmp':
                 return
             try:
                 import main as _m
@@ -409,7 +409,7 @@ class VoiceListenerManager:
                         st.paused_by_live = False
                 elif fn_name == 'finish_conversation':
                     resume = bool(args.get('resumePlayback', True))
-                    await self.release_live_pause(cid, resume=resume)
+                    await self.release_live_pause(cid, resume=resume, clear_engaged=True)
                     await sess_obj.send_tool_response(call_id, fn_name, {
                         'status': 'ok',
                         'retryable': False,
@@ -499,21 +499,27 @@ class VoiceListenerManager:
             return False
         now_m = time.monotonic()
         st.last_live_turn_mono = now_m
-        st.live_engaged_until_mono = max(st.live_engaged_until_mono, now_m + 45.0)
+        st.live_engaged_until_mono = max(st.live_engaged_until_mono, now_m + 90.0)
         sess_obj = st.pending_tool_sessions.pop(str(call_id), None) or st.live_session
         if not sess_obj or not sess_obj.connected:
             return False
         return await sess_obj.send_tool_response(call_id, name, response)
 
-    async def push_context_update(self, chat_id: int, summary: str) -> bool:
+    async def push_context_update(self, chat_id: int, summary: str, *, trigger_turn: bool = False) -> bool:
         st = self.states.get(int(chat_id))
         if not st:
             return False
+        now_m = time.monotonic()
+        if trigger_turn:
+            st.last_live_turn_mono = now_m
+            st.live_engaged_until_mono = max(st.live_engaged_until_mono, now_m + 90.0)
         if 'status=paused' in str(summary) and not st.paused_by_live:
             st.paused_by_live = False
             st.live_ntg_resumed = False
         elif 'status=playing' in str(summary):
             st.live_ntg_resumed = False
+        if trigger_turn and st.live_session is not None and getattr(st.live_session, 'connected', False):
+            return await st.live_session.send_text_turn(summary)
         sent_any = False
         for sess_obj in [st.live_session, *list(st.persona_sessions.values())]:
             if sess_obj is not None and getattr(sess_obj, 'connected', False):
@@ -521,7 +527,7 @@ class VoiceListenerManager:
                     sent_any = True
         return sent_any
 
-    async def release_live_pause(self, chat_id: int, *, resume: bool = True) -> bool:
+    async def release_live_pause(self, chat_id: int, *, resume: bool = True, clear_engaged: bool = False) -> bool:
         cid = int(chat_id)
         st = self.states.get(cid)
         if not st:
@@ -530,7 +536,8 @@ class VoiceListenerManager:
         expected_pid = st.paused_track_id
         st.paused_by_live = False
         st.live_ntg_resumed = False
-        st.live_engaged_until_mono = 0.0
+        if clear_engaged:
+            st.live_engaged_until_mono = 0.0
         st.paused_track_id = ''
         if not resume or not was_paused:
             return False
@@ -568,6 +575,7 @@ class VoiceListenerManager:
         authorized_user_ids: list[int] | None = None,
         enforce_auth: bool = False,
         use_live: bool | None = None,
+        force_record: bool = False,
     ) -> ChatListenState:
         cid = int(chat_id)
         st = self.states.get(cid)
@@ -579,7 +587,7 @@ class VoiceListenerManager:
             st.authorized_user_ids = {int(x) for x in authorized_user_ids if int(x or 0) > 0}
         st.enforce_auth = bool(enforce_auth)
         self.ensure_flush_loop()
-        if st.enabled and not st.recording_started:
+        if st.enabled and (force_record or not st.recording_started):
             await self._attach_record(cid, alias, st)
         should_live = bool(use_live) if use_live is not None else bool(getattr(self.bridge, 'enable_gemini_live', False))
         if st.enabled and should_live and st.live_session is None:
@@ -793,18 +801,16 @@ class VoiceListenerManager:
                     or (active_window and (st.active_user_id is None or uid == st.active_user_id or (uid in st.authorized_user_ids)))
                 )
                 if live_ready:
-                    # Forward conversational voice to Gemini Live AEC/Polite-Barge-in, but only clear local SHM
-                    # playback queue immediately on sustained loud speech to prevent echo-click skips mid-story.
-                    if can_barge and rms >= 0.016:
+                    # Only forward or barge-in during active TTS output when a speaker intentionally raises their voice above speakerphone/room echo, preventing mid-story cutoffs.
+                    if can_barge and rms >= 0.024:
                         sb.barge_frames += 1
-                        if sb.barge_frames >= 5:
+                        if sb.barge_frames >= 4:
                             self.trigger_barge_in(cid, user_id=uid, ssrc=ssrc)
                             echo_guarded = False
                             sb.barge_frames = 0
                     else:
                         sb.barge_frames = 0
-                    if rms < 0.0028:
-                        if not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 1.80:
+                        if not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 2.80:
                             st.live_tail_flushed = True
                             try:
                                 if st.live_audio_queue.full():
@@ -842,7 +848,7 @@ class VoiceListenerManager:
                         st.live_audio_queue.put_nowait((raw, sr, ch, uid, s_name))
                     except Exception:
                         pass
-                elif not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 1.80:
+                elif not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 2.80:
                     st.live_tail_flushed = True
                     try:
                         if st.live_audio_queue.full():
@@ -904,12 +910,16 @@ class VoiceListenerManager:
                         if elapsed_idle >= VAD_INCOMPLETE_HOLD_SEC or elapsed_total >= VAD_MAX_MERGED_TURN_SEC:
                             st.pending_turns.pop(ssrc_key, None)
                             self._emit_turn_event(st, pt)
+                    cur_call = self.bridge.calls.get(st.chat_id) or {}
+                    any_speaking = any(sb.in_speech for sb in st.buffers.values())
                     if (
                         st.paused_by_live
+                        and not cur_call.get('browser_live')
+                        and not any_speaking
                         and now >= st.echo_guard_until_mono
-                        and (now - max(st.last_live_turn_mono, st.last_user_speech_mono, st.echo_guard_until_mono)) >= 14.0
+                        and (now - max(st.last_live_turn_mono, st.last_user_speech_mono, st.echo_guard_until_mono)) >= 25.0
                     ):
-                        await self.release_live_pause(st.chat_id, resume=True)
+                        await self.release_live_pause(st.chat_id, resume=True, clear_engaged=False)
         except asyncio.CancelledError:
             pass
 

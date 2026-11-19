@@ -178,7 +178,7 @@ export const DEFAULT_SETTINGS = {
     connectorMode: 'local',      // local | remote | ssh-tunnel
     apiToken: '',
     streamQuality: 'high',       // low | high
-    streamFps: 12,
+    streamFps: 15,
     streamWidth: 1280,
     streamHeight: 720,
     audioMutedByDefault: true,

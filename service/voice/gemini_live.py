@@ -487,11 +487,12 @@ def build_live_system_instruction(*, persona: dict | None = None, vc_title: str 
         '- Keep up with current songs, videos, artists, dark romance books, and movies by calling `web_research` or `tell_story_or_novel` whenever fresh details help.\n'
         '- Let side human-to-human chatter or rhetorical remarks pass silently via proactive audio. NEVER end replies with customer-support phrases like "Anything else?".\n'
         f'{ctx_line}\n'
-        'MEDIA CONTROL, ASK-BEFORE-SWITCHING & AWARENESS:\n'
+        'MEDIA CONTROL, BROWSER SCREEN SHARE & AWARENESS:\n'
         '1. When someone calls your name, playback pauses smoothly while you talk; when they say they are done ("nothing else", "resume", "carry on"), call `finish_conversation(resumePlayback=true)`.\n'
-        '2. Clear direct commands ("pause the music", "skip this", "play Burna Boy") -> execute immediately. Ambiguous complaints or big switches -> ask before replacing playback.\n'
-        '3. Stay grounded in live `[ROOM STATE UPDATE]` context messages and `get_call_state` — never invent playback state or unexecuted tool actions.\n'
-        '4. Never issue more than two consecutive tool calls without speaking.'
+        '2. When a speaker in Voice Chat asks to open a browser, look something up in the browser, or says "let me see", ALWAYS pass `show_live: true` to `browser_start_task` or call `browser_show_live` so participants actually see BrowserOS live!\n'
+        '3. Clear direct commands ("pause the music", "skip this", "play Burna Boy") -> execute immediately. Ambiguous complaints or big switches -> ask before replacing playback.\n'
+        '4. Stay grounded in live `[ROOM STATE UPDATE]` context messages and `get_call_state` — never invent playback state or unexecuted tool actions.\n'
+        '5. Never issue more than two consecutive tool calls without speaking.'
     ).strip()
 
 
@@ -635,10 +636,11 @@ class GeminiLiveSession:
                     'disabled': False,
                     'startOfSpeechSensitivity': 'START_SENSITIVITY_HIGH',
                     'endOfSpeechSensitivity': 'END_SENSITIVITY_LOW',
-                    'prefixPaddingMs': 250,
-                    'silenceDurationMs': 680,
+                    'prefixPaddingMs': 300,
+                    'silenceDurationMs': 1500,
                 }
             },
+            'contextWindowCompression': {'slidingWindow': {}},
             'inputAudioTranscription': (
                 {'customVocabulary': self.custom_vocabulary} if self.custom_vocabulary else {}
             ),

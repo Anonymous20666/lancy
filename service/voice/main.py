@@ -4471,7 +4471,7 @@ class Bridge:
             raise VoiceFailure('INVALID_REQUEST')
         width = max(320, min(1920, int(data.get('width') or 1280))) & ~1
         height = max(180, min(1080, int(data.get('height') or 720))) & ~1
-        fps = max(5, min(30, int(round(float(data.get('fps') or 12)))))
+        fps = max(5, min(30, int(round(float(data.get('fps') or 15)))))
 
         async with self.chat_lock(chat):
             max_vid_raw = data.get('max_video_calls_per_account')
@@ -4628,7 +4628,7 @@ class Bridge:
                     )
                     play_stream = Stream(
                         microphone=AudioStream(MediaSource.SHELL, wrapped_a, AudioParameters(bitrate=48000, channels=2)),
-                        camera=VideoStream(MediaSource.SHELL, wrapped_v, VideoParameters(width=width, height=height, frame_rate=fps)),
+                        screen=VideoStream(MediaSource.SHELL, wrapped_v, VideoParameters(width=width, height=height, frame_rate=fps, adjust_by_height=False)),
                     )
                     await asyncio.wait_for(a['engine'].play(chat, play_stream, config=GroupCallConfig(auto_start=False)), 25)
                     try:
@@ -4649,7 +4649,7 @@ class Bridge:
                 try:
                     if isinstance(data.get('voice_authorized_ids'), list):
                         self.voice_listener.set_authorized_ids(chat, data.get('voice_authorized_ids'))
-                    await self.voice_listener.start_chat(chat, a['alias'], enabled=True)
+                    await self.voice_listener.start_chat(chat, a['alias'], enabled=True, force_record=True)
                 except Exception:
                     pass
             return {
@@ -5058,7 +5058,7 @@ class Bridge:
         summary = str(data.get('summary') or '').strip()
         if chat >= 0 or not summary or self.closing:
             return {'ok': False}
-        sent = await self.voice_listener.push_context_update(chat, summary)
+        sent = await self.voice_listener.push_context_update(chat, summary, trigger_turn=bool(data.get('trigger_turn')))
         return {'ok': True, 'sent': bool(sent)}
 
     async def _fetch_bytes_with_fallback(self, target_url, headers=None, timeout_sec=6.0):

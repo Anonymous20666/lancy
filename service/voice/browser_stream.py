@@ -194,26 +194,39 @@ def decode_jpeg_to_yuv420(jpeg_bytes, width, height, *, decoder=None):
         return None
     f = frames[0]
     src_w, src_h = int(f.width or width), int(f.height or height)
+    lanczos = av.video.reformatter.Interpolation.LANCZOS
     if src_w == width and src_h == height:
-        out = f.reformat(width=width, height=height, format='yuv420p')
+        out = f.reformat(width=width, height=height, format='yuv420p', interpolation=lanczos)
         return b''.join(bytes(p) for p in out.planes)
-
-    # Preserve aspect ratio with crisp letterbox/pillarbox onto target 16:9 canvas
-    scale = min(width / max(1, src_w), height / max(1, src_h))
-    fit_w = max(2, int(round(src_w * scale)) & ~1)
-    fit_h = max(2, int(round(src_h * scale)) & ~1)
-    scaled = f.reformat(width=fit_w, height=fit_h, format='yuv420p')
 
     y_canvas = np.full((height, width), 16, dtype=np.uint8)
     u_canvas = np.full((height // 2, width // 2), 128, dtype=np.uint8)
     v_canvas = np.full((height // 2, width // 2), 128, dtype=np.uint8)
 
+    if src_w <= width and src_h <= height:
+        # Avoid fractional resampling blur when source fits: convert YUV420p at 1:1 pixels and center.
+        fit_w = max(2, src_w & ~1)
+        fit_h = max(2, src_h & ~1)
+        scaled = f.reformat(format='yuv420p', interpolation=lanczos)
+    else:
+        scale = min(width / max(1, src_w), height / max(1, src_h))
+        fit_w = max(2, int(round(src_w * scale)) & ~1)
+        fit_h = max(2, int(round(src_h * scale)) & ~1)
+        scaled = f.reformat(width=fit_w, height=fit_h, format='yuv420p', interpolation=lanczos)
+
     dx = ((width - fit_w) // 2) & ~1
     dy = ((height - fit_h) // 2) & ~1
 
-    sy = np.frombuffer(scaled.planes[0], dtype=np.uint8).reshape(fit_h, scaled.planes[0].line_size)[:, :fit_w]
-    su = np.frombuffer(scaled.planes[1], dtype=np.uint8).reshape(fit_h // 2, scaled.planes[1].line_size)[:, :fit_w // 2]
-    sv = np.frombuffer(scaled.planes[2], dtype=np.uint8).reshape(fit_h // 2, scaled.planes[2].line_size)[:, :fit_w // 2]
+    y_buf = np.frombuffer(scaled.planes[0], dtype=np.uint8)
+    u_buf = np.frombuffer(scaled.planes[1], dtype=np.uint8)
+    v_buf = np.frombuffer(scaled.planes[2], dtype=np.uint8)
+    y_stride = scaled.planes[0].line_size
+    u_stride = scaled.planes[1].line_size
+    v_stride = scaled.planes[2].line_size
+
+    sy = y_buf.reshape(len(y_buf) // y_stride, y_stride)[:fit_h, :fit_w]
+    su = u_buf.reshape(len(u_buf) // u_stride, u_stride)[:fit_h // 2, :fit_w // 2]
+    sv = v_buf.reshape(len(v_buf) // v_stride, v_stride)[:fit_h // 2, :fit_w // 2]
 
     y_canvas[dy:dy + fit_h, dx:dx + fit_w] = sy
     u_canvas[dy // 2:(dy + fit_h) // 2, dx // 2:(dx + fit_w) // 2] = su
@@ -406,7 +419,7 @@ def _read_meta_cached(meta_path, fallback):
 def _run_video(args):
     w = max(2, int(args.width) & ~1)
     h = max(2, int(args.height) & ~1)
-    fps = max(5.0, min(30.0, float(args.fps or 12.0)))
+    fps = max(5.0, min(30.0, float(args.fps or 15.0)))
     frame_interval = 1.0 / fps
 
     overlay = BrowserOverlayRenderer(w, h)
@@ -547,7 +560,7 @@ def _run_nut(args):
     """Emit real-time interleaved NUT stream (`yuv420p` + `pcm_s16le`) for RTMP hub mode."""
     w = max(2, int(args.width) & ~1)
     h = max(2, int(args.height) & ~1)
-    fps = max(5.0, min(30.0, float(args.fps or 12.0)))
+    fps = max(5.0, min(30.0, float(args.fps or 15.0)))
     fps_int = int(round(fps))
     frame_interval = 1.0 / fps_int
 
@@ -640,7 +653,7 @@ def main(argv=None):
     ap.add_argument('--stats-file', default='')
     ap.add_argument('--width', type=int, default=1280)
     ap.add_argument('--height', type=int, default=720)
-    ap.add_argument('--fps', type=float, default=12.0)
+    ap.add_argument('--fps', type=float, default=15.0)
     args = ap.parse_args(argv)
 
     av_sync._set_pdeathsig(signal.SIGTERM)

@@ -73,7 +73,8 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
         self.assertEqual(setup['generationConfig']['responseModalities'], ['AUDIO'])
         self.assertEqual(setup['generationConfig']['speechConfig']['voiceConfig']['prebuiltVoiceConfig']['voiceName'], 'Charon')
         self.assertEqual(setup['realtimeInputConfig']['automaticActivityDetection']['endOfSpeechSensitivity'], 'END_SENSITIVITY_LOW')
-        self.assertEqual(setup['realtimeInputConfig']['automaticActivityDetection']['silenceDurationMs'], 680)
+        self.assertEqual(setup['realtimeInputConfig']['automaticActivityDetection']['silenceDurationMs'], 1500)
+        self.assertEqual(setup.get('contextWindowCompression'), {'slidingWindow': {}})
         self.assertIn('Lancy', setup['inputAudioTranscription']['customVocabulary'])
         self.assertIn('outputAudioTranscription', setup)
         self.assertNotIn('enable_affective_dialog', setup)
@@ -249,15 +250,21 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
             st.live_session = mock_sess
             st.live_audio_queue = q
 
-            # Under echo guard, conversational speech (~0.006 RMS) in Live mode passes & triggers barge-in immediately
+            # Under echo guard, soft speakerphone bleed (~0.006 RMS) is suppressed so long speech isn't cut off,
+            # while loud sustained speech (>=0.024 RMS for >=4 frames) passes & triggers barge-in cleanly.
             mgr.set_echo_guard(-100444, 2.0)
-            conv_frame = MagicMock(ssrc=2222, frame=np.full(720, 220, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
-            mgr.handle_incoming_frames('main', -100444, [conv_frame])
-            self.assertEqual(q.qsize(), 1)
+            bleed_frame = MagicMock(ssrc=2222, frame=np.full(720, 220, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
+            mgr.handle_incoming_frames('main', -100444, [bleed_frame])
+            self.assertEqual(q.qsize(), 0)
+            loud_frame = MagicMock(ssrc=2222, frame=np.full(720, 2200, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
+            mgr.handle_incoming_frames('main', -100444, [loud_frame, loud_frame, loud_frame, loud_frame])
+            self.assertGreaterEqual(q.qsize(), 1)
+            while not q.empty():
+                q.get_nowait()
 
-            # Silence past 1.80s triggers exactly one __FLUSH__ sentinel for snappy VAD completion
+            # Silence past 2.80s triggers exactly one __FLUSH__ sentinel for complete long-talk turns
             sb = st.buffers[2222]
-            sb.last_voice_mono = time.monotonic() - 2.0
+            sb.last_voice_mono = time.monotonic() - 3.0
             st.last_user_speech_mono = sb.last_voice_mono
             quiet_frame = MagicMock(ssrc=2222, frame=np.zeros(720, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
             mgr.handle_incoming_frames('main', -100444, [quiet_frame])
@@ -371,6 +378,74 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
             self.assertEqual(len(pcm_out), 1)
             self.assertEqual(len(transcripts), 1)
             self.assertIn('Pappy', transcripts[0]['input_text'])
+
+        asyncio.run(run())
+
+    def test_long_talk_echo_guard_browser_live_pause_skip_and_context_turn(self):
+        sess = gemini_live.GeminiLiveSession(api_key='k', chat_id=-100555)
+        setup = sess.build_setup_payload()['setup']
+        self.assertEqual(setup.get('contextWindowCompression'), {'slidingWindow': {}})
+        vad = setup['realtimeInputConfig']['automaticActivityDetection']
+        self.assertGreaterEqual(vad['silenceDurationMs'], 1500)
+
+        async def run():
+            from unittest.mock import patch
+            bridge = MagicMock()
+            bridge.factory = None
+            bridge.enable_gemini_live = False
+            bridge.events = asyncio.Queue(maxsize=10)
+            bridge.calls = {-100555: {'av_sync_id': 'sync_browser', 'browser_live': {'sync_id': 'sync_browser'}}}
+            engine = MagicMock()
+            engine.record = AsyncMock()
+            bridge.accounts = {'main': {'uid': 999, 'engine': engine, 'client': None}}
+            bridge.av_sync_pause = AsyncMock()
+            bridge.playback_control = AsyncMock()
+
+            mgr = VoiceListenerManager(bridge=bridge, stt_engine=MagicMock())
+            st = await mgr.start_chat(-100555, 'main', enabled=True, use_live=False)
+            st.ssrc_to_uid[222] = 77
+            st.uid_to_name[77] = 'Sam'
+            st.live_audio_queue = asyncio.Queue(maxsize=20)
+            captured_cbs = {}
+
+            class FakeLiveSess:
+                def __init__(self, **kw):
+                    captured_cbs.update(kw)
+                    self.connected = True
+                    self.closed = False
+                    self.persona_id = kw.get('persona_id', 'pappy')
+                    self.send_text_turn = AsyncMock(return_value=True)
+                    self.send_context_update = AsyncMock(return_value=True)
+                    self.send_pcm_16k_mono = AsyncMock()
+                    self.flush_tail = AsyncMock()
+                    self.close = AsyncMock()
+
+                async def connect(self, **_kw):
+                    return True
+
+            with patch('gemini_live.GeminiLiveSession', FakeLiveSess), patch.dict('os.environ', {'GEMINI_API_KEY': 'test_key'}):
+                await mgr._start_live_session(-100555, st)
+                live_sess = st.live_session
+                self.assertIsNotNone(live_sess)
+
+                # 1) Live TTS audio output must NOT freeze live BrowserOS VC video via av_sync_pause
+                await captured_cbs['on_pcm_48k_stereo'](b'\x01\x00' * 1920)
+                bridge.av_sync_pause.assert_not_awaited()
+                bridge.playback_control.assert_not_awaited()
+
+                # 2) push_context_update with trigger_turn=True speaks result and keeps engaged window alive
+                ok = await mgr.push_context_update(-100555, '[Browser] Avatar movie releases Oct 2026', trigger_turn=True)
+                self.assertTrue(ok)
+                live_sess.send_text_turn.assert_awaited_once()
+                self.assertGreater(st.live_engaged_until_mono, time.monotonic() + 30.0)
+
+                # release_live_pause keeps engaged conversation alive unless clear_engaged=True
+                await mgr.release_live_pause(-100555, clear_engaged=False)
+                self.assertGreater(st.live_engaged_until_mono, time.monotonic() + 30.0)
+                await mgr.release_live_pause(-100555, clear_engaged=True)
+                self.assertEqual(st.live_engaged_until_mono, 0.0)
+
+            await mgr.stop_all()
 
         asyncio.run(run())
 

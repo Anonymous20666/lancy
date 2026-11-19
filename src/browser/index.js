@@ -39,15 +39,30 @@ export class BrowserService {
     const cid = Number(ev?.chatId || 0);
     if (!cid) return;
 
-    // 1) Push crisp screen awareness into Gemini Live context whenever VC live view is active
+    // 1) Push rich browser state into Gemini Live; request an active spoken turn on key outcomes
+    const turnTriggerEvents = new Set(['task_completed', 'task_failed', 'human_help_needed', 'approval_required']);
+    const shouldTriggerTurn = turnTriggerEvents.has(ev.type);
+    let liveDelivered = false;
     if (cid < 0 && this.app?.voiceClient?.pushLiveContext) {
-      const ctxLine = `[Browser] status=${ev.status} domain=${ev.domain || extractDomain(ev.url) || 'page'} action="${sanitizeAuditText(ev.action || ev.type, 70)}" step=${ev.stepCount || 0}`;
-      await this.app.voiceClient.pushLiveContext(cid, ctxLine).catch(() => {});
+      const domain = ev.domain || extractDomain(ev.url) || 'page';
+      let detail = sanitizeAuditText(ev.action || ev.type, 80);
+      if (ev.type === 'task_completed') {
+        detail = sanitizeAuditText(ev.summary || ev.excerpt || `Finished viewing ${domain}`, 280);
+      } else if (ev.type === 'task_failed') {
+        detail = sanitizeAuditText(`Failed: ${ev.error || 'unknown error'}`, 180);
+      } else if (ev.type === 'human_help_needed') {
+        detail = sanitizeAuditText(`Needs human help (${domain}): ${ev.reason || 'Sign-in or verification required'}`, 200);
+      } else if (ev.type === 'approval_required') {
+        detail = sanitizeAuditText(`Needs user approval: ${ev.approval?.actionLabel || 'high-impact action'}`, 200);
+      }
+      const ctxLine = `[Browser] event=${ev.type} status=${ev.status} domain=${domain} step=${ev.stepCount || 0} detail="${detail}"${shouldTriggerTurn ? ' — Briefly tell the user this browser update aloud in your own natural voice.' : ''}`;
+      const pushed = await this.app.voiceClient.pushLiveContext(cid, ctxLine, { triggerTurn: shouldTriggerTurn }).catch(() => null);
+      liveDelivered = Boolean(pushed?.sent);
     }
 
-    // 2) Anti-spam voice narration ONLY on important milestones when speaking in VC
+    // 2) Fallback Edge-TTS narration ONLY when Gemini Live session is NOT active (avoids colliding voices/interruptions)
     const speakable = new Set(['task_started', 'approval_required', 'human_help_needed', 'task_completed', 'task_failed']);
-    if (cid < 0 && speakable.has(ev.type) && this.app?.voiceClient?.speak) {
+    if (cid < 0 && !liveDelivered && speakable.has(ev.type) && this.app?.voiceClient?.speak) {
       const now = Date.now();
       const prev = this._lastSpokenAt.get(cid) || 0;
       const minGap = ev.type === 'human_help_needed' || ev.type === 'approval_required' ? 1000 : 2800;
@@ -57,7 +72,7 @@ export class BrowserService {
         if (ev.type === 'task_started') line = `Opening ${ev.domain || 'the browser'} now to work on that.`;
         else if (ev.type === 'approval_required') line = `Hold on, I need your confirmation before continuing: ${ev.approval?.actionLabel || 'high-impact action'}.`;
         else if (ev.type === 'human_help_needed') line = `I reached a sign-in or verification screen on ${ev.domain || 'the site'}. Please take over briefly and tap done when ready.`;
-        else if (ev.type === 'task_completed') line = sanitizeAuditText(ev.summary || 'Browser task is finished.', 160);
+        else if (ev.type === 'task_completed') line = sanitizeAuditText(ev.summary || 'Browser task is finished.', 220);
         else if (ev.type === 'task_failed') line = `The browser task ran into an issue: ${sanitizeAuditText(ev.error || 'unknown error', 90)}.`;
         if (line) {
           const voiceOpts = this.app?.lancyAgent?.getVoiceProfileForChat?.(cid) || {};

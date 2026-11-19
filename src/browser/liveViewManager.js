@@ -92,7 +92,7 @@ export class BrowserLiveViewManager {
 
     const mcpSessionId = task?.mcpSessionId || client.sessionId;
     const targetQuality = String(quality || this.app?.settings?.get?.('browser.streamQuality') || this.app?.env?.BROWSEROS_STREAM_QUALITY || 'high');
-    const targetFps = Math.max(5, Math.min(30, Number(fps || this.app?.settings?.get?.('browser.streamFps') || this.app?.env?.BROWSEROS_STREAM_FPS || 12)));
+    const targetFps = Math.max(5, Math.min(30, Number(fps || this.app?.settings?.get?.('browser.streamFps') || this.app?.env?.BROWSEROS_STREAM_FPS || 15)));
     const width = Number(this.app?.settings?.get?.('browser.streamWidth') || this.app?.env?.BROWSEROS_STREAM_WIDTH || 1280);
     const height = Number(this.app?.settings?.get?.('browser.streamHeight') || this.app?.env?.BROWSEROS_STREAM_HEIGHT || 720);
 

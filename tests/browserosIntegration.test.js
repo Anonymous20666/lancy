@@ -336,3 +336,83 @@ test('LIVE BrowserOS neo MCP end-to-end: discover tools, open real page, snapsho
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('BrowserOS planner uses ai.chatWithTools (no HTTP 400 object bug), auto-enables VC show_live, and triggers Gemini Live turn on completion', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'lancy-browser-vc-turn-'));
+  const db = new Database(join(dir, 'test.db'));
+  const settings = new SettingsManager(db, { env: { OWNER_IDS: '9001' } });
+  const chatId = -100888;
+  const aiCalls = [];
+  const voiceLog = [];
+
+  const mockVoice = {
+    async startBrowserLive(id, opts) { voiceLog.push(['startBrowserLive', id, opts]); return { ok: true, sync_id: 'bs_auto' }; },
+    async updateBrowserLiveMeta(id, m) { voiceLog.push(['meta', id, m]); return { ok: true }; },
+    async pushLiveContext(id, summary, opts) { voiceLog.push(['pushLiveContext', id, summary, opts]); return { ok: true, sent: true }; },
+    async speak(id, text, opts) { voiceLog.push(['speak', id, text, opts]); return { ok: true }; },
+    async stopBrowserLive(id, opts) { voiceLog.push(['stopBrowserLive', id, opts]); return { ok: true }; }
+  };
+
+  const clientFactory = () => ({
+    sessionId: 'mcp_auto_1',
+    initialized: true,
+    async ensureConnected() { return 'mcp_auto_1'; },
+    hasTool() { return true; },
+    getToolNames() { return ['tabs', 'navigate', 'snapshot', 'act', 'read']; },
+    setEndpoint() {},
+    async tabsNew(url) { return { ok: true, text: 'opened page 1', sessionId: 'mcp_auto_1', url }; },
+    async snapshot() { return { ok: true, text: 'https://duckduckgo.com/?q=Avatar&ia=web\n- link "DuckDuckGo home" [ref=e1]\n- link "The Legend of Aang: The Last Airbender Releases October 2026" [ref=e2]' }; },
+    async read() { return { ok: true, text: '[UNTRUSTED_PAGE_CONTENT]\n## The Legend of Aang releases October 2026 in theaters.\nEverything needed is here.' }; },
+    getScreencastUrl({ sessionId }) { return `http://127.0.0.1:9010/v1/sessions/${sessionId}/screencast?quality=high`; },
+    async close() {}
+  });
+
+  const qm = new MusicQueueManager({
+    app: { db, settings, voiceClient: mockVoice, music: { getCall: () => null }, log: null }
+  });
+
+  const app = {
+    db,
+    settings,
+    env: { OWNER_IDS: '9001' },
+    ai: {
+      async chatWithTools(req) {
+        aiCalls.push(req);
+        return { text: JSON.stringify({ action: 'complete', summary: 'The Legend of Aang movie releases October 2026.' }) };
+      },
+      async chat() {
+        throw new Error('HTTP 400: legacy ai.chat must not be called when chatWithTools exists');
+      }
+    },
+    musicQueueManager: qm,
+    voiceClient: mockVoice,
+    music: { isVcSudo: () => true }
+  };
+  const browserSvc = new BrowserService({ app, clientFactory });
+  app.browser = browserSvc;
+
+  try {
+    const exec = new LancyToolExecutor({ app });
+    // Calling browser_start_task in VC without explicit show_live auto-enables VC live screen
+    const started = await exec.execute('browser_start_task', { goal: 'Search Avatar Aang movie' }, { chatId, userId: 9001 });
+    assert.equal(started.ok, true);
+    assert.equal(started.liveVc?.ok, true);
+    assert.ok(voiceLog.some((v) => v[0] === 'startBrowserLive' && v[1] === chatId && v[2].fps === 15));
+
+    // Wait for autonomous step 1 -> AI planner -> task_completed
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(aiCalls.length >= 1, true);
+    assert.equal(Array.isArray(aiCalls[0].messages), true);
+    const completionPush = voiceLog.find((v) => v[0] === 'pushLiveContext' && String(v[2]).includes('task_completed'));
+    assert.ok(completionPush, 'Expected pushLiveContext on task_completed');
+    assert.equal(completionPush[3]?.triggerTurn, true);
+    assert.equal(voiceLog.some((v) => v[0] === 'speak'), false, 'Should NOT double-speak via Edge-TTS when Gemini Live took the turn');
+  } finally {
+    qm.closed = true;
+    qm.eventAbort.abort();
+    clearInterval(qm.poller);
+    await browserSvc.shutdown();
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

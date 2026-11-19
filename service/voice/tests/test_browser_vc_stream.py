@@ -14,6 +14,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import av
+import numpy as np
 from aiohttp.test_utils import AioHTTPTestCase
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -110,6 +111,31 @@ class BrowserVcStreamUnitTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_decode_jpeg_1to1_preserves_crisp_horizontal_lines_on_odd_height(self):
+        # 1280x633 matches BrowserOS default viewport aspect (odd height); 1:1 copy must not blur 1px horizontal stripes.
+        w, h = 1280, 633
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        for row in range(0, h - 1, 4):
+            rgb[row:row + 2, :, :] = 235
+            rgb[row + 2:row + 4, :, :] = 20
+        f = av.VideoFrame.from_ndarray(rgb, format='rgb24').reformat(format='yuvj420p')
+        enc = av.CodecContext.create('mjpeg', 'w')
+        enc.width, enc.height, enc.pix_fmt = w, h, 'yuvj420p'
+        enc.time_base = __import__('fractions').Fraction(1, 15)
+        enc.open()
+        pkts = list(enc.encode(f)) + list(enc.encode(None))
+        jpeg = bytes(pkts[0])
+
+        yuv = browser_stream.decode_jpeg_to_yuv420(jpeg, 1280, 720)
+        self.assertIsNotNone(yuv)
+        self.assertEqual(len(yuv), 1280 * 720 * 3 // 2)
+        y_plane = np.frombuffer(yuv[:1280 * 720], dtype=np.uint8).reshape(720, 1280)
+        dy = ((720 - (633 & ~1)) // 2) & ~1
+        # Crisp bright/dark stripes preserved across centered region (mean diff > 140)
+        bright = float(y_plane[dy + 1, 100:200].mean())
+        dark = float(y_plane[dy + 3, 100:200].mean())
+        self.assertGreater(bright - dark, 140.0)
+
     def test_nut_role_outputs_valid_interleaved_nut_for_rtmp_hub(self):
         jpeg = _make_sample_jpeg(320, 180, 140)
 
@@ -161,6 +187,31 @@ class BrowserVcStreamUnitTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_decode_jpeg_1to1_preserves_crisp_horizontal_lines_on_odd_height(self):
+        # 1280x633 matches BrowserOS default viewport aspect (odd height); 1:1 copy must not blur 1px horizontal stripes.
+        w, h = 1280, 633
+        rgb = np.zeros((h, w, 3), dtype=np.uint8)
+        for row in range(0, h - 1, 4):
+            rgb[row:row + 2, :, :] = 235
+            rgb[row + 2:row + 4, :, :] = 20
+        f = av.VideoFrame.from_ndarray(rgb, format='rgb24').reformat(format='yuvj420p')
+        enc = av.CodecContext.create('mjpeg', 'w')
+        enc.width, enc.height, enc.pix_fmt = w, h, 'yuvj420p'
+        enc.time_base = __import__('fractions').Fraction(1, 15)
+        enc.open()
+        pkts = list(enc.encode(f)) + list(enc.encode(None))
+        jpeg = bytes(pkts[0])
+
+        yuv = browser_stream.decode_jpeg_to_yuv420(jpeg, 1280, 720)
+        self.assertIsNotNone(yuv)
+        self.assertEqual(len(yuv), 1280 * 720 * 3 // 2)
+        y_plane = np.frombuffer(yuv[:1280 * 720], dtype=np.uint8).reshape(720, 1280)
+        dy = ((720 - (633 & ~1)) // 2) & ~1
+        # Crisp bright/dark stripes preserved across centered region (mean diff > 140)
+        bright = float(y_plane[dy + 1, 100:200].mean())
+        dark = float(y_plane[dy + 3, 100:200].mean())
+        self.assertGreater(bright - dark, 140.0)
 
     @unittest.skipUnless(_is_browseros_up(), 'Live BrowserOS neo container not running on 127.0.0.1:9010')
     def test_live_browseros_neo_screencast_to_yuv420p_end_to_end(self):
@@ -268,6 +319,47 @@ class BrowserBridgeHttpRouteTests(AioHTTPTestCase):
         self.assertTrue(d3['ok'])
         self.assertTrue(d3['stopped'])
         self.assertFalse(browser_stream.browser_meta_path_for(sid).is_file())
+
+    async def test_browser_live_uses_screen_share_and_live_context_trigger_turn(self):
+        import inspect
+        hdr = {'Authorization': f'Bearer {self.token}'}
+        self.engine.streams.clear()
+        vl = MagicMock()
+        vl.start_chat = AsyncMock()
+        vl.set_authorized_ids = MagicMock()
+        vl.push_context_update = AsyncMock(return_value=True)
+        vl.stop_all = AsyncMock()
+        self.bridge.voice_listener = vl
+
+        src_browser_live = inspect.getsource(main.Bridge.start_browser_live)
+        self.assertIn('screen=VideoStream(', src_browser_live)
+        self.assertIn('adjust_by_height=False', src_browser_live)
+        self.assertIn('force_record=True', src_browser_live)
+
+        r1 = await self.client.post('/call/browser-live/start', json={
+            'chat_id': -100777,
+            'screencast_url': 'http://127.0.0.1:9010/v1/sessions/demo/screencast?quality=high',
+            'mcp_session_id': 'demo',
+            'width': 1280,
+            'height': 720,
+        }, headers=hdr)
+        d1 = await r1.json()
+        self.assertTrue(d1['ok'])
+        self.assertEqual(d1['fps'], 15)
+        vl.start_chat.assert_awaited()
+        self.assertTrue(vl.start_chat.await_args.kwargs.get('force_record'))
+
+        r_ctx = await self.client.post('/call/live-context', json={
+            'chat_id': -100777,
+            'summary': '[Browser] completed search result',
+            'trigger_turn': True,
+        }, headers=hdr)
+        d_ctx = await r_ctx.json()
+        self.assertTrue(d_ctx['ok'])
+        self.assertTrue(d_ctx['sent'])
+        vl.push_context_update.assert_awaited_with(-100777, '[Browser] completed search result', trigger_turn=True)
+
+        await self.client.post('/call/browser-live/stop', json={'chat_id': -100777, 'keep_call': False}, headers=hdr)
 
 
 if __name__ == '__main__':

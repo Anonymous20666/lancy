@@ -123,7 +123,7 @@ export class VoiceClient {
         ...(Array.isArray(opts.voiceAuthorizedIds) ? { voice_authorized_ids: opts.voiceAuthorizedIds } : {}),
         width: Number(opts.width || 1280),
         height: Number(opts.height || 720),
-        fps: Number(opts.fps || 12)
+        fps: Number(opts.fps || 15)
       },
       timeoutMs: 45000
     });
@@ -149,7 +149,7 @@ export class VoiceClient {
   getParticipants(id) { return this.request(`/call/participants?chat_id=${Number(id)}`, { timeoutMs:8000 }); }
   bargeIn(id, opts = {}) { return this.request('/call/barge_in', { method:'POST', body:{ chat_id:Number(id), ...opts }, timeoutMs:6000 }); }
   submitLiveToolResult(id, { callId, name, response } = {}) { return this.request('/call/live-tool-result', { method:'POST', body:{ chat_id:Number(id), call_id:String(callId || ''), name:String(name || ''), response }, timeoutMs:8000 }); }
-  pushLiveContext(id, summary) { return this.request('/call/live-context', { method:'POST', body:{ chat_id:Number(id), summary:String(summary || '') }, timeoutMs:4000 }); }
+  pushLiveContext(id, summary, { triggerTurn = false } = {}) { return this.request('/call/live-context', { method:'POST', body:{ chat_id:Number(id), summary:String(summary || ''), trigger_turn:Boolean(triggerTurn) }, timeoutMs:4000 }); }
   async transcribeAudioBuffer(audioBuffer, { extension = 'ogg', activeSession = true, contextHint = '' } = {}) {
     if (!audioBuffer || !audioBuffer.length) return { ok: false, text: '' };
     await this.ensureDaemon();

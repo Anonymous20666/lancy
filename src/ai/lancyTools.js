@@ -1573,7 +1573,7 @@ export class LancyToolExecutor {
             requestedByName: context.senderName || context.speakerName || 'User',
             goal: String(args.goal || args.url || 'Open browser'),
             url: args.url || null,
-            showLiveVc: Boolean(args.show_live ?? (cid < 0 && b.liveView.isLive(cid)))
+            showLiveVc: Boolean(args.show_live ?? (cid < 0))
           });
         }
         if (toolName === 'browser_task_status') {
@@ -1611,7 +1611,16 @@ export class LancyToolExecutor {
         if (toolName === 'browser_replay_task') {
           return await b.getReplay(targetTaskId, { scopeKey: perm.scopeKey || scopeKey });
         }
-        return await b.interactLive({ chatId: cid, userId: uid, scopeKey: perm.scopeKey, command: String(args.command || '') });
+        const liveRes = await b.interactLive({ chatId: cid, userId: uid, scopeKey: perm.scopeKey, command: String(args.command || '') });
+        if (liveRes?.ok && cid < 0 && !b.liveView.isLive(cid)) {
+          await b.showLive(cid, {
+            userId: uid,
+            taskId: liveRes.taskId || targetTaskId,
+            tabId: liveRes.pageId || null,
+            url: liveRes.url || null
+          }).catch(() => {});
+        }
+        return liveRes;
       }
 
       default:
