@@ -317,6 +317,10 @@ class MjpegScreencastReader:
                     headers['Authorization'] = f'Bearer {self.token}'
                 conn.request('GET', path, headers=headers)
                 resp = conn.getresponse()
+                if resp.status == 404 and 'tab=' in self.url:
+                    self.url = re.sub(r'([?&])tab=[^&]*&?', r'\1', self.url).rstrip('?&')
+                    backoff = 0.05
+                    raise RuntimeError('HTTP 404 retrying without tab param')
                 if resp.status != 200:
                     raise RuntimeError(f'HTTP {resp.status} {resp.reason}')
 

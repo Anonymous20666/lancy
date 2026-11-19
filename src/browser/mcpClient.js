@@ -364,11 +364,11 @@ export class BrowserOSMCPClient {
     return this.callTool('request_human_help', args, opts);
   }
 
-  getScreencastUrl({ sessionId = null, quality = 'high', tab = null } = {}) {
+  getScreencastUrl({ sessionId = null, quality = 'high', tab = null, includeTab = false } = {}) {
     const sid = sessionId || this.sessionId;
     if (!sid) return null;
     const qs = new URLSearchParams({ quality: quality === 'low' ? 'low' : 'high' });
-    if (tab !== null && tab !== undefined) qs.set('tab', String(tab));
+    if (includeTab && tab !== null && tab !== undefined) qs.set('tab', String(tab));
     return `${this.baseUrl}/v1/sessions/${encodeURIComponent(sid)}/screencast?${qs.toString()}`;
   }
 

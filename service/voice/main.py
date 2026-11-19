@@ -4658,6 +4658,7 @@ class Bridge:
                         screen=VideoStream(MediaSource.SHELL, wrapped_v, VideoParameters(width=width, height=height, frame_rate=fps, adjust_by_height=False)),
                     )
                     await asyncio.wait_for(a['engine'].play(chat, play_stream, config=GroupCallConfig(auto_start=False)), 25)
+                    log.info('browser_live started chat=%s mode=%s sid=%s url=%s', chat, stream_mode, sid, sc_url)
                     try:
                         await asyncio.wait_for(self.ensure_publisher(a, chat, call), 15)
                     except Exception as pub_err:

@@ -98,8 +98,7 @@ export class BrowserLiveViewManager {
 
     const screencastUrl = client.getScreencastUrl({
       sessionId: mcpSessionId,
-      quality: targetQuality,
-      tab: tabId ?? task?.activePageId ?? null
+      quality: targetQuality
     });
     if (!screencastUrl) return { ok: false, error: 'screencast_url_unavailable' };
 
@@ -163,6 +162,7 @@ export class BrowserLiveViewManager {
       await vc.pushLiveContext?.(cid, `Live BrowserOS screen share active in VC showing ${domain}: ${metaPayload.task}`).catch(() => {});
       return { ok: true, ...entry };
     } catch (err) {
+      this.log?.warn?.({ chatId: cid, err: err?.message || err }, 'Failed starting BrowserOS live VC stream');
       if (lease?.hadMedia && qm?.releaseStreamLease) {
         await qm.releaseStreamLease(cid, { resumePrevious: false }).catch(() => {});
       }

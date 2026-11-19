@@ -136,6 +136,47 @@ class BrowserVcStreamUnitTests(unittest.TestCase):
         dark = float(y_plane[dy + 3, 100:200].mean())
         self.assertGreater(bright - dark, 140.0)
 
+    def test_mjpeg_reader_strips_tab_query_param_on_404(self):
+        jpeg = _make_sample_jpeg(640, 360, 140)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                if 'tab=' in self.path:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+                self.end_headers()
+                self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n' + f'Content-Length: {len(jpeg)}\r\n\r\n'.encode() + jpeg + b'\r\n')
+                self.wfile.flush()
+                time.sleep(0.3)
+
+        srv = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            reader = browser_stream.MjpegScreencastReader(
+                f'http://127.0.0.1:{srv.server_address[1]}/screencast?quality=high&tab=24',
+                target_width=1280,
+                target_height=720,
+            )
+            reader.start()
+            got = False
+            for _ in range(30):
+                if reader.snapshot()[2] >= 1:
+                    got = True
+                    break
+                time.sleep(0.05)
+            reader.stop()
+            self.assertTrue(got)
+            self.assertNotIn('tab=', reader.url)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
     def test_nut_role_outputs_valid_interleaved_nut_for_rtmp_hub(self):
         jpeg = _make_sample_jpeg(320, 180, 140)
 
@@ -187,31 +228,6 @@ class BrowserVcStreamUnitTests(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
-
-    def test_decode_jpeg_1to1_preserves_crisp_horizontal_lines_on_odd_height(self):
-        # 1280x633 matches BrowserOS default viewport aspect (odd height); 1:1 copy must not blur 1px horizontal stripes.
-        w, h = 1280, 633
-        rgb = np.zeros((h, w, 3), dtype=np.uint8)
-        for row in range(0, h - 1, 4):
-            rgb[row:row + 2, :, :] = 235
-            rgb[row + 2:row + 4, :, :] = 20
-        f = av.VideoFrame.from_ndarray(rgb, format='rgb24').reformat(format='yuvj420p')
-        enc = av.CodecContext.create('mjpeg', 'w')
-        enc.width, enc.height, enc.pix_fmt = w, h, 'yuvj420p'
-        enc.time_base = __import__('fractions').Fraction(1, 15)
-        enc.open()
-        pkts = list(enc.encode(f)) + list(enc.encode(None))
-        jpeg = bytes(pkts[0])
-
-        yuv = browser_stream.decode_jpeg_to_yuv420(jpeg, 1280, 720)
-        self.assertIsNotNone(yuv)
-        self.assertEqual(len(yuv), 1280 * 720 * 3 // 2)
-        y_plane = np.frombuffer(yuv[:1280 * 720], dtype=np.uint8).reshape(720, 1280)
-        dy = ((720 - (633 & ~1)) // 2) & ~1
-        # Crisp bright/dark stripes preserved across centered region (mean diff > 140)
-        bright = float(y_plane[dy + 1, 100:200].mean())
-        dark = float(y_plane[dy + 3, 100:200].mean())
-        self.assertGreater(bright - dark, 140.0)
 
     @unittest.skipUnless(_is_browseros_up(), 'Live BrowserOS neo container not running on 127.0.0.1:9010')
     def test_live_browseros_neo_screencast_to_yuv420p_end_to_end(self):

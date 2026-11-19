@@ -330,6 +330,13 @@ test('LIVE BrowserOS neo MCP end-to-end: discover tools, open real page, snapsho
     assert.equal(client.hasTool('snapshot'), true);
     assert.equal(client.hasTool('act'), true);
     assert.equal(client.hasTool('run'), true);
+
+    const scUrl = client.getScreencastUrl({ quality: 'high', tab: started.pageId });
+    assert.equal(scUrl.includes('tab='), false);
+    const scAc = new AbortController();
+    const scRes = await fetch(scUrl, { signal: scAc.signal });
+    assert.equal(scRes.status, 200);
+    scAc.abort();
   } finally {
     await svc.shutdown();
     db.close();
