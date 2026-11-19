@@ -3674,6 +3674,12 @@ class Bridge:
                             await self.stream(a, chat, call)
                         else:
                             raise stream_err
+                    elif type(stream_err).__name__ in {'NoVideoSourceFound', 'InvalidVideoProportion'} and (call.get('video') or call.get('dj_desk')) and (call.get('is_music') or not call.get('is_channel')):
+                        log.warning('Video source unavailable for chat=%s (%s); falling back to audio-only stream', chat, type(stream_err).__name__)
+                        call['video'] = False
+                        call['dj_desk'] = False
+                        call['dj_desk_image'] = None
+                        await self.stream(a, chat, call)
                     elif type(stream_err).__name__ == 'FloodWait' and getattr(stream_err, 'value', 0) <= 10:
                         await asyncio.sleep(getattr(stream_err, 'value', 1))
                         await self.stream(a, chat, call)
@@ -3697,7 +3703,7 @@ class Bridge:
                 call['status'] = 'playing'; self.calls[chat] = call; self.last_failures.pop(chat, None); self.last_ended_positions.pop(chat, None)
                 self._maybe_schedule_sub_align(a, chat, call)
                 self.ensure_sync_monitor()
-                if stream_mode == 'interactive' and bool(data.get('voice_ai_enabled', True)):
+                if bool(data.get('voice_ai_enabled', True)):
                     auth_ids = data.get('voice_authorized_ids')
                     await self.voice_listener.start_chat(
                         chat,

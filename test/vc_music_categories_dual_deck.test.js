@@ -5,6 +5,8 @@ import { QueueManager } from '../src/music/queueManager.js';
 import { InfiniteRadio } from '../src/music/radio.js';
 import { LancyAgent } from '../src/ai/lancyAgent.js';
 import { createMusicScreen } from '../src/telegram/screens/music.js';
+import { enhanceRichText } from '../src/telegram/customEmoji.js';
+import { TelegramAPI } from '../src/telegram/api.js';
 
 test('2026 Music Categories Directory covers all 8 families and 95+ subgenres with smart search', () => {
   assert.equal(MUSIC_CATEGORIES_2026.length, 8);
@@ -384,5 +386,40 @@ test('InfiniteRadio cold-start resolves 2026 subgenre to signature artist fast w
   assert.notEqual(searchedQueries[0], 'Afro-pop', 'Should map Afro-pop to curated Afro-pop artist instead of literal genre name');
   assert.ok(session.upcoming.length >= 1);
   assert.equal(session.upcoming[0].mediaType, 'audio');
+});
+
+test('enhanceRichText preserves combining grapheme clusters and TelegramAPI recovers custom emojis surgically', async () => {
+  // Combining enclosing marks after ♥︎ must not be split into custom_emoji + orphan combining mark, while standalone 🌷 converts
+  const pfpLine = enhanceRichText('╬♥︎⃝🌷 studio');
+  assert.ok(Array.isArray(pfpLine));
+  assert.equal(pfpLine.some((tok) => tok && tok.type === 'custom_emoji' && tok.alternative_text === '♥︎'), false);
+  assert.equal(pfpLine.some((tok) => tok && tok.type === 'custom_emoji' && tok.alternative_text === '🌷'), true);
+
+  // If Telegram rejects button custom emojis with RICH_MESSAGE_EMOJI_INVALID, tier 1 strips ONLY buttons and preserves body custom emojis
+  const api = new TelegramAPI('123456:TESTTOKEN', { log: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} } });
+  const sentPayloads = [];
+  api.call = async (method, params) => {
+    sentPayloads.push(params.rich_message);
+    const hasButtonCustomEmoji = (params.rich_message?.blocks || [])
+      .filter((b) => b.type === 'buttons')
+      .some((b) => JSON.stringify(b).includes('"custom_emoji"'));
+    if (hasButtonCustomEmoji) {
+      const err = new Error('Bad Request: RICH_MESSAGE_EMOJI_INVALID');
+      err.description = 'Bad Request: RICH_MESSAGE_EMOJI_INVALID';
+      throw err;
+    }
+    return { message_id: 99, rich_message: params.rich_message };
+  };
+  const payload = {
+    blocks: [
+      { type: 'heading', text: [{ type: 'custom_emoji', alternative_text: '🎧', custom_emoji_id: '5354899958329784877' }, ' Player'], size: 1 },
+      { type: 'buttons', buttons: [{ text: [{ type: 'custom_emoji', alternative_text: '⏮', custom_emoji_id: '5375401426371514977' }, ' Prev'], callback_data: 'x', style: 'primary' }] }
+    ]
+  };
+  const out = await api.sendRichMessage(-100123, payload);
+  assert.equal(out.message_id, 99);
+  assert.equal(sentPayloads.length, 2);
+  assert.equal(out.rich_message.blocks[0].text[0].type, 'custom_emoji', 'Heading custom_emoji must survive button fallback');
+  assert.equal(out.rich_message.blocks[1].buttons[0].text, '⏮ Prev', 'Button custom_emoji cleanly downgraded to text');
 });
 

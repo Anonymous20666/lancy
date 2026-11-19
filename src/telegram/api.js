@@ -2,7 +2,10 @@ import { openAsBlob, existsSync, statSync } from 'node:fs';
 import { logger } from '../core/logger.js';
 import { sleep } from '../utils/time.js';
 import { RichMessageBuilder } from './rich.js';
-import { enhanceHtmlWithCustomEmojis, extractCustomEmojiEntities, getCustomEmojiId } from './customEmoji.js';
+import { CUSTOM_EMOJI_MAP, enhanceHtmlWithCustomEmojis, extractCustomEmojiEntities, getCustomEmojiId } from './customEmoji.js';
+
+const VERIFIED_CUSTOM_EMOJI_IDS = new Set(Object.values(CUSTOM_EMOJI_MAP).map((id) => String(id)));
+const RICH_EMOJI_ERROR_RE = /RICH_MESSAGE_EMOJI_INVALID|CUSTOM_EMOJI|EMOJI_INVALID|BUTTON_ICON_INVALID|DOCUMENT_INVALID/i;
 
 function applyCustomEmojisToOutgoingParams(params, { isCaption = false } = {}) {
   if (!params || typeof params !== 'object') return params;
@@ -74,18 +77,37 @@ function sanitizeInlineResults(results) {
   });
 }
 
-function stripCustomEmojisFromRichPayload(node) {
+function stripCustomEmojisFromRichPayload(node, { onlyButtons = false, allowedIds = null, inButtons = false } = {}) {
   if (node == null || typeof node !== 'object') return node;
   if (Array.isArray(node)) {
-    return node.map(stripCustomEmojisFromRichPayload);
+    const mapped = node.map((item) => stripCustomEmojisFromRichPayload(item, { onlyButtons, allowedIds, inButtons }));
+    const coalesced = [];
+    for (const item of mapped) {
+      if (typeof item === 'string' && coalesced.length > 0 && typeof coalesced[coalesced.length - 1] === 'string') {
+        coalesced[coalesced.length - 1] += item;
+      } else {
+        coalesced.push(item);
+      }
+    }
+    return coalesced.length === 1 && typeof coalesced[0] === 'string' ? coalesced[0] : coalesced;
   }
-  if (node.type === 'custom_emoji' && typeof node.alternative_text === 'string') {
-    return node.alternative_text;
+  const hereButtons = inButtons || node.type === 'buttons';
+  if (node.type === 'custom_emoji') {
+    const shouldStrip = onlyButtons
+      ? hereButtons
+      : (allowedIds ? !allowedIds.has(String(node.custom_emoji_id || '')) : true);
+    if (shouldStrip) {
+      return typeof node.alternative_text === 'string' ? node.alternative_text : '';
+    }
+    return node;
   }
   const out = {};
   for (const [k, v] of Object.entries(node)) {
-    if (k === 'icon_custom_emoji_id') continue;
-    out[k] = stripCustomEmojisFromRichPayload(v);
+    if (k === 'icon_custom_emoji_id') {
+      const stripIcon = onlyButtons ? true : (allowedIds ? !allowedIds.has(String(v || '')) : true);
+      if (stripIcon) continue;
+    }
+    out[k] = stripCustomEmojisFromRichPayload(v, { onlyButtons, allowedIds, inButtons: hereButtons });
   }
   return out;
 }
@@ -271,6 +293,39 @@ export class TelegramAPI {
     return this.call('sendMessage', params);
   }
 
+  async #callRichWithEmojiFallback(method, baseParams, payload, callOpts = {}) {
+    try {
+      return await this.call(method, { ...baseParams, rich_message: payload }, callOpts);
+    } catch (err) {
+      const desc = String(err?.description || err?.message || '');
+      if (!RICH_EMOJI_ERROR_RE.test(desc)) throw err;
+      this.log?.warn?.({ method, chatId: baseParams?.chat_id, err: desc }, 'Rich custom emoji rejected by Telegram; applying tiered fallback');
+      const noButtons = stripCustomEmojisFromRichPayload(payload, { onlyButtons: true });
+      const candidates = [
+        noButtons,
+        stripCustomEmojisFromRichPayload(payload, { onlyButtons: false, allowedIds: VERIFIED_CUSTOM_EMOJI_IDS }),
+        stripCustomEmojisFromRichPayload(noButtons, { onlyButtons: false, allowedIds: VERIFIED_CUSTOM_EMOJI_IDS }),
+        stripCustomEmojisFromRichPayload(payload)
+      ];
+      let prevJson = JSON.stringify(payload);
+      let lastErr = err;
+      for (const candidate of candidates) {
+        const nextJson = JSON.stringify(candidate);
+        if (nextJson === prevJson) continue;
+        prevJson = nextJson;
+        try {
+          return await this.call(method, { ...baseParams, rich_message: candidate }, callOpts);
+        } catch (retryErr) {
+          lastErr = retryErr;
+          if (!RICH_EMOJI_ERROR_RE.test(String(retryErr?.description || retryErr?.message || ''))) {
+            throw retryErr;
+          }
+        }
+      }
+      throw lastErr;
+    }
+  }
+
   /** Bot API 10.1+: send a Rich Message. rich_message = InputRichMessage or { html: '...' } */
   async sendRichMessage(chatId, richMessage, extra = {}, files = null) {
     let payload = richMessage;
@@ -279,15 +334,7 @@ export class TelegramAPI {
     } else if (richMessage && typeof richMessage.html === 'string') {
       payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
     }
-    try {
-      return await this.call('sendRichMessage', { chat_id: chatId, rich_message: payload, ...extra }, { files });
-    } catch (err) {
-      if (/RICH_MESSAGE_EMOJI_INVALID|CUSTOM_EMOJI|EMOJI_INVALID|BUTTON_ICON_INVALID|DOCUMENT_INVALID/i.test(String(err?.description || err?.message || ''))) {
-        const cleanPayload = stripCustomEmojisFromRichPayload(payload);
-        return await this.call('sendRichMessage', { chat_id: chatId, rich_message: cleanPayload, ...extra }, { files });
-      }
-      throw err;
-    }
+    return this.#callRichWithEmojiFallback('sendRichMessage', { chat_id: chatId, ...extra }, payload, { files });
   }
 
   /** Bot API 10.3+: send an ephemeral rich notice/card to a single user inside a group/chat. */
@@ -353,25 +400,12 @@ export class TelegramAPI {
     }
     const { dropOnFloodWait: rawDrop, ...restExtra } = (extra && typeof extra === 'object') ? extra : {};
     const dropOnFloodWait = Boolean(rawDrop);
-    try {
-      return await this.call('editMessageText', {
-        chat_id: chatId,
-        message_id: messageId,
-        rich_message: payload,
-        ...restExtra
-      }, { files, dropOnFloodWait });
-    } catch (err) {
-      if (/RICH_MESSAGE_EMOJI_INVALID|CUSTOM_EMOJI|EMOJI_INVALID|BUTTON_ICON_INVALID|DOCUMENT_INVALID/i.test(String(err?.description || err?.message || ''))) {
-        const cleanPayload = stripCustomEmojisFromRichPayload(payload);
-        return await this.call('editMessageText', {
-          chat_id: chatId,
-          message_id: messageId,
-          rich_message: cleanPayload,
-          ...restExtra
-        }, { files, dropOnFloodWait });
-      }
-      throw err;
-    }
+    return this.#callRichWithEmojiFallback(
+      'editMessageText',
+      { chat_id: chatId, message_id: messageId, ...restExtra },
+      payload,
+      { files, dropOnFloodWait }
+    );
   }
 
   editMessageText(chatId, messageId, text, extra = {}) {

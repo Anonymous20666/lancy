@@ -856,6 +856,12 @@ class VoiceListenerManager:
         if self.bridge.factory:
             st.recording_started = True
             return
+        cur_call = (self.bridge.calls.get(int(chat_id)) or {}) if getattr(self.bridge, 'calls', None) else {}
+        native_call = cur_call.get('native_call')
+        if cur_call.get('stream_mode') == 'rtmp' and getattr(native_call, 'rtmp_stream', False):
+            # Pure Telegram RTMP broadcast calls reject WebRTC participant RecordStream joins.
+            log.info('Skipping RecordStream on RTMP broadcast chat=%s alias=%s', chat_id, alias)
+            return
         acct = self.bridge.accounts.get(alias)
         engine = acct.get('engine') if acct else None
         if engine is None or not hasattr(engine, 'record'):

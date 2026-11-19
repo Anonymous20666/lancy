@@ -268,6 +268,58 @@ class VoiceAiListenerAndTtsTests(unittest.TestCase):
             self.assertEqual(m_out['skew_ms'], 0)
             self.assertEqual(call_music['_sync_mon']['skew_streak'], 0)
 
+    def test_rtmp_keeps_voice_listener_and_skips_record_on_rtmp_stream_only(self):
+        async def run():
+            from types import SimpleNamespace
+            from unittest.mock import AsyncMock
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                track = root / 'song.mp3'
+                track.write_bytes(b'fake')
+                engine = SimpleNamespace(
+                    play=AsyncMock(),
+                    leave_call=AsyncMock(),
+                    record=AsyncMock(),
+                    get_participants=AsyncMock(return_value=[]),
+                    _binding=SimpleNamespace(get_state=AsyncMock(return_value=None)),
+                )
+                client = SimpleNamespace(
+                    get_me=AsyncMock(return_value=SimpleNamespace(id=12345, is_bot=False)),
+                    get_chat=AsyncMock(return_value=SimpleNamespace(id=-100888)),
+                    resolve_peer=AsyncMock(return_value=SimpleNamespace(channel_id=999, access_hash=1)),
+                )
+                async def fake_factory(_alias, _sess):
+                    return client, engine, 12345
+                bridge = bridge_main.Bridge(root, factory=fake_factory)
+                await bridge.register({'alias': 'a1', 'session': 'sess', 'enabled': True, 'allowed': ['-100888'], 'managed_destinations': [-100888]})
+                bridge.native_call = AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace(id=77, access_hash=88, rtmp_stream=True)))
+                bridge._get_group_call_is_rtmp = AsyncMock(return_value=True)
+                bridge._fetch_rtmp_ingest = AsyncMock(return_value=('rtmps://example/live/key', 'rtmps://example/live/', 'key'))
+                bridge._stream_rtmp = AsyncMock()
+                bridge.ensure_call_settings = AsyncMock()
+                bridge.resolve_call_invite_link = AsyncMock(return_value=None)
+                res = await bridge.play({
+                    'chat_id': -100888,
+                    'playback_id': 'pb-rtmp-1',
+                    'stream_url': str(track),
+                    'stream_mode': 'rtmp',
+                    'is_music': True,
+                    'voice_ai_enabled': True,
+                })
+                self.assertTrue(res['ok'])
+                self.assertEqual(res['stream_mode'], 'rtmp')
+                self.assertIn(-100888, bridge.voice_listener.states)
+                # Exercise non-factory _attach_record guard against rtmp_stream=True
+                bridge.factory = None
+                st = bridge.voice_listener.states[-100888]
+                st.recording_started = False
+                await bridge.voice_listener._attach_record(-100888, 'a1', st)
+                self.assertFalse(st.recording_started)
+                engine.record.assert_not_awaited()
+                await bridge.voice_listener.stop_all()
+
+        asyncio.run(run())
+
 
 if __name__ == '__main__':
     unittest.main()

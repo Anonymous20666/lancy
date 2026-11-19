@@ -416,6 +416,12 @@ function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+const COMBINING_FOLLOW_RE = /^[\u200D\u20DD-\u20E4\uFE00-\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
+
+function hasCombiningFollow(str, endIdx) {
+  return typeof str === 'string' && endIdx < str.length && COMBINING_FOLLOW_RE.test(str.slice(endIdx));
+}
+
 function resolveEmojiIdWithCatalog(emoji, { registry = null } = {}) {
   if (!emoji) return null;
   if (CUSTOM_EMOJI_MAP[emoji]) return CUSTOM_EMOJI_MAP[emoji];
@@ -452,8 +458,8 @@ export function toCustomEmojiHtml(text, opts = {}) {
       return id ? `<tg-emoji emoji-id="${id}">${match}</tg-emoji>` : match;
     });
   }
-  return text.replace(UNICODE_EMOJI_SEGMENT_RE, (match) => {
-    if (/^[0-9#*©®™]$/.test(match)) return match;
+  return text.replace(UNICODE_EMOJI_SEGMENT_RE, (match, _g, offset, full) => {
+    if (/^[0-9#*©®™]$/.test(match) || hasCombiningFollow(full, offset + match.length)) return match;
     const id = resolveEmojiIdWithCatalog(match, opts);
     return id ? `<tg-emoji emoji-id="${id}">${match}</tg-emoji>` : match;
   });
@@ -474,8 +480,8 @@ export function enhanceHtmlWithCustomEmojis(html, { registry = null } = {}) {
     if (!part) return '';
     // Odd indices are matched protected tags/blocks -> preserve untouched
     if (idx % 2 === 1) return part;
-    return part.replace(UNICODE_EMOJI_SEGMENT_RE, (match) => {
-      if (/^[0-9#*©®™]$/.test(match)) return match;
+    return part.replace(UNICODE_EMOJI_SEGMENT_RE, (match, _g, offset, full) => {
+      if (/^[0-9#*©®™]$/.test(match) || hasCombiningFollow(full, offset + match.length)) return match;
       const id = resolveEmojiIdWithCatalog(match, lookupOpts);
       return id ? `<tg-emoji emoji-id="${id}">${match}</tg-emoji>` : match;
     });
@@ -493,7 +499,7 @@ export function extractCustomEmojiEntities(text, { maxEntities = 80, registry = 
   const entities = [];
   for (const m of text.matchAll(matcher)) {
     const match = m[0];
-    if (!match || /^[0-9#*©®™]$/.test(match)) continue;
+    if (!match || /^[0-9#*©®™]$/.test(match) || hasCombiningFollow(text, m.index + match.length)) continue;
     const id = resolveEmojiIdWithCatalog(match, lookupOpts);
     if (!id) continue;
     entities.push({
@@ -530,11 +536,14 @@ export function enhanceRichText(content, opts = {}) {
   if (parts.length <= 1) return content;
 
   const result = [];
-  for (const part of parts) {
+  for (let i = 0; i < parts.length; i += 1) {
+    const part = parts[i];
     if (!part) continue;
+    const nextPart = parts[i + 1] || '';
+    const splitCluster = typeof nextPart === 'string' && COMBINING_FOLLOW_RE.test(nextPart);
     const isRealEmoji = matcher === EMOJI_REGEX ? Boolean(CUSTOM_EMOJI_MAP[part]) : (!/^[0-9#*©®™]$/.test(part) && UNICODE_EMOJI_SEGMENT_RE.test(part));
     if (UNICODE_EMOJI_SEGMENT_RE.lastIndex) UNICODE_EMOJI_SEGMENT_RE.lastIndex = 0;
-    const id = isRealEmoji ? resolveEmojiIdWithCatalog(part, opts) : null;
+    const id = (isRealEmoji && !splitCluster) ? resolveEmojiIdWithCatalog(part, opts) : null;
     if (id) {
       result.push({
         type: 'custom_emoji',
