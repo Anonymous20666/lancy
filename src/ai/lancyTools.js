@@ -132,15 +132,37 @@ export const LANCY_TOOLS_SCHEMA = [
     type: 'function',
     function: {
       name: 'search_and_play_music',
-      description: 'Search songs, artists, or 2026 genres across Spotify/Deezer/Apple Music/JioSaavn/SoundCloud/Audius, show search results cleanly, play or queue tracks (audio or video over RTMP), or enable Infinite Radio from an artist/genre.',
+      description: 'In Groups/VC: search and play/queue music or start Infinite Radio over RTMP. In Private DM: search tracks or directly download and send the full MP3 song into DM chat (NO VC in DM).',
       parameters: {
         type: 'object',
         properties: {
           query: { type: 'string', description: 'Song title, artist(s), 2026 genre/category, or vibe description.' },
           action: { type: 'string', enum: ['play_now', 'queue', 'search', 'ai_dj', 'infinite_radio'] },
-          video: { type: 'boolean', description: 'True only if user explicitly asked for the music video; false (default) for studio master audio over RTMP.' }
+          video: { type: 'boolean', description: 'True only if user explicitly asked for the music video; false (default) for studio master audio.' }
         },
         required: ['query', 'action']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'open_dm_menu',
+      description: 'Open any DM menu studio screen or Help & Guide in private chat (dashboard, moviehub, music_play, url_downloader, tiktok_search, lyrics, recognize, pinterest, stickers, cemoji, whatsapp, channel_post, autopost, broadcast, clone, settings, ai, help, game_hub). Optionally execute a query directly for music, URLs, Pinterest, TikTok, lyrics, or movies.',
+      parameters: {
+        type: 'object',
+        properties: {
+          screen: {
+            type: 'string',
+            enum: ['dashboard', 'moviehub', 'music_play', 'url_downloader', 'tiktok_search', 'lyrics', 'recognize', 'pinterest', 'stickers', 'cemoji', 'whatsapp', 'channel_post', 'autopost', 'broadcast', 'clone', 'settings', 'ai', 'help', 'game_hub'],
+            description: 'Target DM menu screen to open.'
+          },
+          query: {
+            type: 'string',
+            description: 'Optional song title, URL, movie title, or search topic to run immediately.'
+          }
+        },
+        required: ['screen']
       }
     }
   },
@@ -490,11 +512,54 @@ export class LancyToolExecutor {
   constructor({ app }) {
     this.app = app;
     this.browser = new WebBrowser();
+    this.dmLastMusicSearch = new Map();
   }
 
   #qm() { return this.app?.musicQueueManager || null; }
   #music() { return this.app?.music || null; }
   #movieUi() { return this.app?.screens?.get?.('music')?.movieUi || this.app?.screens?.get?.('movieUi') || null; }
+  #isDm(chatId, context = {}) {
+    const cid = Number(chatId || context?.telegramChatId || 0);
+    const surf = String(context?.surface || '');
+    return cid > 0 && !surf.startsWith('vc_');
+  }
+  #buildDmCtx(chatId, context = {}) {
+    const cid = Number(context.telegramChatId || chatId || context.userId || 0);
+    const uid = Number(context.userId || context.ctx?.tgId || cid || 0);
+    const api = context.ctx?.api || this.app?.telegram?.api || null;
+    const screens = context.ctx?.screens || this.app?.screens || null;
+    const base = context.ctx || {};
+    return {
+      ...base,
+      chatId: cid,
+      chat: base.chat || { id: cid, type: cid > 0 ? 'private' : 'supergroup' },
+      tgId: uid,
+      user: context.user || base.user || null,
+      api,
+      screens,
+      settings: base.settings || this.app?.settings,
+      db: base.db || this.app?.db,
+      sm: base.sm || this.app?.sm,
+      controller: base.controller || this.app?.telegram?.controller || null,
+      botName: base.botName || this.app?.telegram?.botName || 'Lancy Bot',
+      bot: base.bot || this.app?.telegram?.controller?.botContext || null,
+      isGroup: cid < 0,
+      isPrivate: cid > 0,
+      forceNew: true,
+      reply: base.reply || ((text, extra = {}) => api?.sendMessage?.(cid, text, extra)),
+      replyRich: base.replyRich || ((rich, extra = {}, files = null) => api?.sendRichMessage?.(cid, rich, extra, files)),
+      sendRichMessage: base.sendRichMessage || ((rich, extra = {}, files = null) => api?.sendRichMessage?.(cid, rich, extra, files)),
+      editScreen: base.editScreen || (async (rich, extra = {}, files = null) => {
+        if (typeof api?.sendRichMessage === 'function') {
+          return await api.sendRichMessage(cid, rich, extra, files);
+        }
+        if (typeof api?.sendMessage === 'function') {
+          return await api.sendMessage(cid, rich?.html || rich?.plainText || 'Menu', { parse_mode: 'HTML' });
+        }
+        return null;
+      })
+    };
+  }
   #session(chatId) {
     const qm = this.#qm();
     const id = Number(chatId);
@@ -618,6 +683,29 @@ export class LancyToolExecutor {
         const clonesCount = typeof this.app?.cloneManager?.getActiveCount === 'function'
           ? this.app.cloneManager.getActiveCount()
           : (clonesMap?.size ?? 0);
+        if (this.#isDm(chatId, context)) {
+          const dmMusic = this.dmLastMusicSearch.get(chatId) || null;
+          const storedSearch = this.#getStoredMovieSearch(chatId, s);
+          return {
+            ok: true,
+            isDm: true,
+            vcSupported: false,
+            status: 'dm',
+            bot: {
+              name: botInfo?.first_name || 'Lancy',
+              username: botInfo?.username || this.app?.config?.telegram?.botUsername || null,
+              clonesCount
+            },
+            lastMusicSearch: dmMusic ? {
+              query: dmMusic.query || null,
+              results: (dmMusic.tracks || []).slice(0, 5).map((t, idx) => ({ index: idx + 1, title: t.title, artist: t.artist || null }))
+            } : null,
+            lastMovieSearch: storedSearch?.results?.length ? {
+              query: storedSearch.query || null,
+              results: storedSearch.results.slice(0, 5).map((m, idx) => ({ index: Number(m.index || idx + 1), id: m.id, title: m.title, year: m.year || null, type: m.type || 'movie' }))
+            } : null
+          };
+        }
         if (!s) {
           return {
             ok: false,
@@ -703,6 +791,9 @@ export class LancyToolExecutor {
       }
 
       case 'control_playback': {
+        if (this.#isDm(chatId, context)) {
+          return { ok: false, error: 'vc_not_available_in_dm', message: 'Voice Chat controls only work inside Group Chats or Channels — not private DM! In DM I can download songs, movies, or links directly for you.' };
+        }
         if (!qm || !chatId) return { ok: false, error: 'music_unavailable' };
         const action = String(args.action || '').toLowerCase();
         if (action === 'pause') {
@@ -786,6 +877,9 @@ export class LancyToolExecutor {
       }
 
       case 'adjust_volume': {
+        if (this.#isDm(chatId, context)) {
+          return { ok: false, error: 'vc_not_available_in_dm', message: 'Voice Chat volume only applies to Group/Channel Voice Chats, not DM.' };
+        }
         if (!qm || !chatId || !s) return { ok: false, error: 'music_unavailable' };
         const rawMode = String(args.mode || 'set').toLowerCase();
         const mode = rawMode === 'up' ? 'louder' : rawMode === 'down' ? 'lower' : rawMode;
@@ -814,6 +908,9 @@ export class LancyToolExecutor {
       }
 
       case 'seek_playback': {
+        if (this.#isDm(chatId, context)) {
+          return { ok: false, error: 'vc_not_available_in_dm', message: 'Seek controls apply to active Voice Chat streams in Groups/Channels, not DM.' };
+        }
         if (!qm || !chatId || !s) return { ok: false, error: 'music_unavailable' };
         if (!s.currentTrack) return { ok: false, error: 'nothing_playing' };
         const dur = Number(s.currentTrack.durationSeconds || 0);
@@ -837,6 +934,9 @@ export class LancyToolExecutor {
       }
 
       case 'manage_queue': {
+        if (this.#isDm(chatId, context)) {
+          return { ok: false, error: 'vc_not_available_in_dm', message: 'VC Queue & playlists apply to Group/Channel Voice Chats. In DM just ask me to download any song or movie!' };
+        }
         if (!qm || !chatId || !s) return { ok: false, error: 'music_unavailable' };
         const rawAction = String(args.action || 'list').toLowerCase();
         const action = rawAction === 'move_to_top' ? 'promote' : rawAction;
@@ -1000,6 +1100,37 @@ export class LancyToolExecutor {
           fetchSeasons: action === 'search' || action === 'inspect' || action === 'trending' || action === 'random' || resultIndex > 0
         });
         const top = enriched[pickedIdx] || enriched[0];
+
+        if ((action === 'play_now' || action === 'queue') && this.#isDm(chatId, context)) {
+          const dmCtx = this.#buildDmCtx(chatId, context);
+          const movieUi = this.#movieUi();
+          if (movieUi?.openMovieSearch) {
+            await movieUi.openMovieSearch(dmCtx, query || top.title, { preloadedResults: enriched, forceNewCard: true }).catch(() => null);
+          } else {
+            await this.#syncMovieSearchCard(gcCtx, chatId, s, query || top.title, enriched);
+          }
+          return {
+            ok: true,
+            dmDownload: true,
+            action: 'search',
+            cardKind: 'movie_list',
+            query: query || top.title,
+            postedToChat: true,
+            count: enriched.length,
+            results: enriched.map((m) => ({
+              index: m.index,
+              id: m.id,
+              title: m.title,
+              year: m.year || null,
+              type: m.type || 'movie',
+              rating: m.rating || null,
+              totalSeasons: m.totalSeasons || null,
+              totalEpisodes: m.totalEpisodes || null,
+              seasonsBreakdown: m.seasonsBreakdown || null,
+              overview: safeClip(m.overview || '', 120) || null
+            }))
+          };
+        }
 
         if ((action === 'play_now' || action === 'queue') && qm && chatId) {
           const isTv = top.type === 'tv' || reqSeason != null || reqEpisode != null;
@@ -1193,6 +1324,30 @@ export class LancyToolExecutor {
           };
         }
 
+        if ((action === 'play_now' || action === 'queue') && this.#isDm(chatId, context)) {
+          const dmCtx = this.#buildDmCtx(chatId, context);
+          const dlScreen = this.app?.screens?.get?.('downloader') || context.ctx?.screens?.get?.('downloader');
+          if (dlScreen?.executeDownload && pick.url) {
+            const job = dlScreen.executeDownload(dmCtx, pick.url);
+            if (context.waitForUpload) await job;
+            else void job.catch(() => {});
+          } else {
+            await this.#postVideoSearchCard(gcCtx, pick.title, [pick]);
+          }
+          return {
+            ok: true,
+            dmDownload: true,
+            action: 'send_to_chat',
+            cardKind: 'video',
+            index: pick.index,
+            title: pick.title,
+            author: pick.author,
+            duration: pick.duration,
+            url: pick.url,
+            sent: true
+          };
+        }
+
         if ((action === 'play_now' || action === 'queue') && qm && chatId) {
           const track = {
             ...normalizeTrack({
@@ -1233,8 +1388,9 @@ export class LancyToolExecutor {
         const action = String(args.action || 'play_now').toLowerCase();
         const wantsVideo = Boolean(args.video || /\b(?:music\s*video|official\s*video|with\s+video|\bmv\b)\b/i.test(query));
         if (!query) return { ok: false, error: 'missing_query' };
+        const isDm = this.#isDm(chatId, context);
 
-        if (action === 'ai_dj' && this.#music()?.aiDj && s) {
+        if (!isDm && action === 'ai_dj' && this.#music()?.aiDj && s) {
           const djRes = await this.#music().aiDj.chatWithDj(s, query, { apply: true }).catch(() => null);
           if (djRes) return { ok: true, action: 'ai_dj', reply: djRes.reply || null, addedCount: djRes.added?.length || 0, results: (djRes.added || []).slice(0, 5).map((t, i) => ({ index: i + 1, title: t.title, artist: t.artist || null, sourceBadge: t.sourceBadge || 'Studio' })) };
         }
@@ -1264,9 +1420,16 @@ export class LancyToolExecutor {
             results: tracks.slice(0, 8)
           };
         }
+        if (isDm) {
+          this.dmLastMusicSearch.set(chatId, {
+            query,
+            timestamp: Date.now(),
+            tracks: tracks.slice(0, 8)
+          });
+        }
 
         if (action === 'search') {
-          return { ok: true, action: 'search', cardKind: 'music_list', query, results: formattedResults };
+          return { ok: true, dmMode: isDm, action: 'search', cardKind: 'music_list', query, results: formattedResults };
         }
 
         const pick = {
@@ -1274,6 +1437,46 @@ export class LancyToolExecutor {
           mediaType: wantsVideo ? 'video' : 'audio',
           requester: context.senderName || 'Lancy AI'
         };
+
+        if (isDm) {
+          const dmCtx = this.#buildDmCtx(chatId, context);
+          const dlScreen = this.app?.screens?.get?.('downloader') || context.ctx?.screens?.get?.('downloader');
+          const dlTarget = `${pick.artist || ''} ${pick.title}`.trim() || query;
+          if (typeof dlScreen?.executeDownload === 'function') {
+            const dlJob = dlScreen.executeDownload(dmCtx, dlTarget);
+            if (context.waitForUpload) await dlJob;
+            else void dlJob.catch(() => {});
+          } else if (this.app?.musicLibrary?.acquire && dmCtx.api?.sendAudio) {
+            const acquired = await this.app.musicLibrary.acquire(pick, { download: true, video: wantsVideo }).catch(() => null);
+            if (acquired?.filePath) {
+              await dmCtx.api.sendAudio(chatId, audioUpload(acquired.filePath, acquired.track?.title || pick.title, acquired.track?.artist || pick.artist), {
+                title: acquired.track?.title || pick.title,
+                performer: acquired.track?.artist || pick.artist || undefined
+              }).catch(() => {});
+              acquired.release?.();
+            }
+          }
+          this.app?.lancyAgent?.taste?.recordPreference?.({
+            userId: context.userId,
+            chatId,
+            displayName: context.senderName,
+            artist: pick.artist || pick.channel || query,
+            requestText: query
+          });
+          return {
+            ok: true,
+            dmDownload: true,
+            action: 'download_dm',
+            cardKind: 'music',
+            query,
+            title: pick.title,
+            artist: pick.artist || null,
+            album: pick.album || null,
+            sourceBadge: pick.sourceBadge || 'Studio Master MP3',
+            mediaType: 'audio',
+            results: formattedResults
+          };
+        }
 
         if (qm && chatId) {
           // Enable Smart Infinite Radio from this artist/genre cluster when requested or when radio is enabled
@@ -1322,6 +1525,9 @@ export class LancyToolExecutor {
       }
 
       case 'tune_cinema_stream': {
+        if (this.#isDm(chatId, context)) {
+          return { ok: false, error: 'vc_not_available_in_dm', message: 'Voice Chat stream settings only apply to Group/Channel Voice Chats, not DM.' };
+        }
         if (!qm || !chatId || !s) return { ok: false, error: 'music_unavailable' };
         let setting = String(args.setting || '').toLowerCase();
         let val = String(args.value || '').trim().toLowerCase();
@@ -1420,6 +1626,9 @@ export class LancyToolExecutor {
       }
 
       case 'ai_dj_control': {
+        if (this.#isDm(chatId, context)) {
+          return { ok: false, error: 'vc_not_available_in_dm', message: 'VC AI DJ controls apply inside Group/Channel Voice Chats, not DM. In DM I can download any song directly for you!' };
+        }
         if (!s || !this.#music()?.aiDj) return { ok: false, error: 'aidj_unavailable' };
         const aiDj = this.#music().aiDj;
         const action = String(args.action || '').toLowerCase();
@@ -1509,21 +1718,132 @@ export class LancyToolExecutor {
         const kind = String(args.kind || '');
         const target = String(args.target || '').trim();
         if (!target) return { ok: false, error: 'missing_target' };
+        const dmCtx = this.#buildDmCtx(chatId, context);
+        const screens = dmCtx.screens || this.app?.screens;
         if (kind === 'download_url') {
-          const dlScreen = this.app?.screens?.get?.('downloader');
-          if (context.ctx && dlScreen?.executeDownload) {
-            await dlScreen.executeDownload(context.ctx, target);
-            return { ok: true, kind, started: true, target };
+          const dlScreen = screens?.get?.('downloader');
+          if (dlScreen?.executeDownload) {
+            const job = dlScreen.executeDownload(dmCtx, target);
+            if (context.waitForUpload) await job;
+            else void job.catch(() => {});
+            return { ok: true, dmDownload: this.#isDm(chatId, context), kind, started: true, target };
           }
         }
         if (kind === 'search_images') {
-          const pin = this.app?.screens?.get?.('pinterest');
-          if (context.ctx && pin?.executeSearch) {
-            await pin.executeSearch(context.ctx, target);
-            return { ok: true, kind, started: true, target };
+          const pin = screens?.get?.('pinterest');
+          if (pin?.executeSearch) {
+            await pin.executeSearch(dmCtx, target);
+            return { ok: true, dmMenu: this.#isDm(chatId, context), kind, started: true, target };
           }
         }
         return { ok: false, error: 'screen_unavailable' };
+      }
+
+      case 'open_dm_menu': {
+        const targetScreen = String(args.screen || 'help').trim().toLowerCase();
+        const query = String(args.query || '').trim();
+        const dmCtx = this.#buildDmCtx(chatId, context);
+        const screens = dmCtx.screens || this.app?.screens;
+        if (!screens) return { ok: false, error: 'screens_unavailable' };
+
+        if (targetScreen === 'moviehub') {
+          const movieUi = this.#movieUi();
+          if (query && movieUi?.openMovieSearch) {
+            await movieUi.openMovieSearch(dmCtx, query, { forceNewCard: true });
+            return { ok: true, openedMenu: true, screen: 'moviehub', query };
+          }
+          if (movieUi?.openHub) {
+            await movieUi.openHub(dmCtx);
+            return { ok: true, openedMenu: true, screen: 'moviehub' };
+          }
+          const musicScreen = screens.get('music');
+          if (musicScreen?.handle) {
+            await musicScreen.handle(dmCtx, 'moviehub', []);
+            return { ok: true, openedMenu: true, screen: 'moviehub' };
+          }
+        }
+
+        if (targetScreen === 'music_play') {
+          const dl = screens.get('downloader');
+          if (query && dl?.executeDownload) {
+            void dl.executeDownload(dmCtx, query).catch(() => {});
+            return { ok: true, dmDownload: true, openedMenu: true, screen: 'music_play', query };
+          }
+          if (dl?.handle) {
+            await dl.handle(dmCtx, 'play', []);
+            return { ok: true, openedMenu: true, screen: 'music_play' };
+          }
+        }
+
+        if (targetScreen === 'url_downloader') {
+          const dl = screens.get('downloader');
+          if (query && dl?.executeDownload) {
+            void dl.executeDownload(dmCtx, query).catch(() => {});
+            return { ok: true, dmDownload: true, openedMenu: true, screen: 'url_downloader', query };
+          }
+          if (dl?.open) {
+            await dl.open(dmCtx);
+            return { ok: true, openedMenu: true, screen: 'url_downloader' };
+          }
+        }
+
+        if (targetScreen === 'tiktok_search') {
+          const dl = screens.get('downloader');
+          if (query && dl?.executeTikTokSearch) {
+            await dl.executeTikTokSearch(dmCtx, query);
+            return { ok: true, openedMenu: true, screen: 'tiktok_search', query };
+          }
+          if (dl?.handle) {
+            await dl.handle(dmCtx, 'tiktokSearch', []);
+            return { ok: true, openedMenu: true, screen: 'tiktok_search' };
+          }
+        }
+
+        if (targetScreen === 'lyrics') {
+          const dl = screens.get('downloader');
+          if (query && dl?.executeLyricsSearch) {
+            await dl.executeLyricsSearch(dmCtx, query);
+            return { ok: true, openedMenu: true, screen: 'lyrics', query };
+          }
+          if (dl?.handle) {
+            await dl.handle(dmCtx, 'searchLyrics', []);
+            return { ok: true, openedMenu: true, screen: 'lyrics' };
+          }
+        }
+
+        if (targetScreen === 'recognize') {
+          const dl = screens.get('downloader');
+          if (dl?.handle) {
+            await dl.handle(dmCtx, 'recognize', []);
+            return { ok: true, openedMenu: true, screen: 'recognize' };
+          }
+        }
+
+        if (targetScreen === 'pinterest') {
+          const pin = screens.get('pinterest');
+          if (query && pin?.executeSearch) {
+            await pin.executeSearch(dmCtx, query);
+            return { ok: true, openedMenu: true, screen: 'pinterest', query };
+          }
+          if (pin?.open) {
+            await pin.open(dmCtx);
+            return { ok: true, openedMenu: true, screen: 'pinterest' };
+          }
+        }
+
+        if (targetScreen === 'game_hub') {
+          if (typeof this.app?.games?.openHub === 'function') {
+            await this.app.games.openHub(dmCtx, 'visual');
+            return { ok: true, openedMenu: true, screen: 'game_hub' };
+          }
+        }
+
+        const mod = screens.get(targetScreen);
+        if (mod?.open) {
+          await mod.open(dmCtx);
+          return { ok: true, openedMenu: true, screen: targetScreen };
+        }
+        return { ok: false, error: `menu_not_found:${targetScreen}` };
       }
 
       case 'create_group_poll':

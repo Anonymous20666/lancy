@@ -309,8 +309,15 @@ export class PlayMusicProvider {
     if (!video && existsSync(diskCachePattern) && statSync(diskCachePattern).size > 40000) {
       const buf = readFileSync(diskCachePattern);
       writeFileSync(path, buf);
-      return normalizeTrack({ ...track, filePath: path, availability: 'resolved' }, this.id);
+      return normalizeTrack({
+        ...track,
+        filePath: path,
+        mediaType: 'audio',
+        availability: 'resolved',
+        capabilities: { stream: true, download: true, seek: true, video: false }
+      }, this.id);
     }
+    const minAudioSeconds = Math.max(45, Math.min(85, Math.floor((Number(track.durationSeconds) || 120) * 0.55)));
     let matchedVideoId = null;
     let matchedRealMusicVideo = false;
     const titleWords = String(track.title || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2 && !['official', 'music', 'video', 'audio', 'feat', 'ft', 'the'].includes(w));
@@ -349,7 +356,7 @@ export class PlayMusicProvider {
       } catch {}
     }
 
-    if (!matchedVideoId) {
+    if (video && !matchedVideoId) {
       try {
         const fastItems = await searchYouTubeFast(`${cleanQuery} official audio`, 'NG', { wide: true });
         const filtered = (fastItems || []).filter(v =>
@@ -425,12 +432,13 @@ export class PlayMusicProvider {
         return normalizeTrack({
           ...track,
           filePath: path,
+          mediaType: 'audio',
           availability: 'resolved',
-          capabilities: { stream: true, download: true, seek: true, video }
+          capabilities: { stream: true, download: true, seek: true, video: false }
         }, this.id);
       }
 
-      // When using real exec runner (production), try Multi-Source Audio Engines FIRST (JioSaavn 320kbps -> Spotify/Apple/Audiomack social-dl -> Audius -> SoundCloud)
+      // When using real exec runner (production), try Multi-Source Audio Engines FIRST (JioSaavn 320kbps -> Spotify/Apple/Audiomack -> Audius -> SoundCloud)
       let resolvedMultiSource = false;
       if (this.runner === exec) {
         const multiRes = await resolveAndDownloadAudio({
@@ -438,7 +446,7 @@ export class PlayMusicProvider {
           trackId: matchedVideoId,
           tempPath: path,
           ffmpegPath: ffmpegBin,
-          minSeconds: 30,
+          minSeconds: minAudioSeconds,
           meta: {
             title: track.title,
             artist: track.artist || 'Music',
@@ -467,14 +475,14 @@ export class PlayMusicProvider {
             trackId: matchedVideoId,
             tempPath: path,
             ffmpegPath: ffmpegBin,
-            minSeconds: 30,
+            minSeconds: minAudioSeconds,
             meta: { title: track.title, artist: track.artist || 'Music' },
             skipYouTube: true,
           }).catch(() => null) : null;
           if (!rescue?.ok || (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000))) {
             try {
               const scTarget = this.runner === exec ? `scsearch5:${cleanQuery}` : `scsearch1:${cleanQuery}`;
-              await this.runner('yt-dlp', buildArgs(scTarget, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 }).catch(e => {
+              await this.runner('yt-dlp', buildArgs(scTarget, { asVideo: false }), { timeout: 45000, maxBuffer: 4 * 1024 * 1024 }).catch(e => {
                 if (this.runner === exec && existsSync(path) && statSync(path).size >= 10000) return;
                 throw e;
               });
@@ -496,8 +504,9 @@ export class PlayMusicProvider {
     return normalizeTrack({
       ...track,
       filePath: path,
+      mediaType: downloadedAsVideo ? 'video' : 'audio',
       availability: 'resolved',
-      capabilities: { stream: true, download: true, seek: true, video }
+      capabilities: { stream: true, download: true, seek: true, video: downloadedAsVideo }
     }, this.id);
   }
 }

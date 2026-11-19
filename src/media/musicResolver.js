@@ -484,7 +484,7 @@ export async function resolveAndDownloadAudio({
     const [metaSettled, rawYtIdSettled, proxyUpSettled] = await Promise.allSettled([
         preResolvedMeta !== undefined ? Promise.resolve(preResolvedMeta) : resolveMetadata(query),
         (!hasValidYtId && !skipYouTube && rawQuery) ? ytSearchId(rawQuery, minSeconds) : Promise.resolve(null),
-        isProxyReachable(RESIDENTIAL_PROXY),
+        skipYouTube ? Promise.resolve(false) : isProxyReachable(RESIDENTIAL_PROXY),
     ]);
     const meta = metaSettled.status === 'fulfilled' ? metaSettled.value : null;
     const rawYtId = rawYtIdSettled.status === 'fulfilled' ? rawYtIdSettled.value : null;
@@ -494,65 +494,76 @@ export async function resolveAndDownloadAudio({
     const attempts = [];
     const triedYtIds = new Set();
 
-    // 1. Primary Multi-Source Audio Engines: JioSaavn 320kbps CDN -> Spotify/Apple/Audiomack (social-dl & btch-downloader) -> Audius -> SoundCloud
-    attempts.push({
-        name: 'jiosaavn',
-        run: async () => {
-            onProgress?.(`Resolving 320kbps studio master on JioSaavn for "${searchQuery || rawQuery}"… ♡`);
-            const t = await jiosaavnPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await jiosaavnPick(rawQuery) : null);
-            if (!t) return false;
-            onProgress?.(`Downloading 320kbps studio track "${t.title}"… ♡`);
-            const ok = await jiosaavnDownload(t, tempPath, resolvedFfmpeg);
-            if (ok) {
-                try {
-                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.artist}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
-                    unlinkSync(tempPath);
-                    renameSync(`${tempPath}.tag.mp3`, tempPath);
-                } catch {}
+    // 1. Direct Spotify / Apple Music / Audiomack / SoundCloud URLs first (fast direct link resolution)
+    const directSocialRef = String(meta?.sourceRef || '').trim();
+    if (/open\.spotify\.com\/track\/|spotify\.link\/|spoti\.fi\/|music\.apple\.com\/|audiomack\.com\/|soundcloud\.com\//i.test(directSocialRef)) {
+        attempts.push({
+            name: 'spotify-social',
+            run: async () => {
+                const res = await resolveSocialOrSpotifyAudio({
+                    title: meta?.title || rawQuery,
+                    artist: meta?.artist || '',
+                    sourceRef: directSocialRef,
+                    durationSeconds: meta?.durationSeconds || meta?.duration || undefined
+                }, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg, onProgress });
+                return Boolean(res?.ok);
             }
-            return ok;
-        },
-    });
+        });
+    }
 
-    attempts.push({
-        name: 'spotify-social',
-        run: async () => {
-            const res = await resolveSocialOrSpotifyAudio({
-                title: meta?.title || rawQuery,
-                artist: meta?.artist || '',
-                sourceRef: meta?.sourceRef || '',
-                durationSeconds: meta?.durationSeconds || meta?.duration || undefined
-            }, tempPath, { minSeconds, ffmpegPath: resolvedFfmpeg, onProgress });
-            return Boolean(res?.ok);
-        }
-    });
+    // 2. Race JioSaavn 320kbps + Audius track discovery in parallel (<2.5s total) so non-hits fail fast
+    const primaryQ = searchQuery || rawQuery;
+    const [jioSettled, audiusSettled] = await Promise.allSettled([
+        primaryQ ? jiosaavnPick(primaryQ) : Promise.resolve(null),
+        primaryQ ? audiusPick(primaryQ) : Promise.resolve(null)
+    ]);
+    const jioTrack = jioSettled.status === 'fulfilled' ? jioSettled.value : null;
+    const audiusTrack = audiusSettled.status === 'fulfilled' ? audiusSettled.value : null;
 
-    attempts.push({
-        name: 'audius',
-        run: async () => {
-            onProgress?.(`Resolving media on Audius for "${searchQuery || rawQuery}"… ♡`);
-            const t = await audiusPick(searchQuery || rawQuery) || (searchQuery !== rawQuery ? await audiusPick(rawQuery) : null);
-            if (!t) return false;
-            onProgress?.(`Downloading full track "${t.title}"… ♡`);
-            const ok = await audiusDownload(t, tempPath);
-            if (ok) {
-                try {
-                    await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${t.title}`, '-metadata', `artist=${t.user?.name || 'Unknown'}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
-                    unlinkSync(tempPath);
-                    renameSync(`${tempPath}.tag.mp3`, tempPath);
-                } catch {}
-            }
-            return ok;
-        },
-    });
+    if (jioTrack) {
+        attempts.push({
+            name: 'jiosaavn',
+            run: async () => {
+                onProgress?.(`Downloading 320kbps studio track "${jioTrack.title}"… ♡`);
+                const ok = await jiosaavnDownload(jioTrack, tempPath, resolvedFfmpeg);
+                if (ok) {
+                    try {
+                        await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${jioTrack.title}`, '-metadata', `artist=${jioTrack.artist}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
+                        unlinkSync(tempPath);
+                        renameSync(`${tempPath}.tag.mp3`, tempPath);
+                    } catch {}
+                }
+                return ok;
+            },
+        });
+    }
 
+    if (audiusTrack) {
+        attempts.push({
+            name: 'audius',
+            run: async () => {
+                onProgress?.(`Downloading full track "${audiusTrack.title}"… ♡`);
+                const ok = await audiusDownload(audiusTrack, tempPath);
+                if (ok) {
+                    try {
+                        await execFileAsync(resolvedFfmpeg, ['-y', '-i', tempPath, '-metadata', `title=${audiusTrack.title}`, '-metadata', `artist=${audiusTrack.user?.name || 'Unknown'}`, '-id3v2_version', '3', '-c', 'copy', `${tempPath}.tag.mp3`], { timeout: 30000 });
+                        unlinkSync(tempPath);
+                        renameSync(`${tempPath}.tag.mp3`, tempPath);
+                    } catch {}
+                }
+                return ok;
+            },
+        });
+    }
+
+    // 3. SoundCloud fast full-track search (minSeconds automatically skips 30s Go+ previews)
     attempts.push({
         name: 'soundcloud',
         run: async () => {
             const q1 = meta ? searchQuery : (rawQuery || searchQuery);
-            if (await ytDlpMp3(`scsearch6:${q1}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg })) return true;
+            if (await ytDlpMp3(`scsearch6:${q1}`, tempPath, { minSeconds, timeoutMs: 35000, ffmpegPath: resolvedFfmpeg })) return true;
             if (rawQuery && rawQuery !== q1) {
-                return await ytDlpMp3(`scsearch6:${rawQuery}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg });
+                return await ytDlpMp3(`scsearch6:${rawQuery}`, tempPath, { minSeconds, timeoutMs: 35000, ffmpegPath: resolvedFfmpeg });
             }
             return false;
         }

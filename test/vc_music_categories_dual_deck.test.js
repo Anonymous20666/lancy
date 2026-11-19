@@ -271,3 +271,118 @@ test('/vc Mode Selector, Music Streaming Hub, 2026 Categories Screen, Category S
   assert.ok(prevStr.includes('Send 30s Audio Clip'));
 });
 
+test('DM AI avoids VC confusion, treats "okay" after song offer as MP3 download, and opens DM menu/help screens', async () => {
+  const downloaded = [];
+  const openedMenus = [];
+  const vcPlayed = [];
+
+  const mockApp = {
+    ai: {
+      chatWithTools: async ({ system, messages }) => {
+        // Verify DM system prompt explicitly tells AI NOT to confuse DM with VC and lists DM menus
+        assert.ok(system.includes('NEVER for private DM'));
+        assert.ok(system.includes('DM STUDIO & FULL MENU KNOWLEDGE'));
+        const lastUser = messages.at(-1)?.content || '';
+        if (/help|menu/i.test(lastUser)) {
+          return {
+            text: 'Opening the full Help & Guide right now!',
+            toolCalls: [{ id: 'tc_help', function: { name: 'open_dm_menu', arguments: { screen: 'help' } } }]
+          };
+        }
+        return {
+          text: 'Downloading Rema — Calm Down straight to your DM!',
+          toolCalls: [{ id: 'tc_dl', function: { name: 'search_and_play_music', arguments: { query: 'Rema Calm Down', action: 'play_now' } } }]
+        };
+      }
+    },
+    screens: new Map([
+      ['downloader', {
+        executeDownload: async (_ctx, query) => {
+          downloaded.push(query);
+          return { ok: true };
+        }
+      }],
+      ['help', {
+        open: async () => {
+          openedMenus.push('help');
+        }
+      }]
+    ]),
+    musicProviders: {
+      get: () => ({
+        search: async (q) => ({
+          items: [
+            { id: 'music:rema1', provider: 'music', providerId: 'rema1', title: 'Calm Down', artist: 'Rema', durationSeconds: 239, sourceBadge: 'Deezer · Studio' }
+          ]
+        })
+      })
+    },
+    musicQueueManager: {
+      sessions: new Map(),
+      getSession: () => ({ chatId: 7778165287, upcoming: [], movieUpcoming: [] }),
+      playImmediateAndContinue: async (cid, track) => {
+        vcPlayed.push({ cid, track });
+      }
+    }
+  };
+
+  const agent = new LancyAgent({ app: mockApp });
+  const dmCtx = { chatId: 7778165287, tgId: 7778165287, user: { id: 7778165287, first_name: 'Koko' } };
+
+  // 1. Direct music request in DM -> downloads MP3 to DM, never calls VC playImmediateAndContinue, no VC card
+  const dmRes = await agent.handleBotTurn(dmCtx, 'play rema calm down', { mode: 'companion', surface: 'dm_text' });
+  assert.equal(vcPlayed.length, 0, 'DM must never start VC playback');
+  assert.equal(downloaded.length, 1);
+  assert.ok(downloaded[0].includes('Calm Down'));
+  assert.equal(dmRes.card, null, 'DM download must not post redundant VC DJ card');
+
+  // 2. User says "okay" after a song was discussed/offered in DM -> automatically downloads MP3 to DM
+  const conv = agent.getBotConversation(7778165287, 7778165287);
+  conv.history.push({ role: 'assistant', content: 'Want me to download "Tyla - Water" to your DM?' });
+  const okRes = await agent.handleBotTurn(dmCtx, 'okay', { mode: 'companion', surface: 'dm_text' });
+  assert.equal(vcPlayed.length, 0);
+  assert.equal(downloaded.length, 2);
+  assert.ok(okRes.reply.toLowerCase().includes('downloading'));
+
+  // 3. User asks for help / DM menu -> opens Help & Guide screen cleanly
+  const helpRes = await agent.handleBotTurn(dmCtx, 'show me help and dm menu', { mode: 'companion', surface: 'dm_text' });
+  assert.deepEqual(openedMenus, ['help']);
+  assert.equal(helpRes.card, null);
+
+  // 4. VC deck controls in DM are rejected cleanly with non-VC explanation
+  const ctrlOut = await agent.executor.execute('control_playback', { action: 'pause' }, { chatId: 7778165287, surface: 'dm_text' });
+  assert.equal(ctrlOut.ok, false);
+  assert.equal(ctrlOut.error, 'vc_not_available_in_dm');
+});
+
+test('InfiniteRadio cold-start resolves 2026 subgenre to signature artist fast without multi-round delay', async () => {
+  const searchedQueries = [];
+  const session = { chatId: -100777888, upcoming: [], history: [], streamMode: 'rtmp' };
+  const mockApp = {
+    musicProviders: {
+      search: async (q) => {
+        searchedQueries.push(q);
+        return {
+          items: [
+            { id: 'music:afro1', provider: 'music', providerId: 'afro1', title: 'Water', artist: 'Tyla', durationSeconds: 200, sourceBadge: 'Deezer' },
+            { id: 'music:afro2', provider: 'music', providerId: 'afro2', title: 'Push 2 Start', artist: 'Tyla', durationSeconds: 185, sourceBadge: 'Deezer' }
+          ]
+        };
+      },
+      get: () => ({ enabled: false })
+    },
+    musicQueueManager: {
+      closed: false,
+      enqueue: (cid, item) => { session.upcoming.push(item); }
+    }
+  };
+  const radio = new InfiniteRadio({ app: mockApp });
+  radio.configure(session, ['Afro-pop'], { video: false });
+  assert.equal(session.radio.video, false);
+  await radio.refill(session);
+  assert.equal(searchedQueries.length, 1, 'Cold-start 2026 subgenre should resolve in 1 fast search call');
+  assert.notEqual(searchedQueries[0], 'Afro-pop', 'Should map Afro-pop to curated Afro-pop artist instead of literal genre name');
+  assert.ok(session.upcoming.length >= 1);
+  assert.equal(session.upcoming[0].mediaType, 'audio');
+});
+

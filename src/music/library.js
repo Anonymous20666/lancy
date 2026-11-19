@@ -198,15 +198,30 @@ export class MediaLibrary {
               args.push('-f', 'lavfi', '-i', 'color=c=0x0b1021:s=1280x720:r=2', '-i', input, '-t', '14400', '-map', '0:v:0', '-map', '1:a:0', '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'stillimage', '-crf', '22', '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2', '-shortest', '-movflags', '+faststart');
             }
           } else {
-            args.push('-i', input, '-t', '14400', '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2', '-ar', '48000', '-ac', '2');
+            let canCopyMp3 = false;
+            if (typeof this.runner === 'function') {
+              try {
+                const probeAudio = await this.runner(this.ffprobe, ['-v', 'error', '-show_entries', 'format=format_name:stream=codec_type,codec_name,sample_rate,channels', '-of', 'json', input], { timeout: 8000 });
+                const aJson = JSON.parse(probeAudio.stdout || '{}');
+                const aSt = aJson.streams?.find(s => s.codec_type === 'audio');
+                const vSt = aJson.streams?.find(s => s.codec_type === 'video');
+                canCopyMp3 = Boolean(!vSt && aSt?.codec_name === 'mp3' && Number(aSt?.sample_rate) === 48000 && Number(aSt?.channels) === 2);
+              } catch {}
+            }
+            if (canCopyMp3) {
+              args.push('-i', input, '-t', '14400', '-map', '0:a:0', '-vn', '-c:a', 'copy');
+            } else {
+              args.push('-i', input, '-t', '14400', '-map', '0:a:0', '-vn', '-c:a', 'libmp3lame', '-q:a', '2', '-ar', '48000', '-ac', '2');
+            }
           }
           args.push('-metadata', `title=${meta.title}`, '-metadata', `artist=${meta.artist || ''}`, '-fs', String(limit), output);
           await this.runner(this.ffmpeg, args, { timeout: 180000 + Math.min(14400, Number(meta.durationSeconds) || 0) * (needsVideo ? 1500 : 200), maxBuffer: 1024 * 1024 });
           const probe = await this.runner(this.ffprobe, ['-v', 'error', '-show_entries', 'format=duration:stream=codec_type', '-of', 'json', output], { timeout: 15000 });
           const info = JSON.parse(probe.stdout); const duration = Number(info.format?.duration); const size = (await stat(output)).size;
-          if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (needsVideo && !info.streams.some(s => s.codec_type === 'video')) || size >= limit || (meta.durationSeconds && duration < Math.min(meta.durationSeconds - 20, meta.durationSeconds * 0.7))) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
+          const outputHasVideo = Boolean(info.streams?.some(s => s.codec_type === 'video'));
+          if (!Number.isFinite(duration) || duration <= 0 || !info.streams?.some(s => s.codec_type === 'audio') || (needsVideo && !outputHasVideo) || size >= limit || (meta.durationSeconds && duration < Math.min(meta.durationSeconds - 20, meta.durationSeconds * 0.7))) throw new MusicError('INVALID_MEDIA', 'The selected file is incomplete or missing the required media streams.');
           await rename(output, filePath);
-          result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: sourceVideo ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || ['youtube', 'music'].includes(track.provider), seek: true, video: sourceVideo } } }; this.active.set(key, result);
+          result = { key, filePath, track: { ...meta, sourceDurationSeconds: meta.durationSeconds, durationSeconds: duration, filePath, availability: 'resolved', mediaType: outputHasVideo ? 'video' : 'audio', capabilities: { stream: true, download: download || meta.downloadable === true || ['youtube', 'music'].includes(track.provider), seek: true, video: outputHasVideo } } }; this.active.set(key, result);
         } catch (error) {
           if (error instanceof MusicError) throw error;
           throw new MusicError('RESOLUTION_FAILED', 'The selected recording could not be downloaded or decoded. Try another permitted result.');

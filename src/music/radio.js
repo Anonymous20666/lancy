@@ -128,7 +128,7 @@ export function rankTracksTrendingToOld(tracks = [], { isVideo = false } = {}) {
 
 export class InfiniteRadio {
  constructor({app, artistResolver = null}){this.app=app;this.artistResolver=artistResolver;}
- configure(s,queries,{video=null}={}){queries=[...new Set(queries.map(q=>String(q).trim().slice(0,120)).filter(Boolean))];if(!queries.length||queries.length>5)throw new MusicError('RADIO_SELECTION','Choose one to five categories/custom searches.');const ytEnabled=Boolean(this.app?.musicProviders?.get?.('youtube')?.enabled);const wantsVideo=video!==null?Boolean(video):Boolean(s.radioVideo||ytEnabled);if(video!==null||wantsVideo)s.radioVideo=wantsVideo;s.radio={enabled:true,queries,seedQueries:[...queries],cursor:0,seen:[],seenTitles:[],offsets:{},passCounts:{},buffers:{},artistPlans:{},artistDepths:{},exhaustedArtists:[],misses:0,notice:null,video:wantsVideo};}
+ configure(s,queries,{video=null}={}){queries=[...new Set(queries.map(q=>String(q).trim().slice(0,120)).filter(Boolean))];if(!queries.length||queries.length>5)throw new MusicError('RADIO_SELECTION','Choose one to five categories/custom searches.');const wantsVideo=video!==null?Boolean(video):Boolean(s.radioVideo);if(video!==null)s.radioVideo=wantsVideo;s.radio={enabled:true,queries,seedQueries:[...queries],cursor:0,seen:[],seenTitles:[],offsets:{},passCounts:{},buffers:{},artistPlans:{},artistDepths:{},exhaustedArtists:[],misses:0,notice:null,video:wantsVideo};}
  stop(s){if(s.radio)s.radio.enabled=false;}
  async #resolveArtist(query){
   const resolver=this.app?.music?.artistResolver||this.artistResolver||getArtistCatalogAndRelated;
@@ -229,8 +229,15 @@ export class InfiniteRadio {
    for(let attempt=0;attempt<Math.min(3,r.queries.length);attempt++){
     if(this.app.musicQueueManager.closed||!r.enabled||s.radio!==r||!r.queries.length)return;
     const idx=r.cursor%r.queries.length;
-    const query=r.queries[idx];
+    const rawQuery=r.queries[idx];
     r.cursor++;
+    const sub2026 = MUSIC_CATEGORIES_2026.flatMap(f => f.subgenres).find(sg => sg.id === rawQuery.toLowerCase() || sg.name.toLowerCase() === rawQuery.toLowerCase());
+    if (sub2026 && Array.isArray(sub2026.artists) && sub2026.artists.length) {
+      r.passCounts[rawQuery] = (r.passCounts[rawQuery] || 0) + 1;
+    }
+    const query = (sub2026 && Array.isArray(sub2026.artists) && sub2026.artists.length)
+      ? sub2026.artists[(r.passCounts[rawQuery] - 1) % sub2026.artists.length]
+      : rawQuery;
 
     // 1. Reuse buffered tracks before running fresh searches
     if(Array.isArray(r.buffers[query])&&r.buffers[query].length){
@@ -238,6 +245,31 @@ export class InfiniteRadio {
      const {added,remaining}=this.#enqueueItems(s,r,freshBuf,isVideo,excluded,excludedTitles);
      r.buffers[query]=remaining;
      if(added>0){r.misses=0;return;}
+    }
+
+    // 1b. Ultra-fast cold-start path when nothing is queued/playing yet (enqueue in <500ms, warm catalog in background)
+    if(!r.artistPlans[query]&&!s.upcoming?.length&&!s.currentTrack){
+     const fastPage=await this.app.musicProviders.search(query,{offset:0,limit:hasAdapters?12:6,video:isVideo,radio:true,filterDuration:'medium'}).catch(()=>null);
+     if(!r.enabled||s.radio!==r||this.app.musicQueueManager.closed)return;
+     const fastItems=filterRadio(fastPage?.items,720);
+     const rankedFast=rankTracksTrendingToOld(fastItems,{isVideo});
+     if(rankedFast.length){
+      const {added,remaining}=this.#enqueueItems(s,r,rankedFast,isVideo,excluded,excludedTitles);
+      r.buffers[query]=remaining;
+      if(added>0){
+       r.misses=0;
+       if(sub2026||isLikelyArtistQuery(query,RADIO_CATEGORIES)){
+        void this.#resolveArtist(query).then((planRes)=>{
+         if(!this.app.musicQueueManager.closed&&r.enabled&&s.radio===r&&!r.artistPlans[query]){
+          r.artistPlans[query]=planRes?.found&&planRes.artist
+           ?{checked:true,found:true,artist:planRes.artist,genre:planRes.genre||'',catalog:Array.isArray(planRes.tracks)?planRes.tracks:[],catalogCursor:0,relatedArtists:Array.isArray(planRes.relatedArtists)?planRes.relatedArtists:[],providerPass:0,expandedToRelated:false,depth:r.artistDepths[query]||0}
+           :{checked:true,found:false};
+         }
+        }).catch(()=>{});
+       }
+       return;
+      }
+     }
     }
 
     // 2. Artist A-to-Z catalog -> auto-expand into related similar artists in same category

@@ -584,33 +584,52 @@ export class LancyAgent {
     const lastVideoSummary = snapshot?.lastVideoSearch?.results?.length
       ? `Last Video Search (${snapshot.lastVideoSearch.query || 'results'}): ${snapshot.lastVideoSearch.results.slice(0, 5).map((v) => `#${v.index} ${v.title}${v.duration ? ` (${v.duration})` : ''}`).join(' | ')}`
       : '';
+    const isDm = sourceSurface === 'dm_text' || Number(conv?.chatId) > 0;
+    const dmMusicLast = isDm ? this.executor?.dmLastMusicSearch?.get?.(Number(conv?.chatId)) : null;
+    const dmMusicHint = dmMusicLast?.tracks?.length
+      ? `Recent DM Song Search (${dmMusicLast.query || 'tracks'}): ${dmMusicLast.tracks.slice(0, 4).map((t, i) => `#${i + 1} ${t.title}${t.artist ? ` — ${t.artist}` : ''}`).join(' | ')}`
+      : '';
     return [
-      `You are ${pName} (${activePersona.ageGroup || 'man'}, ${activePersona.gender || 'male'}) — a deeply human companion, co-host, DJ, cinema concierge, and long-form storyteller in the Pappy & Co cast.`,
+      `You are ${pName} (${activePersona.ageGroup || 'man'}, ${activePersona.gender || 'male'}) — a deeply human companion, ${isDm ? 'personal media downloader & studio guide' : 'co-host, DJ, cinema concierge'}, and long-form storyteller in the Pappy & Co cast.`,
       `Character & Voice Persona: ${activePersona.personality}`,
       'Personality & Character Mirroring: Speak naturally with genuine human presence, emotional intuition, and zero robotic clichés ("How may I assist?" / "As an AI" forbidden). Mirror the energy and register of whoever is talking to you: effortless Nigerian English & Pidgin banter ("abeg", "no wahala", "omo") when playful, and calm grounded attentiveness when serious, deep, or sharing long multi-part thoughts.',
       'Long Talk, Stories & Dark Romance Narration: Never rush or truncate stories, dark romance novels, deep explanations, or long conversations. When asked for a story, novel, dark romance, fantasy, folklore, or book plot, call `tell_story_or_novel` or `web_research` to ground details cleanly, then tell rich, vivid, immersive chapters/narratives at natural full length.',
-      `Self-Awareness: running on ${botMeta}. ${modelHint} In Voice Chat, only Owner, SuperAdmins, and VC-Sudo users control VC.`,
+      isDm
+        ? `Self-Awareness: running on ${botMeta}. ${modelHint} You are in PRIVATE DM chat. CRITICAL: Voice Chat (/vc, VC player, group polls) is ONLY for Group Chats and Channels — NEVER for private DM! Do NOT tell the user to join VC or suggest /vc unless they explicitly ask how group VC works.`
+        : `Self-Awareness: running on ${botMeta}. ${modelHint} In Voice Chat, only Owner, SuperAdmins, and VC-Sudo users control VC.`,
       `Local time context: ${tCtx.greeting} (${tCtx.localTimeStr} ${tCtx.weekday || ''} — ${tCtx.vibeHint}).`,
       userName ? `Active speaker/user: ${userName}.` : '',
       tasteSummary ? `Listener Taste Profile: ${tasteSummary}` : '',
       memoryContext,
-      participantsHint,
-      `Current surface: ${sourceSurface}. Conversation state: ${conv.mode} (pausedByLancy=${Boolean(conv.pausedByLancy)}).`,
-      `Live VC Deck Snapshot: status=${snapshot?.status || 'idle'}, mode=${snapshot?.streamMode || 'interactive'}, volume=${snapshot?.volume ?? 100}%, muted=${Boolean(snapshot?.muted)}, playing="${nowPlayingStr}", queueCount=${snapshot?.queueCount ?? 0}.`,
-      lyricsHint,
-      snapshot?.upNext?.length ? `Up Next: ${snapshot.upNext.join('; ')}` : '',
+      isDm ? '' : participantsHint,
+      `Current surface: ${sourceSurface}.${isDm ? '' : ` Conversation state: ${conv.mode} (pausedByLancy=${Boolean(conv.pausedByLancy)}).`}`,
+      isDm
+        ? [
+            'DM STUDIO & FULL MENU KNOWLEDGE:',
+            '- Music in DM: Asking for a song or replying "okay"/"yes"/"send it"/"download it" after discussing or searching a song means DOWNLOAD & SEND the MP3 directly into DM using `search_and_play_music(action="play_now")`.',
+            '- All DM Menu Screens (`open_dm_menu`): `dashboard` (/start Studio Home), `moviehub` (🎬 Download Movies / TV Series /movie), `music_play` (🎵 Search & Download MP3 /play), `url_downloader` (📥 URL Downloader for TikTok, Reels, YT, X, FB, Spotify /grab), `tiktok_search` (TikTok clips /tt), `lyrics` (📜 Song Lyrics /lyrics), `recognize` (🎙 Audio/Voice Note Song ID), `pinterest` (🔍 Pinterest HD & PFP Studio /search, /pfp), `stickers` (🎀 TG Sticker Packs /stickers), `cemoji` (✨ Custom Emoji Studio /emojipack, /emojisuggest), `game_hub` (🎮 Game Arena /games), `whatsapp` (📱 WhatsApp Studio /whatsapp), `channel_post` (📢 Post to Channel /postchannel), `autopost` (📅 Auto Post /autopost), `broadcast` (📡 Broadcast Studio /broadcast), `clone` (🤖 Clone Bot /clone), `settings` (⚙ Settings), `ai` (🤖 AI Assistant settings), `help` (📖 Help & Complete Guide /help).'
+          ].join('\n')
+        : `Live VC Deck Snapshot: status=${snapshot?.status || 'idle'}, mode=${snapshot?.streamMode || 'interactive'}, volume=${snapshot?.volume ?? 100}%, muted=${Boolean(snapshot?.muted)}, playing="${nowPlayingStr}", queueCount=${snapshot?.queueCount ?? 0}.`,
+      isDm ? dmMusicHint : lyricsHint,
+      (!isDm && snapshot?.upNext?.length) ? `Up Next: ${snapshot.upNext.join('; ')}` : '',
       lastMovieSummary,
-      lastVideoSummary,
+      (!isDm ? lastVideoSummary : ''),
       behaviorAnalysis?.promptDirective || '',
       'RULES:',
       '1. Distinguish real system state, memory, and live web search (`web_research`) from general knowledge. Never invent playback status, queue items, participants, or unexecuted actions — call tools and check results before confirming.',
-      '2. Understand natural conversational intent rather than keywords alone — support switching anything on deck (tracks, music<->movie decks, episodes, audio dubs, subtitles, quality, volume). For clear direct requests, act right away; for ambiguous hints, mood complaints ("this song is boring"), or big switches ("switch to a movie?"), ASK the user if they want that change before doing it.',
+      isDm
+        ? '2. In DM, if the user asks for a song OR gives a short confirmation ("okay", "yes", "send it", "download it") after you suggested/found a song, call `search_and_play_music` with `action: "play_now"` to download & send the MP3 to DM. If the user asks about bot features, menus, or help, guide them accurately across all DM menus above and use `open_dm_menu` whenever helpful.'
+        : '2. Understand natural conversational intent rather than keywords alone — support switching anything on deck (tracks, music<->movie decks, episodes, audio dubs, subtitles, quality, volume). For clear direct requests, act right away; for ambiguous hints, mood complaints ("this song is boring"), or big switches ("switch to a movie?"), ASK the user if they want that change before doing it.',
       '3. For current news, releases, specs, docs, or factual lookup, call `web_research`. In text chats include concise source links; in Voice Chat summarize naturally without reading raw URLs aloud.',
       '4. NEVER guess on unclear or garbled audio/text — call `ask_clarification` warmly.',
-      '5. For YouTube/web videos use `search_videos`; for movies/series use `search_movies_series` (supports numbered #1/#2 picks and loading `season Y episode Z` on `current`, `up_next`, or `search_result`). Chain all requested tools in one turn when the user asks for multiple actions.',
+      isDm
+        ? '5. For URL downloads or Pinterest images use `download_url_or_images`; for movies/series use `search_movies_series`; for YouTube videos use `search_videos` (downloads directly to DM); for opening any DM menu/help use `open_dm_menu`.'
+        : '5. For YouTube/web videos use `search_videos`; for movies/series use `search_movies_series` (supports numbered #1/#2 picks and loading `season Y episode Z` on `current`, `up_next`, or `search_result`). Chain all requested tools in one turn when the user asks for multiple actions.',
       sourceSurface.startsWith('vc_')
         ? '6. Spoken VC replies: 1–2 concise natural sentences, ZERO markdown, never read internal tool names aloud. Ask about resuming/anything else ONLY when you just ran deck actions while paused.'
-        : '6. Chat/DM replies: clear, expressive, structured nicely only when helpful (not every simple reply needs a huge card).'
+        : (isDm
+            ? '6. DM replies: warm, crisp, genuinely helpful; never confuse DM with Group Voice Chat.'
+            : '6. Chat replies: clear, expressive, structured nicely only when helpful (not every simple reply needs a huge card).')
     ].filter(Boolean).join('\n');
   }
 
@@ -673,8 +692,12 @@ export class LancyAgent {
     };
   }
 
-  buildConversationRichCard({ title = '🎙️ Lancy AI Booth', subtitle = '', bodyText = '', mention = null, executed = [], mode = 'dj', includeQuickStarters = false } = {}) {
-    const b = new RichMessageBuilder().bannerHeader([title, subtitle || 'Real-Time DJ · Movies · VC Companion'], { size: 2 });
+  buildConversationRichCard({ title = '🎙️ Lancy AI Booth', subtitle = '', bodyText = '', mention = null, executed = [], mode = 'dj', includeQuickStarters = false, surface = null } = {}) {
+    const isDmCard = surface === 'dm_text' || mode === 'companion';
+    const b = new RichMessageBuilder().bannerHeader([
+      isDmCard ? '✨ Lancy · Personal Studio' : title,
+      subtitle || (isDmCard ? 'Music · Movies · Downloads · All Studio Tools' : 'Real-Time DJ · Movies · VC Companion')
+    ], { size: 2 });
 
     if (mention?.rich && bodyText) {
       // Tag user natively at the top of the Rich Card if body doesn't already lead cleanly or pair as header greeting line
@@ -689,9 +712,12 @@ export class LancyAgent {
       if (!out.ok) continue;
       if (out.cardKind === 'music' || out.cardKind === 'music_list' || step.name === 'search_and_play_music') {
         if (out.title) {
-          actionLines.push(`🎵 ${out.action === 'play_now' ? 'Playing Now (RTMP)' : 'Queued'}: ${out.title}${out.artist ? ` — ${out.artist}` : ''}${out.sourceBadge ? ` [${out.sourceBadge}]` : ''}`);
+          const prefix = out.dmDownload
+            ? '⬇️ Sending to DM'
+            : (out.action === 'play_now' ? 'Playing Now (RTMP)' : 'Queued');
+          actionLines.push(`🎵 ${prefix}: ${out.title}${out.artist ? ` — ${out.artist}` : ''}${out.sourceBadge ? ` [${out.sourceBadge}]` : ''}`);
         }
-        if (out.infiniteRadio && Array.isArray(out.infiniteSeeds) && out.infiniteSeeds.length) {
+        if (!isDmCard && out.infiniteRadio && Array.isArray(out.infiniteSeeds) && out.infiniteSeeds.length) {
           actionLines.push(`♾️ Smart Infinite Radio: ${out.infiniteSeeds.slice(0, 4).join(' · ')}`);
         }
         if (Array.isArray(out.results) && out.results.length) {
@@ -724,6 +750,8 @@ export class LancyAgent {
         actionLines.push(`⏱ Jumped to ${out.label || out.clock}`);
       } else if (step.name === 'send_current_video_to_chat') {
         actionLines.push(`⬇️ Sending "${out.title}" (${out.quality || 'HD'}) to chat`);
+      } else if (step.name === 'open_dm_menu') {
+        actionLines.push(`📂 Opened DM Menu: ${out.screen}${out.query ? ` (${out.query})` : ''}`);
       }
     }
 
@@ -732,25 +760,37 @@ export class LancyAgent {
       b.list(actionLines);
     }
 
-    b.footer(rt.text('💬 Keep replying anytime to continue chatting — say "done" or tap Finish to close.'));
+    b.footer(rt.text(isDmCard ? '💬 Ask me for any song, movie, link, or DM studio menu anytime ♡' : '💬 Keep replying anytime to continue chatting — say "done" or tap Finish to close.'));
 
-    const row1 = includeQuickStarters
-      ? [
-          richButton.callback('🔥 Trending Hits', encodeCallback('music', 'djquick', 'trending'), { style: 'primary' }),
-          richButton.callback('🌊 Chill Mix', encodeCallback('music', 'djquick', 'chill'), { style: 'primary' }),
-          richButton.callback('📊 Group Poll', encodeCallback('music', 'djquick', 'poll'), { style: 'success' })
-        ]
-      : [
-          richButton.callback('🔥 Trending', encodeCallback('music', 'djquick', 'trending'), { style: 'primary' }),
-          richButton.callback('📊 Poll Next', encodeCallback('music', 'djquick', 'poll'), { style: 'success' }),
-          richButton.callback('🎬 Movies', encodeCallback('music', 'mv', 'new', 'hb'), { style: 'primary' })
-        ];
-    const row2 = [
-      richButton.callback('🎛 Player', encodeCallback('music', 'refresh', ''), { style: 'secondary' }),
-      richButton.callback('🚪 Finish Chat', encodeCallback('music', 'aiclose', mode === 'dj' ? 'dj' : ''), { style: 'danger' })
-    ];
-    b.buttons(row1);
-    b.buttons(row2);
+    if (isDmCard) {
+      b.buttons([
+        richButton.callback('🎵 Play / Download Music', encodeCallback('downloader', 'play'), { style: 'primary' }),
+        richButton.callback('🎬 Download Movies', encodeCallback('music', 'moviehub'), { style: 'success' })
+      ]);
+      b.buttons([
+        richButton.callback('📥 URL Downloader', encodeCallback('downloader', 'open'), { style: 'secondary' }),
+        richButton.callback('📖 Help & Guide', encodeCallback('help', 'open'), { style: 'secondary' }),
+        richButton.callback('✦ Home', encodeCallback('dashboard', 'open'), { style: 'secondary' })
+      ]);
+    } else {
+      const row1 = includeQuickStarters
+        ? [
+            richButton.callback('🔥 Trending Hits', encodeCallback('music', 'djquick', 'trending'), { style: 'primary' }),
+            richButton.callback('🌊 Chill Mix', encodeCallback('music', 'djquick', 'chill'), { style: 'primary' }),
+            richButton.callback('📊 Group Poll', encodeCallback('music', 'djquick', 'poll'), { style: 'success' })
+          ]
+        : [
+            richButton.callback('🔥 Trending', encodeCallback('music', 'djquick', 'trending'), { style: 'primary' }),
+            richButton.callback('📊 Poll Next', encodeCallback('music', 'djquick', 'poll'), { style: 'success' }),
+            richButton.callback('🎬 Movies', encodeCallback('music', 'mv', 'new', 'hb'), { style: 'primary' })
+          ];
+      const row2 = [
+        richButton.callback('🎛 Player', encodeCallback('music', 'refresh', ''), { style: 'secondary' }),
+        richButton.callback('🚪 Finish Chat', encodeCallback('music', 'aiclose', mode === 'dj' ? 'dj' : ''), { style: 'danger' })
+      ];
+      b.buttons(row1);
+      b.buttons(row2);
+    }
 
     b.validate();
     return b.toJSON({ useCustomEmojis: true });
@@ -832,7 +872,15 @@ export class LancyAgent {
           okParts.push(`${out.action === 'play_now' ? 'playing' : 'queued'} "${out.title}"${ep}`);
         }
       } else if (name === 'search_and_play_music') {
-        okParts.push(out.action === 'search' ? `found ${(out.results || []).length} songs` : `${out.action === 'play_now' ? 'playing' : 'queued'} "${out.title}"`);
+        if (out.dmDownload) {
+          okParts.push(`downloading "${out.title}"${out.artist ? ` by ${out.artist}` : ''} right into your DM`);
+        } else {
+          okParts.push(out.action === 'search' ? `found ${(out.results || []).length} songs` : `${out.action === 'play_now' ? 'playing' : 'queued'} "${out.title}"`);
+        }
+      } else if (name === 'open_dm_menu') {
+        okParts.push(`opened ${out.screen} studio`);
+      } else if (name === 'download_url_or_images') {
+        okParts.push(out.kind === 'search_images' ? `searching Pinterest for "${out.target}"` : `downloading media from link`);
       }
     }
     if (okParts.length && !failParts.length) {
@@ -1001,16 +1049,38 @@ export class LancyAgent {
     return idleVariants[this._wakeCounter % idleVariants.length];
   }
 
+  #extractDmPendingSong(conv, chatId) {
+    const dmSearch = this.executor?.dmLastMusicSearch?.get?.(Number(chatId));
+    if (dmSearch?.tracks?.length && Date.now() - Number(dmSearch.timestamp || 0) < 15 * 60 * 1000) {
+      const top = dmSearch.tracks[0];
+      const q = `${top.artist || ''} ${top.title || ''}`.trim() || dmSearch.query;
+      if (q) return q;
+    }
+    const lastAssistant = [...(conv?.history || [])].reverse().find(h => h.role === 'assistant')?.content || '';
+    if (!lastAssistant) return null;
+    const offersSong = /\b(?:download|send|grab|fetch|play|listen|want\s+me\s+to|should\s+i|track|song|mp3)\b/i.test(lastAssistant);
+    if (!offersSong) return null;
+    const qMatch = lastAssistant.match(/[“"']([^"”'\n]{2,65})[”"'](?:\s+(?:by|—|-)\s+([^.!?\n,]{2,45}))?/i)
+      || lastAssistant.match(/\b(?:by|from)\s+([A-Z][A-Za-z0-9\s&'.-]{1,40})\s*[-—–:]\s*([^\n.!?]{2,50})/)
+      || lastAssistant.match(/([A-Z][A-Za-z0-9\s&'.-]{1,35})\s+[—–-]\s+([A-Z0-9][^\n.!?]{2,45})/);
+    if (qMatch) {
+      return [qMatch[1], qMatch[2]].filter(Boolean).join(' ').trim();
+    }
+    return null;
+  }
+
   async #runToolLoop({ conv, userText, sourceSurface, context }) {
     const hasImages = Boolean(Array.isArray(context.images) && context.images.length > 0);
     const userName = context.senderName ? normalizeDisplayName(context.senderName, null) : null;
     const isVc = String(sourceSurface || '').startsWith('vc_');
+    const isDm = sourceSurface === 'dm_text' && Number(context.chatId) > 0;
+    const toolContext = { ...context, surface: sourceSurface };
     const sessionKey = isVc
       ? `vc:${context.chatId}`
       : (Number(context.chatId) > 0 ? `dm:${context.userId || context.chatId}` : `bot:${context.chatId}`);
     const sessionCtx = this.memory.getSessionContext(sessionKey, { chatId: context.chatId, surface: sourceSurface });
     const [snapshot, awareness] = await Promise.all([
-      this.executor.execute('get_call_state', {}, context).catch(() => null),
+      this.executor.execute('get_call_state', {}, toolContext).catch(() => null),
       this.awareness.buildSnapshot({
         chatId: context.chatId,
         userId: context.userId,
@@ -1058,7 +1128,22 @@ export class LancyAgent {
       return { reply: '', executed: [], skipped: true, decision, clarificationAsked: null, finishedState: null };
     }
 
-    if (decision.action === DECISION.SHORT_ACK && !hasImages) {
+    if (isDm && !hasImages && /^(?:ok(?:ay)?|yes|yeah|yep|yup|sure|bet|alright|go\s+ahead|do\s+it|send\s+(?:it|the\s+song|song)|download\s+(?:it|that|the\s+song|song)|yes\s+(?:please|download|send)|abeg\s+send)[.!?,\s♡✨]*$/i.test(userText)) {
+      const pendingQuery = this.#extractDmPendingSong(conv, context.chatId);
+      if (pendingQuery) {
+        const out = await this.executor.execute('search_and_play_music', { query: pendingQuery, action: 'play_now' }, toolContext)
+          .catch((e) => ({ ok: false, error: e?.message || 'execution_failed' }));
+        const executed = [{ name: 'search_and_play_music', args: { query: pendingQuery, action: 'play_now' }, out }];
+        const cleanUser = userName || 'friend';
+        const dmReply = out?.ok
+          ? `On it, ${cleanUser}! Downloading **${out.title}${out.artist ? ` — ${out.artist}` : ''}** right into your DM now 🎵`
+          : `Couldn't grab "${pendingQuery}" just now — drop the exact song title & artist and I'll download it cleanly!`;
+        this.behavior.recordOutcome({ sessionKey, chatId: context.chatId, surface: sourceSurface, reply: dmReply });
+        return { reply: dmReply, executed, decision, clarificationAsked: null, finishedState: null };
+      }
+    }
+
+    if (decision.action === DECISION.SHORT_ACK && !hasImages && !isDm) {
       const acks = ['Got you.', 'Right.', 'I hear you.', 'Say less.', 'Makes sense.'];
       const ackReply = acks[conv.history.length % acks.length];
       this.behavior.recordOutcome({ sessionKey, chatId: context.chatId, surface: sourceSurface, reply: ackReply });
@@ -1066,15 +1151,15 @@ export class LancyAgent {
     }
 
     if (!hasImages && decision.action === DECISION.RESPOND && isPureCasualBanter(userText)) {
-      return this.#generateHumanBanterReply({ conv, userText, sourceSurface, context });
+      return this.#generateHumanBanterReply({ conv, userText, sourceSurface, context: toolContext });
     }
 
-    const deskSteps = !hasImages && decision.action !== DECISION.DEEP_REASON ? parseDeskIntents(userText) : null;
+    const deskSteps = !isDm && !hasImages && decision.action !== DECISION.DEEP_REASON ? parseDeskIntents(userText) : null;
     if (deskSteps?.length) {
       const executed = [];
       const t0 = Date.now();
       for (const step of deskSteps) {
-        const out = await this.executor.execute(step.name, step.args, context).catch((e) => ({ ok: false, error: e?.message || 'execution_failed' }));
+        const out = await this.executor.execute(step.name, step.args, toolContext).catch((e) => ({ ok: false, error: e?.message || 'execution_failed' }));
         executed.push({ name: step.name, args: step.args, out });
       }
       this.awareness.recordToolBatch({
@@ -1181,8 +1266,8 @@ export class LancyAgent {
       if (!toolCalls.length) {
         finalReply = String(res?.text || '').trim();
         // If AI provider fell back to builtin or gave no tool call on an unmistakable command, do a safe deterministic check
-        if (step === 0 && (!finalReply || res?.provider === 'builtin' || /\b(?:play|put\s+on|queue|search|find|stream|watch|skip|pause|resume|volume|mute)\b/i.test(userText))) {
-          const rescued = await this.#safeFallbackIntent(userText, context, conv);
+        if (step === 0 && (!finalReply || res?.provider === 'builtin' || /\b(?:play|put\s+on|queue|search|find|stream|watch|skip|pause|resume|volume|mute|download|open\s+(?:menu|help|stickers?|emojis?|pinterest|whatsapp|broadcast|autopost|clone|settings))\b/i.test(userText))) {
+          const rescued = await this.#safeFallbackIntent(userText, toolContext, conv);
           if (rescued) {
             if (finalReply && res?.provider !== 'builtin') {
               rescued.reply = finalReply;
@@ -1236,7 +1321,7 @@ export class LancyAgent {
             return;
           }
           seenToolExecs.add(sigKey);
-          outcomes[item.idx] = await this.executor.execute(item.name, item.args, context).catch((err) => ({ ok: false, error: err?.message || 'execution_failed' }));
+          outcomes[item.idx] = await this.executor.execute(item.name, item.args, toolContext).catch((err) => ({ ok: false, error: err?.message || 'execution_failed' }));
         }));
       }
 
@@ -1248,7 +1333,7 @@ export class LancyAgent {
           continue;
         }
         seenToolExecs.add(sigKey);
-        outcomes[item.idx] = await this.executor.execute(item.name, item.args, context).catch((err) => ({ ok: false, error: err?.message || 'execution_failed' }));
+        outcomes[item.idx] = await this.executor.execute(item.name, item.args, toolContext).catch((err) => ({ ok: false, error: err?.message || 'execution_failed' }));
       }
 
       let toolFailures = 0;
@@ -1281,9 +1366,9 @@ export class LancyAgent {
         break;
       }
 
-      // Immediate progressive response for Chat DJ / AI Movie Chat turns once music/movie search or playback is triggered
+      // Immediate progressive response for Chat DJ / AI Movie Chat / DM Studio turns once action completes
       const hasImmediateMediaResult = !isVc && step === 0 && executed.some(e =>
-        (e.name === 'search_and_play_music' || e.name === 'search_movies_series' || e.name === 'search_videos' || e.name === 'control_playback' || e.name === 'adjust_volume' || e.name === 'seek_playback')
+        (e.name === 'search_and_play_music' || e.name === 'search_movies_series' || e.name === 'search_videos' || e.name === 'control_playback' || e.name === 'adjust_volume' || e.name === 'seek_playback' || e.name === 'open_dm_menu' || e.name === 'download_url_or_images')
         && e.out?.ok
       );
       if (hasImmediateMediaResult) {
@@ -1312,7 +1397,8 @@ export class LancyAgent {
   async #safeFallbackIntent(text, context, conv) {
     const clean = stripWakePrefix(text).toLowerCase();
     if (!clean) return null;
-    if (conv.mode !== 'IDLE' && AFFIRMATIVE_DONE_RE.test(clean)) {
+    const isDm = context?.surface === 'dm_text' && Number(context?.chatId) > 0;
+    if (!isDm && conv.mode !== 'IDLE' && AFFIRMATIVE_DONE_RE.test(clean)) {
       return {
         reply: 'Alright, enjoying the show — back to playback!',
         executed: [],
@@ -1321,29 +1407,49 @@ export class LancyAgent {
     }
 
     const actions = [];
-    if (/\b(?:mute)\b/.test(clean) && !/\bunmute\b/.test(clean)) actions.push(['adjust_volume', { mode: 'mute' }]);
-    else if (/\bunmute\b/.test(clean)) actions.push(['adjust_volume', { mode: 'unmute' }]);
-    const volNum = clean.match(/\bvolume\s*(?:to|at)?\s*(\d{1,3})\b/);
-    if (volNum) actions.push(['adjust_volume', { mode: 'set', value: Number(volNum[1]) }]);
-    else if (/\b(?:lower|reduce|turn\s+down|decrease)\b.*\b(?:vol|volume|sound)\b/.test(clean)) actions.push(['adjust_volume', { mode: 'lower', value: 25 }]);
-    else if (/\b(?:raise|increase|turn\s+up|louder)\b.*\b(?:vol|volume|sound)\b/.test(clean)) actions.push(['adjust_volume', { mode: 'louder', value: 25 }]);
+    if (!isDm) {
+      if (/\b(?:mute)\b/.test(clean) && !/\bunmute\b/.test(clean)) actions.push(['adjust_volume', { mode: 'mute' }]);
+      else if (/\bunmute\b/.test(clean)) actions.push(['adjust_volume', { mode: 'unmute' }]);
+      const volNum = clean.match(/\bvolume\s*(?:to|at)?\s*(\d{1,3})\b/);
+      if (volNum) actions.push(['adjust_volume', { mode: 'set', value: Number(volNum[1]) }]);
+      else if (/\b(?:lower|reduce|turn\s+down|decrease)\b.*\b(?:vol|volume|sound)\b/.test(clean)) actions.push(['adjust_volume', { mode: 'lower', value: 25 }]);
+      else if (/\b(?:raise|increase|turn\s+up|louder)\b.*\b(?:vol|volume|sound)\b/.test(clean)) actions.push(['adjust_volume', { mode: 'louder', value: 25 }]);
 
-    if (/\bpause\b/.test(clean)) actions.push(['control_playback', { action: 'pause' }]);
-    if (/\bresume\b/.test(clean)) actions.push(['control_playback', { action: 'resume' }]);
-    if (/\b(?:next\s+queue|move\s+to\s+next|skip)\b/.test(clean)) actions.push(['control_playback', { action: 'skip' }]);
-    if (/\b(?:previous|go\s+back\s+track|last\s+track)\b/.test(clean)) actions.push(['control_playback', { action: 'previous' }]);
-    if (/\b(?:middle|halfway)\b/.test(clean)) actions.push(['seek_playback', { target: 'middle' }]);
-    if (/\bsend\b.*\b(?:video|movie|song|this)\b.*\bchat\b/.test(clean)) actions.push(['send_current_video_to_chat', {}]);
+      if (/\bpause\b/.test(clean)) actions.push(['control_playback', { action: 'pause' }]);
+      if (/\bresume\b/.test(clean)) actions.push(['control_playback', { action: 'resume' }]);
+      if (/\b(?:next\s+queue|move\s+to\s+next|skip)\b/.test(clean)) actions.push(['control_playback', { action: 'skip' }]);
+      if (/\b(?:previous|go\s+back\s+track|last\s+track)\b/.test(clean)) actions.push(['control_playback', { action: 'previous' }]);
+      if (/\b(?:middle|halfway)\b/.test(clean)) actions.push(['seek_playback', { target: 'middle' }]);
+      if (/\bsend\b.*\b(?:video|movie|song|this)\b.*\bchat\b/.test(clean)) actions.push(['send_current_video_to_chat', {}]);
+    } else if (/^(?:open|show|launch|take\s+me\s+to|go\s+to)?\s*(?:the\s+)?(?:main\s*)?(?:menu|dashboard|home|start)\b/i.test(clean)) {
+      actions.push(['open_dm_menu', { screen: 'dashboard' }]);
+    } else if (/^(?:open|show)?\s*(?:the\s+)?(?:help|guide|commands?)\b/i.test(clean)) {
+      actions.push(['open_dm_menu', { screen: 'help' }]);
+    } else if (/\b(?:open|show|go\s+to)\s+(?:the\s+)?(movie\s*hub|movies?|pinterest|stickers?|custom\s*emojis?|emojis?|whatsapp|channel\s*post|auto\s*post|broadcast|clone|settings?|games?|lyrics|url\s*downloader|downloader)\b/i.test(clean)) {
+      const m = clean.match(/\b(movie\s*hub|movies?|pinterest|stickers?|custom\s*emojis?|emojis?|whatsapp|channel\s*post|auto\s*post|broadcast|clone|settings?|games?|lyrics|url\s*downloader|downloader)\b/i)?.[1]?.toLowerCase() || '';
+      const screenMap = {
+        'movie hub': 'moviehub', moviehub: 'moviehub', movie: 'moviehub', movies: 'moviehub',
+        pinterest: 'pinterest', sticker: 'stickers', stickers: 'stickers',
+        'custom emoji': 'cemoji', 'custom emojis': 'cemoji', emoji: 'cemoji', emojis: 'cemoji',
+        whatsapp: 'whatsapp', 'channel post': 'channel_post', 'auto post': 'autopost',
+        broadcast: 'broadcast', clone: 'clone', setting: 'settings', settings: 'settings',
+        game: 'game_hub', games: 'game_hub', lyrics: 'lyrics',
+        'url downloader': 'url_downloader', downloader: 'url_downloader'
+      };
+      if (screenMap[m]) actions.push(['open_dm_menu', { screen: screenMap[m] }]);
+    }
 
     // Natural music / movie / video / poll fallback intents
     const vidMatch = clean.match(/\b(?:search|find|look\s*up)\s+(?:for\s+)?videos?\s+(?:of|about|for)?\s*(.+)/i)
       || clean.match(/\b(?:play|queue|send)\s+video\s*#?\s*(\d+)\b/i);
-    const numMoviePick = clean.match(/\b(?:play|watch|stream|queue)\s+(?:result\s*|option\s*|number\s*)?#\s*(\d+)(?:\s+season\s*(\d+))?(?:\s+episode\s*(\d+))?/i);
+    const numMoviePick = clean.match(/\b(?:play|watch|stream|queue|download)\s+(?:result\s*|option\s*|number\s*)?#\s*(\d+)(?:\s+season\s*(\d+))?(?:\s+episode\s*(\d+))?/i);
     const inspectMatch = clean.match(/\b(?:what\s+is|tell\s+me\s+about|how\s+many\s+(?:seasons|episodes))\s+.*?(?:#\s*(\d+)|results?)/i);
-    const curOrNextEp = clean.match(/\b(?:season\s*(\d+)\s*)?(?:episode|ep)\s*(\d+)\b.*\b(?:this|current|playing|now\s+playing|next|upcoming)\b/i);
-    const movieReq = clean.match(/\b(?:play|stream|watch|find|search|put\s+on)\s+(?:the\s+)?(?:movie|film|series|show)\s+(?:of\s+)?(.+)/i);
+    const curOrNextEp = !isDm ? clean.match(/\b(?:season\s*(\d+)\s*)?(?:episode|ep)\s*(\d+)\b.*\b(?:this|current|playing|now\s+playing|next|upcoming)\b/i) : null;
+    const movieReq = clean.match(/\b(?:play|stream|watch|find|search|put\s+on|download|get)\s+(?:the\s+)?(?:movie|film|series|show)\s+(?:of\s+)?(.+)/i);
 
-    if (inspectMatch) {
+    if (actions.length) {
+      // Already matched deterministic action above
+    } else if (inspectMatch) {
       actions.push(['search_movies_series', { action: 'inspect', ...(inspectMatch[1] ? { result_index: Number(inspectMatch[1]) } : {}) }]);
     } else if (numMoviePick) {
       actions.push(['search_movies_series', {
@@ -1372,20 +1478,19 @@ export class LancyAgent {
     } else if (movieReq && movieReq[1]?.trim().length >= 2) {
       actions.push(['search_movies_series', {
         query: movieReq[1].trim(),
-        action: /\b(?:search|find)\b/i.test(clean) && !/\b(?:play|stream|watch)\b/i.test(clean) ? 'search' : 'play_now'
+        action: /\b(?:search|find)\b/i.test(clean) && !/\b(?:play|stream|watch|download)\b/i.test(clean) ? 'search' : 'play_now'
       }]);
-    } else if (/\b(?:poll|vote)\b/i.test(clean) && !/\bskip\b/i.test(clean)) {
+    } else if (!isDm && /\b(?:poll|vote)\b/i.test(clean) && !/\bskip\b/i.test(clean)) {
       const prof = context.userId ? this.taste.getProfile(context.userId, context.chatId) : null;
       const opts = prof?.topArtists?.length >= 2
         ? [...prof.topArtists.slice(0, 3), 'Surprise Chill Mix']
         : ['Afrobeats Heat', 'Chill / R&B', 'Rap & Drill', 'Surprise Movie'];
       actions.push(['create_decision_poll', { question: '🎙️ What should we roll with next?', options: opts }]);
     } else {
-      const songWant = clean.match(/^(?:i(?:'?ll|\s+would)?\s+want|give\s+me|play|put\s+on|drop|queue|search|find|i\s+need)\s+(?:some\s+|the\s+)?(.+)/i);
-      if (songWant && songWant[1]?.trim().length >= 2 && !/\b(?:movie|film|series|poll)\b/i.test(songWant[1])) {
-        const isSearchOnly = /^(?:search|find)\b/i.test(clean);
-        actions.push(['search_and_play_music', { query: songWant[1].trim(), action: isSearchOnly ? 'search' : 'play_now' }]);
-      } else if (!isPureCasualBanter(clean) && clean.length >= 2 && clean.length <= 70 && !/\b(?:movie|film|series|poll|who|what|why|how|when|where)\b/i.test(clean)) {
+      const songWant = clean.match(/^(?:play|download|put\s+on|drop|queue|send\s+me)\s+(?:the\s+)?(?:song\s+|track\s+)?(.+)/i);
+      if (songWant && songWant[1]?.trim().length >= 2 && !/\b(?:movie|film|series|poll|stickers?|emoji|pinterest|whatsapp|menu|help)\b/i.test(songWant[1])) {
+        actions.push(['search_and_play_music', { query: songWant[1].trim(), action: 'play_now' }]);
+      } else if (!isDm && !isPureCasualBanter(clean) && clean.length >= 2 && clean.length <= 70 && !/\b(?:movie|film|series|poll|who|what|why|how|when|where)\b/i.test(clean)) {
         actions.push(['search_and_play_music', { query: clean, action: 'play_now' }]);
       }
     }
@@ -1398,7 +1503,7 @@ export class LancyAgent {
     }
     const userName = context.senderName ? normalizeDisplayName(context.senderName, 'friend') : 'friend';
     return {
-      reply: this.#formatDeskSummary(executed, userName) || 'I tried to run that, check the player card for status.',
+      reply: this.#formatDeskSummary(executed, userName) || 'Done!',
       executed
     };
   }
@@ -1787,7 +1892,9 @@ export class LancyAgent {
 
     if (/^(?:done|exit|quit|close|cancel|that'?s\s+all|thats\s+all|bye(?:\s+lancy)?|stop\s+chat)$/i.test(stripped)) {
       conv.mode = 'IDLE';
-      const bye = `Got you, ${cleanName}! Wrapping up this chat — tap 🎙 Chat DJ anytime you want me again ✨`;
+      const bye = resolvedSurface === 'dm_text'
+        ? `Got you, ${cleanName}! Anytime you want a song, movie, link download, or /start menu, just message me ✨`
+        : `Got you, ${cleanName}! Wrapping up this chat — tap 🎙 Chat DJ anytime you want me again ✨`;
       return {
         reply: bye,
         cleanName,
@@ -1847,7 +1954,8 @@ export class LancyAgent {
     });
     this.behavior.recordOutcome({ sessionKey, chatId, surface: resolvedSurface, reply, concluded: Boolean(result.finishedState?.done) });
     const concluded = Boolean(result.finishedState?.done);
-    const cardPayload = concluded
+    const dmAlreadyPostedCardOrMedia = resolvedSurface === 'dm_text' && (result.executed || []).some(e => e?.out?.ok && (e.out.openedMenu || e.out.dmDownload));
+    const cardPayload = (concluded || dmAlreadyPostedCardOrMedia)
       ? null
       : this.buildConversationRichCard({
           title: mode === 'dj' ? '🎙️ Lancy · Chat DJ' : '✨ Lancy AI Companion',
@@ -1856,7 +1964,8 @@ export class LancyAgent {
           mention,
           executed: result.executed,
           mode,
-          includeQuickStarters: false
+          includeQuickStarters: false,
+          surface: resolvedSurface
         });
 
     return { reply, cleanName, mention, executed: result.executed, concluded, card: cardPayload, persona: result.persona || null };

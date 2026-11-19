@@ -2062,11 +2062,21 @@ export function createMusicScreen({ app }) {
         }
         const generation = app.music.queueGeneration(destination);
         await app.music.authorize(targetCtx, true, destination, { allowDj: true });
-        if (typeof app.voiceClient?.setup === 'function') await app.music.prepare(targetCtx, destination);
         app.music.assertQueueGeneration(destination, generation);
         if (isVideo) qmSession.radioVideo = true;
         app.music.radio.configure(qmSession, [genre], { video: isVideo });
-        await app.music.radio.refill(qmSession);
+        await Promise.all([
+          typeof app.voiceClient?.setup === 'function' ? app.music.prepare(targetCtx, destination) : Promise.resolve(),
+          app.music.radio.refill(qmSession)
+        ]);
+        app.music.assertQueueGeneration(destination, generation);
+        const firstQueued = qmSession?.upcoming?.[0];
+        if (ctx.messageId && firstQueued?.title) {
+          const loadMsg = card(`Lancy · ${cut(genre, 40)}`, `Streaming via ${qmSession?.streamMode === 'rtmp' ? 'RTMP' : 'VC'}…`);
+          loadMsg.quote(rt.text(`⏳ Loading ${firstQueued.title}${firstQueued.artist ? ` — ${firstQueued.artist}` : ''}…`));
+          loadMsg.buttons([button('⏳ Connecting…', 'noop')]);
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, finish(loadMsg)).catch(() => {});
+        }
         await app.musicQueueManager.ensurePlaying(destination);
         s.view = 'player';
         s.overlayView = null;

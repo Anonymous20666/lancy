@@ -545,7 +545,8 @@ export class QueueManager extends EventEmitter {
         const subtitleManualOverride=subSaved.manual;
         const subDriftRate = Number(subSaved.driftRate || 0) || 0;
         const subDriftAnchor = Number(subSaved.driftAnchor || 0) || 0;
-        const isVideo=track.mediaType==='video' || Boolean(djDesk && djDeskImage);
+        const sourceLooksAudioOnly = typeof source === 'string' && /\.(?:mp3|m4a|aac|ogg|opus|wav|flac)(?:\?|$)/i.test(source);
+        const isVideo = Boolean((track.mediaType === 'video' && track.capabilities?.video !== false && !sourceLooksAudioOnly) || (djDesk && djDeskImage));
         const startSeconds=Math.max(0, Number(entry.startOffsetSeconds ?? entry.resumePositionSeconds ?? 0) || 0);
         const vcTitle=String(track.title||'').trim().slice(0, 64) || undefined;
         const volume=Number.isFinite(Number(s.volume)) ? Number(s.volume) : 100;
