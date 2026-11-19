@@ -47,6 +47,16 @@ export function getEnv() {
     AI_BACKUP_MODEL: process.env.AI_BACKUP_MODEL || '',
     AI_BACKUP_API_KEY: process.env.AI_BACKUP_API_KEY || '',
     PINTEREST_PROVIDER: process.env.PINTEREST_PROVIDER || '',
-    LOG_LEVEL: process.env.LOG_LEVEL || 'info'
+    LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+    BROWSEROS_ENABLED: process.env.BROWSEROS_ENABLED ?? 'true',
+    BROWSEROS_MCP_URL: process.env.BROWSEROS_MCP_URL || 'http://127.0.0.1:9010/mcp',
+    BROWSEROS_BASE_URL: process.env.BROWSEROS_BASE_URL || 'http://127.0.0.1:9010',
+    BROWSEROS_NOVNC_URL: process.env.BROWSEROS_NOVNC_URL || 'http://127.0.0.1:6080',
+    BROWSEROS_API_TOKEN: process.env.BROWSEROS_API_TOKEN || process.env.BROWSEROS_MCP_TOKEN || '',
+    BROWSEROS_CONNECTOR_MODE: process.env.BROWSEROS_CONNECTOR_MODE || 'local',
+    BROWSEROS_STREAM_QUALITY: process.env.BROWSEROS_STREAM_QUALITY || 'high',
+    BROWSEROS_STREAM_FPS: Number(process.env.BROWSEROS_STREAM_FPS || 12) || 12,
+    BROWSEROS_STREAM_WIDTH: Number(process.env.BROWSEROS_STREAM_WIDTH || 1280) || 1280,
+    BROWSEROS_STREAM_HEIGHT: Number(process.env.BROWSEROS_STREAM_HEIGHT || 720) || 720
   };
 }

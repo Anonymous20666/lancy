@@ -48,6 +48,8 @@ import { createChannelPostScreen } from './telegram/screens/channelPost.js';
 import { createAutoPostScreen } from './telegram/screens/autoPost.js';
 import { createNsfwScreen } from './telegram/screens/nsfw.js';
 import { createMusicScreen } from './telegram/screens/music.js';
+import { createBrowserScreen } from './telegram/screens/browser.js';
+import { BrowserService } from './browser/index.js';
 import { MultiBotManager } from './telegram/multiBotManager.js';
 import { VoiceClient } from './music/voiceClient.js';
 import { QueueManager as MusicQueueManager } from './music/queueManager.js';
@@ -188,6 +190,7 @@ export class LancyApp {
     // ── Voice Chat & Music Streaming ──
     this.voiceClient = new VoiceClient({ app: this, log: this.log });
     this.musicQueueManager = new MusicQueueManager({ app: this, voiceClient: this.voiceClient, db: this.db, log: this.log });
+    this.browser = new BrowserService({ app: this, log: this.log });
 
     this.musicProviders = new MusicProviders();
     this.musicProviders.get('youtube').enabled = this.settings.get('music.allowYtDlp');
@@ -299,7 +302,7 @@ export class LancyApp {
       createDashboardScreen, createPinterestScreen, createStickersScreen,
       createCustomEmojiStudioScreen, createWhatsAppScreen, createAIScreen, createSettingsScreen, createHelpScreen,
       createDownloaderScreen, createCloneScreen, createBroadcastScreen, createChannelPostScreen,
-      createAutoPostScreen, createNsfwScreen, createMusicScreen
+      createAutoPostScreen, createNsfwScreen, createMusicScreen, createBrowserScreen
     ];
     for (const factory of factories) {
       const screen = factory({ app: this });
@@ -456,6 +459,7 @@ export class LancyApp {
     await this.telegram.controller?.stop();
     await this.multiBotManager?.stopAll();
     await this.musicQueueManager?.shutdown();
+    await this.browser?.shutdown?.().catch(() => {});
     await this.music?.previews?.shutdown();
     await this.screens.get('music')?.cleanup?.();
     await this.musicLibrary?.shutdown();

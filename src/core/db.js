@@ -267,6 +267,68 @@ export class Database {
           summary TEXT,
           updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
+        CREATE TABLE IF NOT EXISTS browser_sessions (
+          scope_key TEXT PRIMARY KEY,
+          chat_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          mcp_session_id TEXT,
+          connector_id TEXT NOT NULL DEFAULT 'local',
+          connector_url TEXT,
+          task_name TEXT,
+          tab_group_id TEXT,
+          active_page_id INTEGER,
+          active_url TEXT,
+          active_domain TEXT,
+          live_vc_enabled INTEGER NOT NULL DEFAULT 0,
+          human_takeover INTEGER NOT NULL DEFAULT 0,
+          takeover_user_id INTEGER,
+          status TEXT NOT NULL DEFAULT 'idle',
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_browser_sessions_chat ON browser_sessions(chat_id, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS browser_tasks (
+          id TEXT PRIMARY KEY,
+          scope_key TEXT NOT NULL,
+          chat_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          requested_by_name TEXT,
+          goal TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'queued',
+          mcp_session_id TEXT,
+          active_page_id INTEGER,
+          current_url TEXT,
+          current_domain TEXT,
+          current_action TEXT,
+          step_count INTEGER NOT NULL DEFAULT 0,
+          max_steps INTEGER NOT NULL DEFAULT 24,
+          pending_approval_json TEXT,
+          summary TEXT,
+          error_text TEXT,
+          replay_json TEXT,
+          created_at TEXT NOT NULL DEFAULT (datetime('now')),
+          updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+          finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_browser_tasks_scope ON browser_tasks(scope_key, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_browser_tasks_chat ON browser_tasks(chat_id, status, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS browser_audit_logs (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id TEXT,
+          scope_key TEXT NOT NULL,
+          chat_id INTEGER NOT NULL,
+          user_id INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          tool_name TEXT,
+          target_url TEXT,
+          domain TEXT,
+          summary TEXT,
+          requires_approval INTEGER NOT NULL DEFAULT 0,
+          approved_by INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_browser_audit_task ON browser_audit_logs(task_id, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_browser_audit_scope ON browser_audit_logs(scope_key, id DESC);
       `);
     } catch {}
     try {
@@ -970,6 +1032,177 @@ export class Database {
       return this.get('SELECT * FROM tg_channels WHERE channel_id = ?', Number(channelId)) || null;
     } catch {
       return null;
+    }
+  }
+
+  upsertBrowserSession(session) {
+    if (!session?.scopeKey) return null;
+    this.run(
+      `INSERT INTO browser_sessions (
+        scope_key, chat_id, user_id, mcp_session_id, connector_id, connector_url,
+        task_name, tab_group_id, active_page_id, active_url, active_domain,
+        live_vc_enabled, human_takeover, takeover_user_id, status, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(scope_key) DO UPDATE SET
+        mcp_session_id = COALESCE(excluded.mcp_session_id, browser_sessions.mcp_session_id),
+        connector_id = excluded.connector_id,
+        connector_url = COALESCE(excluded.connector_url, browser_sessions.connector_url),
+        task_name = COALESCE(excluded.task_name, browser_sessions.task_name),
+        tab_group_id = COALESCE(excluded.tab_group_id, browser_sessions.tab_group_id),
+        active_page_id = COALESCE(excluded.active_page_id, browser_sessions.active_page_id),
+        active_url = COALESCE(excluded.active_url, browser_sessions.active_url),
+        active_domain = COALESCE(excluded.active_domain, browser_sessions.active_domain),
+        live_vc_enabled = excluded.live_vc_enabled,
+        human_takeover = excluded.human_takeover,
+        takeover_user_id = excluded.takeover_user_id,
+        status = excluded.status,
+        updated_at = datetime('now')`,
+      String(session.scopeKey),
+      Number(session.chatId || 0),
+      Number(session.userId || 0),
+      session.mcpSessionId || null,
+      String(session.connectorId || 'local'),
+      session.connectorUrl || null,
+      session.taskName || null,
+      session.tabGroupId || null,
+      session.activePageId ?? null,
+      session.activeUrl || null,
+      session.activeDomain || null,
+      session.liveVcEnabled ? 1 : 0,
+      session.humanTakeover ? 1 : 0,
+      session.takeoverUserId ?? null,
+      String(session.status || 'idle')
+    );
+    return this.getBrowserSession(session.scopeKey);
+  }
+
+  getBrowserSession(scopeKey) {
+    if (!scopeKey) return null;
+    try {
+      return this.get('SELECT * FROM browser_sessions WHERE scope_key = ?', String(scopeKey)) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  upsertBrowserTask(task) {
+    if (!task?.id) return null;
+    this.run(
+      `INSERT INTO browser_tasks (
+        id, scope_key, chat_id, user_id, requested_by_name, goal, status,
+        mcp_session_id, active_page_id, current_url, current_domain, current_action,
+        step_count, max_steps, pending_approval_json, summary, error_text, replay_json,
+        updated_at, finished_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), ?)
+      ON CONFLICT(id) DO UPDATE SET
+        status = excluded.status,
+        mcp_session_id = COALESCE(excluded.mcp_session_id, browser_tasks.mcp_session_id),
+        active_page_id = COALESCE(excluded.active_page_id, browser_tasks.active_page_id),
+        current_url = COALESCE(excluded.current_url, browser_tasks.current_url),
+        current_domain = COALESCE(excluded.current_domain, browser_tasks.current_domain),
+        current_action = excluded.current_action,
+        step_count = excluded.step_count,
+        pending_approval_json = excluded.pending_approval_json,
+        summary = COALESCE(excluded.summary, browser_tasks.summary),
+        error_text = excluded.error_text,
+        replay_json = COALESCE(excluded.replay_json, browser_tasks.replay_json),
+        updated_at = datetime('now'),
+        finished_at = COALESCE(excluded.finished_at, browser_tasks.finished_at)`,
+      String(task.id),
+      String(task.scopeKey),
+      Number(task.chatId || 0),
+      Number(task.userId || 0),
+      task.requestedByName || null,
+      String(task.goal || ''),
+      String(task.status || 'running'),
+      task.mcpSessionId || null,
+      task.activePageId ?? null,
+      task.currentUrl || null,
+      task.currentDomain || null,
+      task.currentAction || null,
+      Number(task.stepCount || 0),
+      Number(task.maxSteps || 24),
+      task.pendingApproval ? JSON.stringify(task.pendingApproval) : null,
+      task.summary || null,
+      task.errorText || null,
+      task.replay ? JSON.stringify(task.replay) : null,
+      task.finishedAt || null
+    );
+    return this.getBrowserTask(task.id);
+  }
+
+  getBrowserTask(taskId) {
+    if (!taskId) return null;
+    try {
+      return this.get('SELECT * FROM browser_tasks WHERE id = ?', String(taskId)) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  listBrowserTasks(scopeKey, { chatId = null, limit = 10 } = {}) {
+    try {
+      if (scopeKey) {
+        return this.all(
+          'SELECT * FROM browser_tasks WHERE scope_key = ? ORDER BY created_at DESC LIMIT ?',
+          String(scopeKey),
+          Number(limit) || 10
+        );
+      }
+      if (chatId !== null && chatId !== undefined) {
+        return this.all(
+          'SELECT * FROM browser_tasks WHERE chat_id = ? ORDER BY created_at DESC LIMIT ?',
+          Number(chatId),
+          Number(limit) || 10
+        );
+      }
+      return this.all('SELECT * FROM browser_tasks ORDER BY created_at DESC LIMIT ?', Number(limit) || 10);
+    } catch {
+      return [];
+    }
+  }
+
+  logBrowserAudit(entry) {
+    try {
+      this.run(
+        `INSERT INTO browser_audit_logs (
+          task_id, scope_key, chat_id, user_id, event_type, tool_name,
+          target_url, domain, summary, requires_approval, approved_by
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        entry.taskId || null,
+        String(entry.scopeKey || 'global'),
+        Number(entry.chatId || 0),
+        Number(entry.userId || 0),
+        String(entry.eventType || 'action'),
+        entry.toolName || null,
+        entry.targetUrl || null,
+        entry.domain || null,
+        entry.summary || null,
+        entry.requiresApproval ? 1 : 0,
+        entry.approvedBy ?? null
+      );
+    } catch {}
+  }
+
+  listBrowserAuditLogs({ taskId = null, scopeKey = null, limit = 30 } = {}) {
+    try {
+      if (taskId) {
+        return this.all(
+          'SELECT * FROM browser_audit_logs WHERE task_id = ? ORDER BY id ASC LIMIT ?',
+          String(taskId),
+          Number(limit) || 30
+        );
+      }
+      if (scopeKey) {
+        return this.all(
+          'SELECT * FROM browser_audit_logs WHERE scope_key = ? ORDER BY id DESC LIMIT ?',
+          String(scopeKey),
+          Number(limit) || 30
+        );
+      }
+      return this.all('SELECT * FROM browser_audit_logs ORDER BY id DESC LIMIT ?', Number(limit) || 30);
+    } catch {
+      return [];
     }
   }
 

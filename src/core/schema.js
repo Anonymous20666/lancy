@@ -510,4 +510,70 @@ CREATE TABLE IF NOT EXISTS star_payments (
 );
 CREATE INDEX IF NOT EXISTS idx_star_payments_chat ON star_payments(chat_id, status, expires_at);
 CREATE INDEX IF NOT EXISTS idx_star_payments_payer ON star_payments(payer_tg_id, status);
+
+-- BrowserOS Neo autonomous sessions, tasks, and redacted audit trail
+CREATE TABLE IF NOT EXISTS browser_sessions (
+  scope_key TEXT PRIMARY KEY,
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  mcp_session_id TEXT,
+  connector_id TEXT NOT NULL DEFAULT 'local',
+  connector_url TEXT,
+  task_name TEXT,
+  tab_group_id TEXT,
+  active_page_id INTEGER,
+  active_url TEXT,
+  active_domain TEXT,
+  live_vc_enabled INTEGER NOT NULL DEFAULT 0,
+  human_takeover INTEGER NOT NULL DEFAULT 0,
+  takeover_user_id INTEGER,
+  status TEXT NOT NULL DEFAULT 'idle',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_browser_sessions_chat ON browser_sessions(chat_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS browser_tasks (
+  id TEXT PRIMARY KEY,
+  scope_key TEXT NOT NULL,
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  requested_by_name TEXT,
+  goal TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued', -- queued | running | paused | awaiting_approval | awaiting_human | completed | failed | stopped
+  mcp_session_id TEXT,
+  active_page_id INTEGER,
+  current_url TEXT,
+  current_domain TEXT,
+  current_action TEXT,
+  step_count INTEGER NOT NULL DEFAULT 0,
+  max_steps INTEGER NOT NULL DEFAULT 24,
+  pending_approval_json TEXT,
+  summary TEXT,
+  error_text TEXT,
+  replay_json TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_browser_tasks_scope ON browser_tasks(scope_key, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_browser_tasks_chat ON browser_tasks(chat_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS browser_audit_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id TEXT,
+  scope_key TEXT NOT NULL,
+  chat_id INTEGER NOT NULL,
+  user_id INTEGER NOT NULL,
+  event_type TEXT NOT NULL,
+  tool_name TEXT,
+  target_url TEXT,
+  domain TEXT,
+  summary TEXT,
+  requires_approval INTEGER NOT NULL DEFAULT 0,
+  approved_by INTEGER,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_browser_audit_task ON browser_audit_logs(task_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_browser_audit_scope ON browser_audit_logs(scope_key, id DESC);
 `;

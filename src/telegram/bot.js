@@ -500,6 +500,7 @@ export class TelegramController extends EventEmitter {
       { command: 'player', description: 'Open the destination music dashboard' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
+      { command: 'browser', description: '🌐 Autonomous BrowserOS & Live VC Screen' },
       { command: 'stickers', description: '🎀 Telegram sticker pack studio' },
       { command: 'emojipack', description: '✨ Custom Emoji Studio & HD Media Converter' },
       { command: 'emoji2media', description: '🖼 Export custom emojis or stickers to HD media' },
@@ -540,6 +541,7 @@ export class TelegramController extends EventEmitter {
       { command: 'player', description: 'Open the destination music dashboard' },
       { command: 'grab', description: '📥 Universal media downloader (TikTok, IG, YT, X)' },
       { command: 'download', description: '📥 Universal media downloader (TikTok, IG, YT)' },
+      { command: 'browser', description: '🌐 Autonomous BrowserOS & Live VC Screen' },
       { command: 'search', description: '🔍 Search Pinterest (HD photos & videos)' },
       { command: 'music', description: '🎧 Fast music & Spotify track search' },
       { command: 'lyrics', description: '📝 Get lyrics for any song or snippet' },
@@ -555,6 +557,7 @@ export class TelegramController extends EventEmitter {
       { command: 'broadcast', description: '📡 Broadcast messages, media & albums to channels, groups & users' },
       { command: 'autopost', description: '📅 Schedule automated sticker drops' },
       { command: 'schedule', description: '📅 Schedule screening & media drops' },
+      { command: 'browser', description: '🌐 Autonomous BrowserOS & Live VC Screen' },
       { command: 'forcejoin', description: '🔒 Configure Force-Join channels & groups' },
       { command: 'setprefix', description: '⚡ Change command trigger prefix (/ to !, ., etc.)' },
       ...(isClone ? [] : [
@@ -4936,6 +4939,13 @@ export class TelegramController extends EventEmitter {
         const aiScreen = this.screens.get('ai');
         const sent = await aiScreen?.open(this.#ctx(tgId, { message }, { forceNew: true }));
         updateScreenMsg(sent);
+        return;
+      }
+      if (command === '/browser' || command === '/neo') {
+        await this.sm.reset(tgId, { reason: 'command' });
+        const bScreen = this.screens.get('browser');
+        const bctx = this.#ctx(tgId, { message }, { isGroup, isPrivate: !isGroup && !isChannel, forceNew: true });
+        await bScreen?.handleCommand?.(bctx, [`/${command.slice(1)}`, ...rest].join(' '));
         return;
       }
       if (command === '/cancel') {

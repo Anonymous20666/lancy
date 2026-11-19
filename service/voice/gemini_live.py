@@ -378,6 +378,89 @@ LANCY_LIVE_TOOL_DECLARATIONS = [
             },
         },
     },
+    {
+        'name': 'browser_start_task',
+        'description': 'Start an autonomous BrowserOS Chromium task for websites, forms, research, downloads, or interactive browsing.',
+        'parameters': {
+            'type': 'OBJECT',
+            'properties': {
+                'goal': {'type': 'STRING', 'description': 'What to do or look up in the browser'},
+                'url': {'type': 'STRING', 'description': 'Optional starting URL'},
+                'show_live': {'type': 'BOOLEAN', 'description': 'True to show BrowserOS live in this Voice Chat'},
+            },
+            'required': ['goal'],
+        },
+    },
+    {
+        'name': 'browser_show_live',
+        'description': 'Show Lancy live BrowserOS browser screen inside the Telegram Voice Chat (pausing music cleanly if playing).',
+        'parameters': {
+            'type': 'OBJECT',
+            'properties': {
+                'url': {'type': 'STRING'},
+            },
+        },
+    },
+    {
+        'name': 'browser_hide_live',
+        'description': 'Stop showing BrowserOS live in VC and resume previously paused music or movie.',
+        'parameters': {
+            'type': 'OBJECT',
+            'properties': {
+                'resume_media': {'type': 'BOOLEAN'},
+            },
+        },
+    },
+    {
+        'name': 'browser_interact_live',
+        'description': 'Manipulate the live BrowserOS tab by voice ("click the second result", "scroll down", "go back", "read this page", "open github.com").',
+        'parameters': {
+            'type': 'OBJECT',
+            'properties': {
+                'command': {'type': 'STRING'},
+            },
+            'required': ['command'],
+        },
+    },
+    {
+        'name': 'browser_pause_task',
+        'description': 'Pause active autonomous browser task.',
+        'parameters': {'type': 'OBJECT', 'properties': {'task_id': {'type': 'STRING'}}},
+    },
+    {
+        'name': 'browser_resume_task',
+        'description': 'Resume paused or human-takeover browser task.',
+        'parameters': {'type': 'OBJECT', 'properties': {'task_id': {'type': 'STRING'}}},
+    },
+    {
+        'name': 'browser_stop_task',
+        'description': 'Stop active browser task.',
+        'parameters': {'type': 'OBJECT', 'properties': {'task_id': {'type': 'STRING'}}},
+    },
+    {
+        'name': 'browser_task_status',
+        'description': 'Check active BrowserOS task status and visible page.',
+        'parameters': {'type': 'OBJECT', 'properties': {'task_id': {'type': 'STRING'}}},
+    },
+    {
+        'name': 'browser_list_tabs',
+        'description': 'List open BrowserOS tabs.',
+        'parameters': {'type': 'OBJECT', 'properties': {}},
+    },
+    {
+        'name': 'browser_request_human_help',
+        'description': 'Pause browser task and ask human user to handle login, OTP/2FA, or CAPTCHA.',
+        'parameters': {
+            'type': 'OBJECT',
+            'properties': {'reason': {'type': 'STRING'}},
+            'required': ['reason'],
+        },
+    },
+    {
+        'name': 'browser_replay_task',
+        'description': 'Fetch step-by-step replay log for the browser task.',
+        'parameters': {'type': 'OBJECT', 'properties': {'task_id': {'type': 'STRING'}}},
+    },
 ]
 
 

@@ -2060,7 +2060,7 @@ export class QueueManager extends EventEmitter {
     try{return await this.reconciling;}finally{this.reconciling=null;}
   }
   async #reconcile() {
-    await Promise.allSettled([...this.sessions.values()].filter(s => s.connected||s.stopPending).map(s => this.locks.run(s.chatId, async () => {
+    await Promise.allSettled([...this.sessions.values()].filter(s => (s.connected||s.stopPending) && !s.browserStreamLease?.active).map(s => this.locks.run(s.chatId, async () => {
       if (this.closed) return;
       if(s.stopPending){if(Date.now()<(s.stopRetryAfter||0))return;try{await this.#finishStop(s);s.status='idle';}catch{s.stopRetryAfter=Date.now()+30000;s.lastError='Queue cleared; call/group departure is still awaiting confirmation.';}await this.updatePlayerCard(s.chatId);return;}
       try {
@@ -2781,6 +2781,55 @@ export class QueueManager extends EventEmitter {
       }
     });
   }
+  /**
+   * Acquire an exclusive VC media lease (e.g. for live BrowserOS screen sharing) without losing the music/movie queue or position.
+   */
+  async acquireStreamLease(id, owner = 'browser') {
+    return this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      if (s.browserStreamLease?.active) return { ok: true, alreadyLeased: true, hadMedia: s.browserStreamLease.hadMedia };
+      const wasActive = Boolean(s.connected && s.currentTrack && ['playing', 'paused', 'buffering'].includes(s.status));
+      const prevStatus = s.status;
+      const savedPos = wasActive ? this.#requeueCurrentForResume(s) : 0;
+      s.browserStreamLease = {
+        owner: String(owner || 'browser'),
+        active: true,
+        hadMedia: wasActive,
+        previousStatus: prevStatus,
+        savedPos,
+        accountAlias: s.accountAlias || null,
+        acquiredAt: Date.now()
+      };
+      if (wasActive) {
+        s.connected = false;
+        s.playbackId = null;
+        s.status = 'paused';
+        s.lastNotice = `Paused at ${this.#formatSavedClock(savedPos)} for live Lancy Browser VC view.`;
+        this.#savePlaybackSnapshot(s);
+        await this.updatePlayerCard(id, { forceEdit: true }).catch(() => {});
+      }
+      return { ok: true, hadMedia: wasActive, savedPos, accountAlias: s.browserStreamLease.accountAlias };
+    });
+  }
+
+  /**
+   * Release VC stream lease and optionally resume any paused music/movie track at its exact saved position.
+   */
+  async releaseStreamLease(id, { resumePrevious = true } = {}) {
+    const lease = await this.locks.run(Number(id), async () => {
+      const s = this.getSession(id);
+      const cur = s.browserStreamLease || null;
+      s.browserStreamLease = null;
+      return cur;
+    });
+    if (resumePrevious && lease?.hadMedia) {
+      await this.resume(Number(id)).catch((err) => {
+        this.log?.warn?.({ chatId: id, err: err?.message }, 'Failed restoring leased playback after browser VC hide');
+      });
+    }
+    return { ok: true, restored: Boolean(resumePrevious && lease?.hadMedia), lease };
+  }
+
   async shutdown() {
     for (const s of this.sessions.values()) this.#savePlaybackSnapshot(s);
     this.closed = true;this.eventAbort.abort(); clearInterval(this.poller);for(const s of this.sessions.values())s.prepareAbort?.abort();

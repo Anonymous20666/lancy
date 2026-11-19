@@ -21,11 +21,13 @@ from aiohttp import web
 AV_SYNC_SCRIPT = str(Path(__file__).resolve().with_name('av_sync.py'))
 AV_HUB_SCRIPT = str(Path(__file__).resolve().with_name('av_hub.py'))
 RTMP_HUB_SCRIPT = str(Path(__file__).resolve().with_name('rtmp_hub.py'))
+BROWSER_STREAM_SCRIPT = str(Path(__file__).resolve().with_name('browser_stream.py'))
 _VOICE_DIR = Path(__file__).resolve().parent
 if str(_VOICE_DIR) not in sys.path:
     sys.path.insert(0, str(_VOICE_DIR))
 import av_hub
 import av_sync
+import browser_stream
 import rtmp_streamer
 import stt_engine
 import sub_align
@@ -2115,7 +2117,13 @@ class Bridge:
                     pass
             sid = call.get('av_sync_id')
             if sid:
-                for p in (av_sync.shm_path_for(sid), av_sync.substatus_path_for(sid), av_sync.vchud_config_path_for(sid)):
+                for p in (
+                    av_sync.shm_path_for(sid),
+                    av_sync.substatus_path_for(sid),
+                    av_sync.vchud_config_path_for(sid),
+                    browser_stream.browser_meta_path_for(sid),
+                    browser_stream.browser_stats_path_for(sid),
+                ):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:
@@ -3719,7 +3727,8 @@ class Bridge:
             hot_resumed = False
             if op == 'stop':
                 await self._stop_secondary_tile_unlocked(chat)
-                await self.voice_listener.stop_chat(chat)
+                if self.voice_listener:
+                    await self.voice_listener.stop_chat(chat)
                 if is_rtmp:
                     await self._stop_rtmp_proc(call, wait_settle=False)
                 self._cleanup_sub_overlay(call)
@@ -4453,6 +4462,245 @@ class Bridge:
             stopped = await self._stop_secondary_tile_unlocked(chat)
             return {'ok': True, 'stopped': stopped}
 
+    async def start_browser_live(self, data):
+        chat = int(data['chat_id'])
+        if chat >= 0 or self.closing:
+            raise VoiceFailure('INVALID_REQUEST')
+        sc_url = str(data.get('screencast_url') or '').strip()
+        if not re.fullmatch(r'https?://[^\s\'"`<>]+', sc_url):
+            raise VoiceFailure('INVALID_REQUEST')
+        width = max(320, min(1920, int(data.get('width') or 1280))) & ~1
+        height = max(180, min(1080, int(data.get('height') or 720))) & ~1
+        fps = max(5, min(30, int(round(float(data.get('fps') or 12)))))
+
+        async with self.chat_lock(chat):
+            max_vid_raw = data.get('max_video_calls_per_account')
+            max_vid_cap = int(max_vid_raw) if max_vid_raw is not None and int(max_vid_raw) > 0 else None
+            a = await self.lease(chat, data.get('account_alias'), for_video=True, max_video_calls=max_vid_cap)
+            await self._stop_secondary_tile_unlocked(chat)
+            previous = self.calls.get(chat)
+            req_mode = str(data.get('stream_mode') or '').strip().lower()
+            stream_mode = req_mode if req_mode in {'interactive', 'rtmp'} else (previous.get('stream_mode', 'interactive') if previous else 'interactive')
+            wants_rtmp = stream_mode == 'rtmp'
+            vc_title = str(data.get('vc_title') or 'Lancy Browser Live').strip()[:64]
+
+            if previous:
+                if previous.get('stream_mode') == 'rtmp':
+                    await self._stop_rtmp_proc(previous, wait_settle=(stream_mode != 'rtmp'))
+                self._cleanup_sub_overlay(previous)
+
+            sid = re.sub(r'[^a-zA-Z0-9_-]', '_', f'blive-{abs(chat)}-{uuid.uuid4().hex[:8]}')[:64]
+            meta_file = str(browser_stream.write_browser_meta(sid, data))
+            stats_file = str(browser_stream.browser_stats_path_for(sid))
+            _init_sync_state(sid, paused=False)
+
+            call = {
+                'alias': a['alias'],
+                'path': sc_url,
+                'stream_mode': stream_mode,
+                'video': True,
+                'video_quality': 'HD_720p',
+                'is_channel': False,
+                'remote_proxy': False,
+                'is_music': False,
+                'music_freerun': True,
+                'dj_desk': False,
+                'browser_live': {
+                    'screencast_url': sc_url,
+                    'mcp_session_id': str(data.get('mcp_session_id') or ''),
+                    'domain': str(data.get('domain') or 'browser'),
+                    'task': str(data.get('task') or 'Lancy Browser'),
+                    'action': str(data.get('action') or 'Live'),
+                    'state': str(data.get('state') or 'LIVE').upper(),
+                    'meta_file': meta_file,
+                    'stats_file': stats_file,
+                    'width': width,
+                    'height': height,
+                    'fps': fps,
+                },
+                'av_sync_id': sid,
+                'duration': 0.0,
+                'offset': 0.0,
+                'playback_id': str(data.get('playback_id') or sid),
+                'status': 'buffering',
+                'clock_errors': 0,
+                'position_seconds': 0.0,
+                'last_known_position': 0.0,
+                'retries': 0,
+                'retry_after': 0.0,
+                'last_progress': time.monotonic(),
+                'vc_title': vc_title,
+            }
+
+            try:
+                if self.factory or not a.get('uid') or time.monotonic() - a.get('me_checked_at', 0) >= 300:
+                    me = await asyncio.wait_for(a['client'].get_me(), 10)
+                    if me.is_bot:
+                        raise VoiceFailure('SESSION_NOT_READY')
+                    a['me_checked_at'] = time.monotonic()
+
+                can_reuse = (
+                    not getattr(self, 'auto_create_call_in_tests', False)
+                    and previous is not None
+                    and previous.get('alias') == a['alias']
+                    and previous.get('stream_mode', 'interactive') == stream_mode
+                    and previous.get('status') in {'playing', 'paused', 'buffering', 'idle'}
+                    and previous.get('native_call') is not None
+                )
+                if can_reuse:
+                    call['native_call'] = previous['native_call']
+                elif not self.factory or getattr(self, 'auto_create_call_in_tests', False) or wants_rtmp:
+                    await self.resolve_destination(a['client'], chat)
+                    try:
+                        peer, native = await self.native_call(a['client'], chat)
+                    except Exception:
+                        peer, native = None, None
+                    if peer is not None and native is None:
+                        native = await self._create_group_call(a, chat, peer, vc_title=vc_title, rtmp_stream=wants_rtmp)
+                    if native is not None:
+                        call['native_call'] = native
+                        if wants_rtmp and not call.get('_rtmp_target') and peer is not None and (not self.factory or getattr(self, 'test_rtmp_ingest', False)):
+                            rtmp_target, _, _ = await self._fetch_rtmp_ingest(a, peer)
+                            call['_rtmp_target'] = rtmp_target
+                        elif wants_rtmp and self.factory and not call.get('_rtmp_target'):
+                            call['_rtmp_target'] = 'rtmps://mock-tg-rtmp.local/live/mock-key'
+                    elif not call.get('native_call'):
+                        raise VoiceFailure('NO_ACTIVE_CALL')
+
+                if wants_rtmp:
+                    dec_args = [
+                        sys.executable, BROWSER_STREAM_SCRIPT,
+                        '--role', 'nut',
+                        '--screencast-url', sc_url,
+                        '--meta-file', meta_file,
+                        '--width', str(width),
+                        '--height', str(height),
+                        '--fps', str(fps),
+                    ]
+                    cmd_args = [
+                        sys.executable, RTMP_HUB_SCRIPT,
+                        '--sync-id', sid,
+                        '--width', str(width),
+                        '--height', str(height),
+                        '--fps', str(fps),
+                        '--video-quality', 'HD_720p',
+                        '--preset', 'ultrafast',
+                        '--threads', '4',
+                        '--rtmp-env', 'LANCY_RTMP_TARGET',
+                        '--no-audio-eof',
+                        '--', *dec_args,
+                    ]
+                    env = dict(os.environ)
+                    env['LANCY_RTMP_TARGET'] = call.get('_rtmp_target') or ''
+                    if data.get('api_token'):
+                        env['BROWSEROS_API_TOKEN'] = str(data['api_token'])
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd_args,
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                        env=env,
+                    )
+                    call['_rtmp_proc'] = proc
+                    call['_rtmp_stderr'] = asyncio.create_task(self._drain_rtmp_stderr(chat, proc))
+                    call['rtmp_standby'] = False
+                elif self.factory:
+                    await asyncio.wait_for(a['engine'].play(chat, call['browser_live']), 15)
+                else:
+                    from pytgcalls.types import GroupCallConfig
+                    from pytgcalls.types.raw import Stream, AudioStream, VideoStream, AudioParameters, VideoParameters
+                    from ntgcalls import MediaSource
+
+                    a_in = f'{shlex.quote(sys.executable)} {shlex.quote(BROWSER_STREAM_SCRIPT)} --role audio'
+                    v_in = (
+                        f'{shlex.quote(sys.executable)} {shlex.quote(BROWSER_STREAM_SCRIPT)} '
+                        f'--role video --screencast-url {shlex.quote(sc_url)} '
+                        f'--meta-file {shlex.quote(meta_file)} --stats-file {shlex.quote(stats_file)} '
+                        f'--width {width} --height {height} --fps {fps}'
+                    )
+                    wrapped_a, wrapped_v = wrap_av_sync_pair(
+                        a_in,
+                        v_in,
+                        frame_bytes=width * height * 3 // 2,
+                        fps=float(fps),
+                        sync_id=sid,
+                        music_freerun=True,
+                    )
+                    play_stream = Stream(
+                        microphone=AudioStream(MediaSource.SHELL, wrapped_a, AudioParameters(bitrate=48000, channels=2)),
+                        camera=VideoStream(MediaSource.SHELL, wrapped_v, VideoParameters(width=width, height=height, frame_rate=fps)),
+                    )
+                    await asyncio.wait_for(a['engine'].play(chat, play_stream, config=GroupCallConfig(auto_start=False)), 25)
+                    try:
+                        await asyncio.wait_for(self.ensure_publisher(a, chat, call), 15)
+                    except Exception as pub_err:
+                        log.warning('browser_live ensure_publisher chat=%s err=%s', chat, type(pub_err).__name__)
+            except Exception:
+                self._cleanup_sub_overlay(call)
+                if previous is None:
+                    self.release_destination(a, chat)
+                raise
+
+            call['status'] = 'playing'
+            call['started_at'] = time.monotonic()
+            call['last_progress'] = time.monotonic()
+            self.calls[chat] = call
+            if self.voice_listener and (data.get('voice_ai_enabled') is not False):
+                try:
+                    if isinstance(data.get('voice_authorized_ids'), list):
+                        self.voice_listener.set_authorized_ids(chat, data.get('voice_authorized_ids'))
+                    await self.voice_listener.start_chat(chat, a['alias'], enabled=True)
+                except Exception:
+                    pass
+            return {
+                'ok': True,
+                'chat_id': chat,
+                'sync_id': sid,
+                'account_alias': a['alias'],
+                'stream_mode': stream_mode,
+                'width': width,
+                'height': height,
+                'fps': fps,
+            }
+
+    async def update_browser_live_meta(self, data):
+        chat = int(data['chat_id'])
+        call = self.calls.get(chat)
+        if not call or not call.get('browser_live'):
+            return {'ok': False, 'error': 'NO_BROWSER_LIVE'}
+        sid = call.get('av_sync_id')
+        bl = call['browser_live']
+        for k in ('domain', 'url', 'task', 'action', 'state', 'step'):
+            if k in data and data[k] is not None:
+                bl[k] = str(data[k])
+        if sid:
+            browser_stream.write_browser_meta(sid, bl)
+        stats = None
+        sp = bl.get('stats_file')
+        if sp and os.path.isfile(sp):
+            try:
+                stats = json.loads(Path(sp).read_text(encoding='utf-8'))
+            except Exception:
+                stats = None
+        return {'ok': True, 'sync_id': sid, 'meta': {k: bl.get(k) for k in ('domain', 'task', 'action', 'state', 'step')}, 'stats': stats}
+
+    async def stop_browser_live(self, data):
+        chat = int(data['chat_id'])
+        keep_call = bool(data.get('keep_call', False))
+        if keep_call:
+            async with self.chat_lock(chat):
+                call = self.calls.get(chat)
+                if not call or not call.get('browser_live'):
+                    return {'ok': True, 'stopped': False}
+                call.pop('browser_live', None)
+                return {'ok': True, 'stopped': True, 'kept_call': True}
+        async with self.chat_lock(chat):
+            call = self.calls.get(chat)
+            if not call or not call.get('browser_live'):
+                return {'ok': True, 'stopped': False}
+        res = await self.control('stop', {'chat_id': chat})
+        return {'ok': bool(res.get('ok')), 'stopped': True, 'kept_call': False}
+
     async def speak_in_call(self, data):
         chat = int(data['chat_id'])
         text = str(data.get('text') or '').strip()
@@ -5021,7 +5269,8 @@ class Bridge:
 
     async def shutdown(self):
         self.closing = True
-        await self.voice_listener.stop_all()
+        if self.voice_listener:
+            await self.voice_listener.stop_all()
         mon_task = getattr(self, '_sync_monitor_task', None)
         if mon_task is not None and not mon_task.done():
             mon_task.cancel()
@@ -5079,6 +5328,9 @@ def make_app(bridge, token):
     async def call_messages_delete(request): return web.json_response(await bridge.delete_call_messages(await request.json()))
     async def secondary_tile_start(request): return web.json_response(await bridge.start_secondary_tile(await request.json()))
     async def secondary_tile_stop(request): return web.json_response(await bridge.stop_secondary_tile(await request.json()))
+    async def browser_live_start(request): return web.json_response(await bridge.start_browser_live(await request.json()))
+    async def browser_live_meta(request): return web.json_response(await bridge.update_browser_live_meta(await request.json()))
+    async def browser_live_stop(request): return web.json_response(await bridge.stop_browser_live(await request.json()))
     async def call_speak(request): return web.json_response(await bridge.speak_in_call(await request.json()))
     async def call_barge_in(request): return web.json_response(await bridge.barge_in_call(await request.json()))
     async def call_live_tool_result(request): return web.json_response(await bridge.submit_live_tool_result(await request.json()))
@@ -5095,6 +5347,7 @@ def make_app(bridge, token):
     app.router.add_post('/call/play', play); app.router.add_get('/call/status', status); app.router.add_get('/call/invite-link', call_invite)
     app.router.add_post('/call/settings', call_settings); app.router.add_post('/call/message', call_message); app.router.add_post('/call/messages/delete', call_messages_delete)
     app.router.add_post('/call/secondary-tile/start', secondary_tile_start); app.router.add_post('/call/secondary-tile/stop', secondary_tile_stop)
+    app.router.add_post('/call/browser-live/start', browser_live_start); app.router.add_post('/call/browser-live/meta', browser_live_meta); app.router.add_post('/call/browser-live/stop', browser_live_stop)
     app.router.add_post('/call/speak', call_speak); app.router.add_post('/call/barge_in', call_barge_in); app.router.add_post('/call/live-tool-result', call_live_tool_result); app.router.add_post('/call/live-context', call_live_context); app.router.add_post('/call/listen', call_listen); app.router.add_get('/call/participants', call_participants)
     app.router.add_post('/stt/transcribe', stt_transcribe); app.router.add_post('/tts/synthesize', tts_synthesize)
     app.router.add_post('/verify-audio-lang', verify_audio_lang)

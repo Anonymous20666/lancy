@@ -331,6 +331,20 @@ export class LancyAgent {
     return resolved;
   }
 
+  getVoiceProfileForChat(chatId, userId = null) {
+    const cid = Number(chatId || 0);
+    const uid = Number(userId || 0);
+    const sp = (uid && this.speakerPersonas.get(`${cid}:${uid}`)) || this.vcSessions.get(cid)?.activePersona || null;
+    if (sp) {
+      return {
+        persona: sp.id,
+        voice: sp.edgeVoice || sp.edge_tts_voice,
+        rate: sp.rate || '+0%'
+      };
+    }
+    return {};
+  }
+
   /**
    * Execute an asynchronous tool call emitted by Gemini 3.8 Live and return a strict
    * guide-compliant structured payload ({ status, retryable, message, ... }).
@@ -341,7 +355,10 @@ export class LancyAgent {
     if (!cid || !fnName) {
       return { status: 'invalid_argument', retryable: false, message: 'Missing chat_id or tool name.' };
     }
-    const readOnlyLiveTools = new Set(['get_call_state', 'web_research', 'tell_story_or_novel']);
+    const readOnlyLiveTools = new Set([
+      'get_call_state', 'web_research', 'tell_story_or_novel',
+      'browser_task_status', 'browser_list_tabs', 'browser_replay_task'
+    ]);
     if (!readOnlyLiveTools.has(fnName) && userId) {
       const ok = await this.isAuthorizedSpeaker(cid, userId, { fromAdmin: false });
       if (!ok) {

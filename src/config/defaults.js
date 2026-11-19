@@ -170,6 +170,24 @@ export const DEFAULT_SETTINGS = {
     cleanupIntervalMinutes: 30
   },
 
+  browser: {
+    enabled: true,
+    mcpUrl: 'http://127.0.0.1:9010/mcp',
+    baseUrl: 'http://127.0.0.1:9010',
+    novncUrl: 'http://127.0.0.1:6080',
+    connectorMode: 'local',      // local | remote | ssh-tunnel
+    apiToken: '',
+    streamQuality: 'high',       // low | high
+    streamFps: 12,
+    streamWidth: 1280,
+    streamHeight: 720,
+    audioMutedByDefault: true,
+    requireApprovalForHighImpact: true,
+    maxTaskSteps: 24,
+    stepTimeoutMs: 45000,
+    blockedDomains: ['169.254.169.254', 'metadata.google.internal']
+  },
+
   performance: {
     workerConcurrency: 8,
     queueConcurrency: 6,

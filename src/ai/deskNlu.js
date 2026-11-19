@@ -294,6 +294,29 @@ function parseSingleClause(clause) {
     return { name: 'send_current_video_to_chat', args: { ...(qm ? { quality: qm[1].toLowerCase() } : {}) } };
   }
 
+  // BrowserOS Neo Live VC controls & conversational page manipulation
+  if (/^(?:show|share|stream|open)\s+(?:the\s+)?browser(?:\s+screen)?(?:\s+live)?(?:\s+in\s+(?:the\s+)?vc)?$/i.test(lower)) {
+    return { name: 'browser_show_live', args: {} };
+  }
+  if (/^(?:hide|stop|close|exit)\s+(?:the\s+)?browser(?:\s+screen|\s+live|\s+view)?(?:\s+from\s+vc)?$/i.test(lower)) {
+    return { name: 'browser_hide_live', args: { resume_media: true } };
+  }
+  if (/^pause\s+(?:the\s+)?browser(?:\s+task)?$/i.test(lower)) {
+    return { name: 'browser_pause_task', args: {} };
+  }
+  if (/^(?:resume|continue)\s+(?:the\s+)?browser(?:\s+task)?$/i.test(lower)) {
+    return { name: 'browser_resume_task', args: {} };
+  }
+  if (/^scroll\s+(up|down|left|right)(?:\s+\d+)?$/i.test(lower)) {
+    return { name: 'browser_interact_live', args: { command: clean } };
+  }
+  if (/^(?:click|open|select)\s+(?:the\s+)?(?:first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th|\d+(?:st|nd|rd|th)?)\s+(?:result|link|item|button|option)$/i.test(lower)) {
+    return { name: 'browser_interact_live', args: { command: clean } };
+  }
+  if (/^(?:go\s+back|back|go\s+forward|reload|refresh)\s+(?:in|on)?\s*(?:the\s+)?browser$/i.test(lower) || /^(?:read|summarize)\s+(?:this|the)\s+(?:web\s*)?page$/i.test(lower)) {
+    return { name: 'browser_interact_live', args: { command: clean.replace(/\s+(?:in|on)\s+(?:the\s+)?browser$/i, '') } };
+  }
+
   return null;
 }
 

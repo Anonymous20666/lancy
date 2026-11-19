@@ -101,6 +101,47 @@ export class VoiceClient {
     });
   }
   stopSecondaryTile(id) { return this.request('/call/secondary-tile/stop', { method: 'POST', body: { chat_id: Number(id) }, timeoutMs: 15000 }); }
+  async startBrowserLive(id, opts = {}) {
+    await this.ensureDaemon();
+    return this.request('/call/browser-live/start', {
+      method: 'POST',
+      body: {
+        chat_id: Number(id),
+        screencast_url: String(opts.screencastUrl || ''),
+        mcp_session_id: String(opts.mcpSessionId || ''),
+        ...(opts.apiToken ? { api_token: String(opts.apiToken) } : {}),
+        ...(opts.domain ? { domain: String(opts.domain) } : {}),
+        ...(opts.url ? { url: String(opts.url) } : {}),
+        ...(opts.task ? { task: String(opts.task) } : {}),
+        ...(opts.action ? { action: String(opts.action) } : {}),
+        ...(opts.state ? { state: String(opts.state) } : {}),
+        ...(opts.step ? { step: String(opts.step) } : {}),
+        ...(opts.streamMode ? { stream_mode: String(opts.streamMode) } : {}),
+        ...(opts.accountAlias ? { account_alias: String(opts.accountAlias) } : {}),
+        ...(opts.vcTitle ? { vc_title: String(opts.vcTitle).slice(0, 64) } : {}),
+        ...(opts.voiceAiEnabled !== undefined ? { voice_ai_enabled: Boolean(opts.voiceAiEnabled) } : {}),
+        ...(Array.isArray(opts.voiceAuthorizedIds) ? { voice_authorized_ids: opts.voiceAuthorizedIds } : {}),
+        width: Number(opts.width || 1280),
+        height: Number(opts.height || 720),
+        fps: Number(opts.fps || 12)
+      },
+      timeoutMs: 45000
+    });
+  }
+  updateBrowserLiveMeta(id, meta = {}) {
+    return this.request('/call/browser-live/meta', {
+      method: 'POST',
+      body: { chat_id: Number(id), ...meta },
+      timeoutMs: 6000
+    });
+  }
+  stopBrowserLive(id, { keepCall = false } = {}) {
+    return this.request('/call/browser-live/stop', {
+      method: 'POST',
+      body: { chat_id: Number(id), keep_call: Boolean(keepCall) },
+      timeoutMs: 15000
+    });
+  }
   control(op, id, more = {}) { return this.request(`/call/${op}`, { method:'POST', body:{ chat_id:Number(id), ...more }, timeoutMs: op === 'seek' ? 65000 : op === 'resume' ? 35000 : op === 'subcheck' ? 30000 : 20000 }); }
   sendCallMessage(id, text, more = {}) { return this.request('/call/message', { method:'POST', body:{ chat_id:Number(id), text:String(text || ''), ...more }, timeoutMs:12000 }); }
   speak(id, text, opts = {}) { return this.request('/call/speak', { method:'POST', body:{ chat_id:Number(id), text:String(text || ''), ...(opts.voice ? { voice: String(opts.voice) } : {}), ...(opts.rate ? { rate: String(opts.rate) } : {}), ...(opts.append_mode !== undefined ? { append_mode: Boolean(opts.append_mode) } : {}), ...(opts.barge_in_clear !== undefined ? { barge_in_clear: Boolean(opts.barge_in_clear) } : {}), ...(opts.speaker_name ? { speaker_name: String(opts.speaker_name) } : {}), ...(opts.user_text ? { user_text: String(opts.user_text) } : {}), ...(opts.lancy_text ? { lancy_text: String(opts.lancy_text) } : {}), ...(opts.hud_theme ? { hud_theme: String(opts.hud_theme) } : {}) }, timeoutMs:18000 }); }

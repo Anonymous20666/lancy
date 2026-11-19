@@ -282,6 +282,137 @@ export const LANCY_TOOLS_SCHEMA = [
         required: ['resume_playback']
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_start_task',
+      description: 'Operate real BrowserOS Chromium autonomously for any website workflow, login-assisted flow, form, search, download, or live screen share.',
+      parameters: {
+        type: 'object',
+        properties: {
+          goal: { type: 'string', description: 'Clear description of the website task or navigation goal.' },
+          url: { type: 'string', description: 'Optional starting URL (e.g. "https://github.com").' },
+          show_live: { type: 'boolean', description: 'True to also show live BrowserOS screen video in the active Voice Chat.' }
+        },
+        required: ['goal']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_task_status',
+      description: 'Get the current BrowserOS task status, active domain/URL, step progress, and pending approvals.',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Optional task ID; omits for active task in this chat.' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_list_tabs',
+      description: 'List open tabs in the scoped BrowserOS session.',
+      parameters: { type: 'object', properties: {} }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_pause_task',
+      description: 'Pause the active autonomous BrowserOS task without closing its tabs.',
+      parameters: { type: 'object', properties: { task_id: { type: 'string' } } }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_resume_task',
+      description: 'Resume a paused or human-takeover BrowserOS task after user login/verification.',
+      parameters: { type: 'object', properties: { task_id: { type: 'string' } } }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_stop_task',
+      description: 'Stop the active autonomous BrowserOS task immediately.',
+      parameters: { type: 'object', properties: { task_id: { type: 'string' } } }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_request_human_help',
+      description: 'Pause BrowserOS automation safely and ask the human user to handle login, OTP, 2FA, CAPTCHA, or sensitive approval.',
+      parameters: {
+        type: 'object',
+        properties: {
+          reason: { type: 'string', description: 'Short explanation of what the human needs to complete.' },
+          task_id: { type: 'string' }
+        },
+        required: ['reason']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_show_live',
+      description: 'Stream the real BrowserOS browser screen live inside the Telegram Voice Chat (auto-leases and pauses media cleanly).',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: 'Optional URL to open if no browser task is open yet.' },
+          task_id: { type: 'string' },
+          quality: { type: 'string', enum: ['low', 'high'] }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_hide_live',
+      description: 'Hide the live BrowserOS screen share from Telegram Voice Chat and smoothly restore any paused music/movie track.',
+      parameters: {
+        type: 'object',
+        properties: {
+          resume_media: { type: 'boolean', description: 'True to restore previously paused music/movie stream (default true).' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_replay_task',
+      description: 'Inspect the step-by-step audit and replay timeline of a BrowserOS task.',
+      parameters: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Optional task ID; omits for latest task.' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'browser_interact_live',
+      description: 'Perform a quick conversational action on the live visible browser page ("click the second result", "scroll down", "go back", "read this page", "open example.com").',
+      parameters: {
+        type: 'object',
+        properties: {
+          command: { type: 'string', description: 'Exact natural browser command or navigation instruction.' }
+        },
+        required: ['command']
+      }
+    }
   }
 ];
 
@@ -1411,6 +1542,77 @@ export class LancyToolExecutor {
           resumePlayback: Boolean(args.resumePlayback ?? args.resume_playback),
           closingLine: String(args.closingLine || args.closing_line || '')
         };
+
+      case 'browser_start_task':
+      case 'browser_task_status':
+      case 'browser_list_tabs':
+      case 'browser_pause_task':
+      case 'browser_resume_task':
+      case 'browser_stop_task':
+      case 'browser_request_human_help':
+      case 'browser_show_live':
+      case 'browser_hide_live':
+      case 'browser_replay_task':
+      case 'browser_interact_live': {
+        const b = this.app?.browser;
+        if (!b) return { ok: false, error: 'browser_service_unavailable' };
+        const cid = Number(context.telegramChatId || chatId || context.userId || 0);
+        const uid = Number(context.userId || context.ctx?.tgId || cid || 0);
+        const scopeKey = b.constructor?.name ? `${cid < 0 ? `gc:${cid}` : `dm:${uid || cid}`}` : 'global';
+        const perm = await b.perms.authorize(context, { chatId: cid, userId: uid });
+        if (!perm.allowed) {
+          return { ok: false, error: `permission_denied:${perm.reason}` };
+        }
+        const active = b.tasks.getActiveTaskForScope(perm.scopeKey);
+        const targetTaskId = args.task_id || active?.id || null;
+
+        if (toolName === 'browser_start_task') {
+          return await b.startTask({
+            chatId: cid,
+            userId: uid,
+            requestedByName: context.senderName || context.speakerName || 'User',
+            goal: String(args.goal || args.url || 'Open browser'),
+            url: args.url || null,
+            showLiveVc: Boolean(args.show_live ?? (cid < 0 && b.liveView.isLive(cid)))
+          });
+        }
+        if (toolName === 'browser_task_status') {
+          return b.getTaskStatus({ scopeKey: perm.scopeKey, taskId: targetTaskId });
+        }
+        if (toolName === 'browser_list_tabs') {
+          return await b.listTabs(perm.scopeKey);
+        }
+        if (toolName === 'browser_pause_task') {
+          if (!targetTaskId) return { ok: false, error: 'no_active_browser_task' };
+          return await b.pauseTask(targetTaskId);
+        }
+        if (toolName === 'browser_resume_task') {
+          if (!targetTaskId) return { ok: false, error: 'no_paused_browser_task' };
+          return await b.resumeTask(targetTaskId);
+        }
+        if (toolName === 'browser_stop_task') {
+          if (!targetTaskId) return { ok: false, error: 'no_active_browser_task' };
+          const res = await b.stopTask(targetTaskId);
+          if (cid < 0 && b.liveView.isLive(cid)) await b.hideLive(cid, { resumeMedia: true });
+          return res;
+        }
+        if (toolName === 'browser_request_human_help') {
+          if (!targetTaskId) return { ok: false, error: 'no_active_browser_task' };
+          return await b.requestHumanHelp(targetTaskId, { reason: String(args.reason || 'Human help required'), userId: uid });
+        }
+        if (toolName === 'browser_show_live') {
+          if (cid >= 0) return { ok: false, error: 'vc_requires_group_chat' };
+          return await b.showLive(cid, { userId: uid, taskId: targetTaskId, url: args.url || null, quality: args.quality || null });
+        }
+        if (toolName === 'browser_hide_live') {
+          if (cid >= 0) return { ok: false, error: 'vc_requires_group_chat' };
+          return await b.hideLive(cid, { resumeMedia: args.resume_media !== false });
+        }
+        if (toolName === 'browser_replay_task') {
+          return await b.getReplay(targetTaskId, { scopeKey: perm.scopeKey || scopeKey });
+        }
+        return await b.interactLive({ chatId: cid, userId: uid, scopeKey: perm.scopeKey, command: String(args.command || '') });
+      }
 
       default:
         return { ok: false, error: `unknown_tool:${toolName}` };
