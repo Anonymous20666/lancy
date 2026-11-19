@@ -241,12 +241,12 @@ LANCY_LIVE_TOOL_DECLARATIONS = [
     },
     {
         'name': 'seek_playback',
-        'description': 'Seek to timestamp/percentage/middle in current audio or video.',
+        'description': 'Seek to timestamp, relative offset (+/- seconds), or percentage in current audio or video.',
         'parameters': {
             'type': 'OBJECT',
             'properties': {
-                'seconds': {'type': 'INTEGER', 'description': 'Target second position'},
-                'relative': {'type': 'INTEGER', 'description': 'Relative offset in seconds'},
+                'seconds': {'type': 'INTEGER', 'description': 'Absolute target timestamp in seconds from start'},
+                'relative': {'type': 'INTEGER', 'description': 'Signed relative offset in seconds (e.g. 30 for +30s forward, -15 for 15s back)'},
                 'fraction': {'type': 'NUMBER', 'description': '0.5 for middle'},
             },
         },
@@ -463,6 +463,11 @@ LANCY_LIVE_TOOL_DECLARATIONS = [
     },
 ]
 
+_BLOCKING_LIVE_TOOLS = {'switch_persona', 'finish_conversation'}
+for _decl in LANCY_LIVE_TOOL_DECLARATIONS:
+    if _decl.get('name') not in _BLOCKING_LIVE_TOOLS:
+        _decl['behavior'] = 'NON_BLOCKING'
+
 
 def build_live_system_instruction(*, persona: dict | None = None, vc_title: str = '', now_playing: str = '') -> str:
     p = persona or PERSONA_CAST['pappy']
@@ -471,28 +476,27 @@ def build_live_system_instruction(*, persona: dict | None = None, vc_title: str 
     p_desc = p.get('personality') or PERSONA_CAST['pappy']['personality']
     ctx_bits = []
     if vc_title:
-        ctx_bits.append(f'Active VC title: "{vc_title}".')
+        ctx_bits.append(f'Room: "{vc_title}".')
     if now_playing:
-        ctx_bits.append(f'Currently playing on deck: {now_playing}.')
+        ctx_bits.append(f'Playing: {now_playing}.')
     ctx_line = ' '.join(ctx_bits)
     return (
-        f'You are {p_name} ({p_age_gender}) — a deeply human co-host, DJ, cinema buff, and storyteller in a live Telegram Voice Chat.\n'
-        f'YOUR CHARACTER: {p_desc}\n'
-        'STANDALONE CAST & VOICE SWITCHING:\n'
-        '- You are part of a real multi-voice cast in the room: Pappy (deep male host), Ava (warm lady), Maya (young girl), Leo (young boy), Nana (wise older woman), Elder (wise older man), Zara, Marcus, Chloe — plus any custom name speakers call.\n'
-        '- If a speaker calls another character by name (e.g. "Hey Ava...", "Nana tell us...", "Pappy...", or asks for a "lady/girl/boy/old woman/man voice"), IMMEDIATELY call `switch_persona(name=..., voice_type=..., handoff_text=...)` and stay silent yourself so that character answers in their own real voice!\n'
-        'HUMAN SOCIAL INTELLIGENCE & LONG TALK / STORYTELLING:\n'
-        '- Mirror the mood and pace of whoever speaks to you: warm Naija/Pidgin wit when playful, calm grounded empathy when serious/frustrated/sad (zero forced jokes in serious moments).\n'
-        '- NEVER cut your answers artificially short when asked for a story, dark romance novel, movie breakdown, or long conversation! For stories/novels/long talks, use `tell_story_or_novel` or `web_research` when helpful and speak richly, vividly, and at full narrative length across paragraphs without stopping mid-story.\n'
-        '- Keep up with current songs, videos, artists, dark romance books, and movies by calling `web_research` or `tell_story_or_novel` whenever fresh details help.\n'
-        '- Let side human-to-human chatter or rhetorical remarks pass silently via proactive audio. NEVER end replies with customer-support phrases like "Anything else?".\n'
+        f'You are {p_name} ({p_age_gender}) — a sharp, warm, natural human co-host, DJ, cinema buff, and storyteller in a live Telegram Voice Chat.\n'
+        f'VIBE: {p_desc}\n'
+        'CONVERSATIONAL FLOW & SOCIAL INTELLIGENCE:\n'
+        '- Talk like a real person in a room — snappy, expressive, relaxed 1–3 sentence reactions in everyday banter; zero robotic or customer-support phrases ("Anything else?", "How can I assist?").\n'
+        '- Match the speaker\'s mood and energy naturally (playful wit when hyped, grounded empathy when serious/frustrated).\n'
+        '- Go deep and expansive across paragraphs ONLY when asked for a story, dark romance novel (`tell_story_or_novel`), movie plot/lore, or multi-part breakdown — never cut a story short.\n'
+        '- Ignore side human-to-human chatter cleanly via proactive audio.\n'
+        'VOICE CAST HANDOFF:\n'
+        '- Cast in room: Pappy (man), Ava (lady), Maya (girl), Leo (boy), Nana (old woman), Elder (old man), Zara, Marcus, Chloe.\n'
+        '- If someone calls another character or asks to switch voices, call `switch_persona(name=..., voice_type=..., handoff_text=...)` immediately and stay silent so they speak.\n'
         f'{ctx_line}\n'
-        'MEDIA CONTROL, BROWSER SCREEN SHARE & AWARENESS:\n'
-        '1. When someone calls your name, playback pauses smoothly while you talk; when they say they are done ("nothing else", "resume", "carry on"), call `finish_conversation(resumePlayback=true)`.\n'
-        '2. When a speaker in Voice Chat asks to open a browser, look something up in the browser, or says "let me see", ALWAYS pass `show_live: true` to `browser_start_task` or call `browser_show_live` so participants actually see BrowserOS live!\n'
-        '3. Clear direct commands ("pause the music", "skip this", "play Burna Boy") -> execute immediately. Ambiguous complaints or big switches -> ask before replacing playback.\n'
-        '4. Stay grounded in live `[ROOM STATE UPDATE]` context messages and `get_call_state` — never invent playback state or unexecuted tool actions.\n'
-        '5. Never issue more than two consecutive tool calls without speaking.'
+        'TOOLS, SPEED & LIVE BROWSER:\n'
+        '1. Quick controls ("skip", "volume up", "jump 30 seconds", "pause") run asynchronously without stalling — confirm briskly in one natural line. Never issue more than two consecutive tool calls without speaking.\n'
+        '2. Stay truthful to `[ROOM STATE UPDATE]` messages and `get_call_state` — never invent playback state.\n'
+        '3. On browser requests in VC, pass `show_live: true` to `browser_start_task` or call `browser_show_live` so participants see BrowserOS live.\n'
+        '4. When user finishes talking ("carry on", "resume", "nothing else"), call `finish_conversation(resumePlayback=true)`.'
     ).strip()
 
 
@@ -575,6 +579,7 @@ class GeminiLiveSession:
         on_transcription=None,
         on_turn_complete=None,
         on_close=None,
+        on_go_away=None,
         is_conversation_engaged=None,
         on_wake_engaged=None,
         on_persona_redirect=None,
@@ -598,6 +603,7 @@ class GeminiLiveSession:
         self.on_transcription = on_transcription
         self.on_turn_complete = on_turn_complete
         self.on_close = on_close
+        self.on_go_away = on_go_away
         self.is_conversation_engaged = is_conversation_engaged
         self.on_wake_engaged = on_wake_engaged
         self.on_persona_redirect = on_persona_redirect
@@ -609,6 +615,7 @@ class GeminiLiveSession:
         self._in_buf = bytearray()
         self._gate_buf = bytearray()
         self._pending_tool_calls: list[dict] = []
+        self._awaiting_blocking_tools: set[str] = set()
         self._turn_wake_authorized = False
         self._turn_redirected_to: dict | None = None
         self._out_prev_sample: float | None = None
@@ -621,7 +628,8 @@ class GeminiLiveSession:
         self.session_handle: str | None = None
 
     def build_setup_payload(self) -> dict:
-        # Note: Do NOT pass legacy `enable_affective_dialog` or `proactivity` in 3.8 Live.
+        # Official Gemini 3.8 Live v1beta protocol: `sessionResumption: {}` enables handles from turn 0;
+        # `proactiveAudio` and `thinkingConfig` are rejected with 1007 on this checkpoint.
         setup: dict = {
             'model': self.model,
             'generationConfig': {
@@ -637,10 +645,11 @@ class GeminiLiveSession:
                     'startOfSpeechSensitivity': 'START_SENSITIVITY_HIGH',
                     'endOfSpeechSensitivity': 'END_SENSITIVITY_LOW',
                     'prefixPaddingMs': 300,
-                    'silenceDurationMs': 1500,
+                    'silenceDurationMs': 1150,
                 }
             },
             'contextWindowCompression': {'slidingWindow': {}},
+            'sessionResumption': {'handle': self.session_handle} if self.session_handle else {},
             'inputAudioTranscription': (
                 {'customVocabulary': self.custom_vocabulary} if self.custom_vocabulary else {}
             ),
@@ -650,8 +659,6 @@ class GeminiLiveSession:
             setup['systemInstruction'] = {'parts': [{'text': self.system_instruction}]}
         if self.function_declarations:
             setup['tools'] = [{'functionDeclarations': self.function_declarations}]
-        if self.session_handle:
-            setup['sessionResumption'] = {'handle': self.session_handle}
         return {'setup': setup}
 
     async def connect(self, timeout_sec: float = 8.0, *, start_reader: bool = True) -> bool:
@@ -684,10 +691,15 @@ class GeminiLiveSession:
 
     async def _recv_loop(self):
         import aiohttp
+        close_frame_code = None
+        close_frame_reason = ''
         try:
             while self.connected and self._ws is not None and not self.closed:
                 msg = await self._ws.receive()
                 if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    if msg.type == aiohttp.WSMsgType.CLOSE:
+                        close_frame_code = msg.data
+                        close_frame_reason = str(msg.extra or '')
                     break
                 raw = msg.data.decode('utf-8', 'replace') if isinstance(msg.data, (bytes, bytearray)) else str(msg.data or '')
                 if not raw:
@@ -700,6 +712,13 @@ class GeminiLiveSession:
                 upd = obj.get('sessionResumptionUpdate')
                 if isinstance(upd, dict) and upd.get('newHandle'):
                     self.session_handle = str(upd['newHandle'])
+
+                go_away = obj.get('goAway')
+                if isinstance(go_away, dict):
+                    time_left = str(go_away.get('timeLeft') or '')
+                    log.info('GeminiLive goAway chat=%s timeLeft=%s has_handle=%s', self.chat_id, time_left, bool(self.session_handle))
+                    if self.on_go_away:
+                        asyncio.create_task(self.on_go_away(time_left, self))
 
                 sc = obj.get('serverContent') or {}
                 if sc.get('interrupted'):
@@ -746,6 +765,11 @@ class GeminiLiveSession:
                 tc = obj.get('toolCall')
                 if isinstance(tc, dict) and tc.get('functionCalls'):
                     fcalls = tc['functionCalls']
+                    for fc in fcalls:
+                        fname = str(fc.get('name') or '')
+                        cid_fc = str(fc.get('id') or '')
+                        if cid_fc and fname in _BLOCKING_LIVE_TOOLS:
+                            self._awaiting_blocking_tools.add(cid_fc)
                     has_switch = any(f.get('name') == 'switch_persona' for f in fcalls)
                     if has_switch:
                         self._turn_wake_authorized = True
@@ -852,9 +876,10 @@ class GeminiLiveSession:
         except Exception as err:
             log.warning('GeminiLive recv_loop error (%s): %s', type(err).__name__, str(err)[:200])
         finally:
-            close_code = getattr(self._ws, 'close_code', None) if self._ws is not None else None
-            close_reason = getattr(self._ws, 'close_reason', None) if self._ws is not None else None
-            if close_code in (1007, 1008):
+            self._awaiting_blocking_tools.clear()
+            close_code = close_frame_code if close_frame_code is not None else (getattr(self._ws, 'close_code', None) if self._ws is not None else None)
+            close_reason = close_frame_reason or (getattr(self._ws, 'close_reason', None) if self._ws is not None else '')
+            if close_code == 1007:
                 self.session_handle = None
             if close_code is not None:
                 log.info('GeminiLive ws closed chat=%s code=%s reason=%s', self.chat_id, close_code, str(close_reason or '')[:120])
@@ -865,24 +890,34 @@ class GeminiLiveSession:
                 except Exception:
                     pass
 
-    async def flush_tail(self):
-        """Pad any partial `<40ms` input PCM tail + send one clean silence frame so Gemini VAD ends turns promptly."""
-        if not self.connected or self._ws is None:
-            return
-        chunk_target = 1280
+    async def send_audio_stream_end(self) -> bool:
+        """Notify Gemini Live that the active microphone speech burst ended so server VAD commits cleanly."""
+        if not self.connected or self._ws is None or self._awaiting_blocking_tools:
+            self._in_buf.clear()
+            return False
         tail = bytes(self._in_buf)
         self._in_buf.clear()
-        if tail:
-            if len(tail) < chunk_target:
-                tail = tail + (b'\x00' * (chunk_target - len(tail)))
-            while tail:
-                part = tail[:chunk_target]
-                tail = tail[chunk_target:]
-                if len(part) < chunk_target:
-                    part = part + (b'\x00' * (chunk_target - len(part)))
-                await self._send_realtime_audio(part)
-        else:
-            await self._send_realtime_audio(b'\x00' * chunk_target)
+        while tail:
+            part = tail[:1280]
+            tail = tail[1280:]
+            if len(part) < 1280:
+                part = part + (b'\x00' * (1280 - len(part)))
+            await self._send_realtime_audio(part)
+        async with self._send_lock:
+            if not self.connected or self._ws is None:
+                return False
+            try:
+                maybe = self._ws.send_json({'realtimeInput': {'audioStreamEnd': True}})
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+                return True
+            except Exception as err:
+                log.debug('GeminiLive audioStreamEnd error (%s): %s', type(err).__name__, str(err)[:120])
+                return False
+
+    async def flush_tail(self):
+        """Pad any partial `<40ms` input PCM tail + emit audioStreamEnd so Gemini VAD ends turns cleanly."""
+        await self.send_audio_stream_end()
 
     async def push_pcm_chunk(
         self,
@@ -953,10 +988,10 @@ class GeminiLiveSession:
                 return False
 
     async def _send_realtime_audio(self, pcm_16k_mono: bytes):
-        if not self.connected or self._ws is None or not pcm_16k_mono:
+        if not self.connected or self._ws is None or not pcm_16k_mono or self._awaiting_blocking_tools:
             return
         async with self._send_lock:
-            if not self.connected or self._ws is None:
+            if not self.connected or self._ws is None or self._awaiting_blocking_tools:
                 return
             try:
                 await self._ws.send_json({
@@ -971,8 +1006,9 @@ class GeminiLiveSession:
                 log.debug('GeminiLive send audio error (%s): %s', type(err).__name__, str(err)[:120])
                 self.connected = False
 
-    async def send_tool_response(self, call_id: str, name: str, response: dict | None):
-        """Send strict structured FunctionResponse (never `{}` or `None`)."""
+    async def send_tool_response(self, call_id: str, name: str, response: dict | None, *, scheduling: str | None = None):
+        """Send strict structured FunctionResponse (with NON_BLOCKING `scheduling` when applicable)."""
+        self._awaiting_blocking_tools.discard(str(call_id))
         if not self.connected or self._ws is None:
             return False
         self._turn_wake_authorized = True
@@ -983,6 +1019,8 @@ class GeminiLiveSession:
             payload_resp['status'] = 'ok' if payload_resp.get('ok', True) else 'error'
         payload_resp.setdefault('retryable', False)
         payload_resp.setdefault('message', 'Completed.')
+        if str(name) not in _BLOCKING_LIVE_TOOLS:
+            payload_resp.setdefault('scheduling', scheduling or 'WHEN_IDLE')
         async with self._send_lock:
             if not self.connected or self._ws is None:
                 return False

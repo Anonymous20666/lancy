@@ -396,6 +396,10 @@ test('Gemini Live tool declarations align with LancyToolExecutor across all 5 no
 
   const sRel = await exec.execute('seek_playback', { seconds: 30, relative: true }, { chatId: -100888 });
   assert.equal(sRel.seekSeconds, 130);
+  const sRelInt = await exec.execute('seek_playback', { relative: 30 }, { chatId: -100888 });
+  assert.equal(sRelInt.seekSeconds, 130);
+  const sRelNeg = await exec.execute('seek_playback', { relative: -15 }, { chatId: -100888 });
+  assert.equal(sRelNeg.seekSeconds, 85);
   const sFrac = await exec.execute('seek_playback', { fraction: 0.5 }, { chatId: -100888 });
   assert.equal(sFrac.seekSeconds, 500);
 

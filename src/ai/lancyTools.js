@@ -821,6 +821,9 @@ export class LancyToolExecutor {
         if (targetSpec === undefined || targetSpec === null || targetSpec === '') {
           if (args.fraction !== undefined && Number.isFinite(Number(args.fraction))) {
             targetSpec = `${Math.max(0, Math.min(100, Number(args.fraction) * 100))}%`;
+          } else if (args.relative !== undefined && typeof args.relative !== 'boolean' && Number.isFinite(Number(args.relative))) {
+            const rel = Math.trunc(Number(args.relative));
+            targetSpec = `${rel >= 0 ? '+' : ''}${rel}s`;
           } else if (args.seconds !== undefined && Number.isFinite(Number(args.seconds))) {
             const sec = Number(args.seconds);
             targetSpec = args.relative ? `${sec >= 0 ? '+' : ''}${sec}s` : `${sec}s`;

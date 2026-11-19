@@ -72,6 +72,8 @@ class SyncState(ctypes.Structure):
         ('eq_bands', ctypes.c_uint8 * 16), # 16-band real-time PCM FFT meter for Visual DJ Desk
         ('bass_pulse', ctypes.c_uint8),    # smoothed low-bass beat envelope (0..255)
         ('tts_hold', ctypes.c_int32),      # 1 = pause-hold allows TTS / silence keepalive on audio pipe
+        ('tts_play_end_mono', ctypes.c_double),  # monotonic timestamp when buffered TTS finishes playing
+        ('duck_active', ctypes.c_int32),   # 1 = gently duck active media without hard-pausing FFmpeg
     ]
 
 
@@ -325,11 +327,12 @@ class TtsAudioFeeder:
             chunk = chunk + (b'\x00' * (size_bytes - len(chunk)))
         return chunk, True
 
-    def mix_media_packet(self, media_pcm, tts_chunk, tts_active, duck_factor=0.22):
+    def mix_media_packet(self, media_pcm, tts_chunk, tts_active, duck_factor=0.22, *, force_duck=False):
         """Smoothly ramp duck gain between 1.0 and `duck_factor` over chunks without harsh audio steps."""
         start_gain = float(self.duck_gain)
-        target_gain = float(duck_factor) if (tts_active and tts_chunk) else 1.0
-        if not tts_active and start_gain >= 0.995:
+        want_duck = bool((tts_active and tts_chunk) or force_duck)
+        target_gain = float(duck_factor) if want_duck else 1.0
+        if not want_duck and start_gain >= 0.995:
             self.duck_gain = 1.0
             return media_pcm
         step = 0.28 if target_gain < start_gain else 0.18
@@ -342,6 +345,30 @@ class TtsAudioFeeder:
             start_gain=start_gain,
             end_gain=end_gain,
         )
+
+    def remaining_seconds(self, bps=PCM_BYTES_PER_SEC):
+        return max(0.0, len(self._buf) / float(max(1, bps)))
+
+
+def _overlay_tts_packet(state, tts_feeder, pkt_body, bps, *, duck_factor=0.24):
+    """Pop buffered TTS PCM if present, publish real playback tail timestamp to SyncState, and mix smoothly."""
+    if tts_feeder is None:
+        return pkt_body
+    tts_chunk, tts_active = tts_feeder.pop_chunk(len(pkt_body))
+    force_duck = int(getattr(state, 'duck_active', 0) or 0) == 1
+    if hasattr(state, 'tts_play_end_mono'):
+        if tts_active or len(tts_feeder._buf) > 0:
+            rem = (len(tts_chunk) + len(tts_feeder._buf)) / float(max(1, bps))
+            state.tts_play_end_mono = time.monotonic() + rem
+        else:
+            state.tts_play_end_mono = 0.0
+    return tts_feeder.mix_media_packet(
+        pkt_body,
+        tts_chunk,
+        tts_active,
+        duck_factor=duck_factor,
+        force_duck=force_duck,
+    )
 
 
 def mix_pcm_with_tts(media_pcm, tts_pcm, duck_factor=0.22, *, start_gain=None, end_gain=None):
@@ -383,6 +410,12 @@ def _wait_if_paused(state, stop_ev, *, out=None, bps=PCM_BYTES_PER_SEC, sample_a
                     chunk = silence
                     if tts_feeder is not None:
                         tts_chunk, active = tts_feeder.pop_chunk(chunk_sz)
+                        if hasattr(state, 'tts_play_end_mono'):
+                            if active or len(tts_feeder._buf) > 0:
+                                rem = (len(tts_chunk) + len(tts_feeder._buf)) / float(max(1, bps))
+                                state.tts_play_end_mono = time.monotonic() + rem
+                            else:
+                                state.tts_play_end_mono = 0.0
                         if active and tts_chunk:
                             chunk = tts_chunk
                     try:
@@ -665,10 +698,7 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                 _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
             if stop_ev.is_set():
                 break
-            emit_pkt = pkt_body
-            if tts_feeder is not None:
-                tts_chunk, tts_active = tts_feeder.pop_chunk(len(pkt_body))
-                emit_pkt = tts_feeder.mix_media_packet(pkt_body, tts_chunk, tts_active, duck_factor=0.22)
+            emit_pkt = _overlay_tts_packet(state, tts_feeder, pkt_body, bps) if tts_feeder is not None else pkt_body
             _write_all(out, emit_pkt)
             silence_since_last_real = 0
             if dj_analyzer is not None:
@@ -831,10 +861,7 @@ def _run_audio(proc, state, stop_ev, sample_rate, channels, *, sub_monitor=None,
                 _wait_if_paused(state, stop_ev, out=out, bps=bps, sample_align=sample_align, tts_feeder=tts_feeder)
             if stop_ev.is_set():
                 break
-            emit_pkt = pkt
-            if tts_feeder is not None:
-                tts_chunk, tts_active = tts_feeder.pop_chunk(len(pkt))
-                emit_pkt = tts_feeder.mix_media_packet(pkt, tts_chunk, tts_active, duck_factor=0.22)
+            emit_pkt = _overlay_tts_packet(state, tts_feeder, pkt, bps) if tts_feeder is not None else pkt
             _write_all(out, emit_pkt)
             if dj_analyzer is not None:
                 dj_analyzer(pkt, state, sample_rate, channels)

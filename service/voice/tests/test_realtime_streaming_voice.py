@@ -73,8 +73,11 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
         self.assertEqual(setup['generationConfig']['responseModalities'], ['AUDIO'])
         self.assertEqual(setup['generationConfig']['speechConfig']['voiceConfig']['prebuiltVoiceConfig']['voiceName'], 'Charon')
         self.assertEqual(setup['realtimeInputConfig']['automaticActivityDetection']['endOfSpeechSensitivity'], 'END_SENSITIVITY_LOW')
-        self.assertEqual(setup['realtimeInputConfig']['automaticActivityDetection']['silenceDurationMs'], 1500)
+        self.assertEqual(setup['realtimeInputConfig']['automaticActivityDetection']['silenceDurationMs'], 1150)
         self.assertEqual(setup.get('contextWindowCompression'), {'slidingWindow': {}})
+        self.assertEqual(setup.get('sessionResumption'), {})
+        self.assertNotIn('proactiveAudio', setup)
+        self.assertNotIn('thinkingConfig', setup['generationConfig'])
         self.assertIn('Lancy', setup['inputAudioTranscription']['customVocabulary'])
         self.assertIn('outputAudioTranscription', setup)
         self.assertNotIn('enable_affective_dialog', setup)
@@ -251,20 +254,20 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
             st.live_audio_queue = q
 
             # Under echo guard, soft speakerphone bleed (~0.006 RMS) is suppressed so long speech isn't cut off,
-            # while loud sustained speech (>=0.024 RMS for >=4 frames) passes & triggers barge-in cleanly.
+            # while loud sustained speech (>=0.015 RMS for >=2 frames) passes with pre-roll & triggers barge-in cleanly.
             mgr.set_echo_guard(-100444, 2.0)
             bleed_frame = MagicMock(ssrc=2222, frame=np.full(720, 220, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
             mgr.handle_incoming_frames('main', -100444, [bleed_frame])
             self.assertEqual(q.qsize(), 0)
             loud_frame = MagicMock(ssrc=2222, frame=np.full(720, 2200, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
-            mgr.handle_incoming_frames('main', -100444, [loud_frame, loud_frame, loud_frame, loud_frame])
-            self.assertGreaterEqual(q.qsize(), 1)
+            mgr.handle_incoming_frames('main', -100444, [loud_frame, loud_frame])
+            self.assertGreaterEqual(q.qsize(), 2)
             while not q.empty():
                 q.get_nowait()
 
-            # Silence past 2.80s triggers exactly one __FLUSH__ sentinel for complete long-talk turns
+            # Silence past 1.10s triggers exactly one __FLUSH__ sentinel for audioStreamEnd VAD commit
             sb = st.buffers[2222]
-            sb.last_voice_mono = time.monotonic() - 3.0
+            sb.last_voice_mono = time.monotonic() - 1.5
             st.last_user_speech_mono = sb.last_voice_mono
             quiet_frame = MagicMock(ssrc=2222, frame=np.zeros(720, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
             mgr.handle_incoming_frames('main', -100444, [quiet_frame])
@@ -385,8 +388,12 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
         sess = gemini_live.GeminiLiveSession(api_key='k', chat_id=-100555)
         setup = sess.build_setup_payload()['setup']
         self.assertEqual(setup.get('contextWindowCompression'), {'slidingWindow': {}})
+        self.assertEqual(setup.get('sessionResumption'), {})
         vad = setup['realtimeInputConfig']['automaticActivityDetection']
-        self.assertGreaterEqual(vad['silenceDurationMs'], 1500)
+        self.assertGreaterEqual(vad['silenceDurationMs'], 1150)
+        seek_decl = next(t for t in setup['tools'][0]['functionDeclarations'] if t['name'] == 'seek_playback')
+        self.assertEqual(seek_decl.get('behavior'), 'NON_BLOCKING')
+        self.assertIn('relative', seek_decl['parameters']['properties'])
 
         async def run():
             from unittest.mock import patch
@@ -446,6 +453,58 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
                 self.assertEqual(st.live_engaged_until_mono, 0.0)
 
             await mgr.stop_all()
+
+        asyncio.run(run())
+
+    def test_non_blocking_tool_scheduling_audio_stream_end_and_resumption_continuity(self):
+        import json
+        import types
+        import aiohttp
+
+        async def run():
+            sent_payloads = []
+            go_aways = []
+
+            class FakeWS:
+                def __init__(self, msgs):
+                    self._msgs = [types.SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(m)) for m in msgs]
+                    self.close_code = 1008
+                    self.close_reason = 'Session timeout'
+
+                async def receive(self):
+                    if not self._msgs:
+                        return types.SimpleNamespace(type=aiohttp.WSMsgType.CLOSED, data=b'')
+                    return self._msgs.pop(0)
+
+                async def send_json(self, obj):
+                    sent_payloads.append(obj)
+
+            sess = gemini_live.GeminiLiveSession(
+                api_key='k',
+                chat_id=-100777,
+                on_go_away=AsyncMock(side_effect=lambda tl, _s: go_aways.append(tl)),
+            )
+            sess.connected = True
+            sess._ws = FakeWS([
+                {'sessionResumptionUpdate': {'newHandle': 'resume_tok_abc'}},
+                {'goAway': {'timeLeft': '5s'}},
+            ])
+            await sess._recv_loop()
+            await asyncio.sleep(0)
+            # 1008 idle closes must preserve valid session_handle for seamless reconnects
+            self.assertEqual(sess.session_handle, 'resume_tok_abc')
+            self.assertEqual(go_aways, ['5s'])
+
+            # Reconnect setup includes the saved handle
+            self.assertEqual(sess.build_setup_payload()['setup']['sessionResumption'], {'handle': 'resume_tok_abc'})
+
+            # Non-blocking tool response includes scheduling=WHEN_IDLE and audioStreamEnd commits cleanly
+            sess.connected = True
+            sess._ws = FakeWS([])
+            await sess.send_tool_response('c1', 'seek_playback', {'ok': True, 'seekSeconds': 130}, scheduling='WHEN_IDLE')
+            self.assertEqual(sent_payloads[-1]['toolResponse']['functionResponses'][0]['response']['scheduling'], 'WHEN_IDLE')
+            await sess.send_audio_stream_end()
+            self.assertEqual(sent_payloads[-1], {'realtimeInput': {'audioStreamEnd': True}})
 
         asyncio.run(run())
 

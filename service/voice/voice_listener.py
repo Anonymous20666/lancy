@@ -88,11 +88,13 @@ class SpeakerBuffer:
     sample_rate: int = 36000
     channels: int = 1
     pre_roll: deque = field(default_factory=lambda: deque(maxlen=PRE_ROLL_CHUNKS))
+    live_preroll: deque = field(default_factory=lambda: deque(maxlen=4))
     chunks: list[bytes] = field(default_factory=list)
     total_bytes: int = 0
     in_speech: bool = False
     speech_started_mono: float = 0.0
     last_voice_mono: float = 0.0
+    noise_floor: float = 0.004
     barge_frames: int = 0
 
 
@@ -125,9 +127,11 @@ class ChatListenState:
     live_pcm_seq: int = 0
     logged_ssrcs: set[int] = field(default_factory=set)
     paused_by_live: bool = False
+    ducked_by_live: bool = False
     paused_track_id: str = ''
     live_ntg_resumed: bool = False
     live_tail_flushed: bool = False
+    live_stream_active: bool = False
     last_live_turn_mono: float = 0.0
     last_user_speech_mono: float = 0.0
     live_engaged_until_mono: float = 0.0
@@ -215,6 +219,13 @@ class VoiceListenerManager:
                 return
             try:
                 import main as _m
+                if cur_call.get('is_music') or cur_call.get('music_freerun'):
+                    # Keep music playing smoothly at ducked volume instead of hard-pausing FFmpeg.
+                    _m._set_sync_duck(sync_id, True)
+                    _m._set_sync_tts_hold(sync_id, True)
+                    st.ducked_by_live = True
+                    return
+                cur_call['_live_paused'] = True
                 _m._set_sync_tts_hold(sync_id, True)
                 _m._set_sync_paused(sync_id, True)
                 cur_call['status'] = 'paused'
@@ -338,6 +349,14 @@ class VoiceListenerManager:
                     except Exception:
                         pass
 
+                async def _on_persona_go_away(_time_left, sess_ref=None, p_key=pid):
+                    cur_s = st.persona_sessions.get(p_key)
+                    if not st.enabled or cur_s is None or cur_s.closed or not getattr(cur_s, 'session_handle', None):
+                        return
+                    await asyncio.sleep(0.25)
+                    if st.enabled and st.persona_sessions.get(p_key) is cur_s and not cur_s.closed:
+                        await cur_s.connect(timeout_sec=6.0, start_reader=True)
+
                 target_sess = gemini_live.GeminiLiveSession(
                     chat_id=cid,
                     persona_id=pid,
@@ -349,6 +368,7 @@ class VoiceListenerManager:
                     on_transcription=_on_transcription,
                     on_turn_complete=_flush_out_tail,
                     on_close=_on_persona_close,
+                    on_go_away=_on_persona_go_away,
                     is_conversation_engaged=lambda: (time.monotonic() <= max(st.live_engaged_until_mono, st.active_until_mono)),
                     on_wake_engaged=_mark_live_engaged,
                     on_persona_redirect=_on_persona_redirect,
@@ -533,26 +553,40 @@ class VoiceListenerManager:
         if not st:
             return False
         was_paused = bool(st.paused_by_live)
+        was_ducked = bool(st.ducked_by_live)
         expected_pid = st.paused_track_id
         st.paused_by_live = False
+        st.ducked_by_live = False
         st.live_ntg_resumed = False
         if clear_engaged:
             st.live_engaged_until_mono = 0.0
         st.paused_track_id = ''
-        if not resume or not was_paused:
-            return False
         cur_call = self.bridge.calls.get(cid) or {}
+        sync_id = cur_call.get('av_sync_id')
+        if was_ducked and sync_id:
+            try:
+                import main as _m
+                _m._set_sync_duck(sync_id, False)
+                if not was_paused:
+                    _m._set_sync_tts_hold(sync_id, False)
+            except Exception:
+                pass
+        if not resume or not was_paused:
+            return was_ducked
         if expected_pid and str(cur_call.get('playback_id') or '') != expected_pid:
             return False
-        sync_id = cur_call.get('av_sync_id')
         if sync_id and cur_call.get('status') == 'paused':
             try:
                 import main as _m
+                cur_call['_live_paused'] = False
                 _m._set_sync_paused(sync_id, False)
                 _m._set_sync_tts_hold(sync_id, False)
+                _m._set_sync_duck(sync_id, False)
                 _m._write_vchud_state(sync_id, active=False)
                 cur_call['status'] = 'playing'
                 cur_call['last_progress'] = time.monotonic()
+                if hasattr(self.bridge, 'ensure_engine_resumed'):
+                    await self.bridge.ensure_engine_resumed(cid)
                 if self.bridge.events.full():
                     self.bridge.events.get_nowait()
                 self.bridge.events.put_nowait({
@@ -614,11 +648,22 @@ class VoiceListenerManager:
         if st:
             now = time.monotonic()
             dur = max(0.02, float(duration_sec))
-            if extend and st.echo_guard_until_mono > now:
-                # Extend accurately by chunk duration without compounding tail padding per chunk
-                st.echo_guard_until_mono = max(st.echo_guard_until_mono + dur, now + dur + 0.25)
+            real_end = 0.0
+            cur_call = (self.bridge.calls.get(int(chat_id)) or {}) if getattr(self.bridge, 'calls', None) else {}
+            sync_id = cur_call.get('av_sync_id')
+            if sync_id:
+                try:
+                    import main as _m
+                    real_end = _m._get_sync_tts_play_end(sync_id)
+                except Exception:
+                    real_end = 0.0
+            if real_end > now:
+                st.echo_guard_until_mono = real_end + 0.08
+            elif extend and st.echo_guard_until_mono > now:
+                # Cap extension tightly to actual remaining stream budget instead of compounding +0.25s per chunk.
+                st.echo_guard_until_mono = max(st.echo_guard_until_mono + dur, now + dur + 0.08)
             else:
-                st.echo_guard_until_mono = max(st.echo_guard_until_mono, now + max(0.2, dur) + 0.35)
+                st.echo_guard_until_mono = max(st.echo_guard_until_mono, now + max(0.15, dur) + 0.14)
             # Drop partial captures recorded during TTS tail to avoid self-trigger unless extending queued sentence
             if not extend:
                 for sb in st.buffers.values():
@@ -626,6 +671,7 @@ class VoiceListenerManager:
                     sb.total_bytes = 0
                     sb.in_speech = False
                     sb.barge_frames = 0
+                    sb.live_preroll.clear()
 
     def trigger_barge_in(self, chat_id: int, *, user_id: int | None = None, ssrc: int | None = None) -> bool:
         """Cancel queued/streaming TTS audio mid-speech when a speaker interrupts Lancy."""
@@ -795,23 +841,44 @@ class VoiceListenerManager:
                 st.logged_ssrcs.add(ssrc)
                 log.info('Receiving PyTgCalls audio stream frames chat=%s ssrc=%s uid=%s sr=%s ch=%s bytes=%s rms=%.4f live=%s', cid, ssrc, uid, sr, ch, len(raw), rms, live_ready)
 
+            s_name = st.uid_to_name.get(int(uid)) if uid is not None else ''
+            if rms < 0.015:
+                sb.noise_floor = (sb.noise_floor * 0.92) + (rms * 0.08)
+
             if echo_guarded:
                 can_barge = (
                     (live_ready and (not st.enforce_auth or not st.authorized_user_ids or uid in st.authorized_user_ids))
                     or (active_window and (st.active_user_id is None or uid == st.active_user_id or (uid in st.authorized_user_ids)))
                 )
                 if live_ready:
-                    # Only forward or barge-in during active TTS output when a speaker intentionally raises their voice above speakerphone/room echo, preventing mid-story cutoffs.
-                    if can_barge and rms >= 0.024:
+                    # Calibrated adaptive barge-in (prevents speakerphone cutoff while preserving Turn-2 opening words).
+                    sb.live_preroll.append((raw, sr, ch, uid, s_name))
+                    barge_thresh = max(0.015, min(0.024, sb.noise_floor * 3.0))
+                    if can_barge and rms >= barge_thresh:
                         sb.barge_frames += 1
-                        if sb.barge_frames >= 4:
+                        if sb.barge_frames >= 2:
                             self.trigger_barge_in(cid, user_id=uid, ssrc=ssrc)
                             echo_guarded = False
                             sb.barge_frames = 0
+                            st.live_stream_active = True
+                            st.last_user_speech_mono = now
+                            sb.last_voice_mono = now
+                            st.live_tail_flushed = False
+                            for pre_item in list(sb.live_preroll)[:-1]:
+                                try:
+                                    if st.live_audio_queue.full():
+                                        st.live_audio_queue.get_nowait()
+                                    st.live_audio_queue.put_nowait(pre_item)
+                                except Exception:
+                                    pass
+                            sb.live_preroll.clear()
+                        else:
+                            continue
                     else:
                         sb.barge_frames = 0
-                        if not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 2.80:
+                        if st.live_stream_active and not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 1.10:
                             st.live_tail_flushed = True
+                            st.live_stream_active = False
                             try:
                                 if st.live_audio_queue.full():
                                     st.live_audio_queue.get_nowait()
@@ -834,22 +901,26 @@ class VoiceListenerManager:
             else:
                 sb.barge_frames = 0
 
-            # Continuous streaming into Gemini 3.8 Live (Proactive Audio + VAD handled natively by 3.8 Live)
+            # Continuous streaming into Gemini 3.8 Live with clean audioStreamEnd commit on turn end
             if live_ready:
-                if rms >= 0.0012:
+                gate_rms = max(0.0014, sb.noise_floor * 1.4)
+                if rms >= gate_rms:
                     sb.last_voice_mono = now
                     st.last_user_speech_mono = now
                     st.live_tail_flushed = False
-                if rms >= 0.0012 or (now - sb.last_voice_mono) <= 1.80:
-                    s_name = st.uid_to_name.get(int(uid)) if uid is not None else ''
+                    st.live_stream_active = True
+                else:
+                    sb.live_preroll.append((raw, sr, ch, uid, s_name))
+                if rms >= gate_rms or (now - sb.last_voice_mono) <= 1.10:
                     try:
                         if st.live_audio_queue.full():
                             st.live_audio_queue.get_nowait()
                         st.live_audio_queue.put_nowait((raw, sr, ch, uid, s_name))
                     except Exception:
                         pass
-                elif not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 2.80:
+                elif not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 1.10:
                     st.live_tail_flushed = True
+                    st.live_stream_active = False
                     try:
                         if st.live_audio_queue.full():
                             st.live_audio_queue.get_nowait()
@@ -913,11 +984,11 @@ class VoiceListenerManager:
                     cur_call = self.bridge.calls.get(st.chat_id) or {}
                     any_speaking = any(sb.in_speech for sb in st.buffers.values())
                     if (
-                        st.paused_by_live
+                        (st.paused_by_live or st.ducked_by_live)
                         and not cur_call.get('browser_live')
                         and not any_speaking
                         and now >= st.echo_guard_until_mono
-                        and (now - max(st.last_live_turn_mono, st.last_user_speech_mono, st.echo_guard_until_mono)) >= 25.0
+                        and (now - max(st.last_live_turn_mono, st.last_user_speech_mono, st.echo_guard_until_mono)) >= 20.0
                     ):
                         await self.release_live_pause(st.chat_id, resume=True, clear_engaged=False)
         except asyncio.CancelledError:

@@ -256,6 +256,32 @@ def _set_sync_tts_hold(sync_id, hold):
     return _mutate_sync_state(sync_id, _upd)
 
 
+def _set_sync_duck(sync_id, active):
+    def _upd(st):
+        if hasattr(st, 'duck_active'):
+            st.duck_active = 1 if active else 0
+    return _mutate_sync_state(sync_id, _upd)
+
+
+def _get_sync_tts_play_end(sync_id):
+    shm_p = av_sync.shm_path_for(sync_id)
+    if not sync_id or not shm_p.is_file():
+        return 0.0
+    fd = mm = None
+    try:
+        fd, mm, st = av_sync._open_sync_state(shm_p)
+        return float(getattr(st, 'tts_play_end_mono', 0.0) or 0.0)
+    except Exception:
+        return 0.0
+    finally:
+        if mm is not None:
+            try: mm.close()
+            except Exception: pass
+        if fd is not None:
+            try: os.close(fd)
+            except Exception: pass
+
+
 def _write_vchud_state(
     sync_id,
     *,
@@ -2435,6 +2461,7 @@ class Bridge:
         since_resync = now_m - float(mon.get('last_resync_at') or 0.0)
         can_resync = (
             call.get('status') == 'playing'
+            and not call.get('_live_paused')
             and int(mon.get('resync_count') or 0) < 3
             and since_seek >= 18.0
             and since_resync >= 22.0
@@ -5266,6 +5293,28 @@ class Bridge:
             self._audio_lang_cache.clear()
         self._audio_lang_cache[url] = (now, dict(best_res))
         return best_res
+
+    async def ensure_engine_resumed(self, chat_id: int) -> bool:
+        """Resume PyTgCalls capture if an earlier paused seek paused the engine."""
+        chat = int(chat_id)
+        call = self.calls.get(chat) or {}
+        if not call or call.get('stream_mode') == 'rtmp':
+            return False
+        acct = self.accounts.get(call.get('alias'))
+        engine = acct.get('engine') if acct else None
+        if engine is None or self.factory:
+            return False
+        try:
+            binding = getattr(engine, '_binding', None)
+            if binding is not None and hasattr(binding, 'get_state'):
+                b_state = await asyncio.wait_for(binding.get_state(chat), 1.5)
+                if not getattr(b_state, 'paused', False):
+                    return True
+            await asyncio.wait_for(engine.resume(chat), 2.5)
+            call['last_progress'] = time.monotonic()
+            return True
+        except Exception:
+            return False
 
     async def shutdown(self):
         self.closing = True
