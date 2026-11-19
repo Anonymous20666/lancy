@@ -254,14 +254,14 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
             st.live_audio_queue = q
 
             # Under echo guard, soft speakerphone bleed (~0.006 RMS) is suppressed so long speech isn't cut off,
-            # while loud sustained speech (>=0.015 RMS for >=2 frames) passes with pre-roll & triggers barge-in cleanly.
+            # while loud sustained speech (>=0.022 RMS for >=3 frames) passes & triggers barge-in cleanly.
             mgr.set_echo_guard(-100444, 2.0)
             bleed_frame = MagicMock(ssrc=2222, frame=np.full(720, 220, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
             mgr.handle_incoming_frames('main', -100444, [bleed_frame])
             self.assertEqual(q.qsize(), 0)
             loud_frame = MagicMock(ssrc=2222, frame=np.full(720, 2200, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
-            mgr.handle_incoming_frames('main', -100444, [loud_frame, loud_frame])
-            self.assertGreaterEqual(q.qsize(), 2)
+            mgr.handle_incoming_frames('main', -100444, [loud_frame, loud_frame, loud_frame])
+            self.assertGreaterEqual(q.qsize(), 1)
             while not q.empty():
                 q.get_nowait()
 

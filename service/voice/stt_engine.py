@@ -281,7 +281,7 @@ class SttEngine:
                         name,
                         device='cpu',
                         compute_type='int8',
-                        cpu_threads=4,
+                        cpu_threads=2,
                         download_root=str(self.download_root),
                     )
                     log.info('Loaded spoken-language detector model=%s', name)

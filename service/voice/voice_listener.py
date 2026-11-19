@@ -397,7 +397,7 @@ class VoiceListenerManager:
             return target_sess
 
         async def _on_tool_call(function_calls, sess_obj):
-            st.last_live_turn_mono = time.monotonic()
+            _mark_live_engaged()
             for fc in (function_calls or []):
                 call_id = str(fc.get('id') or '')
                 fn_name = str(fc.get('name') or '')
@@ -658,12 +658,12 @@ class VoiceListenerManager:
                 except Exception:
                     real_end = 0.0
             if real_end > now:
-                st.echo_guard_until_mono = real_end + 0.08
+                st.echo_guard_until_mono = max(st.echo_guard_until_mono, real_end + 0.45)
             elif extend and st.echo_guard_until_mono > now:
-                # Cap extension tightly to actual remaining stream budget instead of compounding +0.25s per chunk.
-                st.echo_guard_until_mono = max(st.echo_guard_until_mono + dur, now + dur + 0.08)
+                # Cap extension to buffered audio duration + WebRTC acoustic tail without compounding.
+                st.echo_guard_until_mono = max(st.echo_guard_until_mono + dur, now + dur + 0.45)
             else:
-                st.echo_guard_until_mono = max(st.echo_guard_until_mono, now + max(0.15, dur) + 0.14)
+                st.echo_guard_until_mono = max(st.echo_guard_until_mono, now + max(0.20, dur) + 0.45)
             # Drop partial captures recorded during TTS tail to avoid self-trigger unless extending queued sentence
             if not extend:
                 for sb in st.buffers.values():
@@ -851,27 +851,19 @@ class VoiceListenerManager:
                     or (active_window and (st.active_user_id is None or uid == st.active_user_id or (uid in st.authorized_user_ids)))
                 )
                 if live_ready:
-                    # Calibrated adaptive barge-in (prevents speakerphone cutoff while preserving Turn-2 opening words).
-                    sb.live_preroll.append((raw, sr, ch, uid, s_name))
-                    barge_thresh = max(0.015, min(0.024, sb.noise_floor * 3.0))
+                    # Ignore WebRTC/speakerphone echo during active TTS; require sustained real speech (>=0.022 RMS for >=3 frames) to barge in.
+                    barge_thresh = max(0.022, min(0.028, sb.noise_floor * 3.5))
                     if can_barge and rms >= barge_thresh:
                         sb.barge_frames += 1
-                        if sb.barge_frames >= 2:
+                        if sb.barge_frames >= 3:
                             self.trigger_barge_in(cid, user_id=uid, ssrc=ssrc)
                             echo_guarded = False
                             sb.barge_frames = 0
+                            sb.live_preroll.clear()
                             st.live_stream_active = True
                             st.last_user_speech_mono = now
                             sb.last_voice_mono = now
                             st.live_tail_flushed = False
-                            for pre_item in list(sb.live_preroll)[:-1]:
-                                try:
-                                    if st.live_audio_queue.full():
-                                        st.live_audio_queue.get_nowait()
-                                    st.live_audio_queue.put_nowait(pre_item)
-                                except Exception:
-                                    pass
-                            sb.live_preroll.clear()
                         else:
                             continue
                     else:

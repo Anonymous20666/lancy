@@ -5235,60 +5235,65 @@ class Bridge:
 
         best_res = {'ok': True, 'language': None, 'probability': 0.0, 'speech_detected': False, 'sample_text': ''}
         looks_hls = bool('.m3u8' in url.lower() or '/m/' in url.lower())
-        for off in offsets_to_try:
-            raw_sample = None
-            if looks_hls:
-                raw_sample = await self._extract_hls_audio_sample_bytes(url, headers=headers, offset_sec=off)
+        if not hasattr(self, '_audio_lang_sem'):
+            self._audio_lang_sem = asyncio.Semaphore(1)
+        if sub_align.host_load_pressure() >= 0.92:
+            offsets_to_try = offsets_to_try[:1]
+        async with self._audio_lang_sem:
+            for off in offsets_to_try:
+                raw_sample = None
+                if looks_hls:
+                    raw_sample = await self._extract_hls_audio_sample_bytes(url, headers=headers, offset_sec=off)
 
-            if raw_sample:
-                cmd = [
-                    'ffmpeg', '-nostdin', '-v', 'error',
-                    '-i', 'pipe:0',
-                    '-vn', '-sn', '-dn',
-                    '-t', '22',
-                    '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                    'pipe:1',
-                ]
-            else:
-                cmd = ['ffmpeg', '-nostdin', '-v', 'error']
-                if hdr_lines:
-                    cmd.extend(['-headers', hdr_lines])
-                cmd.extend([
-                    '-user_agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
-                    '-ss', str(off),
-                    '-i', url,
-                    '-vn', '-sn', '-dn',
-                    '-t', '18',
-                    '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-                    'pipe:1',
-                ])
+                if raw_sample:
+                    cmd = [
+                        'ffmpeg', '-nostdin', '-v', 'error',
+                        '-i', 'pipe:0',
+                        '-vn', '-sn', '-dn',
+                        '-t', '22',
+                        '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                        'pipe:1',
+                    ]
+                else:
+                    cmd = ['ffmpeg', '-nostdin', '-v', 'error']
+                    if hdr_lines:
+                        cmd.extend(['-headers', hdr_lines])
+                    cmd.extend([
+                        '-user_agent', 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36',
+                        '-ss', str(off),
+                        '-i', url,
+                        '-vn', '-sn', '-dn',
+                        '-t', '18',
+                        '-f', 's16le', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+                        'pipe:1',
+                    ])
 
-            proc = None
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE if raw_sample else asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, _ = await asyncio.wait_for(
-                    proc.communicate(input=raw_sample if raw_sample else None),
-                    timeout=9.0,
-                )
-                if len(stdout) >= 32000:
-                    res = await self.stt.detect_spoken_language(stdout, sample_rate=16000, channels=1)
-                    if res.get('speech_detected'):
-                        best_res = res
-                        break
-                    if (res.get('probability') or 0.0) > (best_res.get('probability') or 0.0):
-                        best_res = res
-            except Exception:
-                if proc is not None and proc.returncode is None:
-                    try:
-                        proc.kill()
-                        await proc.wait()
-                    except Exception:
-                        pass
+                proc = None
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd,
+                        stdin=asyncio.subprocess.PIPE if raw_sample else asyncio.subprocess.DEVNULL,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, _ = await asyncio.wait_for(
+                        proc.communicate(input=raw_sample if raw_sample else None),
+                        timeout=9.0,
+                    )
+                    if len(stdout) >= 32000:
+                        res = await self.stt.detect_spoken_language(stdout, sample_rate=16000, channels=1)
+                        if res.get('speech_detected'):
+                            best_res = res
+                            break
+                        if (res.get('probability') or 0.0) > (best_res.get('probability') or 0.0):
+                            best_res = res
+                except Exception:
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            proc.kill()
+                            await proc.wait()
+                        except Exception:
+                            pass
         if len(self._audio_lang_cache) > 256:
             self._audio_lang_cache.clear()
         self._audio_lang_cache[url] = (now, dict(best_res))
