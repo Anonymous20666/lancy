@@ -134,8 +134,13 @@ export class JobPlanner extends EventEmitter {
       try { this._eld.reset(); } catch {}
     }
 
-    const mem = process.memoryUsage();
-    const rssMb = Math.round(mem.rss / (1024 * 1024));
+    let rssMb = 256;
+    try {
+      const mem = process.memoryUsage();
+      rssMb = Math.round(mem.rss / (1024 * 1024));
+    } catch {
+      rssMb = Math.round((process.memoryUsage.rss?.() || 268435456) / (1024 * 1024));
+    }
     const totalMemMb = Math.max(512, Math.round(os.totalmem() / (1024 * 1024)));
     const memPct = Math.round((rssMb / totalMemMb) * 100);
     const ext = this.getStressSignals() || {};

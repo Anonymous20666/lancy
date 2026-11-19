@@ -23,7 +23,7 @@ export class SearchSessions {
     if (index < 0 || index > 19 || index > s.pages.length) throw new MusicError('INVALID_PAGE','That search page is unavailable.');
     if (!s.pages[index]) {
       const previous = s.pages[index-1]; if (index && previous.nextOffset == null) throw new MusicError('NO_MORE_RESULTS','There are no more results.');
-      const ytVideo = Boolean(s.mode === 'video' || (s.mode === 'queue' && this.providers?.get?.('youtube')?.enabled));
+      const ytVideo = Boolean(s.mode === 'video');
       const result = await this.providers.search(s.query, { offset:previous?.nextOffset || 0, limit:5, video:ytVideo });
       const seen = new Set(s.pages.flatMap(p => p.items.map(t => t.id)));
       result.items = result.items.filter(t => !seen.has(t.id)); s.pages[index] = result;

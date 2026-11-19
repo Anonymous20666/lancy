@@ -631,7 +631,7 @@ export class MusicService {
       }
       return;
     }
-    const generation=this.queueGeneration(s.destination);await this.authorize(ctx,true,s.destination,{allowDj:true});this.assertQueueGeneration(s.destination,generation);if(typeof this.app.voiceClient?.setup==='function')await this.prepare(ctx,s.destination);this.assertQueueGeneration(s.destination,generation); const mediaType=(s.mode==='video'||(s.mode==='queue'&&this.hasYoutubeVideo()))?'video':'audio';const tracks=[...s.selected.values()].map(t=>({...t,mediaType,requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
+    const generation=this.queueGeneration(s.destination);await this.authorize(ctx,true,s.destination,{allowDj:true});this.assertQueueGeneration(s.destination,generation);if(typeof this.app.voiceClient?.setup==='function')await this.prepare(ctx,s.destination);this.assertQueueGeneration(s.destination,generation); const mediaType=(s.mode==='video'||(s.mode==='queue'&&[...s.selected.values()].every(t=>t?.provider==='youtube')&&this.hasYoutubeVideo()))?'video':'audio';const tracks=[...s.selected.values()].map(t=>({...t,mediaType,requester:ctx.user?.username || ctx.user?.first_name || 'Member'}));
     const qm = this.app.musicQueueManager;
     const shouldPlayNow = Boolean(playNow || s.playNow);
     if (shouldPlayNow && tracks.length > 0 && typeof qm.playImmediateAndContinue === 'function') {

@@ -1181,9 +1181,14 @@ export class LancyAgent {
       if (!toolCalls.length) {
         finalReply = String(res?.text || '').trim();
         // If AI provider fell back to builtin or gave no tool call on an unmistakable command, do a safe deterministic check
-        if (step === 0 && (!finalReply || res?.provider === 'builtin')) {
+        if (step === 0 && (!finalReply || res?.provider === 'builtin' || /\b(?:play|put\s+on|queue|search|find|stream|watch|skip|pause|resume|volume|mute)\b/i.test(userText))) {
           const rescued = await this.#safeFallbackIntent(userText, context, conv);
-          if (rescued) return rescued;
+          if (rescued) {
+            if (finalReply && res?.provider !== 'builtin') {
+              rescued.reply = finalReply;
+            }
+            return rescued;
+          }
         }
         break;
       }
@@ -1376,9 +1381,12 @@ export class LancyAgent {
         : ['Afrobeats Heat', 'Chill / R&B', 'Rap & Drill', 'Surprise Movie'];
       actions.push(['create_decision_poll', { question: '🎙️ What should we roll with next?', options: opts }]);
     } else {
-      const songWant = clean.match(/^(?:i(?:'?ll|\s+would)?\s+want|give\s+me|play|put\s+on|drop|queue|i\s+need)\s+(?:some\s+|the\s+)?(.+)/i);
+      const songWant = clean.match(/^(?:i(?:'?ll|\s+would)?\s+want|give\s+me|play|put\s+on|drop|queue|search|find|i\s+need)\s+(?:some\s+|the\s+)?(.+)/i);
       if (songWant && songWant[1]?.trim().length >= 2 && !/\b(?:movie|film|series|poll)\b/i.test(songWant[1])) {
-        actions.push(['search_and_play_music', { query: songWant[1].trim(), action: 'play_now' }]);
+        const isSearchOnly = /^(?:search|find)\b/i.test(clean);
+        actions.push(['search_and_play_music', { query: songWant[1].trim(), action: isSearchOnly ? 'search' : 'play_now' }]);
+      } else if (!isPureCasualBanter(clean) && clean.length >= 2 && clean.length <= 70 && !/\b(?:movie|film|series|poll|who|what|why|how|when|where)\b/i.test(clean)) {
+        actions.push(['search_and_play_music', { query: clean, action: 'play_now' }]);
       }
     }
 

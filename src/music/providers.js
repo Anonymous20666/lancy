@@ -376,14 +376,17 @@ export class PlayMusicProvider {
     const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
 
     const buildArgs = (target, { asVideo = false } = {}) => {
+      const isMulti = /^(?:scsearch|ytsearch)[2-9]\d*:/i.test(String(target || ''));
       const fmt = asVideo
         ? 'b[ext=mp4][vcodec^=avc1][height<=720][height>=480]/bv*[vcodec^=avc1][height<=720]+ba[acodec^=mp4a]/b[ext=mp4][height<=720]/bv*[height<=720]+ba/b[height<=720]'
         : 'ba[ext=m4a]/ba/b';
       const a = [
         '--ignore-config',
+        '--ignore-errors',
         '--no-playlist',
         '--no-warnings',
         '--no-progress',
+        ...(isMulti ? ['--max-downloads', '1'] : []),
         '--socket-timeout', '15',
         '--retries', '2',
         '--fragment-retries', '2',
@@ -398,7 +401,7 @@ export class PlayMusicProvider {
         if (existsSync('/usr/bin/node')) a.push('--js-runtimes', 'node:/usr/bin/node');
         if (existsSync('/data/cache/yt-dlp')) a.push('--cache-dir', '/data/cache/yt-dlp');
         if (ffmpegBin) a.push('--ffmpeg-location', ffmpegBin);
-        if (cookieArgs.length) a.push(...cookieArgs);
+        if (cookieArgs.length && !/^scsearch/i.test(String(target || ''))) a.push(...cookieArgs);
       }
       if (asVideo) a.push('--merge-output-format', 'mp4');
       a.push('--', target);
@@ -470,9 +473,13 @@ export class PlayMusicProvider {
           }).catch(() => null) : null;
           if (!rescue?.ok || (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000))) {
             try {
-              await this.runner('yt-dlp', buildArgs(`scsearch1:${cleanQuery}`, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
+              const scTarget = this.runner === exec ? `scsearch5:${cleanQuery}` : `scsearch1:${cleanQuery}`;
+              await this.runner('yt-dlp', buildArgs(scTarget, { asVideo: false }), { timeout: 60000, maxBuffer: 4 * 1024 * 1024 }).catch(e => {
+                if (this.runner === exec && existsSync(path) && statSync(path).size >= 10000) return;
+                throw e;
+              });
               if (this.runner === exec && (!existsSync(path) || statSync(path).size < 10000)) {
-                throw new Error('scsearch1 produced no output file');
+                throw new Error('scsearch produced no output file');
               }
             } catch {
               throw ytErr;
@@ -504,15 +511,17 @@ export class ProviderRegistry {
     let provider;
     if (explicit) {
       provider = prefix === 'yt' ? 'youtube' : (prefix === 'itunes' ? 'music' : prefix);
-    } else if (options?.video || youtubeId(query)) {
+    } else if (youtubeId(query)) {
       provider = 'youtube';
+    } else if (options?.video) {
+      provider = this.adapters.has('music') ? 'music' : 'youtube';
     } else if (options?.radio || options?.filterDuration === 'song' || options?.filterDuration === 'medium') {
       provider = this.adapters.has('music') ? 'music' : (this.get('youtube').enabled ? 'youtube' : 'audius');
     } else {
       provider = this.adapters.has('music') ? 'music' : (this.get('youtube').enabled ? 'youtube' : 'audius');
     }
-    if (options?.video && provider !== 'youtube') throw new MusicError('VIDEO_UNSUPPORTED', 'Choose a permitted YouTube video, or reply /vidc to a video file. Audius and Music are audio-only.');
-    if (options?.video && !this.get('youtube').enabled) throw new MusicError('PROVIDER_DISABLED', 'Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
+    if (options?.video && provider !== 'youtube' && provider !== 'music') throw new MusicError('VIDEO_UNSUPPORTED', 'Choose a permitted YouTube video, or reply /vidc to a video file. Audius is audio-only.');
+    if (options?.video && provider === 'youtube' && !this.get('youtube').enabled) throw new MusicError('PROVIDER_DISABLED', 'Video search requires owner-enabled permitted YouTube resolution. You can still reply /vidc to a video file.');
     const q = m ? m[2] : query;
     const videoFallback = options?.video ? (this.adapters.has('music') ? 'music' : null) : (provider === 'youtube' ? 'audius' : (this.adapters.get('youtube')?.enabled ? 'youtube' : null));
     const canBlendMusic = Boolean(

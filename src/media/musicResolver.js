@@ -155,22 +155,29 @@ export async function resolveMetadata(query) {
     return value;
 }
 
-/** ── source 1: YouTube (direct / optional residential proxy) ──────── */
+/** ── source 1: YouTube / SoundCloud yt-dlp audio extractor ──────── */
 async function ytDlpMp3(url, tempPath, { minSeconds = 45, timeoutMs = 90000, ffmpegPath = 'ffmpeg' } = {}) {
-    const outStem = tempPath.replace(/\.mp3$/i, '');
+    const outStem = tempPath.replace(/\.(?:mp3|source)$/i, '');
     const outTemplate = `${outStem}.%(ext)s`;
+    const isMultiSearch = /^(?:scsearch|ytsearch)[2-9]\d*:/i.test(String(url || ''));
     const resolvedFfmpeg = resolveFfmpegPath(ffmpegPath !== 'ffmpeg' ? ffmpegPath : '') || ffmpegPath;
     const run = (proxy) => execFileAsync('yt-dlp', [
+        '--ignore-errors',
         '--no-warnings', '--no-playlist',
+        ...(isMultiSearch ? ['--max-downloads', '1'] : []),
         ...(proxy ? ['--proxy', proxy] : []),
         ...(resolvedFfmpeg ? ['--ffmpeg-location', resolvedFfmpeg] : []),
         '-N', '4', '--max-filesize', '80M',
         '--js-runtimes', 'node:/usr/bin/node',
-        '--match-filter', `duration>=${minSeconds}`,
+        '--match-filter', `duration>=${minSeconds} & duration<=1200`,
         '-f', 'ba[ext=m4a]/ba/b', '-x', '--audio-format', 'mp3', '--audio-quality', '2',
         '-o', outTemplate, url,
-    ], { timeout: timeoutMs });
-    if (await isProxyReachable(RESIDENTIAL_PROXY)) {
+    ], { timeout: timeoutMs }).catch((err) => {
+        // Note: yt-dlp exits with code 101 when --max-downloads 1 is reached or code 1 when an earlier item in scsearch5 was DRM-skipped
+        if (existsSync(`${outStem}.mp3`) || existsSync(tempPath)) return { stdout: '' };
+        throw err;
+    });
+    if (!/^scsearch/i.test(String(url || '')) && await isProxyReachable(RESIDENTIAL_PROXY)) {
         try {
             await run(RESIDENTIAL_PROXY);
         } catch {
@@ -260,10 +267,20 @@ async function jiosaavnPick(query) {
         if (!res.ok) return null;
         const data = await res.json();
         const rows = (data.results ?? [])
-            .map((r) => ({ title: String(r.title ?? '').replace(/&quot;/g, '"').replace(/&amp;/g, '&'), artist: r.primaryArtists ?? 'Music', duration: Number(r.duration ?? 0), enc: r.encrypted_media_url }))
+            .map((r) => {
+                const artistFromMap = Array.isArray(r?.more_info?.artistMap?.primary_artists)
+                    ? r.more_info.artistMap.primary_artists.map((a) => a?.name).filter(Boolean).join(', ')
+                    : '';
+                return {
+                    title: String(r.title ?? '').replace(/&quot;/g, '"').replace(/&amp;/g, '&'),
+                    artist: String(r.primaryArtists || artistFromMap || r.subtitle || 'Music').replace(/&quot;/g, '"').replace(/&amp;/g, '&'),
+                    duration: Number(r.duration || r?.more_info?.duration || 0),
+                    enc: r.encrypted_media_url || r?.more_info?.encrypted_media_url || null
+                };
+            })
             .filter((r) => r.enc && r.duration >= 45)
             .map((r) => ({ ...r, score: scoreTrackCandidate(query, r.title, r.artist, r.duration) }))
-            .filter((r) => r.score >= 0)
+            .filter((r) => r.score >= 30)
             .sort((a, b) => b.score - a.score);
         const best = rows[0];
         if (!best) return null;
@@ -531,7 +548,14 @@ export async function resolveAndDownloadAudio({
 
     attempts.push({
         name: 'soundcloud',
-        run: () => ytDlpMp3(`scsearch3:${meta ? searchQuery : (rawQuery || searchQuery)}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg }),
+        run: async () => {
+            const q1 = meta ? searchQuery : (rawQuery || searchQuery);
+            if (await ytDlpMp3(`scsearch6:${q1}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg })) return true;
+            if (rawQuery && rawQuery !== q1) {
+                return await ytDlpMp3(`scsearch6:${rawQuery}`, tempPath, { minSeconds, timeoutMs: 45000, ffmpegPath: resolvedFfmpeg });
+            }
+            return false;
+        }
     });
 
     // 2. Last-resort fallback only if direct music engines miss

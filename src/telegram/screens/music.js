@@ -1715,22 +1715,32 @@ export function createMusicScreen({ app }) {
     if (!query) return prompt(ctx, mode);
     const isChan = isChannelCtx(ctx);
     let activePlayerId = ctx.musicPanel?.screenMessageId || null;
+    let qmSessionForSearch = null;
     try {
       const dest = app.music?.destination?.(ctx);
       if (dest && app.musicQueueManager?.getSession) {
-        activePlayerId = activePlayerId || app.musicQueueManager.getSession(dest)?.screenMessageId || null;
+        qmSessionForSearch = app.musicQueueManager.getSession(dest);
+        activePlayerId = activePlayerId || qmSessionForSearch?.screenMessageId || null;
       }
     } catch {}
-    const reuseId = (ctx.query && ctx.messageId && ctx.messageId !== activePlayerId)
-      ? ctx.messageId
-      : (isChan && !ctx.query ? reusableChannelSlotId(ctx) : null);
+    const reuseId = ctx.reuseMessageId
+      ? ctx.reuseMessageId
+      : (ctx.query && ctx.messageId)
+        ? ctx.messageId
+        : (isChan && !ctx.query ? reusableChannelSlotId(ctx) : null);
+    if (reuseId && reuseId === activePlayerId && qmSessionForSearch) {
+      qmSessionForSearch.overlayView = 'search';
+      qmSessionForSearch.overlayAt = Date.now();
+      qmSessionForSearch.lastRender = null;
+    }
 
     let pending = null;
     let temporaryToken = null;
+    const isReusingPlayerCard = Boolean(reuseId && reuseId === activePlayerId);
     const key = chatSlotKey(ctx);
     if (reuseId) {
       let editedOk = false;
-      const preferRichFirst = Boolean(ctx.api?.editMessageRich && (ctx.query || menuMsgByChat.get(key)?.messageId === reuseId));
+      const preferRichFirst = Boolean(ctx.api?.editMessageRich && (ctx.query || isReusingPlayerCard || menuMsgByChat.get(key)?.messageId === reuseId));
       const editTextStatus = () => ctx.api?.editMessageText
         ? ctx.api.editMessageText(ctx.chatId, reuseId, '🔎 Finding your tracks…').then(() => true).catch(() => false)
         : Promise.resolve(false);
@@ -1745,11 +1755,13 @@ export function createMusicScreen({ app }) {
       }
       if (editedOk) {
         pending = { message_id: reuseId };
-        const existingSlot = menuMsgByChat.get(key)?.messageId === reuseId
-          ? menuMsgByChat.get(key)
-          : (noticeMsgByChat.get(key)?.messageId === reuseId ? noticeMsgByChat.get(key) : null);
-        temporaryToken = existingSlot?.token || temporary.remember(ctx, pending, { ttlMs: 300000 });
-        temporary.expire(temporaryToken, 300000);
+        if (!isReusingPlayerCard) {
+          const existingSlot = menuMsgByChat.get(key)?.messageId === reuseId
+            ? menuMsgByChat.get(key)
+            : (noticeMsgByChat.get(key)?.messageId === reuseId ? noticeMsgByChat.get(key) : null);
+          temporaryToken = existingSlot?.token || temporary.remember(ctx, pending, { ttlMs: 300000 });
+          temporary.expire(temporaryToken, 300000);
+        }
       }
     }
     if (!pending) {
@@ -1859,14 +1871,24 @@ export function createMusicScreen({ app }) {
     let sent;
     let temporaryToken;
     let targetSlot = null;
+    let activePlayerId = ctx.musicPanel?.screenMessageId || null;
+    let qmSessionForPrompt = null;
+    try {
+      const dest = app.music?.destination?.(ctx);
+      if (dest && app.musicQueueManager?.getSession) {
+        qmSessionForPrompt = app.musicQueueManager.getSession(dest);
+        activePlayerId = activePlayerId || qmSessionForPrompt?.screenMessageId || null;
+      }
+    } catch {}
+    const canMorphCard = Boolean(ctx.query && ctx.messageId && ctx.api?.editMessageRich);
+    const originCardMessageId = (ctx.query && ctx.messageId) ? ctx.messageId : null;
+    if (originCardMessageId && originCardMessageId === activePlayerId && qmSessionForPrompt) {
+      qmSessionForPrompt.overlayView = `prompt:${mode}`;
+      qmSessionForPrompt.overlayAt = Date.now();
+      qmSessionForPrompt.lastRender = null;
+    }
+
     if (isChan) {
-      let activePlayerId = ctx.musicPanel?.screenMessageId || null;
-      try {
-        const dest = app.music?.destination?.(ctx);
-        if (dest && app.musicQueueManager?.getSession) {
-          activePlayerId = activePlayerId || app.musicQueueManager.getSession(dest)?.screenMessageId || null;
-        }
-      } catch {}
       const key = chatSlotKey(ctx);
       targetSlot = activePlayerId ? noticeMsgByChat : menuMsgByChat;
       if (!activePlayerId && !menuMsgByChat.has(key) && noticeMsgByChat.has(key)) {
@@ -1907,10 +1929,57 @@ export function createMusicScreen({ app }) {
       sent = await upsertChatSlot(targetSlot, ctx, sendPromptFn, editPromptFn, 120000);
       temporaryToken = targetSlot.get(key)?.token || temporary.remember(ctx, sent, { ttlMs: 120000 });
     } else if (mode === 'dj' && djRichCard && ctx.api?.sendRichMessage) {
-      sent = await ctx.api.sendRichMessage(ctx.chatId, djRichCard, {
-        ...(ctx.message?.from?.id === ident.userId ? { reply_to_message_id: ctx.message.message_id } : {})
-      });
-      temporaryToken = temporary.remember(ctx, sent, { ttlMs: 300000 });
+      if (canMorphCard) {
+        try {
+          const ed = await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, djRichCard);
+          sent = ed?.message_id ? ed : { message_id: ctx.messageId };
+        } catch {}
+      }
+      if (!sent) {
+        sent = await ctx.api.sendRichMessage(ctx.chatId, djRichCard, {
+          ...(ctx.message?.from?.id === ident.userId ? { reply_to_message_id: ctx.message.message_id } : {})
+        });
+      }
+      if (sent?.message_id !== activePlayerId) {
+        temporaryToken = temporary.remember(ctx, sent, { ttlMs: 300000 });
+      }
+    } else if (canMorphCard) {
+      const promptTitle = mode === 'cat_search'
+        ? '🔎 Lancy · Search 2026 Categories'
+        : mode === 'video'
+          ? '🎬 Lancy · Search Music Video'
+          : mode === 'radio'
+            ? '♾️ Lancy · Infinite Artist / Genre'
+            : '🔍 Lancy · Search Music';
+      const promptSub = mode === 'cat_search'
+        ? 'Send any genre, subgenre, or artist style in chat'
+        : 'Send song title, artist, album, or genre in chat';
+      const morphedCard = finish(
+        card(promptTitle, promptSub)
+          .blockquote(rt.text(text))
+          .buttons([
+            button('🎧 Categories (2026)', 'catmenu', mode === 'video' ? 'video' : 'queue', '0', { style: 'primary' }),
+            button('« Music Hub', 'vcmode', 'music'),
+            button('✕ Cancel', 'cancelprompt', { style: 'danger' })
+          ])
+      );
+      try {
+        const ed = await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, morphedCard);
+        sent = ed?.message_id ? ed : { message_id: ctx.messageId };
+      } catch {}
+      if (!sent) {
+        const mentionPrefix = (canMentionUser && !text.toLowerCase().startsWith(name.toLowerCase())) ? `${name}, ` : '';
+        const outMsg = `${mentionPrefix}${text}`;
+        const userNum = ident.userId;
+        sent = await ctx.api.sendMessage(ctx.chatId, outMsg, {
+          reply_markup: { force_reply: true, selective: true },
+          ...(canMentionUser ? { entities: [{ type: 'text_mention', offset: 0, length: name.length, user: { id: userNum, is_bot: false, first_name: name } }] } : {}),
+          ...(ctx.message?.from?.id === userNum ? { reply_to_message_id: ctx.message.message_id } : {})
+        });
+      }
+      if (sent?.message_id !== activePlayerId) {
+        temporaryToken = temporary.remember(ctx, sent, { ttlMs: 300000 });
+      }
     } else {
       const mentionPrefix = (canMentionUser && !text.toLowerCase().startsWith(name.toLowerCase())) ? `${name}, ` : '';
       const outMsg = `${mentionPrefix}${text}`;
@@ -1931,8 +2000,10 @@ export function createMusicScreen({ app }) {
           mode,
           botKey: app.music.botKey(ctx),
           promptMessageId: sent.message_id,
-          replyableMessageIds: [sent.message_id],
+          originCardMessageId,
+          replyableMessageIds: [sent.message_id, ...(originCardMessageId && originCardMessageId !== sent.message_id ? [originCardMessageId] : [])],
           temporaryToken,
+          createdAt: Date.now(),
           panelToken: ctx.musicPanel?.panelToken || null,
           isChannelPrompt: isChan
         }
@@ -2321,6 +2392,16 @@ export function createMusicScreen({ app }) {
         if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
           await ctx.api.answerCallbackQuery(ctx.query.id, { text: '🚪 Chat session closed.' }).catch(() => {});
         }
+        try {
+          const dest = app.music?.destination?.(ctx);
+          const qmSess = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+          if (qmSess && ctx.messageId && ctx.messageId === qmSess.screenMessageId) {
+            qmSess.overlayView = null;
+            qmSess.overlayAt = 0;
+            qmSess.lastRender = null;
+            await app.musicQueueManager?.updatePlayerCard?.(qmSess.chatId, { forceEdit: true }).catch(() => {});
+          }
+        } catch {}
         return true;
       }
       if (action === 'djquick') {
@@ -2743,17 +2824,24 @@ export function createMusicScreen({ app }) {
         const stateKey = (isChan && Number(ctx.chatId) < 0) ? String(ctx.chatId) : ctx.tgId;
         if (app.sm?.state?.(stateKey) === States.MUSIC_QUEUE_INPUT) await app.sm.reset(stateKey);
         if (stateKey !== ctx.tgId && app.sm?.state?.(ctx.tgId) === States.MUSIC_QUEUE_INPUT) await app.sm.reset(ctx.tgId);
-        if (isChan) {
-          let activePlayerId = null;
-          try {
-            const dest = app.music?.destination?.(ctx);
-            activePlayerId = dest ? app.musicQueueManager?.getSession?.(dest)?.screenMessageId || null : null;
-          } catch {}
-          if (ctx.messageId && ctx.messageId !== activePlayerId) {
-            await clearChatSlot(menuMsgByChat, ctx, activePlayerId);
-            await clearChatSlot(noticeMsgByChat, ctx, activePlayerId);
-            await ctx.api?.deleteMessage?.(ctx.chatId, ctx.messageId).catch(() => {});
-          }
+        let qmSess = null;
+        let activePlayerId = null;
+        try {
+          const dest = app.music?.destination?.(ctx);
+          qmSess = dest ? app.musicQueueManager?.getSession?.(dest) : null;
+          activePlayerId = qmSess?.screenMessageId || null;
+        } catch {}
+        if (qmSess && ctx.messageId && ctx.messageId === activePlayerId) {
+          qmSess.overlayView = null;
+          qmSess.overlayAt = 0;
+          qmSess.lastRender = null;
+          await app.musicQueueManager?.updatePlayerCard?.(qmSess.chatId, { forceEdit: true }).catch(() => {});
+        } else if (isChan && ctx.messageId && ctx.messageId !== activePlayerId) {
+          await clearChatSlot(menuMsgByChat, ctx, activePlayerId);
+          await clearChatSlot(noticeMsgByChat, ctx, activePlayerId);
+          await ctx.api?.deleteMessage?.(ctx.chatId, ctx.messageId).catch(() => {});
+        } else if (ctx.messageId && ctx.api?.editMessageRich) {
+          await ctx.api.editMessageRich(ctx.chatId, ctx.messageId, renderMusicStreamingHub(qmSess, ctx)).catch(() => {});
         }
         return true;
       }
@@ -3612,8 +3700,14 @@ export function createMusicScreen({ app }) {
           const replyToId = message.reply_to_message?.message_id;
           const trackedIds = Array.isArray(record.context.replyableMessageIds) ? record.context.replyableMessageIds : [];
           const matchesPrompt = Boolean(replyToId && (replyToId === record.context.promptMessageId || trackedIds.includes(replyToId)));
-          const matchesBot = Boolean(ctx.isReplyToBot || ctx.isTag || /\blancy\b/i.test(message.text));
-          if (!matchesPrompt && !matchesBot) return false;
+          const matchesBot = Boolean(ctx.isReplyToBot || ctx.isTag || /\blancy\b/i.test(message.text) || message.reply_to_message?.from?.id === ctx.api?.me?.id);
+          const isDirectPromptFollowup = Boolean(
+            !replyToId
+            && !message.text.startsWith('/')
+            && String(record.tgId) === String(ctx.tgId)
+            && (!record.context.createdAt || (Date.now() - record.context.createdAt) < 180000)
+          );
+          if (!matchesPrompt && !matchesBot && !isDirectPromptFollowup) return false;
         }
         if (isChan) await deleteTriggerMessage({ ...ctx, query: null, isChannel: true, message });
         const mode = record.context.mode;
@@ -3737,15 +3831,23 @@ export function createMusicScreen({ app }) {
               forceNewCard: Boolean(!isChan && !panel)
             });
           } else if (mode === 'cat_search') {
-            if (isChan) record.context.reusedInChannel = true;
+            const reuseCardId = record.context.originCardMessageId || record.context.promptMessageId || null;
+            record.context.reusedInChannel = Boolean(isChan || reuseCardId);
             await sm.reset(stateKey);
             const matches = searchCategories(message.text, { limit: 12 });
             const rich = renderCategorySearchResults(message.text, matches, 'queue');
-            await sendOrEditMenu(panel ? { ...ctx, musicPanel: panel } : ctx, rich);
+            const targetCtx = panel
+              ? { ...ctx, musicPanel: panel }
+              : (reuseCardId ? { ...ctx, query: { id: 'reuse' }, messageId: reuseCardId } : ctx);
+            await sendOrEditMenu(targetCtx, rich);
           } else {
-            if (isChan) record.context.reusedInChannel = true;
+            const reuseCardId = record.context.originCardMessageId || record.context.promptMessageId || null;
+            record.context.reusedInChannel = Boolean(isChan || reuseCardId);
             await sm.reset(stateKey);
-            await search(panel ? { ...ctx, musicPanel: panel } : ctx, message.text, mode);
+            const targetCtx = panel
+              ? { ...ctx, musicPanel: panel }
+              : (reuseCardId ? { ...ctx, reuseMessageId: reuseCardId } : ctx);
+            await search(targetCtx, message.text, mode);
           }
         } catch (e) {
           await sm.reset(stateKey);
@@ -3773,7 +3875,12 @@ export function createMusicScreen({ app }) {
           const trackedIds = Array.isArray(record.context.replyableMessageIds) ? record.context.replyableMessageIds : [];
           const matchesPrompt = Boolean(replyToId && (replyToId === record.context.promptMessageId || trackedIds.includes(replyToId)));
           const matchesBot = Boolean(ctx.isReplyToBot || ctx.isTag || /\blancy\b/i.test(message.text) || message.reply_to_message?.from?.id === ctx.api?.me?.id);
-          if (!matchesPrompt && !matchesBot) return false;
+          const isDirectPromptFollowup = Boolean(
+            !replyToId
+            && !message.text.startsWith('/')
+            && String(record.tgId) === String(ctx.tgId)
+          );
+          if (!matchesPrompt && !matchesBot && !isDirectPromptFollowup) return false;
         }
         if (isChan) await deleteTriggerMessage({ ...ctx, query: null, isChannel: true, message });
         const ind = ctx.api?.sendChatAction ? new ActionIndicator(ctx.api, ctx.chatId, 'typing') : null;
