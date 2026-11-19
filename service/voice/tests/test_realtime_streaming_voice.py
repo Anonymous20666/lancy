@@ -586,6 +586,18 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
                 self.assertIsNotNone(gemini_live.WAKE_CALL_RE.search('Pappyye, you dey?'))
                 self.assertIsNotNone(gemini_live.WAKE_CALL_RE.search('Pappie help me'))
 
+                # 4) When movie is paused, AI speech unpauses ntgcalls pipe (eng.resume) + enables tts_hold
+                # even when ntgcalls.MediaState has no .paused attribute.
+                engine.resume = AsyncMock()
+                bridge.calls[-100888]['status'] = 'paused'
+                mgr.note_user_pause(-100888)
+                self.assertFalse(st.live_ntg_resumed)
+                with patch('main._set_sync_tts_hold') as mock_hold:
+                    await captured_cbs['on_pcm_48k_stereo'](b'\x01\x00' * 1920)
+                    self.assertTrue(st.live_ntg_resumed)
+                    mock_hold.assert_called_with('sync_movie_1', True)
+                    engine.resume.assert_awaited_once_with(-100888)
+
             await mgr.stop_all()
 
         asyncio.run(run())

@@ -5322,7 +5322,12 @@ class Bridge:
             binding = getattr(engine, '_binding', None)
             if binding is not None and hasattr(binding, 'get_state'):
                 b_state = await asyncio.wait_for(binding.get_state(chat), 1.5)
-                if not getattr(b_state, 'paused', False):
+                if b_state is not None and not (
+                    getattr(b_state, 'paused', False)
+                    or getattr(b_state, 'muted', False)
+                    or getattr(b_state, 'video_paused', False)
+                    or getattr(b_state, 'presentation_paused', False)
+                ):
                     return True
             await asyncio.wait_for(engine.resume(chat), 2.5)
             call['last_progress'] = time.monotonic()

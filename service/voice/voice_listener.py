@@ -251,6 +251,22 @@ class VoiceListenerManager:
             except Exception:
                 pass
 
+        async def _ensure_paused_tts_pipe_live(cur_call, sync_id):
+            if not sync_id or cur_call.get('status') != 'paused':
+                return
+            try:
+                import main as _m
+                _m._set_sync_tts_hold(sync_id, True)
+                if not st.live_ntg_resumed:
+                    st.live_ntg_resumed = True
+                    acct = self.bridge.accounts.get(cur_call.get('alias') or st.alias)
+                    eng = acct.get('engine') if acct else None
+                    if eng is not None and not self.bridge.factory:
+                        await asyncio.wait_for(eng.resume(cid), 2.5)
+                        log.info('Gemini 3.8 Live unpaused ntgcalls audio pipe for TTS while media paused chat=%s', cid)
+            except Exception:
+                pass
+
         async def _on_pcm_48k(stereo_48k: bytes):
             cur_call = self.bridge.calls.get(cid) or {}
             sync_id = cur_call.get('av_sync_id')
@@ -259,26 +275,8 @@ class VoiceListenerManager:
             st.last_live_turn_mono = time.monotonic()
             if cur_call.get('status') == 'playing':
                 _engage_live_pause()
-            elif cur_call.get('status') == 'paused' and not st.live_ntg_resumed:
-                st.live_ntg_resumed = True
-                try:
-                    import main as _m
-                    _m._set_sync_tts_hold(sync_id, True)
-                    acct = self.bridge.accounts.get(cur_call.get('alias'))
-                    eng = acct.get('engine') if acct else None
-                    if eng is not None and not self.bridge.factory:
-                        binding = getattr(eng, '_binding', None)
-                        need_resume = True
-                        if binding is not None and hasattr(binding, 'get_state'):
-                            try:
-                                b_state = await asyncio.wait_for(binding.get_state(cid), 1.5)
-                                need_resume = bool(getattr(b_state, 'paused', False))
-                            except Exception:
-                                need_resume = False
-                        if need_resume:
-                            await asyncio.wait_for(eng.resume(cid), 2.5)
-                except Exception:
-                    pass
+            elif cur_call.get('status') == 'paused':
+                await _ensure_paused_tts_pipe_live(cur_call, sync_id)
             q_dir = av_sync.tts_queue_dir_for(sync_id)
             q_dir.mkdir(parents=True, exist_ok=True)
             st.live_out_buf.extend(stereo_48k)
@@ -305,6 +303,8 @@ class VoiceListenerManager:
             if not sync_id:
                 st.live_out_buf.clear()
                 return
+            if cur_call.get('status') == 'paused':
+                await _ensure_paused_tts_pipe_live(cur_call, sync_id)
             q_dir = av_sync.tts_queue_dir_for(sync_id)
             q_dir.mkdir(parents=True, exist_ok=True)
             emit_pcm = bytes(st.live_out_buf)
@@ -315,6 +315,8 @@ class VoiceListenerManager:
             final_f = q_dir / fname
             tmp_f.write_bytes(emit_pcm)
             os.replace(tmp_f, final_f)
+            chunk_dur = len(emit_pcm) / float(av_sync.PCM_BYTES_PER_SEC)
+            self.set_echo_guard(cid, chunk_dur, extend=True)
 
         async def _on_interrupted():
             st.live_out_buf.clear()
@@ -400,6 +402,9 @@ class VoiceListenerManager:
 
             st.active_persona = pid
             st.live_session = target_sess
+            # Keep all speakers in the room aligned with the active persona so frames are never split
+            # across a stale speaker_persona mapping and st.active_persona.
+            st.speaker_persona.clear()
             if bind_uid is not None:
                 st.speaker_persona[int(bind_uid)] = pid
                 target_sess.active_speaker_id = int(bind_uid)
@@ -608,6 +613,17 @@ class VoiceListenerManager:
         st.user_resume_lock_until_mono = 0.0
         st.user_resume_lock_track_id = ''
         st.paused_by_live = False
+        # engine.pause() pauses ntgcalls; reset live_ntg_resumed so the very next AI speech
+        # immediately calls eng.resume() + sets tts_hold=1 so Pappy is heard while paused.
+        st.live_ntg_resumed = False
+        cur_call = self.bridge.calls.get(int(chat_id)) or {}
+        sync_id = cur_call.get('av_sync_id')
+        if sync_id:
+            try:
+                import main as _m
+                _m._set_sync_tts_hold(sync_id, True)
+            except Exception:
+                pass
 
     def user_resume_locked(self, chat_id: int) -> bool:
         st = self.states.get(int(chat_id))
