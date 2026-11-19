@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
@@ -23,6 +24,17 @@ import time
 import numpy as np
 
 log = logging.getLogger('voice.gemini_live')
+
+# Dedicated multi-threaded DSP worker pool so base64 + NumPy 36k->16k and 24k->48k
+# resampling run off the main asyncio event loop thread across CPU cores.
+_AUDIO_DSP_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='gemini-dsp')
+
+
+def _decode_and_upsample_24k_to_48k(b64_data: str, prev_sample: int | None) -> tuple[bytes, int | None]:
+    pcm_24k = base64.b64decode(b64_data or '')
+    if not pcm_24k:
+        return b'', prev_sample
+    return pcm_24k_mono_to_48k_stereo(pcm_24k, prev_sample, return_state=True)
 
 GEMINI_LIVE_WS_URL = (
     'wss://generativelanguage.googleapis.com/ws/'
@@ -796,12 +808,13 @@ class GeminiLiveSession:
                 for p in parts:
                     inl = p.get('inlineData') or {}
                     if 'audio/pcm' in str(inl.get('mimeType') or ''):
-                        pcm_24k = base64.b64decode(inl.get('data') or '')
-                        if pcm_24k and self.on_pcm_48k_stereo and self._turn_redirected_to is None:
-                            stereo_48k, self._out_prev_sample = pcm_24k_mono_to_48k_stereo(
-                                pcm_24k,
+                        b64_raw = inl.get('data') or ''
+                        if b64_raw and self.on_pcm_48k_stereo and self._turn_redirected_to is None:
+                            stereo_48k, self._out_prev_sample = await asyncio.get_running_loop().run_in_executor(
+                                _AUDIO_DSP_POOL,
+                                _decode_and_upsample_24k_to_48k,
+                                b64_raw,
                                 self._out_prev_sample,
-                                return_state=True,
                             )
                             if stereo_48k:
                                 if is_engaged:
@@ -935,7 +948,13 @@ class GeminiLiveSession:
             self.active_speaker_id = int(speaker_id)
         if speaker_name:
             self.active_speaker_name = str(speaker_name)
-        pcm_16k = resample_pcm_to_16k_mono(pcm_bytes, src_rate, channels)
+        pcm_16k = await asyncio.get_running_loop().run_in_executor(
+            _AUDIO_DSP_POOL,
+            resample_pcm_to_16k_mono,
+            pcm_bytes,
+            src_rate,
+            channels,
+        )
         if not pcm_16k:
             return
         self._in_buf.extend(pcm_16k)

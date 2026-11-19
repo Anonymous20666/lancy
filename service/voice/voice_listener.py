@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import logging
 import os
@@ -20,6 +21,17 @@ import time
 import numpy as np
 
 log = logging.getLogger('voice.listener')
+
+# Dedicated multi-threaded I/O pool so SHM / PCM chunk writes never block the asyncio event loop.
+_VOICE_IO_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix='voice-io')
+
+
+def _write_pcm_file_atomic(q_dir, fname: str, emit_pcm: bytes) -> None:
+    q_dir.mkdir(parents=True, exist_ok=True)
+    tmp_f = q_dir / f'.{fname}.tmp'
+    final_f = q_dir / fname
+    tmp_f.write_bytes(emit_pcm)
+    os.replace(tmp_f, final_f)
 
 VAD_FRAME_SILENCE_SEC = 0.85
 VAD_IDLE_SILENCE_SEC = 0.50
@@ -117,6 +129,7 @@ class ChatListenState:
     uid_to_name: dict[int, str] = field(default_factory=dict)
     last_part_refresh_mono: float = 0.0
     live_session: object | None = None
+    use_live_mode: bool = False
     live_audio_queue: asyncio.Queue | None = None
     live_sender_task: asyncio.Task | None = None
     active_persona: str = 'pappy'
@@ -195,12 +208,13 @@ class VoiceListenerManager:
             import gemini_live
         except Exception:
             return
-        await self._stop_live_session(st)
+        if st.live_session is not None or st.persona_sessions or st.live_sender_task is not None:
+            await self._stop_live_session(st)
         call = (self.bridge.calls.get(cid) or {}) if getattr(self.bridge, 'calls', None) else {}
         vc_title = str(call.get('vc_title') or '')
         init_spec = gemini_live.resolve_persona_spec(st.voice_name or 'pappy')
         st.active_persona = init_spec['id']
-        q: asyncio.Queue = asyncio.Queue(maxsize=900)
+        q: asyncio.Queue = st.live_audio_queue if st.live_audio_queue is not None else asyncio.Queue(maxsize=900)
         st.live_audio_queue = q
 
         def _emit_live_state(action: str):
@@ -278,7 +292,6 @@ class VoiceListenerManager:
             elif cur_call.get('status') == 'paused':
                 await _ensure_paused_tts_pipe_live(cur_call, sync_id)
             q_dir = av_sync.tts_queue_dir_for(sync_id)
-            q_dir.mkdir(parents=True, exist_ok=True)
             st.live_out_buf.extend(stereo_48k)
             if len(st.live_out_buf) < 7680:
                 return
@@ -288,10 +301,7 @@ class VoiceListenerManager:
             if st.live_pcm_seq == 1:
                 log.info('Gemini 3.8 Live first 48kHz audio packet queued chat=%s sync_id=%s bytes=%s', cid, sync_id, len(emit_pcm))
             fname = f'{time.monotonic_ns():020d}_{st.live_pcm_seq:04d}_{secrets.token_hex(2)}.pcm'
-            tmp_f = q_dir / f'.{fname}.tmp'
-            final_f = q_dir / fname
-            tmp_f.write_bytes(emit_pcm)
-            os.replace(tmp_f, final_f)
+            await asyncio.get_running_loop().run_in_executor(_VOICE_IO_POOL, _write_pcm_file_atomic, q_dir, fname, emit_pcm)
             chunk_dur = len(emit_pcm) / float(av_sync.PCM_BYTES_PER_SEC)
             self.set_echo_guard(cid, chunk_dur, extend=True)
 
@@ -306,15 +316,11 @@ class VoiceListenerManager:
             if cur_call.get('status') == 'paused':
                 await _ensure_paused_tts_pipe_live(cur_call, sync_id)
             q_dir = av_sync.tts_queue_dir_for(sync_id)
-            q_dir.mkdir(parents=True, exist_ok=True)
             emit_pcm = bytes(st.live_out_buf)
             st.live_out_buf.clear()
             st.live_pcm_seq += 1
             fname = f'{time.monotonic_ns():020d}_{st.live_pcm_seq:04d}_{secrets.token_hex(2)}.pcm'
-            tmp_f = q_dir / f'.{fname}.tmp'
-            final_f = q_dir / fname
-            tmp_f.write_bytes(emit_pcm)
-            os.replace(tmp_f, final_f)
+            await asyncio.get_running_loop().run_in_executor(_VOICE_IO_POOL, _write_pcm_file_atomic, q_dir, fname, emit_pcm)
             chunk_dur = len(emit_pcm) / float(av_sync.PCM_BYTES_PER_SEC)
             self.set_echo_guard(cid, chunk_dur, extend=True)
 
@@ -535,6 +541,34 @@ class VoiceListenerManager:
                     if item is None:
                         break
                     raw_pcm, s_rate, n_ch, u_id, s_name = item
+                    # Coalesce consecutive queued 10ms PCM frames for the same speaker into a single
+                    # ~40ms batch before dispatching to the DSP thread pool, cutting thread handoffs 4x.
+                    flush_after = False
+                    if raw_pcm and raw_pcm != b'__FLUSH__':
+                        batched = bytearray(raw_pcm)
+                        while not q.empty() and len(batched) < 2880:
+                            try:
+                                nxt = q.get_nowait()
+                            except Exception:
+                                break
+                            if nxt is None:
+                                break
+                            n_pcm, n_sr, n_c, n_uid, n_sn = nxt
+                            if n_pcm == b'__FLUSH__':
+                                flush_after = True
+                                break
+                            if n_sr == s_rate and n_c == n_ch and n_uid == u_id and n_pcm:
+                                batched.extend(n_pcm)
+                                if n_sn and not s_name:
+                                    s_name = n_sn
+                            else:
+                                # Different speaker/format: put back at head-compatible processing next tick
+                                try:
+                                    q.put_nowait(nxt)
+                                except Exception:
+                                    pass
+                                break
+                        raw_pcm = bytes(batched)
                     target_pid = (st.speaker_persona.get(int(u_id)) if u_id is not None else None) or st.active_persona
                     target_sess = st.persona_sessions.get(target_pid) or st.live_session
                     if target_sess is None or target_sess.closed:
@@ -550,6 +584,8 @@ class VoiceListenerManager:
                         await target_sess.flush_tail()
                     elif raw_pcm and target_sess.connected:
                         await target_sess.push_pcm_chunk(raw_pcm, s_rate, n_ch, speaker_id=u_id, speaker_name=s_name)
+                        if flush_after:
+                            await target_sess.flush_tail()
             except asyncio.CancelledError:
                 pass
             except Exception as err:
@@ -706,10 +742,13 @@ class VoiceListenerManager:
         if authorized_user_ids is not None:
             st.authorized_user_ids = {int(x) for x in authorized_user_ids if int(x or 0) > 0}
         st.enforce_auth = bool(enforce_auth)
+        should_live = bool(use_live) if use_live is not None else bool(getattr(self.bridge, 'enable_gemini_live', False))
+        st.use_live_mode = should_live
+        if st.enabled and should_live and st.live_audio_queue is None:
+            st.live_audio_queue = asyncio.Queue(maxsize=900)
         self.ensure_flush_loop()
         if st.enabled and (force_record or not st.recording_started):
             await self._attach_record(cid, alias, st)
-        should_live = bool(use_live) if use_live is not None else bool(getattr(self.bridge, 'enable_gemini_live', False))
         if st.enabled and should_live and st.live_session is None:
             task = asyncio.create_task(self._start_live_session(cid, st))
             self._track_task(task)
@@ -922,7 +961,13 @@ class VoiceListenerManager:
             samples = np.frombuffer(raw, dtype='<i2').astype(np.float32) / 32768.0
             rms = float(np.sqrt(np.mean(samples * samples))) if len(samples) else 0.0
 
-            live_ready = bool(st.live_session is not None and not getattr(st.live_session, 'closed', False) and st.live_audio_queue is not None)
+            live_ready = bool(
+                st.live_audio_queue is not None
+                and (
+                    st.use_live_mode
+                    or (st.live_session is not None and not getattr(st.live_session, 'closed', False))
+                )
+            )
             if ssrc not in st.logged_ssrcs:
                 st.logged_ssrcs.add(ssrc)
                 log.info('Receiving PyTgCalls audio stream frames chat=%s ssrc=%s uid=%s sr=%s ch=%s bytes=%s rms=%.4f live=%s', cid, ssrc, uid, sr, ch, len(raw), rms, live_ready)

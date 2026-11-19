@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+process.env.UV_THREADPOOL_SIZE = process.env.UV_THREADPOOL_SIZE || '16';
 import { existsSync, mkdirSync } from 'node:fs';
 if (!process.env.TMPDIR && existsSync('/data')) {
   try {
