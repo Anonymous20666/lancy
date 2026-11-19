@@ -171,7 +171,7 @@ def resolve_persona_spec(name_or_voice: str | None = None, *, voice_type: str | 
 
 
 WAKE_CALL_RE = re.compile(
-    r'\b(?:pappy|papi|poppy|papy|pappi|puppy|lancy|lanci|lancey|nancy|now\s+see|lan\s*see|land\s*see|'
+    r'\b(?:pap+(?:y+e?|i+e?|ie|ey)|pop+(?:y|i)e?|puppy|lancy|lanci|lancey|nancy|now\s+see|lan\s*see|land\s*see|'
     r'ava|eva|maya|maia|leo|nana|mama\s+grace|grandma|elder|zara|marcus|chloe)\b|'
     r'\b(?:switch\s+to|use|give\s+me|change\s+to|talk\s+(?:with|in|like))\s+(?:(?:a|an|the)\s+)?'
     r'(?:old\s+woman|grandma|elder\s+woman|old\s+man|grandpa|elder\s+man|lady|woman|girl|young\s+girl|boy|young\s+boy|man|deep\s+male)\b',
@@ -187,7 +187,7 @@ _PERSONA_CALL_PATTERNS = [
     ('zara', re.compile(r'(?:^(?:hey|hi|yo|ok|okay|abeg|call|ask)\s+|\b)zara\b', re.I)),
     ('marcus', re.compile(r'(?:^(?:hey|hi|yo|ok|okay|abeg|call|ask)\s+|\b)marcus\b', re.I)),
     ('chloe', re.compile(r'(?:^(?:hey|hi|yo|ok|okay|abeg|call|ask)\s+|\b)chloe\b', re.I)),
-    ('pappy', re.compile(r'(?:^(?:hey|hi|yo|ok|okay|abeg|call|ask)\s+|\b)(?:pappy|papi|poppy|papy|pappi|lancy|lanci|lancey|nancy|now\s+see)\b|\b(?:switch\s+to|use|talk\s+(?:with|in|like))\s+(?:(?:a|an|the)\s+)?(?:deep\s+male|man)\s*(?:voice)?\b', re.I)),
+    ('pappy', re.compile(r'(?:^(?:hey|hi|yo|ok|okay|abeg|call|ask)\s+|\b)(?:pap+(?:y+e?|i+e?|ie|ey)|pop+(?:y|i)e?|lancy|lanci|lancey|nancy|now\s+see)\b|\b(?:switch\s+to|use|talk\s+(?:with|in|like))\s+(?:(?:a|an|the)\s+)?(?:deep\s+male|man)\s*(?:voice)?\b', re.I)),
 ]
 
 

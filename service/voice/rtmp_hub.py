@@ -570,7 +570,7 @@ def run_rtmp_hub(
                                         last_audio_pts = emit_a_pts
                                         emit_frame = (
                                             sub_overlay.render_hud(last_raw_frame, rel_last, mode='syncing')
-                                            if (now_m - starve_since) >= STARVE_SEC and sub_overlay is not None
+                                            if (now_m - starve_since) >= av_sync.SYNC_HUD_VISIBLE_SEC and sub_overlay is not None
                                             else (sub_overlay.render(last_raw_frame, rel_last) if sub_overlay is not None else last_raw_frame)
                                         )
                                         emit_pcm = b'\x00' * need_pcm
@@ -585,7 +585,7 @@ def run_rtmp_hub(
                                         last_audio_pts = emit_a_pts
                                         emit_frame = (
                                             sub_overlay.render_hud(last_raw_frame, rel_last, mode='syncing')
-                                            if (now_m - starve_since) >= STARVE_SEC and sub_overlay is not None
+                                            if (now_m - starve_since) >= av_sync.SYNC_HUD_VISIBLE_SEC and sub_overlay is not None
                                             else (sub_overlay.render(last_raw_frame, rel_last) if sub_overlay is not None else last_raw_frame)
                                         )
                                         emit_pcm = b'\x00' * need_pcm
@@ -653,8 +653,8 @@ def run_rtmp_hub(
                                     emit_a_pts = max(0.0, float(audio_head_pts)) if audio_head_pts is not None else last_audio_pts
                                     emit_frame = (
                                         sub_overlay.render_hud(last_raw_frame, _rel_pts(last_frame_pts), mode='syncing')
-                                        if sub_overlay is not None
-                                        else last_raw_frame
+                                        if (now_m - starve_since) >= av_sync.SYNC_HUD_VISIBLE_SEC and sub_overlay is not None
+                                        else (sub_overlay.render(last_raw_frame, _rel_pts(last_frame_pts)) if sub_overlay is not None else last_raw_frame)
                                     )
                                     emit_pcm = b'\x00' * need_pcm
                             cond.notify_all()

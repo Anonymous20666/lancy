@@ -253,14 +253,17 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
             st.live_session = mock_sess
             st.live_audio_queue = q
 
-            # Under echo guard, soft speakerphone bleed (~0.006 RMS) is suppressed so long speech isn't cut off,
-            # while loud sustained speech (>=0.022 RMS for >=3 frames) passes & triggers barge-in cleanly.
+            # Under echo guard, soft speakerphone bleed (~0.006 RMS) is suppressed so long speech isn't cut off.
+            # A short 30ms burst (cough/tap/side chatter) must NOT cut the AI off anymore, while ~200ms of
+            # sustained loud speech still triggers barge-in cleanly.
             mgr.set_echo_guard(-100444, 2.0)
             bleed_frame = MagicMock(ssrc=2222, frame=np.full(720, 220, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
             mgr.handle_incoming_frames('main', -100444, [bleed_frame])
             self.assertEqual(q.qsize(), 0)
             loud_frame = MagicMock(ssrc=2222, frame=np.full(720, 2200, dtype='<i2').tobytes(), info=MagicMock(sample_rate=36000, channels=1))
             mgr.handle_incoming_frames('main', -100444, [loud_frame, loud_frame, loud_frame])
+            self.assertEqual(q.qsize(), 0)
+            mgr.handle_incoming_frames('main', -100444, [loud_frame] * 20)
             self.assertGreaterEqual(q.qsize(), 1)
             while not q.empty():
                 q.get_nowait()
@@ -505,6 +508,85 @@ class RealtimeStreamingVoiceTests(unittest.TestCase):
             self.assertEqual(sent_payloads[-1]['toolResponse']['functionResponses'][0]['response']['scheduling'], 'WHEN_IDLE')
             await sess.send_audio_stream_end()
             self.assertEqual(sent_payloads[-1], {'realtimeInput': {'audioStreamEnd': True}})
+
+        asyncio.run(run())
+
+    def test_movie_soft_ducking_and_user_resume_lock_prevent_ai_repause(self):
+        from unittest.mock import patch
+
+        async def run():
+            bridge = MagicMock()
+            bridge.factory = None
+            bridge.enable_gemini_live = False
+            bridge.events = asyncio.Queue(maxsize=10)
+            bridge.calls = {
+                -100888: {
+                    'av_sync_id': 'sync_movie_1',
+                    'status': 'playing',
+                    'playback_id': 'track_abc',
+                    'is_music': False,
+                },
+            }
+            engine = MagicMock()
+            engine.record = AsyncMock()
+            bridge.accounts = {'main': {'uid': 999, 'engine': engine, 'client': None}}
+
+            mgr = VoiceListenerManager(bridge=bridge, stt_engine=MagicMock())
+            st = await mgr.start_chat(-100888, 'main', enabled=True, use_live=False)
+            captured_cbs = {}
+
+            class FakeLiveSess:
+                def __init__(self, **kw):
+                    captured_cbs.update(kw)
+                    self.connected = True
+                    self.closed = False
+                    self.persona_id = kw.get('persona_id', 'pappy')
+                    self.active_speaker_id = 77
+                    self.active_speaker_name = 'Chidi'
+                    self.send_tool_response = AsyncMock(return_value=True)
+                    self.send_text_turn = AsyncMock(return_value=True)
+                    self.send_context_update = AsyncMock(return_value=True)
+                    self.send_pcm_16k_mono = AsyncMock()
+                    self.flush_tail = AsyncMock()
+                    self.close = AsyncMock()
+
+                async def connect(self, **_kw):
+                    return True
+
+            with (
+                patch('gemini_live.GeminiLiveSession', FakeLiveSess),
+                patch.dict('os.environ', {'GEMINI_API_KEY': 'test_key'}),
+                patch('main._set_sync_duck') as mock_duck,
+                patch('main._set_sync_paused') as mock_paused,
+            ):
+                await mgr._start_live_session(-100888, st)
+                # 1) When AI speaks during a movie, it soft-ducks volume instead of hard-pausing FFmpeg
+                await captured_cbs['on_pcm_48k_stereo'](b'\x01\x00' * 1920)
+                self.assertTrue(st.ducked_by_live)
+                self.assertFalse(st.paused_by_live)
+                self.assertEqual(bridge.calls[-100888]['status'], 'playing')
+                mock_duck.assert_called_with('sync_movie_1', True)
+                mock_paused.assert_not_called()
+
+                # 2) Even if LIVE_MOVIE_HARD_PAUSE=1 is enabled, once user says "resume",
+                # the AI's spoken reply must NOT re-pause the movie.
+                with patch.dict('os.environ', {'LIVE_MOVIE_HARD_PAUSE': '1'}):
+                    st.ducked_by_live = False
+                    await captured_cbs['on_tool_call'](
+                        [{'id': 'tc_res', 'name': 'control_playback', 'args': {'action': 'resume'}}],
+                        st.live_session,
+                    )
+                    self.assertTrue(mgr.user_resume_locked(-100888))
+                    await captured_cbs['on_pcm_48k_stereo'](b'\x01\x00' * 1920)
+                    self.assertEqual(bridge.calls[-100888]['status'], 'playing')
+                    self.assertFalse(st.paused_by_live)
+                    mock_paused.assert_not_called()
+
+                # 3) Broadened wake words ("Pappyye", "Pappie") wake Pappy reliably
+                self.assertIsNotNone(gemini_live.WAKE_CALL_RE.search('Pappyye, you dey?'))
+                self.assertIsNotNone(gemini_live.WAKE_CALL_RE.search('Pappie help me'))
+
+            await mgr.stop_all()
 
         asyncio.run(run())
 

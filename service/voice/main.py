@@ -3875,6 +3875,14 @@ class Bridge:
                                         _set_sync_paused(call.get('av_sync_id'), True)
                                 raise
                 call['status'] = 'paused' if op == 'pause' else 'playing'; call['last_progress'] = time.monotonic()
+                if self.voice_listener:
+                    try:
+                        if op == 'resume':
+                            self.voice_listener.note_user_resume(chat)
+                        else:
+                            self.voice_listener.note_user_pause(chat)
+                    except Exception:
+                        pass
                 if op == 'resume':
                     call['publisher_muted'] = False
                     call['publisher_verified'] = True
@@ -5411,6 +5419,38 @@ def make_app(bridge, token):
     app.on_cleanup.append(cleanup)
     return app
 
+def _reap_orphan_media_pipelines() -> int:
+    """Kill av_hub/av_sync pipelines left behind by a previous (crashed) voice service.
+
+    Orphans are re-parented to PID 1 and keep decoding movies forever, stealing CPU
+    from the live pipeline and causing constant A/V drift/resync.
+    """
+    me = os.getpid()
+    killed = 0
+    try:
+        proc_root = Path('/proc')
+        for p in proc_root.iterdir():
+            if not p.name.isdigit() or int(p.name) == me:
+                continue
+            try:
+                cmd = (p / 'cmdline').read_bytes().replace(b'\x00', b' ').decode('utf-8', 'replace')
+                if 'service/voice/av_hub.py' not in cmd and 'service/voice/av_sync.py' not in cmd:
+                    continue
+                stat = (p / 'stat').read_text()
+                ppid = int(stat.rsplit(')', 1)[1].split()[1])
+                if ppid != 1:
+                    continue
+                os.kill(int(p.name), signal.SIGKILL)
+                killed += 1
+            except Exception:
+                continue
+    except Exception:
+        return killed
+    if killed:
+        log.warning('Reaped %d orphaned media pipeline process(es) from a previous voice service run', killed)
+    return killed
+
+
 async def main():
     handlers = [logging.StreamHandler(sys.stderr)]
     try:
@@ -5428,6 +5468,7 @@ async def main():
     av_sync._set_pdeathsig(signal.SIGTERM)
     if _parent_exited():
         return
+    _reap_orphan_media_pipelines()
     runner = web.AppRunner(app, access_log=None); await runner.setup()
     if _parent_exited():
         await runner.cleanup()

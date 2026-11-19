@@ -28,6 +28,7 @@ VAD_MAX_MERGED_TURN_SEC = 14.0
 VAD_MIN_SPEECH_SEC = 0.28
 VAD_MAX_UTTERANCE_SEC = 11.5
 VAD_RMS_THRESHOLD = 0.014
+BARGE_IN_SUSTAIN_SEC = float(os.environ.get('LIVE_BARGE_IN_SUSTAIN_SEC', '0.20') or 0.20)
 PRE_ROLL_CHUNKS = 8
 
 _COMPLETE_SHORT_UTT_RE = re.compile(
@@ -128,6 +129,9 @@ class ChatListenState:
     logged_ssrcs: set[int] = field(default_factory=set)
     paused_by_live: bool = False
     ducked_by_live: bool = False
+    # When a user explicitly resumes/plays media, the AI must never re-pause it for its own reply.
+    user_resume_lock_until_mono: float = 0.0
+    user_resume_lock_track_id: str = ''
     paused_track_id: str = ''
     live_ntg_resumed: bool = False
     live_tail_flushed: bool = False
@@ -219,10 +223,20 @@ class VoiceListenerManager:
                 return
             try:
                 import main as _m
-                if cur_call.get('is_music') or cur_call.get('music_freerun'):
-                    # Keep music playing smoothly at ducked volume instead of hard-pausing FFmpeg.
+                if st.ducked_by_live:
+                    return
+                # Default: duck ALL media (music + movies) under the AI voice instead of hard-pausing FFmpeg.
+                # Hard pause/resume cycles on every AI reply caused constant A/V re-sync and fought the
+                # user's own "resume" commands. Hard-pause is opt-in (LIVE_MOVIE_HARD_PAUSE=1) and is
+                # always skipped while a user-resume lock is active for this track.
+                hard_pause_movies = os.environ.get('LIVE_MOVIE_HARD_PAUSE', '0').strip().lower() in {'1', 'true', 'yes', 'on'}
+                if (
+                    cur_call.get('is_music')
+                    or cur_call.get('music_freerun')
+                    or not hard_pause_movies
+                    or self.user_resume_locked(cid)
+                ):
                     _m._set_sync_duck(sync_id, True)
-                    _m._set_sync_tts_hold(sync_id, True)
                     st.ducked_by_live = True
                     return
                 cur_call['_live_paused'] = True
@@ -397,6 +411,20 @@ class VoiceListenerManager:
             return target_sess
 
         async def _on_tool_call(function_calls, sess_obj):
+            has_resume_intent = any(
+                (
+                    str(fc.get('name') or '') == 'control_playback'
+                    and str((fc.get('args') or {}).get('action') or '').strip().lower() in {'resume', 'play', 'unpause', 'continue'}
+                )
+                or (
+                    str(fc.get('name') or '') == 'finish_conversation'
+                    and bool((fc.get('args') or {}).get('resumePlayback', True))
+                )
+                for fc in (function_calls or [])
+            )
+            if has_resume_intent:
+                await self.release_live_pause(cid, resume=True, clear_engaged=False)
+                self.note_user_resume(cid)
             _mark_live_engaged()
             for fc in (function_calls or []):
                 call_id = str(fc.get('id') or '')
@@ -424,12 +452,23 @@ class VoiceListenerManager:
                     )
                     continue
                 if fn_name in {'control_playback', 'search_and_play_music', 'search_videos', 'search_movies_series'}:
-                    act = str(args.get('action') or '')
+                    act = str(args.get('action') or '').strip().lower()
                     if fn_name == 'control_playback' and act in {'pause', 'stop', 'leave'}:
-                        st.paused_by_live = False
+                        self.note_user_pause(cid)
+                    elif fn_name == 'control_playback' and act in {'resume', 'play', 'unpause', 'continue'}:
+                        # Lift any AI duck/pause immediately and lock it so the AI's spoken
+                        # confirmation can never re-pause the movie the user just resumed.
+                        await self.release_live_pause(cid, resume=True, clear_engaged=False)
+                        self.note_user_resume(cid)
                 elif fn_name == 'finish_conversation':
                     resume = bool(args.get('resumePlayback', True))
-                    await self.release_live_pause(cid, resume=resume, clear_engaged=True)
+                    await self.release_live_pause(cid, resume=resume, clear_engaged=False)
+                    # Keep a short follow-up window so a misfired "finish" (or a quick "Pappy, you dey?")
+                    # doesn't make Pappy go deaf until the wake word is perfectly recognised again.
+                    st.live_engaged_until_mono = min(
+                        max(st.live_engaged_until_mono, time.monotonic()),
+                        time.monotonic() + 15.0,
+                    )
                     await sess_obj.send_tool_response(call_id, fn_name, {
                         'status': 'ok',
                         'retryable': False,
@@ -546,6 +585,37 @@ class VoiceListenerManager:
                 if await sess_obj.send_context_update(summary):
                     sent_any = True
         return sent_any
+
+    USER_RESUME_LOCK_SEC = 900.0
+
+    def note_user_resume(self, chat_id: int) -> None:
+        """User explicitly resumed/played media: the AI must not re-pause it for its own replies."""
+        st = self.states.get(int(chat_id))
+        if not st:
+            return
+        cur_call = self.bridge.calls.get(int(chat_id)) or {}
+        st.user_resume_lock_until_mono = time.monotonic() + self.USER_RESUME_LOCK_SEC
+        st.user_resume_lock_track_id = str(cur_call.get('playback_id') or '')
+        # Any live hard-pause is now owned by the user's resume; never "restore" it later.
+        st.paused_by_live = False
+        st.live_ntg_resumed = False
+        st.paused_track_id = ''
+
+    def note_user_pause(self, chat_id: int) -> None:
+        st = self.states.get(int(chat_id))
+        if not st:
+            return
+        st.user_resume_lock_until_mono = 0.0
+        st.user_resume_lock_track_id = ''
+        st.paused_by_live = False
+
+    def user_resume_locked(self, chat_id: int) -> bool:
+        st = self.states.get(int(chat_id))
+        if not st or time.monotonic() >= st.user_resume_lock_until_mono:
+            return False
+        cur_call = self.bridge.calls.get(int(chat_id)) or {}
+        pid = str(cur_call.get('playback_id') or '')
+        return not st.user_resume_lock_track_id or not pid or pid == st.user_resume_lock_track_id
 
     async def release_live_pause(self, chat_id: int, *, resume: bool = True, clear_engaged: bool = False) -> bool:
         cid = int(chat_id)
@@ -851,11 +921,15 @@ class VoiceListenerManager:
                     or (active_window and (st.active_user_id is None or uid == st.active_user_id or (uid in st.authorized_user_ids)))
                 )
                 if live_ready:
-                    # Ignore WebRTC/speakerphone echo during active TTS; require sustained real speech (>=0.022 RMS for >=3 frames) to barge in.
-                    barge_thresh = max(0.022, min(0.028, sb.noise_floor * 3.5))
+                    # Ignore WebRTC/speakerphone echo, coughs, taps and side chatter during active AI speech.
+                    # Require ~200ms of sustained real speech (leaky counter) before cutting the AI off;
+                    # PyTgCalls frames are ~10ms, so the old 3-frame rule fired on 30ms noise bursts.
+                    barge_thresh = max(0.024, min(0.032, sb.noise_floor * 4.0))
+                    frame_sec = len(raw) / float(max(1, 2 * max(1, int(ch or 1)) * max(8000, int(sr or 48000))))
+                    need_frames = max(3, int(round(BARGE_IN_SUSTAIN_SEC / max(0.005, frame_sec))))
                     if can_barge and rms >= barge_thresh:
                         sb.barge_frames += 1
-                        if sb.barge_frames >= 3:
+                        if sb.barge_frames >= need_frames:
                             self.trigger_barge_in(cid, user_id=uid, ssrc=ssrc)
                             echo_guarded = False
                             sb.barge_frames = 0
@@ -867,7 +941,8 @@ class VoiceListenerManager:
                         else:
                             continue
                     else:
-                        sb.barge_frames = 0
+                        # Leaky decay: brief dips between syllables don't reset progress.
+                        sb.barge_frames = max(0, sb.barge_frames - 1)
                         if st.live_stream_active and not st.live_tail_flushed and st.last_user_speech_mono > 0.0 and (now - st.last_user_speech_mono) > 1.10:
                             st.live_tail_flushed = True
                             st.live_stream_active = False
@@ -976,6 +1051,15 @@ class VoiceListenerManager:
                     cur_call = self.bridge.calls.get(st.chat_id) or {}
                     any_speaking = any(sb.in_speech for sb in st.buffers.values())
                     if (
+                        st.ducked_by_live
+                        and not st.paused_by_live
+                        and now >= st.echo_guard_until_mono
+                        and (now - max(st.last_live_turn_mono, st.echo_guard_until_mono)) >= 2.5
+                    ):
+                        # Soft duck: restore full media volume ~2.5s after the AI stops talking,
+                        # regardless of room chatter (people talk over movies; that's normal).
+                        await self.release_live_pause(st.chat_id, resume=True, clear_engaged=False)
+                    elif (
                         (st.paused_by_live or st.ducked_by_live)
                         and not cur_call.get('browser_live')
                         and not any_speaking

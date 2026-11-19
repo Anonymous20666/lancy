@@ -35,6 +35,7 @@ VIDEO_MAX_LEAD_SEC = 0.110
 VIDEO_RESUME_LEAD_SEC = 0.030
 PTS_DISCONTINUITY_SEC = 0.035
 SYNC_STARVATION_SEC = 0.380
+SYNC_HUD_VISIBLE_SEC = 3.50
 STALL_HEARTBEAT_TIMEOUT_SEC = 12.0
 F_SETPIPE_SZ = 1031
 TARGET_AUDIO_PIPE_BYTES = 24576    # ~128ms PCM (6x 4KB pages, >1x 100ms ntgcalls burst) for responsive barge-in without starving readers
@@ -559,7 +560,7 @@ def _run_audio_timed(proc, first_pkt, stream, state, stop_ev, sample_rate, chann
                     out_pkts.append((p_pts, body))
                 with cond:
                     for op in out_pkts:
-                        while len(dq) >= 12 and not stop_ev.is_set():
+                        while len(dq) >= 64 and not stop_ev.is_set():
                             cond.wait(timeout=0.04)
                         if stop_ev.is_set():
                             break
@@ -1421,12 +1422,12 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                     state.sync_flags = int(state.sync_flags) | 2
                     sync_flag_held = True
                     state.skew_ms = int(round((float(state.audio_sec) - last_raw_pts) * 1000.0))
-                    if (now_m - last_sync_hud) >= hud_tick_interval:
-                        hud_buf = (
-                            sub_overlay.render_hud(last_raw_frame, last_raw_pts, mode='syncing')
-                            if sub_overlay is not None
-                            else last_raw_frame
-                        )
+                    starve_dur = now_m - dq_wait_started
+                    if (now_m - last_sync_hud) >= max(0.20, hud_tick_interval) and _pipe_unread_bytes(out_fd) <= frame_bytes:
+                        if starve_dur >= SYNC_HUD_VISIBLE_SEC and sub_overlay is not None:
+                            hud_buf = sub_overlay.render_hud(last_raw_frame, last_raw_pts, mode='syncing')
+                        else:
+                            hud_buf = _compose_frame(dj_overlay, sub_overlay, last_raw_frame, last_raw_pts)
                         _write_all(out, hud_buf)
                         last_sync_hud = time.monotonic()
                         state.video_hb_mono = last_sync_hud
@@ -1453,12 +1454,12 @@ def _run_video_timed(proc, first_pkt, stream, state, stop_ev, frame_bytes, fps, 
                     now_m = time.monotonic()
                     if wait_started is None:
                         wait_started = now_m
-                    if (a_starved or (now_m - wait_started) >= SYNC_STARVATION_SEC) and (now_m - last_sync_hud) >= hud_tick_interval:
-                        hud_buf = (
-                            sub_overlay.render_hud(last_raw_frame, last_raw_pts, mode='syncing')
-                            if sub_overlay is not None
-                            else last_raw_frame
-                        )
+                    wait_dur = now_m - wait_started
+                    if wait_dur >= SYNC_STARVATION_SEC and (now_m - last_sync_hud) >= max(0.20, hud_tick_interval) and _pipe_unread_bytes(out_fd) <= frame_bytes:
+                        if wait_dur >= SYNC_HUD_VISIBLE_SEC and sub_overlay is not None:
+                            hud_buf = sub_overlay.render_hud(last_raw_frame, last_raw_pts, mode='syncing')
+                        else:
+                            hud_buf = _compose_frame(dj_overlay, sub_overlay, last_raw_frame, last_raw_pts)
                         _write_all(out, hud_buf)
                         last_sync_hud = time.monotonic()
                     if proc.poll() is None:
