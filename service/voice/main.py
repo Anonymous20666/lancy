@@ -5026,7 +5026,7 @@ class Bridge:
             raise VoiceFailure('INVALID_REQUEST')
         src_path = Path(file_path).resolve()
         cache_attr = getattr(self, 'cache_root', None) or getattr(self, 'cache_dir', None) or getattr(getattr(self, 'tts', None), 'cache_dir', None)
-        allowed_roots = [Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve()]
+        allowed_roots = [Path(tempfile.gettempdir()).resolve(), Path('/tmp').resolve(), Path('/data/tmp').resolve()]
         if cache_attr:
             allowed_roots.append(Path(cache_attr).resolve())
         if not any(src_path == root or root in src_path.parents for root in allowed_roots) or not src_path.is_file():

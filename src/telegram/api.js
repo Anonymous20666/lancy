@@ -74,6 +74,22 @@ function sanitizeInlineResults(results) {
   });
 }
 
+function stripCustomEmojisFromRichPayload(node) {
+  if (node == null || typeof node !== 'object') return node;
+  if (Array.isArray(node)) {
+    return node.map(stripCustomEmojisFromRichPayload);
+  }
+  if (node.type === 'custom_emoji' && typeof node.alternative_text === 'string') {
+    return node.alternative_text;
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(node)) {
+    if (k === 'icon_custom_emoji_id') continue;
+    out[k] = stripCustomEmojisFromRichPayload(v);
+  }
+  return out;
+}
+
 export class TelegramAPI {
   /**
    * baseUrl defaults to TELEGRAM_API_BASE_URL so a self-hosted Bot API server
@@ -256,14 +272,22 @@ export class TelegramAPI {
   }
 
   /** Bot API 10.1+: send a Rich Message. rich_message = InputRichMessage or { html: '...' } */
-  sendRichMessage(chatId, richMessage, extra = {}, files = null) {
+  async sendRichMessage(chatId, richMessage, extra = {}, files = null) {
     let payload = richMessage;
     if (typeof richMessage === 'string') {
       payload = RichMessageBuilder.fromHtml(richMessage).toJSON();
     } else if (richMessage && typeof richMessage.html === 'string') {
       payload = RichMessageBuilder.fromHtml(richMessage.html).toJSON();
     }
-    return this.call('sendRichMessage', { chat_id: chatId, rich_message: payload, ...extra }, { files });
+    try {
+      return await this.call('sendRichMessage', { chat_id: chatId, rich_message: payload, ...extra }, { files });
+    } catch (err) {
+      if (/RICH_MESSAGE_EMOJI_INVALID|CUSTOM_EMOJI|EMOJI_INVALID|BUTTON_ICON_INVALID|DOCUMENT_INVALID/i.test(String(err?.description || err?.message || ''))) {
+        const cleanPayload = stripCustomEmojisFromRichPayload(payload);
+        return await this.call('sendRichMessage', { chat_id: chatId, rich_message: cleanPayload, ...extra }, { files });
+      }
+      throw err;
+    }
   }
 
   /** Bot API 10.3+: send an ephemeral rich notice/card to a single user inside a group/chat. */
@@ -320,7 +344,7 @@ export class TelegramAPI {
   }
 
   /** Edit a message's rich content (Bot API 10.1+ rich_message param). */
-  editMessageRich(chatId, messageId, richMessage, extra = {}, files = null) {
+  async editMessageRich(chatId, messageId, richMessage, extra = {}, files = null) {
     let payload = richMessage;
     if (typeof richMessage === 'string') {
       payload = RichMessageBuilder.fromHtml(richMessage).toJSON();
@@ -329,12 +353,25 @@ export class TelegramAPI {
     }
     const { dropOnFloodWait: rawDrop, ...restExtra } = (extra && typeof extra === 'object') ? extra : {};
     const dropOnFloodWait = Boolean(rawDrop);
-    return this.call('editMessageText', {
-      chat_id: chatId,
-      message_id: messageId,
-      rich_message: payload,
-      ...restExtra
-    }, { files, dropOnFloodWait });
+    try {
+      return await this.call('editMessageText', {
+        chat_id: chatId,
+        message_id: messageId,
+        rich_message: payload,
+        ...restExtra
+      }, { files, dropOnFloodWait });
+    } catch (err) {
+      if (/RICH_MESSAGE_EMOJI_INVALID|CUSTOM_EMOJI|EMOJI_INVALID|BUTTON_ICON_INVALID|DOCUMENT_INVALID/i.test(String(err?.description || err?.message || ''))) {
+        const cleanPayload = stripCustomEmojisFromRichPayload(payload);
+        return await this.call('editMessageText', {
+          chat_id: chatId,
+          message_id: messageId,
+          rich_message: cleanPayload,
+          ...restExtra
+        }, { files, dropOnFloodWait });
+      }
+      throw err;
+    }
   }
 
   editMessageText(chatId, messageId, text, extra = {}) {

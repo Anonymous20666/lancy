@@ -1,4 +1,11 @@
 #!/usr/bin/env node
+import { existsSync, mkdirSync } from 'node:fs';
+if (!process.env.TMPDIR && existsSync('/data')) {
+  try {
+    mkdirSync('/data/tmp', { recursive: true });
+    process.env.TMPDIR = '/data/tmp';
+  } catch {}
+}
 import { loadEnvFile, getEnv } from './config/env.js';
 import { LancyApp } from './app.js';
 
