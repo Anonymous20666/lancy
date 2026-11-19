@@ -615,7 +615,7 @@ export class TelegramController extends EventEmitter {
         const updates = await this.api.poll({ offset: this.offset, timeout: 30, signal: this.abort.signal });
         for (const update of updates) {
           if (Number.isFinite(update?.update_id)) {
-            this.offset = Math.max(this.offset, update.update_id + 1);
+            this.offset = update.update_id + 1;
             if (this.seenUpdateIds.has(update.update_id)) continue;
             this.seenUpdateIds.add(update.update_id);
             if (this.seenUpdateIds.size > 4096) {

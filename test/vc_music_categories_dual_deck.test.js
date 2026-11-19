@@ -523,4 +523,28 @@ test('TelegramController skips stale replayed messages while accepting fresh/dat
   assert.equal(aiTurnCalls.length, 0);
 });
 
+test('TelegramAPI never falls back local Bot API getUpdates to api.telegram.org', async () => {
+  const api = new TelegramAPI('123456:TESTTOKEN', {
+    baseUrl: 'http://127.0.0.1:8081',
+    log: { warn: () => {}, error: () => {}, info: () => {}, debug: () => {} }
+  });
+  const requestedUrls = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    requestedUrls.push(String(url));
+    throw new Error('local bot api temporarily busy');
+  };
+  try {
+    await assert.rejects(
+      () => api.call('getUpdates', { offset: 659026439, timeout: 1 }, { timeoutMs: 500 }),
+      /Telegram request failed \(getUpdates\)/
+    );
+    assert.equal(requestedUrls.length, 1, 'getUpdates must NOT fall back to api.telegram.org');
+    assert.ok(requestedUrls[0].startsWith('http://127.0.0.1:8081/'));
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+
 

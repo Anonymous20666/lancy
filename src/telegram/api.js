@@ -200,7 +200,16 @@ export class TelegramAPI {
       response = await fetch(url, { method: 'POST', body, headers, signal: controller.signal });
     } catch (error) {
       clearTimeout(timer);
-      if (this.isLocalServer && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(this.apiRoot) && totalUploadBytes <= 48 * 1024 * 1024) {
+      // Never fall back polling/webhook/session lifecycle RPCs from a local Bot API server to
+      // api.telegram.org: cloud and local Bot API servers have incompatible update_id sequences
+      // and calling cloud getUpdates poisons polling offsets and replays stale cloud backlogs.
+      const disallowCloudFallback = method === 'getUpdates'
+        || method === 'setWebhook'
+        || method === 'deleteWebhook'
+        || method === 'getWebhookInfo'
+        || method === 'logOut'
+        || method === 'close';
+      if (!disallowCloudFallback && this.isLocalServer && /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(this.apiRoot) && totalUploadBytes <= 48 * 1024 * 1024) {
         try {
           const fallbackUrl = `https://api.telegram.org/bot${this.token}/${method}`;
           const fbCtrl = new AbortController();
