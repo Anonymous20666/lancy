@@ -320,6 +320,136 @@ class VoiceAiListenerAndTtsTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_ambient_filler_persona_switch_cooldown_and_native_call_cache(self):
+        import gemini_live
+        import voice_listener
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, patch
+        from pyrogram import raw
+        from pyrogram.errors import FloodWait
+
+        self.assertTrue(gemini_live.is_ambient_filler_utterance('Omo.'))
+        self.assertTrue(gemini_live.is_ambient_filler_utterance('Oh.'))
+        self.assertTrue(gemini_live.is_ambient_filler_utterance('Hmm...'))
+        self.assertFalse(gemini_live.is_ambient_filler_utterance('Hey Pappy'))
+        self.assertFalse(gemini_live.is_ambient_filler_utterance('Yes'))
+        self.assertFalse(gemini_live.is_ambient_filler_utterance('Play Burna Boy'))
+        self.assertFalse(gemini_live.is_ambient_filler_utterance('What song is this?'))
+
+        async def run():
+            with tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                engine = SimpleNamespace(
+                    play=AsyncMock(),
+                    leave_call=AsyncMock(),
+                    record=AsyncMock(),
+                    resume=AsyncMock(),
+                    get_participants=AsyncMock(return_value=[]),
+                    _binding=SimpleNamespace(get_state=AsyncMock(return_value=None)),
+                )
+                bridge = bridge_main.Bridge(root, factory=None)
+                bridge.calls[-100777] = {'alias': 'a1', 'status': 'playing', 'av_sync_id': 'sync-x'}
+                bridge.accounts['a1'] = {'alias': 'a1', 'engine': engine, 'client': None}
+                mgr = bridge.voice_listener
+                st = voice_listener.ChatListenState(chat_id=-100777, alias='a1', use_live_mode=True)
+                mgr.states[-100777] = st
+
+                captured = {}
+
+                class FakePersonaSess:
+                    def __init__(self, **kwargs):
+                        self.persona_id = kwargs['persona_id']
+                        self.connected = True
+                        self.closed = False
+                        self.active_speaker_id = 11
+                        self.active_speaker_name = 'Yuki'
+                        self.send_tool_response = AsyncMock()
+                        self.send_text_turn = AsyncMock()
+                        self.send_context_update = AsyncMock()
+                        self.close = AsyncMock()
+                        captured[self.persona_id] = kwargs
+
+                    async def connect(self, **_kwargs):
+                        self.connected = True
+                        return True
+
+                with patch('gemini_live.GeminiLiveSession', FakePersonaSess), patch('av_sync.tts_queue_dir_for', return_value=root):
+                    await mgr._start_live_session(-100777, st)
+                    # Simulate Pappy invoking switch_persona -> Nana, then Nana trying to bounce back within cooldown
+                    pappy_sess = st.persona_sessions['pappy']
+                    await captured['pappy']['on_tool_call']([{
+                        'id': 'tc-1',
+                        'name': 'switch_persona',
+                        'args': {'name': 'Nana', 'handoff_text': 'Hey Nana'},
+                    }], pappy_sess)
+                    self.assertEqual(st.active_persona, 'nana')
+                    nana_sess = st.persona_sessions['nana']
+                    # Inactive persona (pappy) PCM chunks must be dropped immediately
+                    await captured['pappy']['on_pcm_48k_stereo'](b'\x01\x00' * 4000)
+                    self.assertEqual(list(root.glob('*.pcm')), [])
+
+                    # Immediate bounce back by Nana within 4s cooldown must be ignored
+                    await captured['nana']['on_tool_call']([{
+                        'id': 'tc-2',
+                        'name': 'switch_persona',
+                        'args': {'name': 'Pappy', 'handoff_text': 'back'},
+                    }], nana_sess)
+                    self.assertEqual(st.active_persona, 'nana')
+                    nana_sess.send_tool_response.assert_awaited()
+                    self.assertEqual(nana_sess.send_tool_response.await_args.args[2]['status'], 'ignored')
+
+                    # finish_conversation clears live_engaged_until_mono to 0.0
+                    await captured['nana']['on_tool_call']([{
+                        'id': 'tc-3',
+                        'name': 'finish_conversation',
+                        'args': {'resumePlayback': True},
+                    }], nana_sess)
+                    self.assertEqual(st.live_engaged_until_mono, 0.0)
+
+                # native_call 3s cache + FloodWait fallback prevents GetFullChannel storms
+                invocations = []
+
+                class FakeClient:
+                    async def resolve_peer(self, _chat):
+                        return raw.types.InputPeerChannel(channel_id=12345, access_hash=67890)
+
+                    async def invoke(self, req, sleep_threshold=0):
+                        invocations.append((type(req).__name__, sleep_threshold))
+                        return SimpleNamespace(full_chat=SimpleNamespace(call=SimpleNamespace(id=555, access_hash=777)))
+
+                cli = FakeClient()
+                p1, c1 = await bridge.native_call(cli, -100777)
+                p2, c2 = await bridge.native_call(cli, -100777)
+                self.assertEqual(c1.id, 555)
+                self.assertEqual(c2.id, 555)
+                self.assertEqual(len(invocations), 1, 'Second native_call within 3s must hit cache')
+
+                # After invalidation, FloodWait returns stale cached result and sets backoff without hammering
+                bridge._invalidate_native_call_cache(cli, -100777)
+                # Seed stale entry cleanly then fail with FloodWait
+                _, _ = await bridge.native_call(cli, -100777)
+                bridge._native_call_cache[bridge._native_call_cache_key(cli, -100777)] = (
+                    bridge_main.time.monotonic() - 5.0,
+                    p1,
+                    SimpleNamespace(id=555, access_hash=777),
+                )
+
+                async def raise_flood(_req, sleep_threshold=0):
+                    invocations.append(('FloodWait', sleep_threshold))
+                    raise FloodWait(10)
+
+                cli.invoke = raise_flood
+                _, c_stale = await bridge.native_call(cli, -100777)
+                self.assertEqual(c_stale.id, 555)
+                count_after_flood = len(invocations)
+                _, c_backoff = await bridge.native_call(cli, -100777)
+                self.assertEqual(c_backoff.id, 555)
+                self.assertEqual(len(invocations), count_after_flood, 'Active FloodWait backoff must not hit invoke again')
+
+                await mgr.stop_all()
+
+        asyncio.run(run())
+
 
 if __name__ == '__main__':
     unittest.main()

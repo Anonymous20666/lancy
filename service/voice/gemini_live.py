@@ -214,6 +214,28 @@ def detect_addressed_persona(text: str) -> dict | None:
     return None
 
 
+AMBIENT_FILLER_RE = re.compile(
+    r'^(?:'
+    r'o+h+|o+mo+|h+m+|m+h+m+|u+h+(?:-?h+u+h+)?|a+h+|e+h+|c+h+a+i+|'
+    r'a+b+e+g+|b+r+u+h+|b+r+o+|w+o+w+|d+a+m+n+|s+h+i+t+|f+u+c+k+|'
+    r'n+a+\s*w+a+|e+h+y+a+|m+a+d+\s*o+|j+e+s+u+s+|g+o+d+'
+    r')(?:[\s.!?,…]+(?:'
+    r'o+h+|o+mo+|h+m+|m+h+m+|u+h+|a+h+|e+h+|c+h+a+i+|b+r+u+h+|b+r+o+|w+o+w+|o+'
+    r'))?[\s.!?,…]*$',
+    re.IGNORECASE,
+)
+
+
+def is_ambient_filler_utterance(text: str) -> bool:
+    """True when an utterance is just passive room noise/exclamation with no wake word or request."""
+    clean = str(text or '').strip()
+    if not clean:
+        return False
+    if '?' in clean or WAKE_CALL_RE.search(clean) or detect_addressed_persona(clean) is not None:
+        return False
+    return bool(AMBIENT_FILLER_RE.match(clean))
+
+
 LANCY_CUSTOM_VOCABULARY = [
     'Pappy', 'Ava', 'Maya', 'Leo', 'Nana', 'Elder', 'Zara', 'Marcus', 'Chloe', 'Lancy',
     'abeg', 'no wahala', 'omo', 'wetin dey happen', 'next queue', 'pause am',
@@ -630,6 +652,7 @@ class GeminiLiveSession:
         self._awaiting_blocking_tools: set[str] = set()
         self._turn_wake_authorized = False
         self._turn_redirected_to: dict | None = None
+        self._switched_via_tool = False
         self._out_prev_sample: float | None = None
         self._pending_in_trans: list[str] = []
         self._pending_out_trans: list[str] = []
@@ -738,6 +761,7 @@ class GeminiLiveSession:
                     self._gate_buf.clear()
                     self._pending_tool_calls.clear()
                     self._turn_redirected_to = None
+                    self._switched_via_tool = False
                     log.info('GeminiLive interrupted by speaker')
                     if self.on_interrupted:
                         await self.on_interrupted()
@@ -784,7 +808,9 @@ class GeminiLiveSession:
                             self._awaiting_blocking_tools.add(cid_fc)
                     has_switch = any(f.get('name') == 'switch_persona' for f in fcalls)
                     if has_switch:
+                        self._switched_via_tool = True
                         self._turn_wake_authorized = True
+                        self._gate_buf.clear()
                         is_engaged = True
                         if self.on_wake_engaged:
                             try:
@@ -809,7 +835,7 @@ class GeminiLiveSession:
                     inl = p.get('inlineData') or {}
                     if 'audio/pcm' in str(inl.get('mimeType') or ''):
                         b64_raw = inl.get('data') or ''
-                        if b64_raw and self.on_pcm_48k_stereo and self._turn_redirected_to is None:
+                        if b64_raw and self.on_pcm_48k_stereo and self._turn_redirected_to is None and not self._switched_via_tool:
                             stereo_48k, self._out_prev_sample = await asyncio.get_running_loop().run_in_executor(
                                 _AUDIO_DSP_POOL,
                                 _decode_and_upsample_24k_to_48k,
@@ -828,6 +854,23 @@ class GeminiLiveSession:
                     out_txt = ''.join(self._pending_out_trans).strip()
                     self._pending_in_trans.clear()
                     self._pending_out_trans.clear()
+                    switched_via_tool = self._switched_via_tool
+                    self._switched_via_tool = False
+
+                    if switched_via_tool:
+                        self._gate_buf.clear()
+                        self._pending_tool_calls.clear()
+                        self._turn_redirected_to = None
+                        self._turn_wake_authorized = False
+                        continue
+
+                    if is_ambient_filler_utterance(in_txt):
+                        self._gate_buf.clear()
+                        self._pending_tool_calls.clear()
+                        self._turn_redirected_to = None
+                        self._turn_wake_authorized = False
+                        log.info('GeminiLive ignored ambient filler chat=%s in="%s"', self.chat_id, in_txt[:120])
+                        continue
 
                     redirect_spec = self._turn_redirected_to or (detect_addressed_persona(in_txt) if in_txt else None)
                     if redirect_spec and redirect_spec.get('id') != self.persona_id and self.on_persona_redirect:
@@ -868,7 +911,7 @@ class GeminiLiveSession:
 
                     self._turn_redirected_to = None
                     self._turn_wake_authorized = False
-                    if self.on_wake_engaged and (in_txt or out_txt):
+                    if self.on_wake_engaged and in_txt:
                         try:
                             self.on_wake_engaged()
                         except Exception:

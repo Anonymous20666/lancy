@@ -112,6 +112,8 @@ export class TelegramController extends EventEmitter {
     this.mainApi = this.botContext?.mainApi || this.app?.telegram?.api || this.api;
     this.log = log ?? logger().child({ module: 'telegram' });
     this.offset = 0;
+    this.seenUpdateIds = new Set();
+    this.maxUpdateAgeSec = Number(process.env.TELEGRAM_MAX_UPDATE_AGE_SEC || 90);
     this.running = false;
     this.abort = null;
     this.globalCallbacks = new Map(); // action -> handler (state-agnostic)
@@ -612,7 +614,15 @@ export class TelegramController extends EventEmitter {
       try {
         const updates = await this.api.poll({ offset: this.offset, timeout: 30, signal: this.abort.signal });
         for (const update of updates) {
-          this.offset = update.update_id + 1;
+          if (Number.isFinite(update?.update_id)) {
+            this.offset = Math.max(this.offset, update.update_id + 1);
+            if (this.seenUpdateIds.has(update.update_id)) continue;
+            this.seenUpdateIds.add(update.update_id);
+            if (this.seenUpdateIds.size > 4096) {
+              const oldest = this.seenUpdateIds.values().next().value;
+              if (oldest !== undefined) this.seenUpdateIds.delete(oldest);
+            }
+          }
           void this.#handleUpdate(update).catch((error) => {
             this.log.error({ err: error, updateId: update.update_id }, 'update handling failed');
           });
@@ -4034,6 +4044,14 @@ export class TelegramController extends EventEmitter {
   async #handleMessage(message, { edited = false, isChannelPost = false } = {}) {
     if (!message) return;
     if (message.is_automatic_forward || message.from?.id === 777000) return;
+    if (!isChannelPost && typeof message.date === 'number' && message.date > 0) {
+      const msgTs = edited ? (Number(message.edit_date) || message.date) : message.date;
+      const ageSec = (Date.now() / 1000) - msgTs;
+      if (ageSec > (this.maxUpdateAgeSec || 90)) {
+        this.log?.debug?.({ chatId: message.chat?.id, messageId: message.message_id, ageSec: Math.round(ageSec) }, 'skipped stale telegram message update');
+        return;
+      }
+    }
     if (message.successful_payment) {
       if (message.from) this.#upsertUser(message.from);
       await this.app?.starsBilling?.handleSuccessfulPayment?.(message, this.api);

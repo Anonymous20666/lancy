@@ -2093,6 +2093,8 @@ export function createMovieUi({
       context: {
         stateKey,
         botKey: app.music.botKey(ctx),
+        createdAt: Date.now(),
+        lastTurnAt: Date.now(),
         promptMessageId: sent?.message_id || null,
         replyableMessageIds: sent?.message_id ? [sent.message_id] : [],
         temporaryToken,

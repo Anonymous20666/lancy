@@ -152,6 +152,7 @@ class ChatListenState:
     last_live_turn_mono: float = 0.0
     last_user_speech_mono: float = 0.0
     live_engaged_until_mono: float = 0.0
+    last_persona_switch_mono: float = 0.0
     voice_name: str = ''
     buffers: dict[int, SpeakerBuffer] = field(default_factory=dict)
     pending_turns: dict[int, PendingTurnBuffer] = field(default_factory=dict)
@@ -281,7 +282,9 @@ class VoiceListenerManager:
             except Exception:
                 pass
 
-        async def _on_pcm_48k(stereo_48k: bytes):
+        async def _on_pcm_48k(stereo_48k: bytes, persona_id: str | None = None):
+            if persona_id and st.active_persona and persona_id != st.active_persona:
+                return
             cur_call = self.bridge.calls.get(cid) or {}
             sync_id = cur_call.get('av_sync_id')
             if not sync_id or not stereo_48k:
@@ -305,7 +308,9 @@ class VoiceListenerManager:
             chunk_dur = len(emit_pcm) / float(av_sync.PCM_BYTES_PER_SEC)
             self.set_echo_guard(cid, chunk_dur, extend=True)
 
-        async def _flush_out_tail():
+        async def _flush_out_tail(persona_id: str | None = None):
+            if persona_id and st.active_persona and persona_id != st.active_persona:
+                return
             if not st.live_out_buf:
                 return
             cur_call = self.bridge.calls.get(cid) or {}
@@ -332,11 +337,12 @@ class VoiceListenerManager:
         def _mark_live_engaged():
             now_m = time.monotonic()
             st.last_live_turn_mono = now_m
-            st.live_engaged_until_mono = max(st.live_engaged_until_mono, now_m + 45.0, st.echo_guard_until_mono + 35.0)
+            st.live_engaged_until_mono = max(st.live_engaged_until_mono, now_m + 14.0, st.echo_guard_until_mono + 8.0)
             _engage_live_pause()
 
         async def _on_persona_redirect(spec: dict, in_txt: str, from_sess):
             st.live_out_buf.clear()
+            st.last_persona_switch_mono = time.monotonic()
             _mark_live_engaged()
             await _activate_persona(
                 spec,
@@ -379,16 +385,22 @@ class VoiceListenerManager:
                     if st.enabled and st.persona_sessions.get(p_key) is cur_s and not cur_s.closed:
                         await cur_s.connect(timeout_sec=6.0, start_reader=True)
 
+                async def _persona_pcm(stereo_48k: bytes, p_key=pid):
+                    await _on_pcm_48k(stereo_48k, persona_id=p_key)
+
+                async def _persona_turn_complete(p_key=pid):
+                    await _flush_out_tail(persona_id=p_key)
+
                 target_sess = gemini_live.GeminiLiveSession(
                     chat_id=cid,
                     persona_id=pid,
                     system_instruction=p_inst,
                     voice_name=spec['voice'],
-                    on_pcm_48k_stereo=_on_pcm_48k,
+                    on_pcm_48k_stereo=_persona_pcm,
                     on_tool_call=_on_tool_call,
                     on_interrupted=_on_interrupted,
                     on_transcription=_on_transcription,
-                    on_turn_complete=_flush_out_tail,
+                    on_turn_complete=_persona_turn_complete,
                     on_close=_on_persona_close,
                     on_go_away=_on_persona_go_away,
                     is_conversation_engaged=lambda: (time.monotonic() <= max(st.live_engaged_until_mono, st.active_until_mono)),
@@ -406,6 +418,8 @@ class VoiceListenerManager:
             elif not target_sess.connected and not target_sess.closed:
                 await target_sess.connect(timeout_sec=6.0, start_reader=True)
 
+            if st.active_persona != pid:
+                st.live_out_buf.clear()
             st.active_persona = pid
             st.live_session = target_sess
             # Keep all speakers in the room aligned with the active persona so frames are never split
@@ -436,7 +450,9 @@ class VoiceListenerManager:
             if has_resume_intent:
                 await self.release_live_pause(cid, resume=True, clear_engaged=False)
                 self.note_user_resume(cid)
-            _mark_live_engaged()
+            fn_names = [str(fc.get('name') or '') for fc in (function_calls or []) if fc.get('name')]
+            if any(n not in {'get_call_state', 'finish_conversation'} for n in fn_names):
+                _mark_live_engaged()
             for fc in (function_calls or []):
                 call_id = str(fc.get('id') or '')
                 fn_name = str(fc.get('name') or '')
@@ -449,6 +465,22 @@ class VoiceListenerManager:
                         st.pending_tool_sessions.pop(next(iter(st.pending_tool_sessions)), None)
                 if fn_name == 'switch_persona':
                     spec = gemini_live.resolve_persona_spec(args.get('name'), voice_type=args.get('voice_type'))
+                    if spec['id'] == st.active_persona:
+                        await sess_obj.send_tool_response(call_id, fn_name, {
+                            'status': 'ok',
+                            'retryable': False,
+                            'message': f"{spec['name']} is already active.",
+                        })
+                        continue
+                    now_sw = time.monotonic()
+                    if st.last_persona_switch_mono > 0 and (now_sw - st.last_persona_switch_mono) < 4.0:
+                        await sess_obj.send_tool_response(call_id, fn_name, {
+                            'status': 'ignored',
+                            'retryable': False,
+                            'message': f"Persona switch cooldown active; let {st.active_persona.title()} finish.",
+                        })
+                        continue
+                    st.last_persona_switch_mono = now_sw
                     handoff = str(args.get('handoff_text') or '').strip()
                     await sess_obj.send_tool_response(call_id, fn_name, {
                         'status': 'ok',
@@ -473,13 +505,8 @@ class VoiceListenerManager:
                         self.note_user_resume(cid)
                 elif fn_name == 'finish_conversation':
                     resume = bool(args.get('resumePlayback', True))
-                    await self.release_live_pause(cid, resume=resume, clear_engaged=False)
-                    # Keep a short follow-up window so a misfired "finish" (or a quick "Pappy, you dey?")
-                    # doesn't make Pappy go deaf until the wake word is perfectly recognised again.
-                    st.live_engaged_until_mono = min(
-                        max(st.live_engaged_until_mono, time.monotonic()),
-                        time.monotonic() + 15.0,
-                    )
+                    await self.release_live_pause(cid, resume=resume, clear_engaged=True)
+                    st.live_engaged_until_mono = 0.0
                     await sess_obj.send_tool_response(call_id, fn_name, {
                         'status': 'ok',
                         'retryable': False,

@@ -1150,6 +1150,9 @@ class Bridge:
         self.enable_gemini_live = (factory is None) and bool(os.environ.get('GEMINI_API_KEY'))
         self.voice_listener = voice_listener.VoiceListenerManager(bridge=self, stt_engine=self.stt)
         self._audio_lang_cache = {}
+        self._native_call_cache = {}
+        self._native_call_inflight = {}
+        self._full_channel_flood_until = {}
 
     def chat_lock(self, chat): return self.chat_locks.setdefault(chat, asyncio.Lock())
 
@@ -1373,17 +1376,89 @@ class Bridge:
         if chat not in self.calls:
             a['leases'].discard(chat)
 
+    def _native_call_cache_key(self, client, chat):
+        try:
+            cid = int(chat)
+        except Exception:
+            cid = str(chat)
+        return (id(client), cid)
+
+    def _invalidate_native_call_cache(self, client=None, chat=None):
+        cache = getattr(self, '_native_call_cache', None)
+        if not cache:
+            return
+        if client is None and chat is None:
+            cache.clear()
+            return
+        if chat is not None and client is not None:
+            cache.pop(self._native_call_cache_key(client, chat), None)
+            return
+        try:
+            target_cid = int(chat) if chat is not None else None
+        except Exception:
+            target_cid = str(chat) if chat is not None else None
+        for k in list(cache.keys()):
+            if (client is None or k[0] == id(client)) and (target_cid is None or k[1] == target_cid):
+                cache.pop(k, None)
+
     async def native_call(self, client, chat):
         from pyrogram import raw
-        peer = await asyncio.wait_for(client.resolve_peer(chat), 15)
-        if isinstance(peer, raw.types.InputPeerChannel):
-            request = raw.functions.channels.GetFullChannel(channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash))
-        elif isinstance(peer, raw.types.InputPeerChat):
-            request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
-        else: raise VoiceFailure('PERMISSION_DENIED')
-        threshold = 0 if self.factory else 10
-        full = await asyncio.wait_for(client.invoke(request, sleep_threshold=threshold), 15)
-        return peer, getattr(full.full_chat, 'call', None)
+        now_m = time.monotonic()
+        if not hasattr(self, '_native_call_cache'):
+            self._native_call_cache = {}
+        if not hasattr(self, '_native_call_inflight'):
+            self._native_call_inflight = {}
+        if not hasattr(self, '_full_channel_flood_until'):
+            self._full_channel_flood_until = {}
+
+        ckey = self._native_call_cache_key(client, chat)
+        ttl_sec = 0.0 if self.factory else 3.0
+        cached = self._native_call_cache.get(ckey)
+        if cached and ttl_sec > 0.0 and (now_m - cached[0]) < ttl_sec:
+            return cached[1], cached[2]
+
+        client_flood_until = float(self._full_channel_flood_until.get(id(client)) or 0.0)
+        if not self.factory and now_m < client_flood_until:
+            if cached and (now_m - cached[0]) < 60.0:
+                return cached[1], cached[2]
+            raise VoiceFailure('RATE_LIMITED', {'retry_after': max(1, int(round(client_flood_until - now_m)))})
+
+        inflight = self._native_call_inflight.get(ckey)
+        if inflight is not None and not inflight.done():
+            return await inflight
+
+        async def _fetch():
+            peer = await asyncio.wait_for(client.resolve_peer(chat), 15)
+            if isinstance(peer, raw.types.InputPeerChannel):
+                request = raw.functions.channels.GetFullChannel(channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash))
+            elif isinstance(peer, raw.types.InputPeerChat):
+                request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
+            else:
+                raise VoiceFailure('PERMISSION_DENIED')
+            threshold = 0 if self.factory else 2
+            try:
+                full = await asyncio.wait_for(client.invoke(request, sleep_threshold=threshold), 15)
+            except Exception as err:
+                if type(err).__name__ == 'FloodWait':
+                    wait_sec = max(1, int(getattr(err, 'value', 10) or 10))
+                    self._full_channel_flood_until[id(client)] = time.monotonic() + min(wait_sec, 30)
+                    stale = self._native_call_cache.get(ckey)
+                    if stale and (time.monotonic() - stale[0]) < 60.0:
+                        return stale[1], stale[2]
+                raise
+            call_obj = getattr(full.full_chat, 'call', None)
+            self._native_call_cache[ckey] = (time.monotonic(), peer, call_obj)
+            if len(self._native_call_cache) > 256:
+                self._native_call_cache.pop(next(iter(self._native_call_cache)), None)
+            return peer, call_obj
+
+        task = asyncio.create_task(_fetch())
+        self._native_call_inflight[ckey] = task
+        try:
+            return await task
+        finally:
+            if self._native_call_inflight.get(ckey) is task:
+                self._native_call_inflight.pop(ckey, None)
 
     async def resolve_call_invite_link(self, a, native_call):
         """Fetch or export the real Telegram GroupCall/Livestream invite link via MTProto."""
@@ -1734,10 +1809,13 @@ class Bridge:
                 await asyncio.sleep(getattr(create_err, 'value', 1))
             else:
                 raise
+        self._invalidate_native_call_cache(a['client'], chat)
         _, call = await self.native_call(a['client'], chat)
         if call is None and (not self.factory or getattr(self, 'auto_create_call_in_tests', False)):
-            for _ in range(6):
-                await asyncio.sleep(0.3)
+            poll_wait = 0.05 if self.factory else 0.8
+            for _ in range(3):
+                await asyncio.sleep(poll_wait)
+                self._invalidate_native_call_cache(a['client'], chat)
                 _, call = await self.native_call(a['client'], chat)
                 if call is not None:
                     break
@@ -1746,6 +1824,7 @@ class Bridge:
     async def _discard_group_call(self, a, native_call):
         if native_call is None or a is None or a.get('client') is None:
             return
+        self._invalidate_native_call_cache(a['client'])
         try:
             from pyrogram import raw
             call_id = getattr(native_call, 'id', None)
@@ -2516,16 +2595,19 @@ class Bridge:
         client = a['client']
         threshold = 0 if self.factory else 10
         if input_call is None:
-            peer = await self.publisher_step(client.resolve_peer(chat), 'resolve_peer')
-            if isinstance(peer, raw.types.InputPeerChannel):
-                request = raw.functions.channels.GetFullChannel(channel=raw.types.InputChannel(channel_id=peer.channel_id, access_hash=peer.access_hash))
-            elif isinstance(peer, raw.types.InputPeerChat):
-                request = raw.functions.messages.GetFullChat(chat_id=peer.chat_id)
-            else:
-                raise VoiceFailure('PERMISSION_DENIED')
-            full = await self.publisher_step(client.invoke(request, sleep_threshold=threshold), 'call_state')
-            input_call = getattr(full.full_chat, 'call', None)
-            if input_call is None: raise VoiceFailure('NO_ACTIVE_CALL')
+            try:
+                _, input_call = await self.native_call(client, chat)
+            except VoiceFailure as vf:
+                if vf.code == 'PERMISSION_DENIED':
+                    raise
+                raise VoiceFailure('PUBLISHER_UNVERIFIED', {'stage': 'call_state', 'detail': vf.detail or vf.code}) from None
+            except Exception as err:
+                detail = {'stage': 'call_state', 'kind': type(err).__name__}
+                if type(err).__name__ == 'FloodWait':
+                    detail['retry_after'] = int(getattr(err, 'value', 0))
+                raise VoiceFailure('PUBLISHER_UNVERIFIED', detail) from None
+            if input_call is None:
+                raise VoiceFailure('NO_ACTIVE_CALL')
         result = await self.publisher_step(client.invoke(raw.functions.phone.GetGroupParticipants(call=input_call, ids=[raw.types.InputPeerSelf()], sources=[], offset='', limit=1), sleep_threshold=threshold), 'self_participant')
         participant = next((p for p in result.participants if getattr(p, 'is_self', False) or getattr(p.peer, 'user_id', None) == a['uid']), None)
         return input_call, participant
@@ -4341,6 +4423,7 @@ class Bridge:
                 call['retry_after'] = time.monotonic() + 5 * (2 ** call['retries'])
                 try:
                     clear_engine_cache(a['engine'], chat)
+                    self._invalidate_native_call_cache(a['client'], chat)
                     peer, native = await self.native_call(a['client'], chat)
                     if native is not None:
                         bind = getattr(getattr(a['engine'], '_app', None), '_bind_client', None)

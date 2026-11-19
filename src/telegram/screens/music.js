@@ -3719,7 +3719,7 @@ export function createMusicScreen({ app }) {
             !replyToId
             && !message.text.startsWith('/')
             && String(record.tgId) === String(ctx.tgId)
-            && (!record.context.createdAt || (Date.now() - record.context.createdAt) < 180000)
+            && (!record.context.createdAt || (Date.now() - record.context.createdAt) < 120000)
           );
           if (!matchesPrompt && !matchesBot && !isDirectPromptFollowup) return false;
         }
@@ -3889,10 +3889,12 @@ export function createMusicScreen({ app }) {
           const trackedIds = Array.isArray(record.context.replyableMessageIds) ? record.context.replyableMessageIds : [];
           const matchesPrompt = Boolean(replyToId && (replyToId === record.context.promptMessageId || trackedIds.includes(replyToId)));
           const matchesBot = Boolean(ctx.isReplyToBot || ctx.isTag || /\blancy\b/i.test(message.text) || message.reply_to_message?.from?.id === ctx.api?.me?.id);
+          const promptTs = Number(record.context.lastTurnAt || record.context.createdAt || 0);
           const isDirectPromptFollowup = Boolean(
             !replyToId
             && !message.text.startsWith('/')
             && String(record.tgId) === String(ctx.tgId)
+            && (!promptTs || (Date.now() - promptTs) < 120000)
           );
           if (!matchesPrompt && !matchesBot && !isDirectPromptFollowup) return false;
         }
@@ -3914,6 +3916,7 @@ export function createMusicScreen({ app }) {
             await sm.reset(stateKey);
           } else {
             record.expiresAt = Date.now() + 300000;
+            record.context.lastTurnAt = Date.now();
             if (res?.sentMessageId) {
               const prevIds = Array.isArray(record.context.replyableMessageIds) ? record.context.replyableMessageIds : [];
               record.context.replyableMessageIds = [...prevIds, res.sentMessageId].slice(-12);

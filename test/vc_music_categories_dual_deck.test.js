@@ -7,6 +7,8 @@ import { LancyAgent } from '../src/ai/lancyAgent.js';
 import { createMusicScreen } from '../src/telegram/screens/music.js';
 import { enhanceRichText } from '../src/telegram/customEmoji.js';
 import { TelegramAPI } from '../src/telegram/api.js';
+import { TelegramController } from '../src/telegram/bot.js';
+import { States } from '../src/core/stateMachine.js';
 
 test('2026 Music Categories Directory covers all 8 families and 95+ subgenres with smart search', () => {
   assert.equal(MUSIC_CATEGORIES_2026.length, 8);
@@ -422,4 +424,103 @@ test('enhanceRichText preserves combining grapheme clusters and TelegramAPI reco
   assert.equal(out.rich_message.blocks[0].text[0].type, 'custom_emoji', 'Heading custom_emoji must survive button fallback');
   assert.equal(out.rich_message.blocks[1].buttons[0].text, '⏮ Prev', 'Button custom_emoji cleanly downgraded to text');
 });
+
+test('TelegramController skips stale replayed messages while accepting fresh/dateless updates and expires un-replied AI_MEDIA_CHAT group follow-ups', async () => {
+  const handledTexts = [];
+  const fakeApi = {
+    me: { id: 999999, username: 'Lancy_easy_bot' },
+    sendMessage: async () => ({ message_id: 1 })
+  };
+  const fakeSm = {
+    get: () => null,
+    state: () => null,
+    states: new Map(),
+    set: () => {},
+    reset: async () => {}
+  };
+  let dbLookups = 0;
+  const ctrl = new TelegramController({
+    api: fakeApi,
+    db: {
+      get: () => { dbLookups += 1; return null; },
+      run: () => {},
+      all: () => []
+    },
+    settings: { get: (k) => (String(k).includes('public') || String(k).includes('enabled') ? false : []) },
+    stateMachine: fakeSm,
+    app: {
+      ai: {
+        chat: async (_ctx, text) => { handledTexts.push(text); }
+      }
+    }
+  });
+  const staleSec = Math.floor(Date.now() / 1000) - 600;
+  await ctrl.handleUpdate({
+    update_id: 1001,
+    message: {
+      message_id: 10,
+      date: staleSec,
+      chat: { id: 555, type: 'private' },
+      from: { id: 555, username: 'tester', first_name: 'Tester' },
+      text: '/help'
+    }
+  });
+  assert.equal(dbLookups, 0, 'Stale replayed message (>90s) must be dropped before running #upsertUser or commands');
+
+  const freshSec = Math.floor(Date.now() / 1000) - 5;
+  await ctrl.handleUpdate({
+    update_id: 1002,
+    message: {
+      message_id: 11,
+      date: freshSec,
+      chat: { id: 555, type: 'private' },
+      from: { id: 555, username: 'tester', first_name: 'Tester' },
+      text: '/help'
+    }
+  });
+  assert.ok(dbLookups >= 1, 'Fresh message must reach #upsertUser and run normally');
+
+  // Verify AI_MEDIA_CHAT group un-replied follow-up respects createdAt expiry (120s)
+  const aiTurnCalls = [];
+  const stateRecords = new Map([
+    ['42', {
+      state: States.AI_MEDIA_CHAT,
+      tgId: '42',
+      chatId: -100777,
+      expiresAt: Date.now() + 300000,
+      context: {
+        stateKey: '42',
+        botKey: 'main',
+        createdAt: Date.now() - 180000,
+        lastTurnAt: Date.now() - 180000,
+        promptMessageId: 77,
+        replyableMessageIds: [77]
+      }
+    }]
+  ]);
+  const testSm = {
+    handlers: new Map(),
+    register(st, def) { this.handlers.set(st, def); },
+    get(k) { return stateRecords.get(String(k)) || null; },
+    reset: async (k) => { stateRecords.delete(String(k)); }
+  };
+  const scr = createMusicScreen({
+    app: {
+      music: { botKey: () => 'main', destination: () => -100777, authorize: async () => -100777 },
+      musicQueueManager: { getSession: () => null },
+      movieUi: {
+        handleAiTurn: async (_ctx, text) => { aiTurnCalls.push(text); return {}; }
+      }
+    }
+  });
+  scr.registerStateHandlers(testSm);
+  const aiHandler = testSm.handlers.get(States.AI_MEDIA_CHAT);
+  const captured = await aiHandler.onMessage(
+    { tgId: '42', chatId: -100777, isChannel: false, api: { me: { id: 999 } } },
+    { message_id: 88, chat: { id: -100777, type: 'supergroup' }, text: 'random group banter' }
+  );
+  assert.equal(captured, false, 'Expired (>120s) AI_MEDIA_CHAT un-replied group message must not hijack random banter');
+  assert.equal(aiTurnCalls.length, 0);
+});
+
 
