@@ -471,9 +471,10 @@ class VoiceAiListenerAndTtsTests(unittest.TestCase):
                 await mgr.refresh_participants(-100777)
                 self.assertEqual(len(direct_calls), 1)
 
-                # _close_dropped_call must stop voice_listener so ended calls never leave zombie Gemini Live reconnect loops
-                bridge.calls[-100777] = {'alias': 'a1', 'status': 'playing', 'stream_mode': 'rtmp', 'playback_id': 'pb-z'}
-                await bridge._close_dropped_call(bridge.accounts['a1'], -100777, bridge.calls[-100777], reason='RTMP_CALL_ENDED')
+                # _close_dropped_call must still remove the dead call & stop voice_listener even if leave_call hits FloodWait
+                engine.leave_call = AsyncMock(side_effect=FloodWait(10))
+                bridge.calls[-100777] = {'alias': 'a1', 'status': 'playing', 'stream_mode': 'interactive', 'playback_id': 'pb-z'}
+                await bridge._close_dropped_call(bridge.accounts['a1'], -100777, bridge.calls[-100777], reason='NO_ACTIVE_CALL', ignore_leave_error=False)
                 self.assertNotIn(-100777, bridge.calls)
                 self.assertNotIn(-100777, mgr.states)
 

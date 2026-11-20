@@ -4292,7 +4292,8 @@ class Bridge:
             try:
                 await asyncio.wait_for(engine.leave_call(chat), 10)
             except Exception as leave_error:
-                if not ignore_leave_error and classify(leave_error) != 'NO_ACTIVE_CALL':
+                err_code = classify(leave_error)
+                if not ignore_leave_error and err_code not in {'NO_ACTIVE_CALL', 'RATE_LIMITED'} and not isinstance(leave_error, (TimeoutError, asyncio.TimeoutError)):
                     raise
         self._cleanup_sub_overlay(call)
         await self._stop_secondary_tile_unlocked(chat)
@@ -5467,7 +5468,7 @@ def make_app(bridge, token):
             payload = {'ok': False, 'error': code, 'message': MESSAGES.get(code, MESSAGES['CALL_FAILED']), 'error_kind': type(e).__name__}
             if type(e).__name__ == 'ShellError':
                 payload['error_detail'] = str(e)[:240]
-            log.warning('Voice operation failed kind=%s', type(e).__name__)
+            log.warning('Voice operation failed path=%s kind=%s', request.path, type(e).__name__)
             return web.json_response(payload, status=503)
     app = web.Application(middlewares=[authenticate], client_max_size=32768)
     async def health(request): return web.json_response({'ok': True, 'protocol': 2, 'ready': any(a['status'] == 'available' and a['enabled'] for a in bridge.accounts.values()), 'active_calls_count': len(bridge.calls), 'session_configured': bool(bridge.accounts), 'mode': 'account_pool'})

@@ -405,9 +405,6 @@ export async function editOrSendRichWithFallback(api, chatId, targetMsgId, rich,
       if (wantMedia && didEditStripMedia(rich, edited)) {
         throw Object.assign(new Error('Telegram editMessageText stripped media blocks from preview card'), { code: 'MEDIA_STRIPPED_ON_EDIT' });
       }
-      if (Number(chatId) < 0 && didEditStripCustomEmojis(rich, edited)) {
-        throw Object.assign(new Error('Telegram editMessageText stripped custom emojis from rich card'), { code: 'CUSTOM_EMOJI_STRIPPED_ON_EDIT' });
-      }
       return {
         sent: edited?.message_id ? edited : { message_id: targetMsgId, ...(edited || {}) },
         edited: true,

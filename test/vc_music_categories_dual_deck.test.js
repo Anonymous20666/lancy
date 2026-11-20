@@ -10,7 +10,7 @@ import { TelegramAPI } from '../src/telegram/api.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { States } from '../src/core/stateMachine.js';
 import { FullTrackPreviews } from '../src/music/preview.js';
-import { extractSentPhotoFileId } from '../src/music/model.js';
+import { extractSentPhotoFileId, editOrSendRichWithFallback } from '../src/music/model.js';
 import { OpenAICompatibleProvider } from '../src/ai/providers/openaiCompatible.js';
 
 test('2026 Music Categories Directory covers all 8 families and 95+ subgenres with smart search', () => {
@@ -629,6 +629,39 @@ test('OpenAICompatibleProvider expands reasoning-model max_tokens and retries on
     globalThis.fetch = origFetch;
   }
 });
+
+test('editOrSendRichWithFallback edits group episode/menu cards in place without delete/resend spam when Telegram strips custom emojis', async () => {
+  let editCalls = 0;
+  let sendCalls = 0;
+  let deleteCalls = 0;
+  const fakeApi = {
+    editMessageRich: async (_chatId, msgId) => {
+      editCalls += 1;
+      // Simulate Telegram Bot API 10.3 stripping custom_emoji on group editMessageText
+      return { message_id: msgId, rich_message: { blocks: [{ type: 'heading', text: 'Season 1', size: 2 }] } };
+    },
+    sendRichMessage: async () => {
+      sendCalls += 1;
+      return { message_id: 999 };
+    },
+    deleteMessage: async () => {
+      deleteCalls += 1;
+    }
+  };
+  const rich = {
+    blocks: [
+      { type: 'heading', text: [{ type: 'custom_emoji', alternative_text: '🎬', custom_emoji_id: '5354899958329784877' }, ' Season 1'], size: 2 }
+    ]
+  };
+  const res = await editOrSendRichWithFallback(fakeApi, -10012345, 55, rich, {}, null, { deleteReplaced: true });
+  assert.equal(res.edited, true);
+  assert.equal(res.didReplace, false);
+  assert.equal(res.sent.message_id, 55);
+  assert.equal(editCalls, 1);
+  assert.equal(sendCalls, 0, 'Must NOT resend a fresh message on episode/menu toggle');
+  assert.equal(deleteCalls, 0, 'Must NOT delete existing card on episode/menu toggle');
+});
+
 
 
 

@@ -2086,6 +2086,7 @@ export class QueueManager extends EventEmitter {
     await Promise.allSettled([...this.sessions.values()].filter(s => (s.connected||s.stopPending) && !s.browserStreamLease?.active).map(s => this.locks.run(s.chatId, async () => {
       if (this.closed) return;
       if(s.stopPending){if(Date.now()<(s.stopRetryAfter||0))return;try{await this.#finishStop(s);s.status='idle';}catch{s.stopRetryAfter=Date.now()+30000;s.lastError='Queue cleared; call/group departure is still awaiting confirmation.';}await this.updatePlayerCard(s.chatId);return;}
+      if (s._statusBackoffUntil && Date.now() < s._statusBackoffUntil) return;
       try {
         const r = this.#assert(await this.voice.getStatus(s.chatId));
         if (!r.active) {
@@ -2192,7 +2193,16 @@ export class QueueManager extends EventEmitter {
           this.#savePlaybackSnapshot(s);
         }
         if(s.status==='playing'&&(!s.prefetched||((s.radio?.enabled||this.app?.music?.aiDj?.isEnabled?.(s))&&s.upcoming.length<3))){this.prefetch(s);}
-      } catch { s.failures = (s.failures || 0) + 1; s.positionSeconds = null; s.lastError = 'Playback status unavailable; reconnecting to the engine.'; }
+      } catch (err) {
+        s.failures = (s.failures || 0) + 1;
+        s.positionSeconds = null;
+        if (err?.code === 'RATE_LIMITED' || err?.backendKind === 'FloodWait') {
+          s._statusBackoffUntil = Date.now() + 6000;
+        } else if (s.failures >= 3) {
+          s._statusBackoffUntil = Date.now() + 4000;
+        }
+        s.lastError = 'Playback status unavailable; reconnecting to the engine.';
+      }
       if(Date.now()>=(s.nextCardEdit||0)){s.nextCardEdit=Date.now()+45000;if(!s.overlayView&&(s.view==='player'||s.view==='cinema')&&!(s._editStripsCustomEmoji&&s._editStripsCustomEmojiMsgId===s.screenMessageId))await this.updatePlayerCard(s.chatId);}
     })));
   }
