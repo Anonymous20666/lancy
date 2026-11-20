@@ -1181,14 +1181,14 @@ class Bridge:
                     from pytgcalls.types import StreamFrames
                 except Exception:
                     StreamFrames = None
-                client = Client(f'lancy_{alias}', api_id=int(os.environ['TELEGRAM_API_ID']), api_hash=os.environ['TELEGRAM_API_HASH'], session_string=data['session'], in_memory=True)
+                client = Client(f'lancy_{alias}', api_id=int(os.environ['TELEGRAM_API_ID']), api_hash=os.environ['TELEGRAM_API_HASH'], session_string=data['session'], in_memory=True, sleep_threshold=2)
                 await asyncio.wait_for(client.start(), 30)
                 me = getattr(client, 'me', None) or await asyncio.wait_for(client.get_me(), 10)
                 if me.is_bot:
                     await client.stop()
                     raise VoiceFailure('SESSION_NOT_READY')
                 uid = me.id
-                engine = PyTgCalls(client)
+                engine = PyTgCalls(client, cache_duration=180)
                 @engine.on_update()
                 async def update(_, event):
                     if StreamFrames is not None and isinstance(event, StreamFrames):
@@ -4296,6 +4296,11 @@ class Bridge:
                     raise
         self._cleanup_sub_overlay(call)
         await self._stop_secondary_tile_unlocked(chat)
+        try:
+            await self.voice_listener.stop_chat(chat)
+        except Exception:
+            pass
+        self._invalidate_native_call_cache(a.get('client') if a else None, chat)
         self.calls.pop(chat, None)
         self.prune_shifted_subtitles()
         if a is not None:

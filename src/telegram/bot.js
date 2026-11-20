@@ -454,7 +454,9 @@ export class TelegramController extends EventEmitter {
     }
 
     // Ensure long polling is clean after any bot token switch (clear any stale webhook)
-    await this.api.call('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
+    if (typeof this.api?.call === 'function') {
+      await this.api.call('deleteWebhook', { drop_pending_updates: false }).catch(() => {});
+    }
 
     // Register slash commands & menu button so typing / and the suggestion box stay synced
     await this.registerCommands();

@@ -2474,7 +2474,8 @@ export class MediaDownloader {
 
       const ffmpegBin = resolveFfmpegPath() || 'ffmpeg';
 
-      // Layer 0.5: Ultra-fast direct HTTP CDN resolver (JioSaavn 320k / Audius — ~0.6s, no yt-dlp process overhead!)
+      // Layer 0.5: Ultra-fast direct HTTP CDN resolver (JioSaavn 320k / Audius / SoundCloud — skips slow YouTube bot-checks)
+      const ytBotCooldownActive = Date.now() < (this._ytBotBlockedUntil || 0);
       if (!downloaded && !wantsLongMix && !isLyricQuery) {
         try {
           const { resolveAndDownloadAudio } = await import('./musicResolver.js');
@@ -2491,7 +2492,7 @@ export class MediaDownloader {
               skipYouTube: true,
               onProgress
             }),
-            new Promise((resolve) => setTimeout(() => resolve({ ok: false }), 4500))
+            new Promise((resolve) => setTimeout(() => resolve({ ok: false }), ytBotCooldownActive ? 9000 : 5500))
           ]);
           if (fastRes?.ok && (await getValidAudioFile())) {
             downloaded = true;
@@ -2500,7 +2501,7 @@ export class MediaDownloader {
       }
 
       // Layer 1: Download matched YouTube video with authenticated session & node challenge solver (-N 8 fast fragments)
-      if (!downloaded && videoId) {
+      if (!downloaded && videoId && !ytBotCooldownActive) {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
@@ -2517,12 +2518,15 @@ export class MediaDownloader {
           ], { timeout: 40000 });
           if (await getValidAudioFile()) downloaded = true;
         } catch (ytDlErr) {
+          if (/sign in to confirm you.?re not a bot/i.test(String(ytDlErr?.message || ''))) {
+            this._ytBotBlockedUntil = Date.now() + 10 * 60 * 1000;
+          }
           this.log.warn({ err: ytDlErr.message, videoId }, 'Direct YouTube video download failed, trying search fallback');
         }
       }
 
       // Layer 2: Direct clean query search with authenticated session & node challenge solver
-      if (!downloaded) {
+      if (!downloaded && Date.now() >= (this._ytBotBlockedUntil || 0)) {
         try {
           await execFileAsync('yt-dlp', [
             '--no-warnings',
@@ -2542,6 +2546,9 @@ export class MediaDownloader {
           ], { timeout: 40000 });
           if (await getValidAudioFile()) downloaded = true;
         } catch (ytSearchErr) {
+          if (/sign in to confirm you.?re not a bot/i.test(String(ytSearchErr?.message || ''))) {
+            this._ytBotBlockedUntil = Date.now() + 10 * 60 * 1000;
+          }
           this.log.warn({ err: ytSearchErr.message }, 'YouTube query search failed, trying proxy fallback');
         }
       }

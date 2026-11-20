@@ -349,7 +349,7 @@ class VoiceAiListenerAndTtsTests(unittest.TestCase):
                 )
                 bridge = bridge_main.Bridge(root, factory=None)
                 bridge.calls[-100777] = {'alias': 'a1', 'status': 'playing', 'av_sync_id': 'sync-x'}
-                bridge.accounts['a1'] = {'alias': 'a1', 'engine': engine, 'client': None}
+                bridge.accounts['a1'] = {'alias': 'a1', 'engine': engine, 'client': None, 'leases': set()}
                 mgr = bridge.voice_listener
                 st = voice_listener.ChatListenState(chat_id=-100777, alias='a1', use_live_mode=True)
                 mgr.states[-100777] = st
@@ -470,6 +470,12 @@ class VoiceAiListenerAndTtsTests(unittest.TestCase):
                 # Immediate second call within 30s must be throttled
                 await mgr.refresh_participants(-100777)
                 self.assertEqual(len(direct_calls), 1)
+
+                # _close_dropped_call must stop voice_listener so ended calls never leave zombie Gemini Live reconnect loops
+                bridge.calls[-100777] = {'alias': 'a1', 'status': 'playing', 'stream_mode': 'rtmp', 'playback_id': 'pb-z'}
+                await bridge._close_dropped_call(bridge.accounts['a1'], -100777, bridge.calls[-100777], reason='RTMP_CALL_ENDED')
+                self.assertNotIn(-100777, bridge.calls)
+                self.assertNotIn(-100777, mgr.states)
 
                 await mgr.stop_all()
 

@@ -712,13 +712,17 @@ export class MovieDownloader {
           (targetQuality === '360p' && !sourceHeight && sizeBytes > 32 * 1024 * 1024)
         )
       );
-      const needsSubBurn = Boolean(!item?.filePath && validSub.ok && validSub.srtPath);
+      const explicitSubBurn = subtitles === 'burn';
+      const hasValidExternalSub = Boolean(!item?.filePath && validSub.ok && validSub.srtPath);
+      const needsSubBurn = Boolean(hasValidExternalSub && explicitSubBurn);
+      const needsSoftSubMux = Boolean(hasValidExternalSub && !explicitSubBurn);
       const audioCodecLower = String(bestAudio.stream?.codec || '').toLowerCase();
       const needsAudioTranscode = Boolean(dlProbe.known && bestAudio.stream && !MP4_UNIVERSAL_AUDIO_CODECS.has(audioCodecLower));
       const needsAudioTrackReselect = Boolean(dlProbe.known && (dlProbe.audioStreams?.length || 0) > 1 && bestAudio.bestIndex > 0);
       const hasUnwantedForeignSoftSubs = Boolean(
-        dlProbe.known && !needsSubBurn && (dlProbe.subtitleStreams || []).some((s) => s.language && !['en', 'eng', 'und', ''].includes(s.language))
+        dlProbe.known && !hasValidExternalSub && (dlProbe.subtitleStreams || []).some((s) => s.language && !['en', 'eng', 'und', ''].includes(s.language))
       );
+      let softSubEmbedded = false;
 
       if (sizeBytes > limitBytes || needsHeightScale || needsSubBurn) {
         if (fitPlan && fitPlan.action === 'reject') {
@@ -790,20 +794,33 @@ export class MovieDownloader {
             cleanup: () => {}
           };
         }
-      } else if (!item?.filePath && (needsAudioTranscode || needsAudioTrackReselect || hasUnwantedForeignSoftSubs)) {
-        // Fast 1-3s stream-copy remux: fixes incompatible audio codec (AC3/DTS/Opus -> AAC), removes wrong dubs/foreign soft-subs
-        emit(`🔧 Normalizing clean AAC audio for ${safeName}…`);
+      } else if (!item?.filePath && (needsSoftSubMux || needsAudioTranscode || needsAudioTrackReselect || hasUnwantedForeignSoftSubs)) {
+        // Fast 1-3s stream-copy remux: embeds toggleable mov_text soft subtitles, fixes incompatible audio codec (AC3/DTS/Opus -> AAC), removes wrong dubs/foreign soft-subs
+        emit(needsSoftSubMux ? `💬 Muxing toggleable English soft subtitles (${safeName})…` : `🔧 Normalizing clean AAC audio for ${safeName}…`);
         const fixedPath = join(workDir, `${safeName}_clean.mp4`);
-        const fastArgs = [
-          '-nostdin', '-y',
-          '-i', outPath,
-          '-map', '0:v:0', '-map', `0:a:${bestAudio.bestIndex}`,
-          '-sn',
-          '-c:v', 'copy',
-          ...(needsAudioTranscode ? ['-c:a', 'aac', '-b:a', '128k', '-ac', '2'] : ['-c:a', 'copy']),
-          '-movflags', '+faststart',
-          fixedPath
-        ];
+        const fastArgs = needsSoftSubMux
+          ? [
+              '-nostdin', '-y',
+              '-i', outPath,
+              '-i', validSub.srtPath,
+              '-map', '0:v:0', '-map', `0:a:${bestAudio.bestIndex}`, '-map', '1:0',
+              '-c:v', 'copy',
+              ...(needsAudioTranscode ? ['-c:a', 'aac', '-b:a', '128k', '-ac', '2'] : ['-c:a', 'copy']),
+              '-c:s', 'mov_text',
+              '-metadata:s:s:0', 'language=eng',
+              '-movflags', '+faststart',
+              fixedPath
+            ]
+          : [
+              '-nostdin', '-y',
+              '-i', outPath,
+              '-map', '0:v:0', '-map', `0:a:${bestAudio.bestIndex}`,
+              '-sn',
+              '-c:v', 'copy',
+              ...(needsAudioTranscode ? ['-c:a', 'aac', '-b:a', '128k', '-ac', '2'] : ['-c:a', 'copy']),
+              '-movflags', '+faststart',
+              fixedPath
+            ];
         try {
           await this.runner('ffmpeg', fastArgs, { timeout: 300_000, maxBuffer: 4 * 1024 * 1024 });
           if (existsSync(fixedPath) && statSync(fixedPath).size > 1024) {
@@ -814,6 +831,9 @@ export class MovieDownloader {
               }
               outPath = fixedPath;
               sizeBytes = statSync(outPath).size;
+              if (needsSoftSubMux && (!fixProbe.known || (fixProbe.subtitleStreams?.length || 0) > 0)) {
+                softSubEmbedded = true;
+              }
             }
           }
         } catch {
@@ -833,8 +853,10 @@ export class MovieDownloader {
         title: displayTitle,
         audioLanguage: resolvedAudioLang || null,
         audioIsDub,
-        subtitleApplied: needsSubBurn,
-        hasEmbeddedEnglishSub,
+        subtitleApplied: needsSubBurn || softSubEmbedded,
+        softSubtitleMuxed: softSubEmbedded,
+        subtitlePath: hasValidExternalSub ? validSub.srtPath : null,
+        hasEmbeddedEnglishSub: hasEmbeddedEnglishSub || softSubEmbedded,
         track,
         cleanup: outPath === track.filePath ? () => {} : cleanup
       };
@@ -947,7 +969,7 @@ export class MovieDownloader {
 
     const manifest = ms?.dlManifest;
     const items = Array.isArray(manifest?.items) ? manifest.items : [];
-    const pageSize = Math.max(1, Math.min(10, Number(manifest?.pageSize) || 4));
+    const pageSize = Math.max(1, Math.min(10, Number(manifest?.pageSize) || 10));
     const totalPages = Math.max(1, Math.ceil(items.length / pageSize));
     const safePage = Math.max(0, Math.min(Number(page) || 0, totalPages - 1));
     ms.dlPage = safePage;

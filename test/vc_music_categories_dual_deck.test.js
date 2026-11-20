@@ -11,6 +11,7 @@ import { TelegramController } from '../src/telegram/bot.js';
 import { States } from '../src/core/stateMachine.js';
 import { FullTrackPreviews } from '../src/music/preview.js';
 import { extractSentPhotoFileId } from '../src/music/model.js';
+import { OpenAICompatibleProvider } from '../src/ai/providers/openaiCompatible.js';
 
 test('2026 Music Categories Directory covers all 8 families and 95+ subgenres with smart search', () => {
   assert.equal(MUSIC_CATEGORIES_2026.length, 8);
@@ -605,6 +606,30 @@ test('FullTrackPreviews supports multi-source music provider and recovers when e
   });
   assert.equal(extracted, 'AgAC_large_poster');
 });
+
+test('OpenAICompatibleProvider expands reasoning-model max_tokens and retries once on empty completion', async () => {
+  const seenBodies = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (_url, opts) => {
+    const body = JSON.parse(opts.body);
+    seenBodies.push(body);
+    if (seenBodies.length === 1) {
+      return { ok: true, json: async () => ({ choices: [{ message: { content: '' } }] }) };
+    }
+    return { ok: true, json: async () => ({ choices: [{ message: { content: 'Hey! Ready when you are.' } }] }) };
+  };
+  try {
+    const prov = new OpenAICompatibleProvider({ endpoint: 'http://127.0.0.1:9999/v1', model: 'gpt-6.2-astra:free', apiKey: 'test' });
+    const reply = await prov.generate({ text: 'Hi', maxTokens: 300 });
+    assert.equal(reply, 'Hey! Ready when you are.');
+    assert.equal(seenBodies.length, 2);
+    assert.ok(seenBodies[0].max_tokens >= 900, 'Reasoning model should get >=900 max_tokens on initial call');
+    assert.ok(seenBodies[1].max_tokens >= 1600, 'Empty completion retry should expand max_tokens >=1600');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
 
 
 

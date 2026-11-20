@@ -35,6 +35,9 @@ export class OpenAICompatibleProvider {
     if (/gemini-4-neon|gemini-2\.5|gemini-3/i.test(String(this.model || ''))) {
       return Math.max(400, requested);
     }
+    if (/gpt-6(?:\.\d+)?-astra|o[134](?:-|$)|thinking|reason/i.test(String(this.model || ''))) {
+      return Math.max(900, requested);
+    }
     return requested;
   }
 
@@ -144,6 +147,45 @@ export class OpenAICompatibleProvider {
         }).filter(tc => tc.function.name)
       : [];
     if (!replyText && !toolCalls.length) {
+      // Reasoning models can exhaust max_tokens in internal thoughts; retry once with a larger token ceiling.
+      const retryBody = { ...body, max_tokens: Math.max(1600, Number(body.max_tokens || 400) * 2) };
+      const retryRes = await fetch(`${this.endpoint}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(this.apiKey ? { authorization: `Bearer ${this.apiKey}` } : {})
+        },
+        body: JSON.stringify(retryBody),
+        signal: AbortSignal.timeout(this.timeoutMs)
+      });
+      if (retryRes.ok) {
+        const retryData = await retryRes.json();
+        const retryMsg = retryData?.choices?.[0]?.message || {};
+        const retryText = String(retryMsg.content ?? '').trim();
+        const retryTools = Array.isArray(retryMsg.tool_calls)
+          ? retryMsg.tool_calls.map((tc, idx) => {
+              const fn = tc?.function || {};
+              let args = fn.arguments;
+              if (typeof args === 'string') {
+                try { args = JSON.parse(args); } catch { args = {}; }
+              }
+              const callObj = {
+                id: tc?.id || `call_${idx}`,
+                type: 'function',
+                function: { name: String(fn.name || '').trim(), arguments: (args && typeof args === 'object') ? args : {} }
+              };
+              if (tc?.thought_signature) callObj.thought_signature = tc.thought_signature;
+              if (tc?.extra_content) callObj.extra_content = tc.extra_content;
+              return callObj;
+            }).filter(tc => tc.function.name)
+          : [];
+        if (retryText || retryTools.length) {
+          if (hasTools || returnObject) {
+            return { text: retryText, toolCalls: retryTools, rawMessage: retryMsg, usage: retryData?.usage || null, model: retryData?.model || this.model };
+          }
+          return retryText;
+        }
+      }
       throw new Error('endpoint returned empty completion');
     }
     if (hasTools || returnObject) {

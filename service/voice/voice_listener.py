@@ -369,8 +369,12 @@ class VoiceListenerManager:
                     cur_s = st.persona_sessions.get(p_key)
                     if not st.enabled or cur_s is None or cur_s.closed:
                         return
+                    if not self.bridge.factory and cid not in getattr(self.bridge, 'calls', {}):
+                        return
                     await asyncio.sleep(0.35)
                     if not st.enabled or st.persona_sessions.get(p_key) is not cur_s or cur_s.closed or cur_s.connected:
+                        return
+                    if not self.bridge.factory and cid not in getattr(self.bridge, 'calls', {}):
                         return
                     try:
                         if q.full():
@@ -603,6 +607,8 @@ class VoiceListenerManager:
                     if target_sess is None or target_sess.closed:
                         continue
                     if not target_sess.connected:
+                        if not self.bridge.factory and cid not in getattr(self.bridge, 'calls', {}):
+                            continue
                         re_ok = await target_sess.connect(timeout_sec=6.0, start_reader=True)
                         if re_ok:
                             log.info('Gemini 3.8 Live session reconnected chat=%s persona=%s', cid, target_sess.persona_id)
@@ -969,6 +975,8 @@ class VoiceListenerManager:
                     log.debug('refresh_participants direct error chat=%s: %s', cid, str(direct_err)[:140])
                     return st.ssrc_to_uid
             if engine is None or not hasattr(engine, 'get_participants'):
+                return st.ssrc_to_uid
+            if not self.bridge.factory and type(engine).__name__ == 'PyTgCalls' and (cid not in getattr(self.bridge, 'calls', {}) or native_call is None):
                 return st.ssrc_to_uid
             parts = await asyncio.wait_for(engine.get_participants(cid), 4.0)
             missing_name_uids = []
