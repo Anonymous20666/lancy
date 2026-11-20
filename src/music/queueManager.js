@@ -2555,7 +2555,7 @@ export class QueueManager extends EventEmitter {
         : screen.renderPlayer(display);
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
-      const curRenderStateKey = `${s.currentTrack?.entryId || s.currentTrack?.id || 'idle'}:${s.status}:${effectiveView}:${s.volume}:${s.loopMode}:${s.upcoming?.length || 0}:${s.movieUpcoming?.length || 0}:${s.subtitleMode || ''}:${s.vcQuality || ''}:${s.streamMode || ''}:${s.pinned ? 1 : 0}`;
+      const curRenderStateKey = `${s.currentTrack?.entryId || s.currentTrack?.id || 'idle'}:${s.status}:${effectiveView}:${s.volume}:${s.loopMode}:${s.upcoming?.length || 0}:${s.movieUpcoming?.length || 0}:${s.subtitleMode || ''}:${s.vcQuality || ''}:${s.streamMode || ''}:${s.pinned ? 1 : 0}:${s.fullPreview?.status || ''}:${s.fullPreview?.fileId || ''}`;
       if (
         !preview
         && !forceEdit
@@ -2692,6 +2692,28 @@ export class QueueManager extends EventEmitter {
               }
             } else {
               throw editErr;
+            }
+          }
+          if (preview && usedEdit && !audioFileId(sent) && typeof api.sendRichMessage === 'function') {
+            const oldMsgId = s.screenMessageId;
+            const replyExtra = this.#playerReplyExtra(s, oldMsgId);
+            const out = await sendRichWithPhotoFallback(api, s.playerChatId, effectiveRich, replyExtra, files);
+            if (out?.sent && audioFileId(out.sent)) {
+              sent = out.sent;
+              renderedHasPhoto = out.hasPhoto;
+              usedEdit = false;
+              if (oldMsgId && oldMsgId !== sent.message_id && typeof api.deleteMessage === 'function') {
+                await api.deleteMessage(s.playerChatId, oldMsgId).catch(() => {});
+              }
+              if (oldMsgId !== sent.message_id) {
+                s.pinned = false;
+                s.pinnedMessageId = null;
+              }
+              s.screenMessageId = sent.message_id;
+              s._editStripsCustomEmoji = false;
+              s._editStripsCustomEmojiMsgId = null;
+              s._editStripsCustomEmojiTrackId = null;
+              s._customEmojiReanchoredMsgId = replyExtra.reply_parameters ? sent.message_id : null;
             }
           }
           if (usedEdit && !preview && sent && Array.isArray(sent.rich_message?.blocks)) {

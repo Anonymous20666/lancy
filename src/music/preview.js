@@ -68,7 +68,7 @@ export class FullTrackPreviews {
     if (s.fullPreview?.trackId === track.id && s.fullPreview.playbackId === s.playbackId) return;
     const request = randomUUID();
     s.fullPreview = { request, trackId: track.id, playbackId: s.playbackId, status: 'pending' };
-    if (!['youtube', 'audius','telegram'].includes(track.provider) || (track.provider === 'audius' && track.downloadable !== true)) {
+    if (!['youtube', 'music', 'audius', 'telegram'].includes(track.provider) || (track.provider === 'audius' && track.downloadable !== true)) {
       s.fullPreview.status = 'unavailable';
       s.fullPreview.reason = 'This source does not permit a full audio-file preview. Voice-chat streaming is separate.';
       return;

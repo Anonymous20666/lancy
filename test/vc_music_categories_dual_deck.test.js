@@ -9,6 +9,7 @@ import { enhanceRichText } from '../src/telegram/customEmoji.js';
 import { TelegramAPI } from '../src/telegram/api.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { States } from '../src/core/stateMachine.js';
+import { FullTrackPreviews } from '../src/music/preview.js';
 
 test('2026 Music Categories Directory covers all 8 families and 95+ subgenres with smart search', () => {
   assert.equal(MUSIC_CATEGORIES_2026.length, 8);
@@ -545,6 +546,48 @@ test('TelegramAPI never falls back local Bot API getUpdates to api.telegram.org'
     globalThis.fetch = origFetch;
   }
 });
+
+test('FullTrackPreviews supports multi-source music provider and recovers when editMessageRich drops audio preview block', async () => {
+  const acquireCalls = [];
+  const publishedCalls = [];
+  const fakeApi = { me: { id: 777 } };
+  const mockApp = {
+    music: {},
+    musicLibrary: {
+      acquire: async (track, opts) => {
+        acquireCalls.push({ provider: track.provider, download: opts?.download });
+        return { track, filePath: '/tmp/fake.mp3', release: () => {} };
+      }
+    },
+    musicQueueManager: {
+      closed: false,
+      updatePlayerCard: async (chatId, opts = {}) => {
+        if (opts.preview) {
+          publishedCalls.push({ chatId, trackId: opts.preview.media.track.id });
+          return true;
+        }
+        return true;
+      }
+    }
+  };
+  const previews = new FullTrackPreviews({ app: mockApp });
+  const session = {
+    chatId: -100555,
+    api: fakeApi,
+    screenMessageId: 42,
+    view: 'player',
+    status: 'playing',
+    playbackId: 'pb-1',
+    currentTrack: { id: 'music:deezer:123', provider: 'music', title: 'Essence', artist: 'Wizkid', durationSeconds: 248 }
+  };
+  previews.schedule(session);
+  await Promise.all([...previews.jobs]);
+  assert.equal(acquireCalls.length, 1, 'provider="music" must be accepted by FullTrackPreviews (not marked unavailable)');
+  assert.equal(acquireCalls[0].download, true);
+  assert.equal(publishedCalls.length, 1);
+  assert.notEqual(session.fullPreview?.status, 'unavailable');
+});
+
 
 
 
