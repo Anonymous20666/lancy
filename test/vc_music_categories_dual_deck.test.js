@@ -10,6 +10,7 @@ import { TelegramAPI } from '../src/telegram/api.js';
 import { TelegramController } from '../src/telegram/bot.js';
 import { States } from '../src/core/stateMachine.js';
 import { FullTrackPreviews } from '../src/music/preview.js';
+import { extractSentPhotoFileId } from '../src/music/model.js';
 
 test('2026 Music Categories Directory covers all 8 families and 95+ subgenres with smart search', () => {
   assert.equal(MUSIC_CATEGORIES_2026.length, 8);
@@ -586,6 +587,23 @@ test('FullTrackPreviews supports multi-source music provider and recovers when e
   assert.equal(acquireCalls[0].download, true);
   assert.equal(publishedCalls.length, 1);
   assert.notEqual(session.fullPreview?.status, 'unavailable');
+
+  // Bot API 10.3 returns rich_message photo blocks as PhotoSize[] arrays; extractSentPhotoFileId must capture the largest file_id
+  const extracted = extractSentPhotoFileId({
+    message_id: 500,
+    rich_message: {
+      blocks: [
+        {
+          type: 'photo',
+          photo: [
+            { file_id: 'AgAC_small', width: 90, height: 135 },
+            { file_id: 'AgAC_large_poster', width: 800, height: 1200 }
+          ]
+        }
+      ]
+    }
+  });
+  assert.equal(extracted, 'AgAC_large_poster');
 });
 
 

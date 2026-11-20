@@ -8,7 +8,7 @@ import { logger } from '../core/logger.js';
 import { getCueAt, mapMediaSecToSubMs } from '../media/subtitles.js';
 import { buildLrcSubtitleText } from './lyrics.js';
 import { resolveAppScreen } from './accounts.js';
-import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, didEditStripMedia, didEditStripCustomEmojis, sendRichWithPhotoFallback, extractRichPhotoUrl, replaceRichPhotoMedia, extractSentPhotoFileId } from './model.js';
+import { KeyedLock, MusicError, queueEntry, stripRemotePhotoBlocks, isRemotePhotoError, hasRichPhotoPayload, didEditStripMedia, didEditStripCustomEmojis, sendRichWithPhotoFallback, extractRichPhotoUrl, replaceRichPhotoMedia, extractSentPhotoFileId, downloadRemotePhotoAsJpeg } from './model.js';
 
 /** Sole owner of ephemeral destination queues. The bridge exclusively owns account leases. */
 export class QueueManager extends EventEmitter {
@@ -2555,7 +2555,7 @@ export class QueueManager extends EventEmitter {
         : screen.renderPlayer(display);
       if (!rich) return false;
       const content = JSON.stringify(rich); if (!preview && !forceEdit && content === s.lastRender) return true;
-      const curRenderStateKey = `${s.currentTrack?.entryId || s.currentTrack?.id || 'idle'}:${s.status}:${effectiveView}:${s.volume}:${s.loopMode}:${s.upcoming?.length || 0}:${s.movieUpcoming?.length || 0}:${s.subtitleMode || ''}:${s.vcQuality || ''}:${s.streamMode || ''}:${s.pinned ? 1 : 0}:${s.fullPreview?.status || ''}:${s.fullPreview?.fileId || ''}`;
+      const curRenderStateKey = `${s.currentTrack?.entryId || s.currentTrack?.id || 'idle'}:${s.status}:${effectiveView}:${s.volume}:${s.loopMode}:${s.upcoming?.length || 0}:${s.movieUpcoming?.length || 0}:${s.subtitleMode || ''}:${s.vcQuality || ''}:${s.streamMode || ''}:${s.pinned ? 1 : 0}:${s.fullPreview?.status || ''}:${s.fullPreview?.fileId || ''}:${s.currentTrack?.artwork || ''}:${s.cardLyrics?.trackId || ''}`;
       if (
         !preview
         && !forceEdit
@@ -2680,14 +2680,38 @@ export class QueueManager extends EventEmitter {
                   s._customEmojiReanchoredMsgId = replyExtra.reply_parameters ? sent.message_id : null;
                 }
               } else {
-                if (rawPhotoUrl) s._photoBlockedUrl = rawPhotoUrl;
-                const noPhoto = stripRemotePhotoBlocks(effectiveRich);
-                if (noPhoto) {
-                  editedPayload = noPhoto;
-                  sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, noPhoto, { dropOnFloodWait: !forceEdit }, files);
-                  renderedHasPhoto = false;
-                } else {
-                  throw editErr;
+                let recoveredViaJpeg = false;
+                if (rawPhotoUrl && s._photoBlockedUrl !== rawPhotoUrl) {
+                  const uploaded = await downloadRemotePhotoAsJpeg(rawPhotoUrl).catch(() => null);
+                  if (uploaded?.buffer?.length) {
+                    const attachRich = replaceRichPhotoMedia(effectiveRich, 'attach://artwork_photo');
+                    const mergedFiles = files ? { ...files, artwork_photo: uploaded } : { artwork_photo: uploaded };
+                    try {
+                      const jpegSent = await api.editMessageRich(s.playerChatId, s.screenMessageId, attachRich, { dropOnFloodWait: !forceEdit }, mergedFiles);
+                      if (!didEditStripMedia(attachRich, jpegSent)) {
+                        sent = jpegSent;
+                        editedPayload = attachRich;
+                        renderedHasPhoto = true;
+                        recoveredViaJpeg = true;
+                        const fid = extractSentPhotoFileId(jpegSent);
+                        if (fid) {
+                          if (!s._photoFileIdByUrl) s._photoFileIdByUrl = new Map();
+                          s._photoFileIdByUrl.set(rawPhotoUrl, fid);
+                        }
+                      }
+                    } catch {}
+                  }
+                }
+                if (!recoveredViaJpeg) {
+                  if (rawPhotoUrl) s._photoBlockedUrl = rawPhotoUrl;
+                  const noPhoto = stripRemotePhotoBlocks(effectiveRich);
+                  if (noPhoto) {
+                    editedPayload = noPhoto;
+                    sent = await api.editMessageRich(s.playerChatId, s.screenMessageId, noPhoto, { dropOnFloodWait: !forceEdit }, files);
+                    renderedHasPhoto = false;
+                  } else {
+                    throw editErr;
+                  }
                 }
               }
             } else {

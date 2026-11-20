@@ -192,15 +192,34 @@ export function extractSentPhotoFileId(sent) {
   if (Array.isArray(sent.photo) && sent.photo.length) {
     return sent.photo[sent.photo.length - 1]?.file_id || null;
   }
+  const pickFromBlock = (b) => {
+    if (!b || typeof b !== 'object') return null;
+    if (b.type === 'photo') {
+      if (Array.isArray(b.photo) && b.photo.length) {
+        return b.photo[b.photo.length - 1]?.file_id || null;
+      }
+      if (Array.isArray(b.photo?.photo) && b.photo.photo.length) {
+        return b.photo.photo[b.photo.photo.length - 1]?.file_id || null;
+      }
+      const fid = b.photo?.file_id
+        || b.photo?.photo?.file_id
+        || b.file_id
+        || (typeof b.photo?.media === 'string' && !/^https?:|^attach:/i.test(b.photo.media) ? b.photo.media : null);
+      if (fid) return fid;
+    }
+    if ((b.type === 'slideshow' || b.type === 'collage') && Array.isArray(b.blocks)) {
+      for (const inner of b.blocks) {
+        const fid = pickFromBlock(inner);
+        if (fid) return fid;
+      }
+    }
+    return null;
+  };
   const blocks = sent.rich_message?.blocks;
   if (Array.isArray(blocks)) {
     for (const b of blocks) {
-      if (b?.type === 'photo') {
-        const fid = b.photo?.file_id
-          || b.photo?.photo?.file_id
-          || (typeof b.photo?.media === 'string' && !/^https?:|^attach:/i.test(b.photo.media) ? b.photo.media : null);
-        if (fid) return fid;
-      }
+      const fid = pickFromBlock(b);
+      if (fid) return fid;
     }
   }
   return null;
