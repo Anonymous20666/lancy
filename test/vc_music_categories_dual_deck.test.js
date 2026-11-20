@@ -630,14 +630,14 @@ test('OpenAICompatibleProvider expands reasoning-model max_tokens and retries on
   }
 });
 
-test('editOrSendRichWithFallback edits group episode/menu cards in place without delete/resend spam when Telegram strips custom emojis', async () => {
+test('editOrSendRichWithFallback preserves custom emojis on major group transitions and edits in place on rapid episode toggles', async () => {
   let editCalls = 0;
   let sendCalls = 0;
   let deleteCalls = 0;
   const fakeApi = {
     editMessageRich: async (_chatId, msgId) => {
       editCalls += 1;
-      // Simulate Telegram Bot API 10.3 stripping custom_emoji on group editMessageText
+      // Simulate Telegram Bot API 10.4 stripping custom_emoji on group editMessageText
       return { message_id: msgId, rich_message: { blocks: [{ type: 'heading', text: 'Season 1', size: 2 }] } };
     },
     sendRichMessage: async () => {
@@ -653,13 +653,24 @@ test('editOrSendRichWithFallback edits group episode/menu cards in place without
       { type: 'heading', text: [{ type: 'custom_emoji', alternative_text: '🎬', custom_emoji_id: '5354899958329784877' }, ' Season 1'], size: 2 }
     ]
   };
-  const res = await editOrSendRichWithFallback(fakeApi, -10012345, 55, rich, {}, null, { deleteReplaced: true });
-  assert.equal(res.edited, true);
-  assert.equal(res.didReplace, false);
-  assert.equal(res.sent.message_id, 55);
+
+  // 1. Rapid episode/checkbox toggles (preserveCustomEmojis: false) edit cleanly in place
+  const toggleRes = await editOrSendRichWithFallback(fakeApi, -10012345, 55, rich, {}, null, { deleteReplaced: true, preserveCustomEmojis: false });
+  assert.equal(toggleRes.edited, true);
+  assert.equal(toggleRes.didReplace, false);
+  assert.equal(toggleRes.sent.message_id, 55);
   assert.equal(editCalls, 1);
-  assert.equal(sendCalls, 0, 'Must NOT resend a fresh message on episode/menu toggle');
-  assert.equal(deleteCalls, 0, 'Must NOT delete existing card on episode/menu toggle');
+  assert.equal(sendCalls, 0, 'Must NOT resend a fresh message on rapid episode toggle');
+  assert.equal(deleteCalls, 0, 'Must NOT delete existing card on rapid episode toggle');
+
+  // 2. Major screen transitions (default preserveCustomEmojis: true) restore custom emojis via sendRichMessage
+  const transitionRes = await editOrSendRichWithFallback(fakeApi, -10012345, 55, rich, {}, null, { deleteReplaced: true });
+  assert.equal(transitionRes.edited, false);
+  assert.equal(transitionRes.didReplace, true);
+  assert.equal(transitionRes.sent.message_id, 999);
+  assert.equal(editCalls, 2);
+  assert.equal(sendCalls, 1, 'Major group card transitions should restore stripped custom emojis');
+  assert.equal(deleteCalls, 1);
 });
 
 

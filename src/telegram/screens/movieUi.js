@@ -1412,7 +1412,7 @@ export function createMovieUi({
       rich,
       sendExtra,
       uploadFiles,
-      { deleteReplaced: false, fallbackArtworkUrls }
+      { deleteReplaced: false, fallbackArtworkUrls, preserveCustomEmojis: opts?.preserveCustomEmojis !== false }
     );
     const sent = out?.sent || null;
     const finalMsgId = sent?.message_id || targetEditId;
@@ -2720,7 +2720,7 @@ export function createMovieUi({
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
         await ctx.api.answerCallbackQuery(ctx.query.id, { text: `${checked ? '☑ Selected' : '☐ Deselected'} S${sStr}E${eStr} (${app.movieSessions.totalSelectedCount(ms)} total)` }).catch(() => {});
       }
-      await upsertCard(resolvedCtx, ms, ms.view === 'episode' ? renderEpisodeDetail(resolvedCtx, ms) : renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, ms.view === 'episode' ? renderEpisodeDetail(resolvedCtx, ms) : renderTvSeason(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
@@ -2730,7 +2730,7 @@ export function createMovieUi({
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
         await ctx.api.answerCallbackQuery(ctx.query.id, { text: selected ? `☑ Page selected (${count} in season)` : '☐ Page unselected' }).catch(() => {});
       }
-      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
@@ -2746,7 +2746,7 @@ export function createMovieUi({
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
         await ctx.api.answerCallbackQuery(ctx.query.id, { text: selected ? `✅ Selected all ${count} episodes of ${sLabel}` : `☐ Cleared ${sLabel}` }).catch(() => {});
       }
-      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
@@ -2772,7 +2772,7 @@ export function createMovieUi({
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
         await ctx.api.answerCallbackQuery(ctx.query.id, { text: ms.notice }).catch(() => {});
       }
-      await upsertCard(resolvedCtx, ms, ms.view === 'seasons' ? renderSeasonPicker(resolvedCtx, ms) : renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, ms.view === 'seasons' ? renderSeasonPicker(resolvedCtx, ms) : renderTvSeason(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
@@ -2790,21 +2790,21 @@ export function createMovieUi({
       if (ctx.query?.id && ctx.api?.answerCallbackQuery) {
         await ctx.api.answerCallbackQuery(ctx.query.id, { text: '✕ Cleared selected episodes' }).catch(() => {});
       }
-      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
     if (op === 'ep') {
       ms.epPage = Math.max(0, Number(arg) || 0);
       ms.view = 'season';
-      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, renderTvSeason(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
     if (op === 'ss') {
       ms.seasonPage = Math.max(0, Number(arg) || 0);
       ms.view = 'seasons';
-      await upsertCard(resolvedCtx, ms, renderSeasonPicker(resolvedCtx, ms));
+      await upsertCard(resolvedCtx, ms, renderSeasonPicker(resolvedCtx, ms), { preserveCustomEmojis: false });
       return true;
     }
 
