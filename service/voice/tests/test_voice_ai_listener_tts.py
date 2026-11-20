@@ -446,6 +446,31 @@ class VoiceAiListenerAndTtsTests(unittest.TestCase):
                 self.assertEqual(c_backoff.id, 555)
                 self.assertEqual(len(invocations), count_after_flood, 'Active FloodWait backoff must not hit invoke again')
 
+                # refresh_participants uses native_call GetGroupParticipants directly (no engine.get_participants / GetFullChannel) and throttles 30s
+                direct_calls = []
+
+                class FakeDirectClient:
+                    async def invoke(self, req, sleep_threshold=0):
+                        direct_calls.append((type(req).__name__, sleep_threshold))
+                        return SimpleNamespace(
+                            participants=[SimpleNamespace(peer=SimpleNamespace(user_id=991), source=4242)],
+                            users=[SimpleNamespace(id=991, first_name='PappyFan', last_name='', username='pf')],
+                        )
+
+                bridge.calls[-100777]['native_call'] = SimpleNamespace(id=555, access_hash=777)
+                bridge.accounts['a1']['client'] = FakeDirectClient()
+                st.last_part_refresh_mono = 0.0
+                st.part_refresh_backoff_until = 0.0
+                mapping = await mgr.refresh_participants(-100777)
+                self.assertEqual(mapping.get(4242), 991)
+                self.assertEqual(st.uid_to_name.get(991), 'PappyFan')
+                self.assertEqual(len(direct_calls), 1)
+                self.assertEqual(direct_calls[0], ('GetGroupParticipants', 0))
+                engine.get_participants.assert_not_awaited()
+                # Immediate second call within 30s must be throttled
+                await mgr.refresh_participants(-100777)
+                self.assertEqual(len(direct_calls), 1)
+
                 await mgr.stop_all()
 
         asyncio.run(run())

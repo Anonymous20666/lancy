@@ -153,6 +153,8 @@ class ChatListenState:
     last_user_speech_mono: float = 0.0
     live_engaged_until_mono: float = 0.0
     last_persona_switch_mono: float = 0.0
+    part_refresh_inflight: bool = False
+    part_refresh_backoff_until: float = 0.0
     voice_name: str = ''
     buffers: dict[int, SpeakerBuffer] = field(default_factory=dict)
     pending_turns: dict[int, PendingTurnBuffer] = field(default_factory=dict)
@@ -909,14 +911,65 @@ class VoiceListenerManager:
         if not st:
             return {}
         now = time.monotonic()
-        if not force and (now - st.last_part_refresh_mono) < 3.0:
+        if st.part_refresh_inflight:
+            return st.ssrc_to_uid
+        if not force and (now < st.part_refresh_backoff_until or (now - st.last_part_refresh_mono) < 30.0):
+            return st.ssrc_to_uid
+        cur_call = (self.bridge.calls.get(cid) or {}) if hasattr(self.bridge, 'calls') else {}
+        if cur_call.get('stream_mode') == 'rtmp' and not st.recording_started:
             return st.ssrc_to_uid
         st.last_part_refresh_mono = now
+        st.part_refresh_inflight = True
         acct = self.bridge.accounts.get(st.alias)
         engine = acct.get('engine') if acct else None
-        if engine is None or not hasattr(engine, 'get_participants'):
-            return st.ssrc_to_uid
+        client = acct.get('client') if acct else None
         try:
+            parts = None
+            native_call = cur_call.get('native_call')
+            if native_call is not None and client is not None and not self.bridge.factory and hasattr(client, 'invoke'):
+                try:
+                    from pyrogram import raw
+                    call_id = getattr(native_call, 'id', None)
+                    access_hash = getattr(native_call, 'access_hash', None)
+                    if call_id is not None and access_hash is not None:
+                        inp_call = raw.types.InputGroupCall(id=int(call_id), access_hash=int(access_hash))
+                        res = await asyncio.wait_for(
+                            client.invoke(
+                                raw.functions.phone.GetGroupParticipants(
+                                    call=inp_call,
+                                    ids=[],
+                                    sources=[],
+                                    offset='',
+                                    limit=100,
+                                ),
+                                sleep_threshold=0,
+                            ),
+                            4.0,
+                        )
+                        parts = []
+                        users_by_id = {int(getattr(u, 'id', 0) or 0): u for u in (getattr(res, 'users', None) or [])}
+                        for p in (getattr(res, 'participants', None) or []):
+                            peer = getattr(p, 'peer', None)
+                            uid = int(getattr(peer, 'user_id', 0) or 0)
+                            src = int(getattr(p, 'source', 0) or 0)
+                            u_obj = users_by_id.get(uid)
+                            if uid and src:
+                                st.ssrc_to_uid[src] = uid
+                            if uid and u_obj is not None:
+                                disp = ' '.join(
+                                    x.strip() for x in (getattr(u_obj, 'first_name', None), getattr(u_obj, 'last_name', None))
+                                    if isinstance(x, str) and x.strip()
+                                ) or getattr(u_obj, 'username', None)
+                                if disp:
+                                    st.uid_to_name[uid] = str(disp).strip()[:64]
+                        return st.ssrc_to_uid
+                except Exception as direct_err:
+                    wait_s = int(getattr(direct_err, 'value', 0) or 0) if type(direct_err).__name__ == 'FloodWait' else 0
+                    st.part_refresh_backoff_until = time.monotonic() + max(60.0, float(wait_s) + 5.0)
+                    log.debug('refresh_participants direct error chat=%s: %s', cid, str(direct_err)[:140])
+                    return st.ssrc_to_uid
+            if engine is None or not hasattr(engine, 'get_participants'):
+                return st.ssrc_to_uid
             parts = await asyncio.wait_for(engine.get_participants(cid), 4.0)
             missing_name_uids = []
             for p in (parts or []):
@@ -938,7 +991,6 @@ class VoiceListenerManager:
                         st.uid_to_name[uid] = raw_name.strip()[:64]
                     elif uid not in st.uid_to_name:
                         missing_name_uids.append(uid)
-            client = acct.get('client') if acct else None
             if missing_name_uids and client is not None and not self.bridge.factory and hasattr(client, 'get_users'):
                 try:
                     users = await asyncio.wait_for(client.get_users(missing_name_uids[:20]), 4.0)
@@ -952,7 +1004,11 @@ class VoiceListenerManager:
                 except Exception:
                     pass
         except Exception as err:
+            wait_s = int(getattr(err, 'value', 0) or 0) if type(err).__name__ == 'FloodWait' else 0
+            st.part_refresh_backoff_until = time.monotonic() + max(60.0, float(wait_s) + 5.0)
             log.debug('refresh_participants error chat=%s: %s', cid, str(err)[:140])
+        finally:
+            st.part_refresh_inflight = False
         return st.ssrc_to_uid
 
     def handle_incoming_frames(self, alias: str, chat_id: int, frames: list):
@@ -1115,7 +1171,7 @@ class VoiceListenerManager:
                 else:
                     sb.pre_roll.append(raw)
 
-        if needs_refresh and (now - st.last_part_refresh_mono) >= 3.0:
+        if needs_refresh and not st.part_refresh_inflight and now >= st.part_refresh_backoff_until and (now - st.last_part_refresh_mono) >= 30.0:
             task = asyncio.create_task(self.refresh_participants(cid))
             self._track_task(task)
 

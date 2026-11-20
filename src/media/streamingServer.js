@@ -543,15 +543,15 @@ export class VideoStreamingServer {
         return existing;
       }
     }
-    if (this.remoteStreams.size > 120_000) {
+    if (this.remoteStreams.size > 12_000) {
       for (const [k, v] of this.remoteStreams) {
         if (now > v.expiresAt) this.remoteStreams.delete(k);
       }
-      if (this.remoteStreams.size > 120_000) {
+      if (this.remoteStreams.size > 12_000) {
         for (const [k, v] of this.remoteStreams) {
-          if (v.isChildSegment && (now - (v.createdAt || 0) > 600_000)) {
+          if (v.isChildSegment && (now - (v.createdAt || 0) > 180_000)) {
             this.remoteStreams.delete(k);
-            if (this.remoteStreams.size <= 90_000) break;
+            if (this.remoteStreams.size <= 6_000) break;
           }
         }
       }
@@ -1260,7 +1260,7 @@ export class VideoStreamingServer {
 
   #putCachedSegment(token, body, contentType) {
     const maxEntry = 16 * 1024 * 1024;
-    const capMb = Math.max(48, Math.min(1024, Number(process.env.MOVIE_SEG_CACHE_MB || 256) || 256));
+    const capMb = Math.max(32, Math.min(512, Number(process.env.MOVIE_SEG_CACHE_MB || 96) || 96));
     const maxTotal = capMb * 1024 * 1024;
     if (!Buffer.isBuffer(body) || !body.length || body.length > maxEntry) return;
     const prev = this.segmentCache.get(token);
